@@ -80,6 +80,10 @@ impl MySqlSession {
             .map(|_| ())
     }
 
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
     pub async fn execute(&self, request: &ExecuteRequest) -> Result<QueryResult, DriverError> {
         let text = request.text.trim();
         if text.is_empty() {

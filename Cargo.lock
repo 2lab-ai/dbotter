@@ -1194,6 +1194,7 @@ name = "dbotter"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bitflags 2.13.0",
  "chrono",
  "clap",
@@ -1201,20 +1202,27 @@ dependencies = [
  "egui_extras",
  "futures-util",
  "mongodb",
+ "proc-macro2",
+ "quote",
  "redis",
  "rust_decimal",
+ "rustix 1.1.4",
+ "rustls-pki-types",
+ "rustls-webpki",
  "secrecy",
  "serde",
  "serde_json",
  "shell-words",
  "sqlparser",
  "sqlx",
+ "syn 2.0.118",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,8 +1,16 @@
 //! Pure profile draft validation plus egui rendering and save correlation.
 
+use std::path::PathBuf;
+
 use eframe::egui;
 
-use crate::model::{ConnectionProfile, DriverKind, OperationId, ProfileId, TlsMode};
+use crate::config::MigrationConsent;
+use crate::model::{
+    ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileGeneration,
+    ProfileId, RedisTlsConfig, TlsMode,
+};
+use crate::secrets::SessionSecretUpdate;
+use crate::service::{CreateProfileRequest, UpdateProfileRequest};
 
 use super::adapter::{SubmitError, UiCommand, UiPort};
 use super::model::UiEvent;
@@ -10,10 +18,13 @@ use super::model::UiEvent;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum EditorMode {
     Add,
-    Edit { original_id: ProfileId },
+    Edit {
+        original_id: ProfileId,
+        expected_generation: ProfileGeneration,
+    },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct ProfileDraft {
     pub id: String,
     pub name: String,
@@ -23,7 +34,28 @@ pub(super) struct ProfileDraft {
     pub database: String,
     pub username: String,
     pub tls: TlsMode,
+    pub credential_mode: CredentialMode,
     pub secret_env: String,
+    pub redis_ca_file: String,
+}
+
+impl std::fmt::Debug for ProfileDraft {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProfileDraft")
+            .field("id", &self.id)
+            .field("name", &"<redacted>")
+            .field("driver", &self.driver)
+            .field("host", &"<redacted>")
+            .field("port", &self.port)
+            .field("database", &"<redacted>")
+            .field("username", &"<redacted>")
+            .field("tls", &self.tls)
+            .field("credential_mode", &self.credential_mode)
+            .field("secret_env", &"<redacted>")
+            .field("redis_ca_file", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ProfileDraft {
@@ -36,8 +68,14 @@ impl ProfileDraft {
             port: default_port(driver).to_string(),
             database: String::new(),
             username: String::new(),
-            tls: TlsMode::Preferred,
+            tls: if driver == DriverKind::Redis {
+                TlsMode::Disabled
+            } else {
+                TlsMode::Preferred
+            },
+            credential_mode: CredentialMode::None,
             secret_env: String::new(),
+            redis_ca_file: String::new(),
         }
     }
 
@@ -51,7 +89,20 @@ impl ProfileDraft {
             database: profile.database.clone().unwrap_or_default(),
             username: profile.username.clone().unwrap_or_default(),
             tls: profile.tls,
+            credential_mode: profile.credential_mode,
             secret_env: profile.secret_env.clone().unwrap_or_default(),
+            redis_ca_file: if profile.driver == DriverKind::Redis
+                && profile.tls != TlsMode::Disabled
+            {
+                profile
+                    .redis_tls
+                    .ca_file
+                    .as_deref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
         }
     }
 
@@ -60,7 +111,30 @@ impl ProfileDraft {
         if self.port.trim().is_empty() || self.port == previous_default {
             self.port = default_port(driver).to_string();
         }
+        if self.driver != DriverKind::Redis
+            && driver == DriverKind::Redis
+            && self.tls == TlsMode::Preferred
+        {
+            self.tls = TlsMode::Disabled;
+        }
         self.driver = driver;
+        if driver != DriverKind::Redis {
+            self.redis_ca_file.clear();
+        }
+    }
+
+    pub fn select_credential_mode(&mut self, mode: CredentialMode) {
+        self.credential_mode = mode;
+        if mode != CredentialMode::Environment {
+            self.secret_env.clear();
+        }
+    }
+
+    pub fn select_tls(&mut self, tls: TlsMode) {
+        self.tls = tls;
+        if self.driver == DriverKind::Redis && tls != TlsMode::Required {
+            self.redis_ca_file.clear();
+        }
     }
 
     pub fn validate(&self) -> Result<ConnectionProfile, Box<ValidationErrors>> {
@@ -96,11 +170,31 @@ impl ProfileDraft {
         {
             errors.database = Some("Redis database must be a non-negative integer".to_owned());
         }
-        let secret_env = optional_trimmed(&self.secret_env);
-        if let Some(secret_env) = secret_env.as_deref()
-            && !valid_env_name(secret_env)
-        {
-            errors.secret_env = Some("Use a valid environment variable name".to_owned());
+        let secret_env = match self.credential_mode {
+            CredentialMode::Environment => optional_trimmed(&self.secret_env),
+            CredentialMode::None | CredentialMode::Session => None,
+        };
+        if self.credential_mode == CredentialMode::Environment {
+            match secret_env.as_deref() {
+                Some(value) if valid_env_name(value) => {}
+                _ => errors.secret_env = Some("Use a valid environment variable name".to_owned()),
+            }
+        }
+        if self.driver == DriverKind::Redis {
+            match self.tls {
+                TlsMode::Preferred => {
+                    errors.tls = Some(
+                        "Preferred is a legacy Redis mode; choose Disabled or Required".to_owned(),
+                    );
+                }
+                TlsMode::Disabled if !self.redis_ca_file.trim().is_empty() => {
+                    errors.redis_ca_file =
+                        Some("A CA file is only available when Redis TLS is Required".to_owned());
+                }
+                TlsMode::Disabled | TlsMode::Required => {}
+            }
+        } else if !self.redis_ca_file.trim().is_empty() {
+            errors.redis_ca_file = Some("A Redis CA file is only valid for Redis".to_owned());
         }
         if !errors.is_empty() {
             return Err(Box::new(errors));
@@ -117,7 +211,15 @@ impl ProfileDraft {
             database,
             username: optional_trimmed(&self.username),
             tls: self.tls,
+            credential_mode: self.credential_mode,
             secret_env,
+            redis_tls: RedisTlsConfig {
+                ca_file: if self.driver == DriverKind::Redis && self.tls == TlsMode::Required {
+                    optional_trimmed(&self.redis_ca_file).map(PathBuf::from)
+                } else {
+                    None
+                },
+            },
         })
     }
 }
@@ -130,6 +232,8 @@ pub(super) struct ValidationErrors {
     pub port: Option<String>,
     pub database: Option<String>,
     pub secret_env: Option<String>,
+    pub tls: Option<String>,
+    pub redis_ca_file: Option<String>,
 }
 
 impl ValidationErrors {
@@ -140,6 +244,8 @@ impl ValidationErrors {
             && self.port.is_none()
             && self.database.is_none()
             && self.secret_env.is_none()
+            && self.tls.is_none()
+            && self.redis_ca_file.is_none()
     }
 }
 
@@ -162,12 +268,14 @@ pub(super) enum SaveAttempt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ProfileEventResult {
     Ignored,
-    Saved(ProfileId),
+    Saved(ProfileId, Option<crate::model::PublicSummary>),
     Failed,
 }
 
 pub(super) struct ProfileEditor {
     pub mode: EditorMode,
+    draft_id: DraftId,
+    session_keep_available: bool,
     pub draft: ProfileDraft,
     pub errors: ValidationErrors,
     status: String,
@@ -175,9 +283,11 @@ pub(super) struct ProfileEditor {
 }
 
 impl ProfileEditor {
-    pub fn new(driver: DriverKind) -> Self {
+    pub fn new(draft_id: DraftId, driver: DriverKind) -> Self {
         Self {
             mode: EditorMode::Add,
+            draft_id,
+            session_keep_available: false,
             draft: ProfileDraft::new(driver),
             errors: ValidationErrors::default(),
             status: "New profile".to_owned(),
@@ -185,11 +295,20 @@ impl ProfileEditor {
         }
     }
 
-    pub fn edit(profile: &ConnectionProfile) -> Self {
+    pub fn edit(
+        draft_id: DraftId,
+        profile: &ConnectionProfile,
+        expected_generation: ProfileGeneration,
+        has_current_session_secret: bool,
+    ) -> Self {
         Self {
             mode: EditorMode::Edit {
                 original_id: ProfileId(profile.id.clone()),
+                expected_generation,
             },
+            draft_id,
+            session_keep_available: profile.credential_mode == CredentialMode::Session
+                && has_current_session_secret,
             draft: ProfileDraft::from_profile(profile),
             errors: ValidationErrors::default(),
             status: "Editing profile".to_owned(),
@@ -224,21 +343,51 @@ impl ProfileEditor {
                 return SaveAttempt::Invalid;
             }
         };
-        if let EditorMode::Edit { original_id } = &self.mode
+        if let EditorMode::Edit { original_id, .. } = &self.mode
             && profile.id != original_id.0
         {
             self.errors.id = Some("Profile id cannot change while editing".to_owned());
             self.status = "Fix the highlighted fields".to_owned();
             return SaveAttempt::Invalid;
         }
+        if profile.credential_mode == CredentialMode::Session && !self.session_keep_available {
+            self.status = "A replacement session credential is required".to_owned();
+            return SaveAttempt::Invalid;
+        }
         let profile_id = ProfileId(profile.id.clone());
-        match port.try_submit(UiCommand::UpsertProfile {
-            operation_id,
-            profile,
+        let draft = profile.as_draft();
+        let pending_profile_id = profile_id.clone();
+        let mode = self.mode.clone();
+        let draft_id = self.draft_id;
+        let destination_mode = profile.credential_mode;
+        match port.try_submit_with(move || match mode {
+            EditorMode::Add => UiCommand::CreateProfile(CreateProfileRequest {
+                draft_id,
+                operation_id,
+                explicit_id: Some(profile_id),
+                draft,
+                secret_update: SessionSecretUpdate::Clear,
+                migration_consent: MigrationConsent::Cancelled,
+            }),
+            EditorMode::Edit {
+                original_id,
+                expected_generation,
+            } => UiCommand::UpdateProfile(UpdateProfileRequest {
+                profile_id: original_id,
+                expected_generation,
+                operation_id,
+                draft,
+                secret_update: if destination_mode == CredentialMode::Session {
+                    SessionSecretUpdate::Keep
+                } else {
+                    SessionSecretUpdate::Clear
+                },
+                migration_consent: MigrationConsent::Cancelled,
+            }),
         }) {
             Ok(()) => {
                 self.errors = ValidationErrors::default();
-                self.pending_save = Some((operation_id, profile_id));
+                self.pending_save = Some((operation_id, pending_profile_id));
                 self.status = "Saving profile…".to_owned();
                 SaveAttempt::Submitted(operation_id)
             }
@@ -258,18 +407,22 @@ impl ProfileEditor {
             UiEvent::ProfileSaved {
                 operation_id,
                 profile_id,
+                warning,
             } if self.pending_save.as_ref() == Some(&(*operation_id, profile_id.clone())) => {
                 self.pending_save = None;
-                self.status = "Profile saved".to_owned();
-                ProfileEventResult::Saved(profile_id.clone())
+                self.status = warning.map_or_else(
+                    || "Profile saved".to_owned(),
+                    |summary| summary.message().to_owned(),
+                );
+                ProfileEventResult::Saved(profile_id.clone(), *warning)
             }
             UiEvent::ProfileSaveFailed {
                 operation_id,
                 profile_id,
-                message,
+                summary,
             } if self.pending_save.as_ref() == Some(&(*operation_id, profile_id.clone())) => {
                 self.pending_save = None;
-                self.status = message.clone();
+                self.status = summary.message().to_owned();
                 ProfileEventResult::Failed
             }
             _ => ProfileEventResult::Ignored,
@@ -328,20 +481,85 @@ impl ProfileEditor {
         );
         text_field(ui, "Username (optional)", &mut self.draft.username, None);
         ui.label("TLS");
-        egui::ComboBox::from_id_salt("profile-tls")
-            .selected_text(tls_name(self.draft.tls))
+        let mut selected_tls = self.draft.tls;
+        egui::ComboBox::from_id_salt(if self.draft.driver == DriverKind::Redis {
+            "profile.redis_tls.mode"
+        } else {
+            "profile.tls.mode"
+        })
+        .selected_text(tls_name(self.draft.tls))
+        .show_ui(ui, |ui| {
+            let choices: &[TlsMode] = if self.draft.driver == DriverKind::Redis {
+                &[TlsMode::Disabled, TlsMode::Required]
+            } else {
+                &[TlsMode::Disabled, TlsMode::Preferred, TlsMode::Required]
+            };
+            for tls in choices {
+                ui.selectable_value(&mut selected_tls, *tls, tls_name(*tls));
+            }
+        });
+        if selected_tls != self.draft.tls {
+            self.draft.select_tls(selected_tls);
+        }
+        render_error(ui, self.errors.tls.as_deref());
+        if self.draft.driver == DriverKind::Redis && self.draft.tls == TlsMode::Preferred {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Preferred is a legacy Redis mode. Choose Disabled or Required before saving.",
+            );
+        }
+        if self.draft.driver == DriverKind::Redis && self.draft.tls == TlsMode::Required {
+            text_field(
+                ui,
+                "Redis CA file (optional; blank uses OS roots)",
+                &mut self.draft.redis_ca_file,
+                self.errors.redis_ca_file.as_deref(),
+            );
+        }
+
+        ui.label("Credential mode");
+        let mut selected_credential_mode = self.draft.credential_mode;
+        egui::ComboBox::from_id_salt("profile.credential.mode")
+            .selected_text(credential_mode_name(self.draft.credential_mode))
             .show_ui(ui, |ui| {
-                for tls in [TlsMode::Disabled, TlsMode::Preferred, TlsMode::Required] {
-                    ui.selectable_value(&mut self.draft.tls, tls, tls_name(tls));
+                for mode in [
+                    CredentialMode::None,
+                    CredentialMode::Session,
+                    CredentialMode::Environment,
+                ] {
+                    ui.selectable_value(
+                        &mut selected_credential_mode,
+                        mode,
+                        credential_mode_name(mode),
+                    );
                 }
             });
-        text_field(
-            ui,
-            "Secret environment variable (optional)",
-            &mut self.draft.secret_env,
-            self.errors.secret_env.as_deref(),
-        );
-        ui.small("Only the environment-variable name is persisted. Password entry is deferred.");
+        if selected_credential_mode != self.draft.credential_mode {
+            self.draft.select_credential_mode(selected_credential_mode);
+        }
+        match self.draft.credential_mode {
+            CredentialMode::Environment => {
+                text_field(
+                    ui,
+                    "Secret environment variable",
+                    &mut self.draft.secret_env,
+                    self.errors.secret_env.as_deref(),
+                );
+                ui.small("Only the environment-variable name is persisted.");
+            }
+            CredentialMode::Session if self.session_keep_available => {
+                ui.small("The current in-memory session credential will be kept.");
+            }
+            CredentialMode::Session => {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "No current session credential is available. Replacement entry is not yet available in this preview, so Save remains disabled for this mode.",
+                );
+            }
+            CredentialMode::None => {
+                ui.small("No credential reference will be stored.");
+            }
+        }
         if self.draft.driver == DriverKind::MongoDb && !self.actions_enabled() {
             ui.colored_label(
                 egui::Color32::YELLOW,
@@ -350,9 +568,11 @@ impl ProfileEditor {
         }
         ui.separator();
         ui.horizontal(|ui| {
+            let session_save_available = self.draft.credential_mode != CredentialMode::Session
+                || self.session_keep_available;
             let save = ui
                 .add_enabled(
-                    self.pending_operation().is_none(),
+                    self.pending_operation().is_none() && session_save_available,
                     egui::Button::new("Save"),
                 )
                 .clicked();
@@ -423,6 +643,14 @@ fn driver_name(driver: DriverKind) -> &'static str {
     }
 }
 
+fn credential_mode_name(mode: CredentialMode) -> &'static str {
+    match mode {
+        CredentialMode::None => "None",
+        CredentialMode::Session => "Session",
+        CredentialMode::Environment => "Environment",
+    }
+}
+
 fn tls_name(tls: TlsMode) -> &'static str {
     match tls {
         TlsMode::Disabled => "Disabled",
@@ -446,12 +674,17 @@ fn render_error(ui: &mut egui::Ui, error: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{ProfileDraft, ProfileEditor, ProfileEventResult, SaveAttempt};
-    use crate::model::{ConnectionProfile, DriverKind, OperationId, ProfileId, TlsMode};
+    use crate::config::MigrationConsent;
+    use crate::model::{
+        ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileGeneration,
+        ProfileId, RedisTlsConfig, TlsMode,
+    };
+    use crate::secrets::SessionSecretUpdate;
     use crate::ui::adapter::{UiCommand, bounded_ports};
     use crate::ui::model::UiEvent;
 
     fn valid_editor(driver: DriverKind) -> ProfileEditor {
-        let mut editor = ProfileEditor::new(driver);
+        let mut editor = ProfileEditor::new(DraftId(101), driver);
         editor.draft.id = "local-profile".to_owned();
         editor.draft.name = "Local profile".to_owned();
         editor
@@ -473,21 +706,197 @@ mod tests {
     }
 
     #[test]
-    fn upsert_command_contains_env_reference_not_secret_literal() {
+    fn credential_mode_transition_requires_and_preserves_only_the_environment_name() {
+        let mut draft = ProfileDraft::new(DriverKind::MySql);
+        draft.id = "credential-mode".to_owned();
+        draft.name = "Credential mode".to_owned();
+        draft.select_credential_mode(CredentialMode::Environment);
+        assert!(
+            draft
+                .validate()
+                .expect_err("environment name required")
+                .secret_env
+                .is_some()
+        );
+
+        draft.secret_env = "DBOTTER_MYSQL_PASSWORD".to_owned();
+        let environment = draft.validate().expect("valid environment reference");
+        assert_eq!(
+            environment.secret_env.as_deref(),
+            Some("DBOTTER_MYSQL_PASSWORD")
+        );
+        draft.select_credential_mode(CredentialMode::None);
+        assert!(draft.secret_env.is_empty());
+        let none = draft.validate().expect("None mode validates");
+        assert_eq!(none.credential_mode, CredentialMode::None);
+        assert!(none.secret_env.is_none());
+
+        draft.secret_env = "MUST_NOT_SURVIVE".to_owned();
+        draft.select_credential_mode(CredentialMode::Session);
+        assert!(draft.secret_env.is_empty());
+        assert!(
+            draft
+                .validate()
+                .expect("Session draft shape validates")
+                .secret_env
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn redis_tls_controls_reject_legacy_preferred_and_clear_hidden_ca_state() {
+        let mut draft = ProfileDraft::new(DriverKind::Redis);
+        draft.id = "redis-tls".to_owned();
+        draft.name = "Redis TLS".to_owned();
+        assert_eq!(draft.tls, TlsMode::Disabled);
+
+        draft.redis_ca_file = "/tmp/hidden-ca.pem".to_owned();
+        assert!(
+            draft
+                .validate()
+                .expect_err("Disabled cannot retain hidden CA state")
+                .redis_ca_file
+                .is_some()
+        );
+        draft.select_tls(TlsMode::Required);
+        let required = draft.validate().expect("Required accepts a CA path shape");
+        assert_eq!(
+            required.redis_tls.ca_file.as_deref(),
+            Some(std::path::Path::new("/tmp/hidden-ca.pem"))
+        );
+        draft.select_tls(TlsMode::Disabled);
+        assert!(draft.redis_ca_file.is_empty());
+        assert!(
+            draft
+                .validate()
+                .expect("Disabled clears CA payload")
+                .redis_tls
+                .ca_file
+                .is_none()
+        );
+
+        draft.select_tls(TlsMode::Preferred);
+        assert!(
+            draft
+                .validate()
+                .expect_err("legacy Preferred is edit-required")
+                .tls
+                .is_some()
+        );
+        draft.select_tls(TlsMode::Required);
+        draft.redis_ca_file = "/tmp/redis-only.pem".to_owned();
+        draft.select_driver(DriverKind::MySql);
+        assert!(draft.redis_ca_file.is_empty());
+
+        draft.tls = TlsMode::Preferred;
+        draft.select_driver(DriverKind::Redis);
+        assert_eq!(draft.tls, TlsMode::Disabled);
+
+        let mut persisted = ConnectionProfile::from_draft(
+            "persisted-hidden-ca".to_owned(),
+            ProfileDraft::new(DriverKind::Redis)
+                .validate()
+                .unwrap_or_else(|_| ConnectionProfile {
+                    id: "persisted-hidden-ca".to_owned(),
+                    name: "Persisted hidden CA".to_owned(),
+                    driver: DriverKind::Redis,
+                    host: "127.0.0.1".to_owned(),
+                    port: 6379,
+                    database: None,
+                    username: None,
+                    tls: TlsMode::Disabled,
+                    credential_mode: CredentialMode::None,
+                    secret_env: None,
+                    redis_tls: RedisTlsConfig::default(),
+                })
+                .as_draft(),
+        );
+        persisted.tls = TlsMode::Disabled;
+        persisted.redis_tls.ca_file = Some("/tmp/persisted-hidden.pem".into());
+        assert!(
+            ProfileDraft::from_profile(&persisted)
+                .redis_ca_file
+                .is_empty()
+        );
+
+        persisted.tls = TlsMode::Preferred;
+        let mut legacy = ProfileDraft::from_profile(&persisted);
+        assert_eq!(legacy.redis_ca_file, "/tmp/persisted-hidden.pem");
+        legacy.select_tls(TlsMode::Required);
+        assert_eq!(legacy.redis_ca_file, "/tmp/persisted-hidden.pem");
+        legacy.select_tls(TlsMode::Disabled);
+        assert!(legacy.redis_ca_file.is_empty());
+    }
+
+    #[test]
+    fn create_command_contains_env_reference_not_secret_literal() {
         let (ui, mut service) = bounded_ports(2);
         let mut editor = valid_editor(DriverKind::MySql);
+        editor.draft.credential_mode = CredentialMode::Environment;
         editor.draft.secret_env = "DBOTTER_MYSQL_PASSWORD".to_owned();
         assert_eq!(
             editor.try_save(&ui, OperationId(7)),
             SaveAttempt::Submitted(OperationId(7))
         );
         let profile = match service.try_next_command() {
-            Some(UiCommand::UpsertProfile { profile, .. }) => profile,
-            _ => panic!("upsert command missing"),
+            Some(UiCommand::CreateProfile(request)) => {
+                assert_eq!(request.migration_consent, MigrationConsent::Cancelled);
+                ConnectionProfile::from_draft(
+                    request.explicit_id.expect("explicit id").0,
+                    request.draft,
+                )
+            }
+            _ => panic!("create command missing"),
         };
         let persisted = toml::to_string(&profile).expect("profile serializes");
         assert!(persisted.contains("DBOTTER_MYSQL_PASSWORD"));
         assert!(!persisted.contains("plain-text-password-must-not-persist"));
+    }
+
+    #[test]
+    fn edit_session_without_a_known_current_arc_never_builds_keep() {
+        let (ui, mut service) = bounded_ports(1);
+        let mut persisted = ConnectionProfile::from_draft(
+            "session".to_owned(),
+            ProfileDraft::new(DriverKind::MySql)
+                .validate()
+                .unwrap_or_else(|_| ConnectionProfile {
+                    id: "session".to_owned(),
+                    name: "Session".to_owned(),
+                    driver: DriverKind::MySql,
+                    host: "127.0.0.1".to_owned(),
+                    port: 3306,
+                    database: None,
+                    username: None,
+                    tls: TlsMode::Preferred,
+                    credential_mode: CredentialMode::Session,
+                    secret_env: None,
+                    redis_tls: RedisTlsConfig::default(),
+                })
+                .as_draft(),
+        );
+        persisted.credential_mode = CredentialMode::Session;
+        let mut editor = ProfileEditor::edit(DraftId(102), &persisted, ProfileGeneration(1), false);
+
+        assert_eq!(editor.try_save(&ui, OperationId(8)), SaveAttempt::Invalid);
+        assert!(service.try_next_command().is_none());
+        assert!(editor.status().contains("replacement"));
+    }
+
+    #[test]
+    fn edit_session_builds_keep_only_when_current_arc_is_known() {
+        let (ui, mut service) = bounded_ports(1);
+        let profile = session_profile();
+        let mut editor = ProfileEditor::edit(DraftId(103), &profile, ProfileGeneration(1), true);
+
+        assert_eq!(
+            editor.try_save(&ui, OperationId(18)),
+            SaveAttempt::Submitted(OperationId(18))
+        );
+        let Some(UiCommand::UpdateProfile(request)) = service.try_next_command() else {
+            panic!("update command missing");
+        };
+        assert!(matches!(request.secret_update, SessionSecretUpdate::Keep));
     }
 
     #[test]
@@ -508,7 +917,7 @@ mod tests {
         );
         assert!(matches!(
             service.try_next_command(),
-            Some(UiCommand::UpsertProfile { .. })
+            Some(UiCommand::CreateProfile(_))
         ));
         assert!(service.try_next_command().is_none());
     }
@@ -524,8 +933,8 @@ mod tests {
         ));
         assert!(matches!(
             service.try_next_command(),
-            Some(UiCommand::UpsertProfile { profile, .. })
-                if profile.driver == DriverKind::MongoDb
+            Some(UiCommand::CreateProfile(request))
+                if request.draft.driver == DriverKind::MongoDb
         ));
     }
 
@@ -542,8 +951,9 @@ mod tests {
             editor.handle_event(&UiEvent::ProfileSaved {
                 operation_id: OperationId(9),
                 profile_id: ProfileId("local-profile".to_owned()),
+                warning: None,
             }),
-            ProfileEventResult::Saved(ProfileId("local-profile".to_owned()))
+            ProfileEventResult::Saved(ProfileId("local-profile".to_owned()), None)
         );
     }
 
@@ -558,10 +968,12 @@ mod tests {
             database: Some("app".to_owned()),
             username: Some("developer".to_owned()),
             tls: TlsMode::Required,
+            credential_mode: CredentialMode::Environment,
             secret_env: Some("MYSQL_PASSWORD".to_owned()),
+            redis_tls: RedisTlsConfig::default(),
         };
 
-        let editor = ProfileEditor::edit(&profile);
+        let editor = ProfileEditor::edit(DraftId(104), &profile, ProfileGeneration(1), false);
 
         assert_eq!(editor.draft.validate(), Ok(profile));
     }
@@ -577,13 +989,31 @@ mod tests {
             database: Some("0".to_owned()),
             username: None,
             tls: TlsMode::Disabled,
+            credential_mode: CredentialMode::None,
             secret_env: None,
+            redis_tls: RedisTlsConfig::default(),
         };
         let (ui, mut service) = bounded_ports(1);
-        let mut editor = ProfileEditor::edit(&profile);
+        let mut editor = ProfileEditor::edit(DraftId(105), &profile, ProfileGeneration(1), false);
         editor.draft.id = "renamed".to_owned();
 
         assert_eq!(editor.try_save(&ui, OperationId(11)), SaveAttempt::Invalid);
         assert!(service.try_next_command().is_none());
+    }
+
+    fn session_profile() -> ConnectionProfile {
+        ConnectionProfile {
+            id: "session".to_owned(),
+            name: "Session".to_owned(),
+            driver: DriverKind::MySql,
+            host: "127.0.0.1".to_owned(),
+            port: 3306,
+            database: None,
+            username: None,
+            tls: TlsMode::Preferred,
+            credential_mode: CredentialMode::Session,
+            secret_env: None,
+            redis_tls: RedisTlsConfig::default(),
+        }
     }
 }

@@ -5,27 +5,28 @@ Redis preview. MongoDB remains honestly Planned.
 
 ## Current status
 
-The approved contract is complete, but usable-MVP production implementation
-has not begun on this branch:
+The approved contract and P1 foundation are complete at this checkpoint:
 
-- P0 repository documentation baseline: complete in the current uncommitted
-  documentation diff;
-- runtime T0 / implementation P1: RED;
-- runtime T1–T10 / P2–P9: Not started.
+- P0 repository documentation baseline: complete;
+- P1 config/profile/credential/public-error foundation: independently reviewed
+  GREEN;
+- T0 overall: RED because P6 first-run RawInput/AccessKit proof is missing; the
+  P1 config portion is GREEN;
+- T1, T2, T8, and T9: Implementing with P1 core evidence complete and their
+  remaining P2/P6 ownership explicit in `03-traces.md`;
+- T3–T7, T10, and P2–P9: Not started.
 
-The source tree contains historical demo code and release machinery. It may
-compile or demonstrate older behavior, but it is **not** proof of the approved
-usable MVP and must not be described as installed/verified. In particular, old
-claims that session credentials, catalog browsing, cancellation/lifecycle,
-copy/export, signed app packaging, or installed AX proof are deferred or already
-complete are superseded by the approved contract and ledger.
+The P1 checkpoint is evidence for that foundation only. Historical demo code
+and release machinery remain **not** proof of the remaining usable MVP or of an
+installed/verified preview.
 
 ## Contract map
 
 - [`01-spec.md`](01-spec.md) — repository product contract and U0–U9 mapping.
 - [`02-architecture.md`](02-architecture.md) — target ownership, typed seams,
   controller, security, export, and distribution architecture.
-- [`03-traces.md`](03-traces.md) — authoritative T0–T10 ledger; T0 is RED.
+- [`03-traces.md`](03-traces.md) — authoritative T0–T10 ledger and partial-state
+  ownership.
 - [`04-patch-plan.md`](04-patch-plan.md) — P0–P9 order and fixed verification
   command interfaces.
 - [`docs/release/spec.md`](docs/release/spec.md) — preview release contract.
@@ -55,17 +56,39 @@ MongoDB stays disabled/Planned. Query history, editable grids, transactions,
 SSH/proxy, import, ER diagrams, AI, keychain persistence, and stable publication
 are not part of this task.
 
-## P0 verification
+## P1 checkpoint verification
 
-This documentation task intentionally changes no Rust source, tests, scripts,
-workflows, lockfiles, or approved artifacts. Verify the baseline with:
+The independently reviewed P1 foundation passed the following local gates:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features --offline -- -D warnings
+cargo test --all-features --offline
+cargo test --doc --all-features --offline
+cargo build --release --all-features --offline
+cargo test --test source_contract --all-features --offline
+sh scripts/test-receipt-contract.sh
+git diff --check
+```
+
+The full test run passed 136 regular tests and 12 doctests; the separate
+doctest run passed 12/12. The source contract passed 1/1, and the receipt
+contract, strict Clippy, formatting, and release build gates passed.
+
+Checkpoint SHA-256 values:
+
+```text
+6ccd3ded9a82384ce92b823914e1b5e9f518886460fc0df1c6455ed6d9a327a9  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
+dfacf608d773ca16dd4d25bdf0dc5bfb8f17926baf60d63bcadb1470ffb8114e  tests snapshot (tests)
+80c8a75e35103a498fa845591c4418b038ac19c68b3d34aef50cf075dc765bb1  target/release/dbotter
+```
+
+The snapshots are reproducible with the tracked-plus-untracked file list in
+each scope, sorted before hashing individual files and then hashing that list.
+The frozen approval set remains unchanged:
 
 ```sh
 shasum -a 256 docs/usable-mvp/spec.md docs/usable-mvp/trace.md docs/usable-mvp/plan.md
-git diff --check
-git status --short --untracked-files=all
-git diff -- 01-spec.md 02-architecture.md 03-traces.md 04-patch-plan.md \
-  docs/release/spec.md docs/release/trace.md README.md
 ```
 
 Expected frozen SHA-256 values:
@@ -78,8 +101,8 @@ ad649d256286f2e8dd8fa630bba8b64bb9f3ac5e6c5930f7ef432d85d0e8bd97  docs/usable-mv
 
 ## Implementation gates
 
-P1 and later must start from failing trace-derived contracts. The planned
-source/hermetic gate is:
+Later slices must start from failing trace-derived contracts. Their full fixed
+source/hermetic interface remains:
 
 ```sh
 ./scripts/check-release-contract.sh

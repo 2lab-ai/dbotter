@@ -1,7 +1,8 @@
 # dbotter — usable MVP implementation and conformance plan
 
-Status: **P0 documentation baseline complete. Production implementation has
-not started: P1/T0 is RED; all later implementation slices are Not started.**
+Status: **P0 documentation baseline complete. P1 foundation is independently
+reviewed GREEN. T0 remains RED overall; T1/T2/T8/T9 are Implementing; P2–P9
+and T3–T7/T10 are Not started.**
 
 This file routes implementation work. The full ordered plan is frozen at
 `docs/usable-mvp/plan.md`; this repository-facing ledger must not weaken it.
@@ -35,6 +36,7 @@ set.
 
 - `Complete (docs)` means repository contract reconciliation only.
 - `RED` means a failing contract exists and production behavior is not green.
+- `Implementing` means one owning slice is GREEN while required owners remain.
 - `Not started` means no approved implementation work/evidence is claimed.
 - `GREEN` and `Verified` require the evidence rules in `03-traces.md`.
 
@@ -46,7 +48,7 @@ substitute for a slice's RED/GREEN/live/installed evidence.
 | Slice | Scope | Trace ownership | Status |
 |---|---|---|---|
 | P0 | approve/reconcile repository and release contracts | all routing | Complete (docs) |
-| P1 | config/profile/credential/public-error foundation | T0, T1, T2, T8, T9 | RED (T0 only) |
+| P1 | config/profile/credential/public-error foundation | T0, T1, T2, T8, T9 | GREEN (independently reviewed foundation) |
 | P2 | generations/cache/controller/reload/shutdown | T2, T3, T9 | Not started |
 | P3 | typed prepared execution/resource/result/CLI seams | T4, shared T5/T6 | Not started |
 | P4 | lazy paginated MySQL catalog | T5 | Not started |
@@ -83,7 +85,8 @@ Completed mapping requirements:
    and Redis keyspace typed/bounded, and Redis TLS CA/Host recovery disjoint;
 5. linked U0–U9 to T0–T10, P1–P9, RED evidence, commands, receipts, package,
    Brew, and installed AX proof;
-6. marked runtime implementation honestly as T0 RED and later rows Not started.
+6. marked the then-current runtime baseline honestly as T0 RED and later rows
+   Not started; the current checkpoint state is recorded in the ledger above.
 
 P0 acceptance commands:
 
@@ -97,10 +100,9 @@ git diff -- 01-spec.md 02-architecture.md 03-traces.md 04-patch-plan.md \
 
 P0 must finish with no production/source/workflow/test diff and no commit.
 
-## P1 — RED foundation
+## P1 — GREEN foundation
 
-Purpose and expected files are exact in approved plan P1. Begin by writing
-failing contracts for:
+The independently reviewed P1 checkpoint implemented and proved:
 
 - exact-path v1 normalization/no write, fixed `.v1.bak`, first v2 mutation,
   frozen v1 reader rejection, and independent config-contract JSON;
@@ -111,8 +113,33 @@ failing contracts for:
 - closed public errors and exhaustive
   `OperationKind × PublicSummary -> NonEmpty<RecoveryAction>`.
 
-P1 does not add the concurrent runtime before P2. It remains RED until these
-tests fail for the intended missing behavior and the file-map/review agrees.
+P1 provides only the service-level observed-state/cache race foundations needed
+by its owned contracts; the full concurrent controller remains P2. T0 therefore
+stays RED pending P6 first-run RawInput/AccessKit, while T1/T2/T8/T9 stay
+Implementing pending their explicit P2/P6 owners.
+
+Checkpoint gates passed:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features --offline -- -D warnings
+cargo test --all-features --offline
+cargo test --doc --all-features --offline
+cargo build --release --all-features --offline
+cargo test --test source_contract --all-features --offline
+sh scripts/test-receipt-contract.sh
+git diff --check
+```
+
+Evidence: 136 regular tests plus 12 doctests passed; the separate doctest run
+was 12/12; source contract was 1/1; strict Clippy, formatting, release build,
+receipt contract, and diff checks passed.
+
+```text
+6ccd3ded9a82384ce92b823914e1b5e9f518886460fc0df1c6455ed6d9a327a9  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
+dfacf608d773ca16dd4d25bdf0dc5bfb8f17926baf60d63bcadb1470ffb8114e  tests snapshot (tests)
+80c8a75e35103a498fa845591c4418b038ac19c68b3d34aef50cf075dc765bb1  target/release/dbotter
+```
 
 ## P2 — controller and lifecycle
 
@@ -166,8 +193,9 @@ higher preview after exact config-contract preflight; tags/assets are immutable.
 
 ## Fixed verification interfaces
 
-The following commands are planned interfaces. A missing command or a failure
-is evidence that its owning slice is not Verified, not permission to weaken the
+The following commands are the full interfaces for later slice claims. P1's
+passed checkpoint subset is recorded above. A missing command or failure is
+evidence that its owning slice is not Verified, not permission to weaken the
 contract.
 
 ### Source and hermetic

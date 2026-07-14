@@ -40,6 +40,7 @@ fn driver_error_display_redacts_raw_backend_messages() {
     let mysql = drivers::DriverError::from(sqlx::Error::Protocol(mysql_secret.to_owned()));
     assert_eq!(mysql.to_string(), "mysql operation failed");
     assert!(!mysql.to_string().contains(mysql_secret));
+    assert!(!format!("{mysql:?}").contains(mysql_secret));
     assert!(mysql.source().is_some());
 
     let redis_secret = "redis contains top-secret-marker";
@@ -47,7 +48,27 @@ fn driver_error_display_redacts_raw_backend_messages() {
     let redis = drivers::DriverError::from(redis_source);
     assert_eq!(redis.to_string(), "redis operation failed");
     assert!(!redis.to_string().contains(redis_secret));
+    assert!(!format!("{redis:?}").contains(redis_secret));
     assert!(redis.source().is_some());
+
+    for error in [
+        drivers::DriverError::InvalidConfig {
+            driver: DriverKind::Redis,
+            message: "secret-ca-path-/sentinel/ca.pem".to_owned(),
+        },
+        drivers::DriverError::RedisParse("raw-command-sentinel".to_owned()),
+        drivers::DriverError::Unsupported {
+            driver: DriverKind::MySql,
+            operation: "raw-export-path-/sentinel/export.csv".to_owned(),
+        },
+    ] {
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        for sentinel in ["secret-ca-path", "raw-command", "raw-export-path"] {
+            assert!(!debug.contains(sentinel));
+            assert!(!display.contains(sentinel));
+        }
+    }
 }
 
 #[test]

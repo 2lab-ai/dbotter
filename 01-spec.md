@@ -1,8 +1,8 @@
 # dbotter — usable MVP product contract
 
-Status: **P0 baseline reconciled; runtime T0 is RED and T1–T10 are Not started.**
-This file describes the approved target, not the capabilities of the historical
-demo currently present in the source tree.
+Status: **P1 foundation independently reviewed GREEN. T0 remains RED overall;
+T1, T2, T8, and T9 are Implementing; T3–T7 and T10 are Not started.** This file
+describes the approved target and the bounded P1 implementation checkpoint.
 
 ## Authority and change control
 
@@ -40,18 +40,18 @@ copied.
 
 ## Implementation state
 
-| Trace | Target | State before production implementation |
+| Trace | Target | Current state |
 |---|---|---|
-| T0 | exact-path v1 read-only load, v2 migration/reload, first run | RED |
-| T1 | Create/Edit, credential intent, side-effect-free draft test | Not started |
-| T2 | confirmed atomic delete | Not started |
+| T0 | exact-path v1 read-only load, v2 migration/reload, first run | RED overall; P1 config GREEN, P6 RawInput/AX missing |
+| T1 | Create/Edit, credential intent, side-effect-free draft test | Implementing; P1 core GREEN, P6 remains |
+| T2 | confirmed atomic delete | Implementing; P1 core GREEN, P2/P6 remain |
 | T3 | controller, reload, connect/disconnect/reconnect/shutdown | Not started |
 | T4 | exact target, prepared-only MySQL/Redis execute, cancel | Not started |
 | T5 | lazy paginated MySQL catalog | Not started |
 | T6 | Redis SCAN/inspect and verified Required TLS | Not started |
 | T7 | profile result, exact copy, streaming atomic export | Not started |
-| T8 | static errors, total recovery, native accessibility | Not started |
-| T9 | restart and credential availability | Not started |
+| T8 | static errors, total recovery, native accessibility | Implementing; P1 core GREEN, P6 remains |
+| T9 | restart and credential availability | Implementing; P1 core GREEN, P2/P6 remain |
 | T10 | gated CI/release/tap/Brew/installed golden journey | Not started |
 
 Existing demo code or historical release artifacts are not evidence that a row
@@ -196,9 +196,19 @@ SSH/proxy tunnels, imports, ER diagrams, AI, multi-tab IDE behavior, keychain
 persistence, guaranteed server cancellation, and multi-process writer safety
 are out of scope. Stable publication is not part of this task.
 
-## Baseline verification
+## P1 checkpoint verification
 
-P0 is documentation-only. Before production implementation begins:
+The P1 foundation is independently reviewed GREEN after 136 regular tests and
+12 doctests, strict Clippy, formatting, release build, source-contract, receipt-
+contract, and diff checks passed. The recorded production and test snapshot
+SHA-256 values are respectively:
+
+```text
+6ccd3ded9a82384ce92b823914e1b5e9f518886460fc0df1c6455ed6d9a327a9
+dfacf608d773ca16dd4d25bdf0dc5bfb8f17926baf60d63bcadb1470ffb8114e
+```
+
+Frozen approval integrity remains checked with:
 
 ```sh
 shasum -a 256 docs/usable-mvp/spec.md docs/usable-mvp/trace.md docs/usable-mvp/plan.md
@@ -207,6 +217,6 @@ git diff -- 01-spec.md 02-architecture.md 03-traces.md 04-patch-plan.md \
   docs/release/spec.md docs/release/trace.md README.md
 ```
 
-Implementation and delivery commands are owned by `04-patch-plan.md` and must
-not be reported green until the corresponding trace row reaches its required
-state.
+Exact checkpoint commands and hashes are recorded in `04-patch-plan.md`.
+Remaining implementation and delivery commands must not be reported green
+until the corresponding trace row reaches its required state.

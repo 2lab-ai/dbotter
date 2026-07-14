@@ -1,8 +1,8 @@
 # dbotter — usable MVP architecture
 
-Status: **approved target architecture; T0 RED, T1–T10 Not started.** Existing
-demo modules are migration inputs, not evidence that this architecture is
-implemented.
+Status: **approved target architecture with the P1 foundation independently
+reviewed GREEN. T0 remains RED overall; T1, T2, T8, and T9 are Implementing;
+T3–T7 and T10 are Not started.**
 
 Normative detail lives in `docs/usable-mvp/{spec,trace,plan}.md`. This document
 is the repository architecture entrypoint and must remain consistent with those
@@ -18,6 +18,15 @@ typed resource browsing, execution, or public error conversion.
 The UI owns pure/display state only. Live sessions, task registry, config
 writer, secrets, and filesystem export workers stay behind typed service and
 runtime boundaries. No lock crosses `.await`.
+
+### P1 checkpoint boundary
+
+P1 implements the config/profile mutation and reconciliation foundation,
+credential storage/resolution types, atomic observed-state and session-cache
+race foundations, and closed public-error/recovery mappings. That bounded slice
+is independently reviewed GREEN. It does not implement the P2 controller or
+the P6 first-run RawInput/AccessKit and full native intent/recovery journey;
+therefore no complete T0/T1/T2/T8/T9 journey is claimed GREEN.
 
 ## Target topology
 

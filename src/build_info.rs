@@ -1,5 +1,7 @@
 //! Compile-time release channel and build identity.
 
+use serde::Serialize;
+
 /// Release channel baked into this executable (`dev`, `preview`, or `stable`).
 pub const BUILD_CHANNEL: &str = match option_env!("DBOTTER_BUILD_CHANNEL") {
     Some(channel) => channel,
@@ -14,6 +16,35 @@ pub const BUILD_ID: &str = match option_env!("DBOTTER_BUILD_ID") {
 
 /// Package version from the root `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub const SOURCE_SHA: &str = match option_env!("DBOTTER_SOURCE_SHA") {
+    Some(source_sha) => source_sha,
+    None => "dev",
+};
+
+pub const TARGET: &str = env!("DBOTTER_TARGET");
+pub const ARCH: &str = env!("DBOTTER_ARCH");
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BuildIdentity {
+    pub package_version: &'static str,
+    pub channel: &'static str,
+    pub build_id: &'static str,
+    pub source_sha: &'static str,
+    pub target: &'static str,
+    pub arch: &'static str,
+}
+
+pub const fn identity() -> BuildIdentity {
+    BuildIdentity {
+        package_version: VERSION,
+        channel: BUILD_CHANNEL,
+        build_id: BUILD_ID,
+        source_sha: SOURCE_SHA,
+        target: TARGET,
+        arch: ARCH,
+    }
+}
 
 /// Version text clap appends after the binary name for `--version`.
 pub fn version_with_build() -> String {

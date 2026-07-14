@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use dbotter::drivers::{self, DriverError, Session};
 use dbotter::model::{
-    Cell, ConnectionProfile, DriverKind, ExecuteRequest, OperationId, ProfileId, QueryLanguage,
-    QueryResult, TlsMode,
+    Cell, ConnectionProfile, CredentialMode, DriverKind, ExecuteRequest, OperationId, ProfileId,
+    QueryLanguage, QueryResult, RedisTlsConfig, TlsMode,
 };
 use secrecy::SecretString;
 
@@ -28,7 +28,9 @@ async fn mysql_session() -> Session {
         database: Some("dbotter".to_owned()),
         username: Some("dbotter".to_owned()),
         tls: TlsMode::Disabled,
+        credential_mode: CredentialMode::None,
         secret_env: None,
+        redis_tls: RedisTlsConfig::default(),
     };
 
     drivers::connect(&profile, Some(&secret), Duration::from_secs(10))

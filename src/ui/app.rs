@@ -5,7 +5,7 @@ use std::time::Duration;
 use eframe::egui;
 use egui_extras::{Column as TableColumn, TableBuilder};
 
-use crate::model::{Cell, DriverAvailability, DriverKind, ProfileId};
+use crate::model::{Cell, DraftId, DriverAvailability, DriverKind, ProfileId};
 
 use super::adapter::{SubmitError, UiCommand, UiPort};
 use super::model::{ConnectionState, ProfileSnapshot, UiModel};
@@ -19,6 +19,7 @@ pub struct DbotterApp {
     port: UiPort,
     model: UiModel,
     profile_editor: Option<ProfileEditor>,
+    next_draft_id: u64,
 }
 
 impl DbotterApp {
@@ -27,9 +28,16 @@ impl DbotterApp {
             port,
             model: UiModel::default(),
             profile_editor: None,
+            next_draft_id: 1,
         };
         let _ = app.port.try_submit(UiCommand::RefreshProfiles);
         app
+    }
+
+    fn allocate_draft_id(&mut self) -> DraftId {
+        let draft_id = DraftId(self.next_draft_id);
+        self.next_draft_id = self.next_draft_id.saturating_add(1);
+        draft_id
     }
 
     fn poll_events(&mut self) {
@@ -41,9 +49,12 @@ impl DbotterApp {
                     editor.handle_event(&event)
                 });
             match profile_result {
-                ProfileEventResult::Saved(profile_id) => {
+                ProfileEventResult::Saved(profile_id, warning) => {
                     self.model.selected_profile = Some(profile_id);
-                    self.model.status = "Profile saved; refreshing profiles…".to_owned();
+                    self.model.status = warning.map_or_else(
+                        || "Profile saved; refreshing profiles…".to_owned(),
+                        |summary| summary.message().to_owned(),
+                    );
                     self.profile_editor = None;
                     if let Err(error) = self.port.try_submit(UiCommand::RefreshProfiles) {
                         self.report_submit_error(error);
@@ -146,13 +157,17 @@ impl DbotterApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.heading("Connections");
                     if ui.small_button("+ MySQL").clicked() {
-                        self.profile_editor = Some(ProfileEditor::new(DriverKind::MySql));
+                        let draft_id = self.allocate_draft_id();
+                        self.profile_editor = Some(ProfileEditor::new(draft_id, DriverKind::MySql));
                     }
                     if ui.small_button("+ Redis").clicked() {
-                        self.profile_editor = Some(ProfileEditor::new(DriverKind::Redis));
+                        let draft_id = self.allocate_draft_id();
+                        self.profile_editor = Some(ProfileEditor::new(draft_id, DriverKind::Redis));
                     }
                     if ui.small_button("+ MongoDB").clicked() {
-                        self.profile_editor = Some(ProfileEditor::new(DriverKind::MongoDb));
+                        let draft_id = self.allocate_draft_id();
+                        self.profile_editor =
+                            Some(ProfileEditor::new(draft_id, DriverKind::MongoDb));
                     }
                 });
                 ui.separator();
@@ -190,7 +205,13 @@ impl DbotterApp {
                 self.submit_test(profile.id.clone());
             }
             if ui.button("Edit").clicked() {
-                self.profile_editor = Some(ProfileEditor::edit(&profile.persisted));
+                let draft_id = self.allocate_draft_id();
+                self.profile_editor = Some(ProfileEditor::edit(
+                    draft_id,
+                    &profile.persisted,
+                    profile.generation,
+                    profile.has_current_session_secret,
+                ));
             }
         });
         if profile.availability == DriverAvailability::Planned {
@@ -306,7 +327,9 @@ fn connection_label(state: &ConnectionState) -> String {
         ConnectionState::Disconnected => "● Disconnected".to_owned(),
         ConnectionState::Pending(_) => "◌ Connecting…".to_owned(),
         ConnectionState::Connected { elapsed_ms } => format!("● Connected · {elapsed_ms} ms"),
-        ConnectionState::Failed { message } => format!("● Failed · {message}"),
+        ConnectionState::Failed { summary } => {
+            format!("● Failed · {}", summary.message())
+        }
     }
 }
 
@@ -378,7 +401,10 @@ fn display_cell(cell: &Cell) -> String {
 #[cfg(test)]
 mod tests {
     use super::DbotterApp;
-    use crate::model::{ConnectionProfile, DriverAvailability, DriverKind, ProfileId, TlsMode};
+    use crate::model::{
+        ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind,
+        ProfileGeneration, ProfileId, RedisTlsConfig, TlsMode,
+    };
     use crate::ui::adapter::{UiCommand, bounded_ports};
     use crate::ui::model::ProfileSnapshot;
 
@@ -396,16 +422,20 @@ mod tests {
             database: None,
             username: None,
             tls: TlsMode::Disabled,
+            credential_mode: CredentialMode::None,
             secret_env: None,
+            redis_tls: RedisTlsConfig::default(),
         };
         ProfileSnapshot {
             id: ProfileId("profile".to_owned()),
+            generation: ProfileGeneration(1),
             name: "Profile".to_owned(),
             driver,
             endpoint: "mysql://127.0.0.1:3306".to_owned(),
             database: None,
             availability,
             planned_reason: None,
+            has_current_session_secret: false,
             persisted,
         }
     }
@@ -444,5 +474,16 @@ mod tests {
         app.submit_execute();
 
         assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn draft_ids_are_owned_by_the_app_and_monotonic() {
+        let (ui, mut service) = bounded_ports(1);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+
+        assert_eq!(app.allocate_draft_id(), DraftId(1));
+        assert_eq!(app.allocate_draft_id(), DraftId(2));
+        assert_eq!(app.allocate_draft_id(), DraftId(3));
     }
 }

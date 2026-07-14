@@ -6,7 +6,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use crate::drivers::DriverError;
 use crate::model::{
     Cell, Column, ConnectionProfile, DriverAvailability, DriverCapabilities, DriverDescriptor,
-    DriverKind, ExecuteRequest, QueryLanguage, QueryResult,
+    DriverKind, ExecuteRequest, QueryLanguage, QueryResult, TlsMode,
 };
 
 pub const DESCRIPTOR: DriverDescriptor = DriverDescriptor {
@@ -33,6 +33,12 @@ impl RedisSession {
         secret: Option<&SecretString>,
         timeout: Duration,
     ) -> Result<Self, DriverError> {
+        if profile.tls != TlsMode::Disabled {
+            return Err(DriverError::Unsupported {
+                driver: DriverKind::Redis,
+                operation: "non-plaintext transport is not implemented".to_owned(),
+            });
+        }
         let db = profile
             .database
             .as_deref()
@@ -81,6 +87,8 @@ impl RedisSession {
             )))
         }
     }
+
+    pub async fn close(&self) {}
 
     pub async fn execute(&self, request: &ExecuteRequest) -> Result<QueryResult, DriverError> {
         let parts = parse_command(&request.text)?;

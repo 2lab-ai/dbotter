@@ -3,23 +3,30 @@
 use std::collections::HashMap;
 
 use crate::model::{
-    ConnectionProfile, DriverAvailability, DriverKind, OperationId, ProfileId, QueryResult,
+    ConnectionProfile, DriverAvailability, DriverKind, OperationId, ProfileGeneration, ProfileId,
+    PublicSummary, QueryResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileSnapshot {
     pub id: ProfileId,
+    pub generation: ProfileGeneration,
     pub name: String,
     pub driver: DriverKind,
     pub endpoint: String,
     pub database: Option<String>,
     pub availability: DriverAvailability,
     pub planned_reason: Option<String>,
+    pub has_current_session_secret: bool,
     pub persisted: ConnectionProfile,
 }
 
 impl ProfileSnapshot {
-    pub fn from_profile(profile: &ConnectionProfile) -> Self {
+    pub fn from_profile(
+        profile: &ConnectionProfile,
+        generation: ProfileGeneration,
+        has_current_session_secret: bool,
+    ) -> Self {
         let descriptor = crate::drivers::descriptors()
             .into_iter()
             .find(|descriptor| descriptor.kind == profile.driver);
@@ -27,12 +34,14 @@ impl ProfileSnapshot {
             descriptor.map_or(DriverAvailability::Planned, |value| value.availability);
         Self {
             id: ProfileId(profile.id.clone()),
+            generation,
             name: profile.name.clone(),
             driver: profile.driver,
             endpoint: profile.redacted_endpoint(),
             database: profile.database.clone(),
             availability,
             planned_reason: descriptor.and_then(|value| value.reason).map(str::to_owned),
+            has_current_session_secret,
             persisted: profile.clone(),
         }
     }
@@ -47,7 +56,7 @@ pub enum ConnectionState {
     Disconnected,
     Pending(OperationId),
     Connected { elapsed_ms: u64 },
-    Failed { message: String },
+    Failed { summary: PublicSummary },
 }
 
 impl ConnectionState {
@@ -59,15 +68,16 @@ impl ConnectionState {
 #[derive(Clone, Debug)]
 pub enum UiEvent {
     ProfilesLoaded(Vec<ProfileSnapshot>),
-    ProfilesFailed(String),
+    ProfilesFailed(PublicSummary),
     ProfileSaved {
         operation_id: OperationId,
         profile_id: ProfileId,
+        warning: Option<PublicSummary>,
     },
     ProfileSaveFailed {
         operation_id: OperationId,
         profile_id: ProfileId,
-        message: String,
+        summary: PublicSummary,
     },
     ConnectionReady {
         operation_id: OperationId,
@@ -83,7 +93,7 @@ pub enum UiEvent {
         operation_id: OperationId,
         profile_id: ProfileId,
         kind: OperationKind,
-        message: String,
+        summary: PublicSummary,
     },
 }
 
@@ -140,8 +150,15 @@ impl UiModel {
     pub fn fold(&mut self, event: UiEvent) {
         match event {
             UiEvent::ProfilesLoaded(profiles) => self.fold_profiles(profiles),
-            UiEvent::ProfilesFailed(message) => self.status = message,
-            UiEvent::ProfileSaved { .. } | UiEvent::ProfileSaveFailed { .. } => {}
+            UiEvent::ProfilesFailed(summary) => self.status = summary.message().to_owned(),
+            UiEvent::ProfileSaved { warning, .. } => {
+                if let Some(summary) = warning {
+                    self.status = summary.message().to_owned();
+                }
+            }
+            UiEvent::ProfileSaveFailed { summary, .. } => {
+                self.status = summary.message().to_owned();
+            }
             UiEvent::ConnectionReady {
                 operation_id,
                 profile_id,
@@ -170,25 +187,21 @@ impl UiModel {
                 operation_id,
                 profile_id,
                 kind,
-                message,
+                summary,
             } => match kind {
                 OperationKind::Connection => {
                     if self.connection_states.get(&profile_id)
                         == Some(&ConnectionState::Pending(operation_id))
                     {
-                        self.connection_states.insert(
-                            profile_id,
-                            ConnectionState::Failed {
-                                message: message.clone(),
-                            },
-                        );
-                        self.status = message;
+                        self.connection_states
+                            .insert(profile_id, ConnectionState::Failed { summary });
+                        self.status = summary.message().to_owned();
                     }
                 }
                 OperationKind::Execute => {
                     if self.pending_execute.as_ref() == Some(&(operation_id, profile_id)) {
                         self.pending_execute = None;
-                        self.status = message;
+                        self.status = summary.message().to_owned();
                     }
                 }
             },
@@ -220,8 +233,8 @@ impl UiModel {
 mod tests {
     use super::{ConnectionState, ProfileSnapshot, UiEvent, UiModel};
     use crate::model::{
-        ConnectionProfile, DriverAvailability, DriverKind, OperationId, ProfileId, QueryResult,
-        TlsMode,
+        ConnectionProfile, CredentialMode, DriverAvailability, DriverKind, OperationId,
+        ProfileGeneration, ProfileId, QueryResult, RedisTlsConfig, TlsMode,
     };
 
     fn result(elapsed_ms: u128) -> QueryResult {
@@ -290,16 +303,20 @@ mod tests {
             database: None,
             username: None,
             tls: TlsMode::Disabled,
+            credential_mode: CredentialMode::None,
             secret_env: None,
+            redis_tls: RedisTlsConfig::default(),
         };
         ProfileSnapshot {
             id: ProfileId(persisted.id.clone()),
+            generation: ProfileGeneration(1),
             name: persisted.name.clone(),
             driver: persisted.driver,
             endpoint: persisted.redacted_endpoint(),
             database: None,
             availability: DriverAvailability::Ready,
             planned_reason: None,
+            has_current_session_secret: false,
             persisted,
         }
     }

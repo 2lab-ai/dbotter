@@ -4,6 +4,8 @@ mod model;
 mod profile_form;
 mod runtime;
 
+pub use adapter::UiCommand;
+
 use crate::error::AppError;
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/dbotter-icon.png");
@@ -13,10 +15,10 @@ fn app_icon() -> Result<eframe::egui::IconData, AppError> {
         .map_err(|error| AppError::Desktop(format!("invalid embedded app icon: {error}")))
 }
 
-pub fn run() -> Result<(), AppError> {
+pub fn run(config_path: std::path::PathBuf) -> Result<(), AppError> {
     let icon = app_icon()?;
     let (ui, service) = adapter::bounded_ports(64);
-    runtime::spawn(service);
+    runtime::spawn(service, config_path);
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])

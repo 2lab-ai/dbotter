@@ -15,7 +15,7 @@ async fn main() -> ExitCode {
     match dbotter::cli::run(dbotter::cli::Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {error}");
+            eprintln!("error: {}", error.public_message());
             ExitCode::FAILURE
         }
     }

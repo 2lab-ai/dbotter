@@ -1,7 +1,8 @@
 # dbotter — authoritative vertical trace index
 
-Status: **P0 repository baseline reconciled. T0 is RED; T1–T10 are Not
-started.** Update this document before changing cross-layer behavior.
+Status: **P1 foundation independently reviewed GREEN. T0 remains RED overall;
+T1, T2, T8, and T9 are Implementing; T3–T7 and T10 are Not started.** Update
+this document before changing cross-layer behavior.
 
 The frozen normative trace is `docs/usable-mvp/trace.md` at SHA-256
 `91bfbe89874e88e2c97c7252073cbf7348778192f2a6a349a68b903e1baceaa4`.
@@ -27,16 +28,16 @@ Allowed implementation states are `Not started`, `RED`, `Implementing`,
 
 | ID | User journey / scenario | Slice owner | Status | Required proof class |
 |---|---|---|---|---|
-| T0 | v1 read-only load, v2 migration/reload, first run | P1/P6 | RED | config/frozen-reader/RawInput |
-| T1 | Create/Edit, credential intent, unsaved draft Test | P1/P6 | Not started | matrix/draft isolation/AX |
-| T2 | confirmed atomic profile delete | P1/P2/P6 | Not started | failpoint/order/tombstone/AX |
+| T0 | v1 read-only load, v2 migration/reload, first run | P1/P6 | RED (P1 config GREEN; P6 remains) | config/frozen-reader/RawInput |
+| T1 | Create/Edit, credential intent, unsaved draft Test | P1/P6 | Implementing (P1 core GREEN; P6 remains) | matrix/draft isolation/AX |
+| T2 | confirmed atomic profile delete | P1/P2/P6 | Implementing (P1 core GREEN; P2/P6 remain) | failpoint/order/tombstone/AX |
 | T3 | controller, reload, connect/disconnect/reconnect/shutdown | P2/P6 | Not started | state/cache/race/shutdown |
 | T4 | exact target, prepared-only execute, cancel | P3/P6 | Not started | scanner/source/live/RawInput |
 | T5 | lazy paginated MySQL catalog | P4/P6 | Not started | hermetic + mandatory live + CLI |
 | T6 | Redis SCAN/inspect and verified TLS | P5/P6 | Not started | hermetic + auth/TLS live + CLI |
 | T7 | result/copy/streaming atomic export | P7 | Not started | byte goldens/filesystem failpoints |
-| T8 | static errors, total recovery, accessibility | P1/P6 | Not started | Cartesian table/RawInput/AccessKit |
-| T9 | restart and credential availability | P1/P2/P6 | Not started | restart contract + installed AX |
+| T8 | static errors, total recovery, accessibility | P1/P6 | Implementing (P1 core GREEN; P6 remains) | Cartesian table/RawInput/AccessKit |
+| T9 | restart and credential availability | P1/P2/P6 | Implementing (P1 core GREEN; P2/P6 remain) | restart contract + installed AX |
 | T10 | CI/manifest/preview/tap/Brew/installed journey | P8/P9 | Not started | source/artifact/process/receipt chain |
 
 ## Approved vocabulary and correlation
@@ -59,7 +60,9 @@ to repair missing identity.
 
 ## T0 — exact-path v1 normalization, v2 load, and first run
 
-Status: **RED**. Contract source: frozen trace T0; slices P1/P6.
+Status: **RED overall** — the P1 config portion is independently reviewed
+GREEN; P6 first-run RawInput/AccessKit remains. Contract source: frozen trace
+T0; slices P1/P6.
 
 Entry resolves one config path: global `--config` → `DBOTTER_CONFIG` → default,
 then calls `config::load_path`. Version 1 loads read-only and normalizes
@@ -71,16 +74,18 @@ writes version 2, and reconciles the observed outcome. A frozen v1 reader must
 reject v2 before service/network construction. First-run UI exposes New
 MySQL/Redis and a disabled Planned MongoDB area.
 
-RED owner/evidence:
+P1 GREEN evidence:
 
 - exact path precedence, v1 normalization/no-write, v2 load, missing vs invalid;
 - fixed backup confirmation/cancel/failpoints and current-v1-reader rejection;
 - exact independent `config-contract` JSON;
-- egui RawInput/AccessKit empty-state contract.
+
+Remaining RED owner/evidence: P6 egui RawInput/AccessKit empty-state contract.
 
 ## T1 — Create/Edit, credential modes, and side-effect-free draft Test
 
-Status: **Not started**. Contract source: frozen trace T1; slices P1/P6.
+Status: **Implementing** — P1 core evidence is GREEN; P6 native intent/AX work
+remains. Contract source: frozen trace T1; slices P1/P6.
 
 Create carries DraftId, chooses the lowest free suffix for automatic ids, and
 maps an occupied explicit id to
@@ -95,13 +100,15 @@ connector acquisition. Draft Test creates/pings/closes temporary resources and
 has no config/cache/store/saved-state/workspace side effect or stored retry
 recipe. Save maps Keep/Replace/Forget exactly after the config commit point.
 
-RED owner/evidence: config/credential matrices, Create versus Update collision,
-draft buffer lifetime and invalidation, no-network/no-side-effect assertions,
-intent AX ids, atomic failpoints, and CommittedDurabilityUnknown reconciliation.
+P1 GREEN evidence covers config/credential matrices, Create versus Update
+collision, draft buffer lifetime/invalidation, no-network/no-side-effect
+assertions, atomic failpoints, and durability-unknown reconciliation. Remaining
+P6 evidence is the complete native intent journey and AX ids.
 
 ## T2 — confirmed atomic profile delete
 
-Status: **Not started**. Contract source: frozen trace T2; slices P1/P2/P6.
+Status: **Implementing** — P1 atomic config-delete/reconciliation evidence is
+GREEN; P2/P6 remain. Contract source: frozen trace T2; slices P1/P2/P6.
 
 Opening/cancelling confirmation is side-effect free. With active work the
 dialog names static OperationKind and says dbotter stops waiting while the
@@ -110,8 +117,9 @@ join, exact-session evict, secret/workspace clear, and correlated deletion with
 server state Unknown. Pre-rename failure changes nothing; post-rename
 durability uncertainty reloads and reconciles.
 
-RED owner/evidence: dialog/AX, failpoint barriers, tombstone recreation race,
-unrelated-profile preservation, restart, and exact order assertions.
+P1 GREEN evidence covers config failpoint barriers, unrelated-profile
+preservation, and durability-unknown reconciliation. Remaining evidence is P2
+tombstone/controller ordering and restart behavior plus P6 dialog/AX coverage.
 
 ## T3 — controller, reload, connection lifecycle, and shutdown
 
@@ -216,8 +224,9 @@ competition/symlink/failpoints/cancel, and installed byte-exact export.
 
 ## T8 — static public errors, total recovery, and accessibility
 
-Status: **Not started**. Contract source: frozen trace T8 and approved spec §8;
-slices P1/P6.
+Status: **Implementing** — P1 public-error/recovery evidence is GREEN; P6
+native accessibility and full dispatch journey remain. Contract source: frozen
+trace T8 and approved spec §8; slices P1/P6.
 
 Internal typed errors convert to allowlisted category/code, static summary, and
 `NonEmpty<RecoveryAction>`. The exhaustive reachable
@@ -230,13 +239,14 @@ Stable author ids, egui RawInput, AccessKit tree, installed AXIdentifier
 readback, numerical contrast, disclosure presence/absence, protected secret
 values, active Delete warning, and real recovery dispatch are all required.
 
-RED owner/evidence: enum Cartesian table, unreachable rejection, every action
-dispatcher, RawInput/AccessKit/contrast/disclosure suites, and installed recovery
-journey.
+P1 GREEN evidence covers the enum Cartesian table, unreachable rejection, and
+typed recovery dispatcher. Remaining P6 evidence is the full action journey,
+RawInput/AccessKit/contrast/disclosure suites, and installed recovery journey.
 
 ## T9 — restart and credential availability
 
-Status: **Not started**. Contract source: frozen trace T9; slices P1/P2/P6.
+Status: **Implementing** — P1 config/credential restart foundation is GREEN;
+P2/P6 remain. Contract source: frozen trace T9; slices P1/P2/P6.
 
 Restart reloads version 2 and creates fresh runtime generations/cache/store/
 workspace. Profiles and Redis TLS fields persist; session secrets/results/
@@ -244,8 +254,10 @@ pending/retry recipes/tombstones do not. Session shows Needs credential with
 Keep disabled, Replace default, Forget available. Environment shows
 Available/Missing/Empty without value exposure.
 
-RED owner/evidence: process A/B restart fixture, migration backup/frozen-reader
-proof, exact credential/intent/AX states, and reconnect recovery.
+P1 GREEN evidence covers persisted v2/TLS fields, migration backup/frozen-reader
+behavior, and session/environment credential availability foundations.
+Remaining evidence is the P2 fresh-runtime/reconnect lifecycle and P6 exact
+credential-intent/AX states.
 
 ## T10 — gated preview publication, Brew install, and installed proof
 
@@ -285,8 +297,9 @@ scan, and final conformance audit.
 
 ## Verification command routing
 
-Commands are fixed interfaces but remain **planned** until their owning slice
-implements them. Do not interpret their presence here as a pass.
+Commands are fixed interfaces. The P1 foundation passed the checkpoint subset
+below; commands owned by later slices remain planned and must not be interpreted
+as passes.
 
 P0 document baseline:
 
@@ -295,7 +308,25 @@ shasum -a 256 docs/usable-mvp/spec.md docs/usable-mvp/trace.md docs/usable-mvp/p
 git diff --check
 ```
 
-P1–P7 source/hermetic gate:
+P1 checkpoint (passed):
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features --offline -- -D warnings
+cargo test --all-features --offline
+cargo test --doc --all-features --offline
+cargo build --release --all-features --offline
+cargo test --test source_contract --all-features --offline
+sh scripts/test-receipt-contract.sh
+git diff --check
+```
+
+This produced 136 passing regular tests and 12 passing doctests (also 12/12 in
+the separate doctest run), with production/test snapshot SHA-256 values
+`6ccd3ded9a82384ce92b823914e1b5e9f518886460fc0df1c6455ed6d9a327a9`
+and `dfacf608d773ca16dd4d25bdf0dc5bfb8f17926baf60d63bcadb1470ffb8114e`.
+
+Full source/hermetic interface for later slice claims:
 
 ```sh
 ./scripts/check-release-contract.sh
@@ -324,7 +355,9 @@ trace row before that row may become Verified.
 
 ## Conformance record
 
-P0 changed documentation only. No runtime row is claimed implemented by this
-reconciliation. Any production deviation is recorded here before code with an
+P0 changed documentation only. The independently reviewed P1 foundation is
+GREEN, but no complete runtime journey is claimed GREEN: T0 remains RED and
+T1/T2/T8/T9 remain Implementing until their listed P2/P6 evidence lands. Any
+production deviation is recorded here before code with an
 ADDED/MODIFIED/REMOVED/RENAMED classification, affected trace ids, migration
 impact, and contract evidence.

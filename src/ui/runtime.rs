@@ -2,15 +2,16 @@
 
 use std::time::Duration;
 
-use crate::model::ExecuteRequest;
+use crate::config::CommitState;
+use crate::model::{ExecuteRequest, PublicSummary};
 use crate::service::{ApplicationService, ServiceError};
 
 use super::adapter::{ServicePort, UiCommand};
 use super::model::{OperationKind, ProfileSnapshot, UiEvent};
 
-pub fn spawn(service_port: ServicePort) {
+pub fn spawn(service_port: ServicePort, config_path: std::path::PathBuf) {
     tokio::spawn(async move {
-        let application = ApplicationService::load();
+        let application = ApplicationService::load_path(config_path);
         run(service_port, application).await;
     });
 }
@@ -19,7 +20,7 @@ async fn run(mut service_port: ServicePort, application: Result<ApplicationServi
     while let Some(command) = service_port.next_command().await {
         let event = match &application {
             Ok(application) => handle_command(application, command).await,
-            Err(error) => service_error_event(command, error.to_string()),
+            Err(error) => service_error_event(command, error.public_error_parts().0),
         };
         if service_port.emit(event).await.is_err() {
             break;
@@ -28,41 +29,58 @@ async fn run(mut service_port: ServicePort, application: Result<ApplicationServi
 }
 
 async fn handle_command(application: &ApplicationService, command: UiCommand) -> UiEvent {
-    handle_command_with_config_path(application, command, crate::config::config_path()).await
-}
-
-async fn handle_command_with_config_path(
-    application: &ApplicationService,
-    command: UiCommand,
-    config_path: Result<std::path::PathBuf, crate::config::ConfigError>,
-) -> UiEvent {
     match command {
-        UiCommand::RefreshProfiles => UiEvent::ProfilesLoaded(
-            application
-                .profiles_snapshot()
-                .await
-                .iter()
-                .map(ProfileSnapshot::from_profile)
-                .collect(),
-        ),
-        UiCommand::UpsertProfile {
-            operation_id,
-            profile,
-        } => {
-            let profile_id = crate::model::ProfileId(profile.id.clone());
-            let outcome = match config_path {
-                Ok(path) => application.upsert_profile_path(&path, profile).await,
-                Err(error) => Err(error.into()),
-            };
+        UiCommand::RefreshProfiles => {
+            let mut snapshots = Vec::new();
+            for (profile, generation) in application.profiles_with_generations_snapshot().await {
+                let profile_id = crate::model::ProfileId(profile.id.clone());
+                let has_current_session_secret =
+                    match application.has_current_session_secret(&profile_id) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return UiEvent::ProfilesFailed(error.public_error_parts().0);
+                        }
+                    };
+                snapshots.push(ProfileSnapshot::from_profile(
+                    &profile,
+                    generation,
+                    has_current_session_secret,
+                ));
+            }
+            UiEvent::ProfilesLoaded(snapshots)
+        }
+        UiCommand::CreateProfile(request) => {
+            let operation_id = request.operation_id;
+            let profile_id = request.explicit_id.clone().unwrap_or_else(|| {
+                crate::model::ProfileId(crate::service::slugify_profile_id(&request.draft.name))
+            });
+            let outcome = application.create_profile(request).await;
             match outcome {
-                Ok(profile_id) => UiEvent::ProfileSaved {
-                    operation_id,
-                    profile_id,
+                Ok(outcome) => UiEvent::ProfileSaved {
+                    operation_id: outcome.operation_id,
+                    profile_id: outcome.profile_id,
+                    warning: commit_warning(outcome.commit_state),
                 },
                 Err(error) => UiEvent::ProfileSaveFailed {
                     operation_id,
                     profile_id,
-                    message: error.to_string(),
+                    summary: error.public_error_parts().0,
+                },
+            }
+        }
+        UiCommand::UpdateProfile(request) => {
+            let operation_id = request.operation_id;
+            let profile_id = request.profile_id.clone();
+            match application.update_profile(request).await {
+                Ok(outcome) => UiEvent::ProfileSaved {
+                    operation_id: outcome.operation_id,
+                    profile_id: outcome.profile_id,
+                    warning: commit_warning(outcome.commit_state),
+                },
+                Err(error) => UiEvent::ProfileSaveFailed {
+                    operation_id,
+                    profile_id,
+                    summary: error.public_error_parts().0,
                 },
             }
         }
@@ -82,7 +100,7 @@ async fn handle_command_with_config_path(
                 operation_id,
                 profile_id,
                 OperationKind::Connection,
-                error.to_string(),
+                error.public_error_parts().0,
             ),
         },
         UiCommand::Execute {
@@ -112,7 +130,7 @@ async fn handle_command_with_config_path(
                 operation_id,
                 profile_id,
                 OperationKind::Execute,
-                error.to_string(),
+                error.public_error_parts().0,
             ),
         },
     }
@@ -122,36 +140,47 @@ fn failed(
     operation_id: crate::model::OperationId,
     profile_id: crate::model::ProfileId,
     kind: OperationKind,
-    message: String,
+    summary: PublicSummary,
 ) -> UiEvent {
     UiEvent::OperationFailed {
         operation_id,
         profile_id,
         kind,
-        message,
+        summary,
     }
 }
 
-fn service_error_event(command: UiCommand, message: String) -> UiEvent {
+fn service_error_event(command: UiCommand, summary: PublicSummary) -> UiEvent {
     match command {
-        UiCommand::RefreshProfiles => UiEvent::ProfilesFailed(message),
-        UiCommand::UpsertProfile {
-            operation_id,
-            profile,
-        } => UiEvent::ProfileSaveFailed {
-            operation_id,
-            profile_id: crate::model::ProfileId(profile.id),
-            message,
+        UiCommand::RefreshProfiles => UiEvent::ProfilesFailed(summary),
+        UiCommand::CreateProfile(request) => UiEvent::ProfileSaveFailed {
+            operation_id: request.operation_id,
+            profile_id: request.explicit_id.unwrap_or_else(|| {
+                crate::model::ProfileId(crate::service::slugify_profile_id(&request.draft.name))
+            }),
+            summary,
+        },
+        UiCommand::UpdateProfile(request) => UiEvent::ProfileSaveFailed {
+            operation_id: request.operation_id,
+            profile_id: request.profile_id,
+            summary,
         },
         UiCommand::TestConnection {
             operation_id,
             profile_id,
-        } => failed(operation_id, profile_id, OperationKind::Connection, message),
+        } => failed(operation_id, profile_id, OperationKind::Connection, summary),
         UiCommand::Execute {
             operation_id,
             profile_id,
             ..
-        } => failed(operation_id, profile_id, OperationKind::Execute, message),
+        } => failed(operation_id, profile_id, OperationKind::Execute, summary),
+    }
+}
+
+const fn commit_warning(commit_state: CommitState) -> Option<PublicSummary> {
+    match commit_state {
+        CommitState::CommittedDurabilityUnknown => Some(PublicSummary::CommittedDurabilityUnknown),
+        CommitState::NotCommitted | CommitState::Committed => None,
     }
 }
 
@@ -159,27 +188,32 @@ fn service_error_event(command: UiCommand, message: String) -> UiEvent {
 mod tests {
     use std::sync::Arc;
 
-    use crate::config::Config;
+    use crate::config::MigrationConsent;
     use crate::model::{
-        ConnectionProfile, DriverKind, OperationId, ProfileId, QueryLanguage, TlsMode,
+        ConnectionDraft, CredentialMode, DraftId, DriverKind, OperationId, ProfileId,
+        PublicSummary, QueryLanguage,
     };
-    use crate::service::{ApplicationService, DriverConnector, EnvironmentSecrets};
+    use crate::secrets::{SessionSecret, SessionSecretUpdate};
+    use crate::service::{ApplicationService, CreateProfileRequest};
 
-    use super::{UiCommand, UiEvent, handle_command_with_config_path};
+    use super::{UiCommand, UiEvent, handle_command};
 
     #[tokio::test]
     async fn saved_profile_is_in_the_live_service_and_next_refresh() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        let service = service();
+        let service = ApplicationService::load_path(&path).expect("service");
 
-        let saved = handle_command_with_config_path(
+        let saved = handle_command(
             &service,
-            UiCommand::UpsertProfile {
+            UiCommand::CreateProfile(CreateProfileRequest {
+                draft_id: DraftId(1),
                 operation_id: OperationId(11),
-                profile: profile(DriverKind::Redis),
-            },
-            Ok(path.clone()),
+                explicit_id: Some(ProfileId("runtime-profile".to_owned())),
+                draft: draft(DriverKind::Redis),
+                secret_update: SessionSecretUpdate::Clear,
+                migration_consent: MigrationConsent::Cancelled,
+            }),
         )
         .await;
 
@@ -188,6 +222,7 @@ mod tests {
             UiEvent::ProfileSaved {
                 operation_id: OperationId(11),
                 profile_id,
+                warning: None,
             } if profile_id == ProfileId("runtime-profile".to_owned())
         ));
         assert_eq!(
@@ -198,8 +233,7 @@ mod tests {
             QueryLanguage::RedisCommand
         );
 
-        let refreshed =
-            handle_command_with_config_path(&service, UiCommand::RefreshProfiles, Ok(path)).await;
+        let refreshed = handle_command(&service, UiCommand::RefreshProfiles).await;
         assert!(matches!(
             refreshed,
             UiEvent::ProfilesLoaded(profiles)
@@ -209,20 +243,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_direct_upsert_emits_failure_without_writing() {
+    async fn refresh_exposes_only_the_safe_current_session_secret_boolean() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        let service = service();
-        let mut invalid = profile(DriverKind::MySql);
+        let service = ApplicationService::load_path(&path).expect("service");
+        let mut session_draft = draft(DriverKind::Redis);
+        session_draft.credential_mode = CredentialMode::Session;
+        let saved = handle_command(
+            &service,
+            UiCommand::CreateProfile(CreateProfileRequest {
+                draft_id: DraftId(20),
+                operation_id: OperationId(20),
+                explicit_id: Some(ProfileId("session-profile".to_owned())),
+                draft: session_draft,
+                secret_update: SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(
+                    "must-never-reach-the-snapshot".to_owned(),
+                ))),
+                migration_consent: MigrationConsent::Cancelled,
+            }),
+        )
+        .await;
+        assert!(matches!(saved, UiEvent::ProfileSaved { .. }));
+
+        let refreshed = handle_command(&service, UiCommand::RefreshProfiles).await;
+        assert!(matches!(
+            refreshed,
+            UiEvent::ProfilesLoaded(profiles)
+                if profiles.len() == 1
+                    && profiles[0].has_current_session_secret
+                    && !format!("{:?}", profiles[0]).contains("must-never-reach-the-snapshot")
+        ));
+
+        let restarted = ApplicationService::load_path(&path).expect("restart service");
+        let refreshed_after_restart = handle_command(&restarted, UiCommand::RefreshProfiles).await;
+        assert!(matches!(
+            refreshed_after_restart,
+            UiEvent::ProfilesLoaded(profiles)
+                if profiles.len() == 1 && !profiles[0].has_current_session_secret
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_create_emits_static_failure_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let service = ApplicationService::load_path(&path).expect("service");
+        let mut invalid = draft(DriverKind::MySql);
         invalid.host.clear();
 
-        let event = handle_command_with_config_path(
+        let event = handle_command(
             &service,
-            UiCommand::UpsertProfile {
+            UiCommand::CreateProfile(CreateProfileRequest {
+                draft_id: DraftId(2),
                 operation_id: OperationId(12),
-                profile: invalid,
-            },
-            Ok(path.clone()),
+                explicit_id: Some(ProfileId("runtime-profile".to_owned())),
+                draft: invalid,
+                secret_update: SessionSecretUpdate::Clear,
+                migration_consent: MigrationConsent::Cancelled,
+            }),
         )
         .await;
 
@@ -231,37 +309,29 @@ mod tests {
             UiEvent::ProfileSaveFailed {
                 operation_id: OperationId(12),
                 profile_id,
-                message,
+                summary: PublicSummary::InvalidInput,
             } if profile_id == ProfileId("runtime-profile".to_owned())
-                && message.contains("host is required")
         ));
         assert!(!path.exists());
         assert!(service.profiles_snapshot().await.is_empty());
     }
 
-    fn service() -> ApplicationService {
-        ApplicationService::new(
-            Config::default(),
-            Arc::new(DriverConnector),
-            Arc::new(EnvironmentSecrets),
-        )
+    #[test]
+    fn durability_unknown_commit_is_a_typed_ui_warning() {
+        assert_eq!(
+            super::commit_warning(crate::config::CommitState::CommittedDurabilityUnknown),
+            Some(PublicSummary::CommittedDurabilityUnknown)
+        );
+        assert_eq!(
+            super::commit_warning(crate::config::CommitState::Committed),
+            None
+        );
     }
 
-    fn profile(driver: DriverKind) -> ConnectionProfile {
-        ConnectionProfile {
-            id: "runtime-profile".to_owned(),
-            name: "Runtime profile".to_owned(),
-            driver,
-            host: "127.0.0.1".to_owned(),
-            port: match driver {
-                DriverKind::MySql => 3306,
-                DriverKind::Redis => 6379,
-                DriverKind::MongoDb => 27017,
-            },
-            database: None,
-            username: None,
-            tls: TlsMode::Disabled,
-            secret_env: None,
-        }
+    fn draft(driver: DriverKind) -> ConnectionDraft {
+        let mut draft = ConnectionDraft::for_driver(driver);
+        draft.name = "Runtime profile".to_owned();
+        draft.credential_mode = CredentialMode::None;
+        draft
     }
 }
