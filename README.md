@@ -9,6 +9,56 @@ persist only an optional `secret_env` variable name, never a password value.
 MongoDB profiles may be saved for future use, while Test and Execute remain
 disabled. Catalog browsing is visibly deferred.
 
+## Install
+
+Stable channel:
+
+```sh
+brew install 2lab-ai/tap/dbotter
+```
+
+Rolling prerelease channel:
+
+```sh
+brew install 2lab-ai/tap/dbotter-preview
+```
+
+Both formulas install the `dbotter` executable, so only one should be linked
+at a time. Switch explicitly:
+
+```sh
+brew uninstall dbotter
+brew install 2lab-ai/tap/dbotter-preview
+
+# Return to stable
+brew uninstall dbotter-preview
+brew install 2lab-ai/tap/dbotter
+```
+
+`dbotter --version` identifies both the Cargo version and the immutable build:
+
+```text
+dbotter 0.1.0 (preview 2026-07-14-0905-0123456789ab)
+```
+
+## Release method
+
+- Every push to `main`/`master` runs CI and publishes a
+  `preview-YYYY-MM-DD-HHMM-<sha12>` GitHub prerelease. The latest 15 previews
+  are retained. Install or upgrade it with
+  `brew upgrade 2lab-ai/tap/dbotter-preview` after the tap bump completes.
+- A stable release is intentionally operator-triggered. Update the version in
+  `Cargo.toml`, merge green CI, then create and push the exact matching tag
+  (for example Cargo `0.1.1` requires tag `v0.1.1`). The stable workflow
+  refuses a mismatch.
+- Both channels publish four desktop-capable macOS/Linux binaries plus
+  `SHA256SUMS`; release builds use all Cargo features, so `dbotter gui` is
+  available.
+
+The complete channel contract and end-to-end workflow are in
+[`docs/release/spec.md`](docs/release/spec.md) and
+[`docs/release/trace.md`](docs/release/trace.md).
+
 ```sh
 cargo run -- drivers
 DBOTTER_CONFIG=config/local.example.toml \

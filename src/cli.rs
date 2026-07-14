@@ -7,7 +7,11 @@ use crate::model::{CheckReceipt, ExecReceipt, ExecuteRequest, OperationId, Profi
 use crate::service::ApplicationService;
 
 #[derive(Debug, Parser)]
-#[command(name = "dbotter", version, about = "Local Rust database client")]
+#[command(
+    name = "dbotter",
+    version = crate::build_info::version_with_build(),
+    about = "Local Rust database client"
+)]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
