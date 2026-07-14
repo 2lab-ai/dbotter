@@ -1,0 +1,30 @@
+version = 1
+
+[[profiles]]
+id = "mysql-local"
+name = "Local MySQL"
+driver = "mysql"
+host = "127.0.0.1"
+port = 33306
+database = "dbotter"
+username = "dbotter"
+tls = "disabled"
+secret_env = "DBOTTER_MYSQL_PASSWORD"
+
+[[profiles]]
+id = "redis-local"
+name = "Local Redis"
+driver = "redis"
+host = "127.0.0.1"
+port = 36379
+database = "0"
+tls = "disabled"
+
+[[profiles]]
+id = "mongodb-local"
+name = "Local MongoDB (planned)"
+driver = "mongodb"
+host = "127.0.0.1"
+port = 37017
+database = "dbotter"
+tls = "disabled"

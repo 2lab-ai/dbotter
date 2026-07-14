@@ -1,0 +1,4 @@
+/target/
+/artifacts/*.json
+/artifacts/.receipt*.tmp
+.DS_Store
