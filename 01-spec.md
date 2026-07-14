@@ -1,173 +1,212 @@
-# dbotter — MVP product contract
+# dbotter — usable MVP product contract
 
-Status: implemented MVP contract, 2026-07-14.
+Status: **P0 baseline reconciled; runtime T0 is RED and T1–T10 are Not started.**
+This file describes the approved target, not the capabilities of the historical
+demo currently present in the source tree.
+
+## Authority and change control
+
+The frozen approval set is normative:
+
+- `docs/usable-mvp/spec.md` — product and wire contract;
+- `docs/usable-mvp/trace.md` — cross-layer vocabulary, T0–T10 flows, and task
+  ledger;
+- `docs/usable-mvp/plan.md` — P0–P9 order, RED contracts, live gates, and
+  delivery proof.
+
+Their approved SHA-256 values are recorded in `04-patch-plan.md`. This document
+reconciles that set into the repository entrypoint. If a summary here appears
+less specific, the frozen approval set wins. Contract changes must update the
+trace before production code.
 
 ## Product boundary
 
-dbotter is a local, single-user desktop database client written in Rust. It is a
-behavior-level rewrite inspired by DBeaver, not a line-for-line translation of
-DBeaver's Java/Eclipse/JDBC/OSGi implementation.
+dbotter is a local, single-user Rust desktop database client. The usable MVP is
+complete only when a developer can perform the full installed journey:
 
-DBeaver upstream evidence reviewed on 2026-07-14:
+1. create or edit a non-secret MySQL or Redis profile;
+2. choose an explicit credential source and test an unsaved draft;
+3. connect, disconnect, reconnect, and delete truthfully;
+4. browse MySQL schemas/relations/columns or Redis keys/values lazily;
+5. execute one selected/current target, understand static failures, and recover;
+6. copy or atomically export a bounded result;
+7. restart and observe honest credential availability;
+8. repeat the journey through the Homebrew-installed preview app and CLI with
+   source, artifact, process, accessibility, and receipt proof.
 
-- <https://github.com/dbeaver/dbeaver> describes a desktop SQL/data client and a
-  Java + Eclipse RCP + OSGi + JDBC architecture.
-- The upstream Community repository is Apache-2.0. Redis and MongoDB are listed
-  as PRO/non-JDBC data sources, so dbotter must not copy unavailable PRO code.
+MongoDB remains visibly Planned with no live connect/query path. DBeaver is
+behavior/product research only; no DBeaver PRO Redis or MongoDB source is
+copied.
 
-The clean first milestone is deliberately smaller than DBeaver: connection
-profiles, MySQL connect/query/results, Redis command execution, and a MongoDB
-driver boundary that compiles and advertises planned capabilities without
-pretending to work. Catalog browsing is deferred.
+## Implementation state
 
-## Users and acceptance
+| Trace | Target | State before production implementation |
+|---|---|---|
+| T0 | exact-path v1 read-only load, v2 migration/reload, first run | RED |
+| T1 | Create/Edit, credential intent, side-effect-free draft test | Not started |
+| T2 | confirmed atomic delete | Not started |
+| T3 | controller, reload, connect/disconnect/reconnect/shutdown | Not started |
+| T4 | exact target, prepared-only MySQL/Redis execute, cancel | Not started |
+| T5 | lazy paginated MySQL catalog | Not started |
+| T6 | Redis SCAN/inspect and verified Required TLS | Not started |
+| T7 | profile result, exact copy, streaming atomic export | Not started |
+| T8 | static errors, total recovery, native accessibility | Not started |
+| T9 | restart and credential availability | Not started |
+| T10 | gated CI/release/tap/Brew/installed golden journey | Not started |
 
-A local developer can:
+Existing demo code or historical release artifacts are not evidence that a row
+is GREEN or Verified. Status moves only through the ledger rules in
+`03-traces.md` and the evidence gates in `04-patch-plan.md`.
 
-1. start dbotter as a native desktop app;
-2. add a MySQL profile without persisting its password in plaintext;
-3. test the profile, execute a SQL statement, and inspect tabular rows or
-   affected-row counts; catalog browsing is visibly deferred in this MVP;
-4. add a Redis profile, connect, and execute commands such as `PING`, `SET`,
-   `GET`, `DEL`, and `SCAN`;
-5. see MongoDB in the driver registry as `planned`, with its module and
-   capability contract present but connect/query actions disabled;
-6. execute the same MySQL and Redis paths headlessly so Docker verification can
-   produce a deterministic JSON receipt.
+## Product invariants
 
-## Functional requirements
+### Profiles, config, and secrets
 
-### FR1 — connection profiles
+- Config version 2 is the current write schema. The new binary reads version 1
+  without writing, normalizes it in memory, and writes version 2 only on the
+  first confirmed committed Create/Edit/Delete.
+- Before that first mutation, dbotter creates the fixed
+  `<config>.v1.bak` through a 0600 same-directory temporary file, file fsync,
+  atomic no-replace rename, and parent-directory fsync. It never overwrites a
+  non-identical backup.
+- A frozen current-v1 reader rejects version 2 with `UnsupportedVersion(2)`
+  before service or network construction. The installer/rollback wrapper owns
+  the backup runbook; direct old-binary invocation only fails closed.
+- `CredentialMode::{None, Session, Environment}` is explicit. Persisted
+  `ConnectionProfile` contains no secret value.
+- Session UX uses `SessionCredentialIntent::{KeepCurrent, Replace, Forget}`;
+  accepted persistence uses `SessionSecretUpdate::{Keep, Replace, Clear}`.
+  Replace owns a `Zeroizing<String>` form buffer, Keep clones an existing
+  `Arc<SessionSecret>` under lock and unlocks before await, and Forget clears.
+- `SessionSecretStore` is `HashMap<ProfileId, Arc<SessionSecret>>`. Secret and
+  sensitive request types have redacted manual `Debug`, no `Serialize`, and no
+  lock is held across `.await`.
+- Create carries `(DraftId, OperationId)`. Explicit-id conflict
+  `PROFILE_ID_CONFLICT` recovers with `EditDraft(draft, ConnectionId)` and
+  focuses `profile.connection_id`; auto-slug collision allocates the lowest
+  free suffix and is not an error. Edit uses immutable `ProfileId` plus expected
+  `ProfileGeneration`.
 
-- Profile fields: stable id, display name, driver kind, host, port, optional
-  database, optional username, TLS mode, and `secret_env`.
-- Persist profiles in `~/.config/dbotter/config.toml`, overridable by
-  `DBOTTER_CONFIG`.
-- Persist no password/token value. Resolve it at connect time from
-  `secret_env`. Session-only password entry is deferred.
-- Config mutations use atomic read-merge-write. A profile upsert is keyed by id.
-- Logs and errors never include the secret or a credential-bearing URI.
+### Runtime identity and lifecycle
 
-### FR2 — driver contract
+- Every saved-profile command/event carries
+  `(ProfileId, ProfileGeneration, OperationId)`. Draft, export, and global work
+  carry only their own approved identities.
+- The task registry is `RegisteredTask { operation_id, scope, cancel, join }`
+  with closed `TaskScope::{Profile, Draft, Export, Global}`. Only Profile scope
+  contains profile/session generations.
+- The runtime has a capacity-16 serialized mutation lane, capacity-32 work
+  lane, capacity-16 control lane, capacity-128 event lane, one active network
+  operation per profile generation, and four process-wide.
+- Cancel/timeout stops client waiting, reports server state Unknown, and
+  compare-removes only the exact session generation. Disconnect/reconnect,
+  committed Edit/Delete fences, tombstones, reload diff, Config uncertain, and
+  shutdown follow T2/T3 exactly.
+- Async network work may use a two-second abort grace. Blocking export is
+  cooperative and must actually return and clean its temporary file. No task is
+  detached.
 
-- Every driver exposes metadata (`kind`, display name, default port,
-  availability, ready capabilities, planned capabilities) separately from
-  live runtime operations. A planned flag is never rendered as ready.
-- Current operations are `connect`, `ping`, and `execute`. `load_catalog` has no
-  runtime command, service method, or driver method in this MVP.
-- A request carries an operation id, profile id, query language, statement
-  text, row limit, and timeout. Every service outcome echoes both ids.
-- A response is backend-neutral: columns, typed cells, rows, affected rows,
-  elapsed time, truncation flag, and backend notices.
-- Planned drivers return typed `DriverError::Unavailable`; denied runtime
-  operations return typed `DriverError::Unsupported`. Production paths contain
-  no `todo!`, `panic!`, `unwrap()`, or `expect()`.
-- CLI and GUI use the same `ApplicationService`: profile lookup, secret
-  resolution, capability validation, connect/ping, cached session reuse, and
-  execute are not reimplemented at either entrypoint.
-- Public error display is redacted and stable. Raw sqlx/Redis errors remain in
-  the source chain for diagnostics but their messages are not shown by CLI/UI.
+### Drivers, execution, browsing, and bounds
 
-### FR3 — MySQL MVP
+- Ready capability bits are truthful and separate: MySQL `CATALOG`, Redis
+  `KEYSPACE_BROWSE`. Neither becomes ready before its mandatory live contract
+  passes in the same reviewed change. MongoDB remains Planned.
+- MySQL user text enters only `MySqlPreparedExecution` and server
+  `COM_STMT_PREPARE` → `COM_STMT_EXECUTE`. SQLx 0.9 may negotiate
+  `CLIENT_MULTI_STATEMENTS`; that flag is not the safety proof. User text never
+  reaches `sqlx::raw_sql`, `Executor::execute(&str)`, `COM_QUERY`, or a fallback
+  after prepared rejection.
+- Explicit selection is the user-declared target boundary. Without selection,
+  the fixed scanner from T4 handles MySQL comments/quotes/SQL-mode ambiguity or
+  one Redis physical line. Unambiguous multiple statements reject locally.
+- Execute row/timeout controls are `editor.row_limit` and `editor.timeout`.
+  `FocusExecuteLimits(ProfileId)` is Execute-only; browser and inspect recovery
+  uses typed clear/restart/dismiss or generation-checked idempotent recipes.
+- MySQL catalog uses static/bound prepared information-schema queries,
+  deterministic keyset pagination, `page_size + 1`, and retained caps. Redis
+  uses SCAN-family paging, raw key identity, bounded inspection, and the closed
+  nonblocking command classifier from T6.
+- Redis TLS UI offers only Disabled/Required. Required verifies certificate and
+  hostname with OS roots or a valid PEM CA. CA failures edit/focus only the CA;
+  hostname mismatch edits/focuses only Host; neither can fall back to plaintext.
+- Driver frames/rows may allocate before dbotter applies retained caps. UI and
+  receipts state this limitation rather than claiming universal allocation
+  prevention.
 
-- Connect using `sqlx::mysql::MySqlConnectOptions`, never by formatting a URI.
-- Bound connect timeout and statement timeout.
-- MySQL-dialect tokenization validates exactly one executable statement before
-  any SQL statement is sent. The shared service may establish a session before
-  driver-level text validation. One optional trailing terminator is accepted;
-  semicolons inside comments or quoted values do not split statements.
-- Prepared-statement metadata, rather than leading-keyword heuristics,
-  distinguishes result sets from mutations. Result sets return up to
-  `row_limit` rows and mark the result truncated when another row exists.
-- Mutation/DDL statements return affected rows and last insert id where the
-  driver supplies it.
-- Only MySQL error 1295 (unsupported by the prepared-statement protocol) may
-  retry the already validated statement through the raw protocol. Other
-  prepare failures are returned without retry.
-- Catalog loading is deferred until the driver contract grows a typed catalog
-  operation. The UI says so explicitly and does not display synthetic schema.
-- One editor action maps to one statement in MVP. Multi-statement scripts,
-  query plans, transactions, data editing, SSH tunnels, import/export, and AI
-  are explicitly deferred.
+### Errors, accessibility, copy, and export
 
-### FR4 — Redis runtime
+- Public failures are
+  `PublicOperationError { OperationKind, ErrorCategory, PublicCode,
+  PublicSummary, NonEmpty<RecoveryAction> }`. Summaries/actions are closed and
+  backend prose is never rendered.
+- `recovery_for` is total over reachable `OperationKind × PublicSummary` and
+  rejects unreachable pairs. Draft/Create field recovery uses `EditDraft` with
+  DraftId; saved-profile actions never borrow a draft identity. Mutating Execute
+  never receives automatic Retry.
+- Stable author ids include `profile.connection_id`, credential-intent controls,
+  `profile.host`, Redis CA controls, `editor.target`, `editor.row_limit`, and
+  `editor.timeout`. RawInput/AccessKit tests prove macOS AXIdentifier readback,
+  roles, names, focus, order, enabled state, keyboard use, and numerical
+  contrast.
+- Secrets and backend prose are absent from public strings, Debug, logs,
+  receipts, clipboard, and AX. User-owned SQL/Redis/result/key/CA/export values
+  may appear only in their intended value node; result data reaches clipboard
+  or file only after explicit Copy/Export. Secret AX values remain protected.
+- `clipboard_scalar(Cell)`, `tsv_field`, CSV/TSV/JSON wire formats, truncation
+  markers, field order, and final newlines are exact as specified in
+  `docs/usable-mvp/spec.md` §9.
+- Export streams from `Arc<ResultSnapshot>` to a 0600 same-directory temporary
+  file, fsyncs, commits under explicit no-overwrite/confirmed-replace policy,
+  and fsyncs the parent directory. Runtime receipts contain no content digest;
+  only the independent seeded verifier records expected/actual digest verdicts.
 
-- Connect with an async multiplexed connection.
-- Parse one command line with shell-style quoting into command + arguments.
-- Convert RESP values to the shared result model without losing nested values;
-  nested arrays/maps may be rendered as JSON in a single `value` column.
-- Passwords use the same secret resolution and masking rules as MySQL.
-- Pub/sub, cluster topology, Redis modules, and key editing are deferred.
+### Distribution identity
 
-### FR5 — MongoDB scaffold
+- Preview installs `Dbotter Preview.app` with bundle id
+  `ai.2lab.dbotter.preview`. The canonical executable is the post-sign embedded
+  file and Homebrew's `dbotter` shim resolves to it.
+- `dbotter version --format json` returns exactly
+  `{package_version,channel,build_id,source_sha,target,arch}`.
+- `dbotter config-contract --format json` is independent and returns exactly
+  `{read_versions:[1,2],write_version:2,migration_backup_suffix:".v1.bak"}`.
+- Cargo `x.y.z` is `CFBundleShortVersionString`; numeric
+  `<run_id>.<run_attempt>` is `CFBundleVersion`; the increasing Homebrew preview
+  version is separate. This task creates no stable tag or stable release.
 
-- `DriverKind::MongoDb`, metadata, default port 27017, capability flags, config
-  validation, UI registry entry, and `drivers/mongodb.rs` exist.
-- Availability is `Planned`; connect and execute controls are disabled.
-- Calling the module directly returns typed unavailable errors.
-- The future seam is document-native: a Mongo request/result must not be forced
-  through SQL text semantics. `QueryLanguage::{Sql, RedisCommand,
-  MongoDocument}` is already part of the request contract.
+## Journey-to-trace map
 
-### FR6 — desktop UI
+| Journey | Trace owner | Planned slice | Required evidence |
+|---|---|---|---|
+| U0 first run | T0 | P1/P6 | config + RawInput/AX |
+| U1 create/test/edit | T1 | P1/P6 | credential matrices + draft isolation |
+| U2 delete | T2 | P1/P2/P6 | failpoints + tombstone/order/AX |
+| U3 connect lifecycle | T3 | P2/P6 | state/cache table + controller races |
+| U4 exact execute target | T4 | P3/P6 | scanner + prepared-only source/live tests |
+| U5 MySQL catalog | T5 | P4/P6 | hermetic + mandatory live + CLI |
+| U6 Redis browse/TLS | T6 | P5/P6 | hermetic + auth/TLS live + CLI |
+| U7 copy/export | T7 | P7 | exact goldens + filesystem failpoints |
+| U8 errors/recovery | T8 | P1/P6 | exhaustive table + RawInput/AccessKit |
+| U9 restart | T9 | P1/P2/P6 | restart contract + installed AX |
+| installed completion | T10 | P8/P9 | CI/manifest/tap/Brew/process/receipt chain |
 
-- `eframe`/`egui` native window with connection/status navigation, editor, and
-  result/status panes. The connection pane marks catalog browsing deferred.
-- UI state never owns network clients. It sends runtime commands through a
-  bounded channel and polls runtime events without blocking the render thread.
-- Connection actions and execute actions have explicit pending/success/failure
-  states. Double-submit while pending is rejected.
-- Results are rendered from the same `QueryResult` returned by headless mode.
+## Exclusions
 
-### FR7 — headless verification and receipts
+Live MongoDB, query history/recent statements, editable grids, transaction UI,
+SSH/proxy tunnels, imports, ER diagrams, AI, multi-tab IDE behavior, keychain
+persistence, guaranteed server cancellation, and multi-process writer safety
+are out of scope. Stable publication is not part of this task.
 
-- `dbotter check --profile <id> --format json` exercises secret resolution,
-  driver selection, connect, and ping.
-- `dbotter exec --profile <id> --text <statement> --format json` exercises the
-  exact application service and driver used by the GUI.
-- `scripts/verify-local.sh` starts no services itself. It assumes the repository
-  Compose stack is healthy, seeds MySQL through dbotter, exercises Redis through
-  dbotter, writes `artifacts/receipt.json`, and exits non-zero on any mismatch.
-- Receipt fields: UTC start/finish, source and toolchain metadata,
-  Docker/Compose service metadata, sanitized profiles, normalized app and
-  official-client outputs, elapsed time, and per-backend assertions. Every app
-  or official-client input is recorded only as a stable fixture statement name
-  plus its SHA-256 fingerprint. SQL text, Redis command text, and
-  credential-bearing argv are not serialized.
-- A passing receipt is source-bound to dbotter's own Git repository: `HEAD` is
-  an attached commit, the worktree (including untracked files) is clean, and
-  the required source/receipt files are tracked. A missing Git repository,
-  nested or untracked checkout, detached `HEAD`, or dirty tree records a
-  provenance failure, forces `assertions.overall = false`, and makes the
-  verifier exit non-zero. The verification binary is rebuilt from this tree.
-- `credential_leak` is derived, never asserted as a constant. The verifier
-  serializes a receipt candidate without derived assertions, scans the complete
-  candidate for fixture passwords, credential-bearing URI syntax, the provided
-  MySQL fixture password, and non-empty values resolved from configured
-  `secret_env` names, then injects the derived boolean and overall verdict. The
-  resolved values are compared in memory and are never written as scan input.
-- A static jq contract enforces input fingerprints, source provenance/pass
-  coupling, and leak/pass coupling. Its shell test rejects injected fixture
-  secrets, resolved secrets, credential-bearing URIs, and false clean-tree
-  claims.
+## Baseline verification
 
-## Non-goals for the first receipt
+P0 is documentation-only. Before production implementation begins:
 
-- DBeaver feature parity or plugin compatibility.
-- JDBC/ODBC compatibility.
-- MongoDB live connectivity.
-- Credential persistence/keychain integration.
-- Catalog browsing, SSH/proxy tunnels, editable grids, schema changes, transactions, execution
-  plans, import/export, ER diagrams, AI, extensions, or auto-update.
-- Production distribution/signing.
+```sh
+shasum -a 256 docs/usable-mvp/spec.md docs/usable-mvp/trace.md docs/usable-mvp/plan.md
+git diff --check
+git diff -- 01-spec.md 02-architecture.md 03-traces.md 04-patch-plan.md \
+  docs/release/spec.md docs/release/trace.md README.md
+```
 
-## Quality gates
-
-- `just check`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo test`.
-- `just check-all`: the same with `--all-features` so MongoDB scaffolding does
-  not silently rot.
-- Contract tests start from the vertical traces in `03-traces.md`.
-- Production paths contain no `unwrap`, `expect`, `panic`, or `todo`.
-- Local live acceptance additionally requires `artifacts/receipt.json` proving
-  MySQL and Redis through the dbotter binary, not only through vendor CLIs.
+Implementation and delivery commands are owned by `04-patch-plan.md` and must
+not be reported green until the corresponding trace row reaches its required
+state.

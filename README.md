@@ -1,105 +1,139 @@
 # dbotter
 
-Local Rust database client MVP. The current executable surface connects to
-MySQL, executes one SQL statement, connects to Redis, executes one Redis
-command, and reports MongoDB honestly as planned. The desktop feature provides
-profiles/status, Add/Edit connection forms, Test, an editor, Execute, and a
-typed result table through a bounded background Tokio bridge. Profile forms
-persist only an optional `secret_env` variable name, never a password value.
-MongoDB profiles may be saved for future use, while Test and Execute remain
-disabled. Catalog browsing is visibly deferred.
+dbotter is a local Rust desktop database client targeting a usable MySQL and
+Redis preview. MongoDB remains honestly Planned.
 
-## Install
+## Current status
 
-Stable channel:
+The approved contract is complete, but usable-MVP production implementation
+has not begun on this branch:
+
+- P0 repository documentation baseline: complete in the current uncommitted
+  documentation diff;
+- runtime T0 / implementation P1: RED;
+- runtime T1–T10 / P2–P9: Not started.
+
+The source tree contains historical demo code and release machinery. It may
+compile or demonstrate older behavior, but it is **not** proof of the approved
+usable MVP and must not be described as installed/verified. In particular, old
+claims that session credentials, catalog browsing, cancellation/lifecycle,
+copy/export, signed app packaging, or installed AX proof are deferred or already
+complete are superseded by the approved contract and ledger.
+
+## Contract map
+
+- [`01-spec.md`](01-spec.md) — repository product contract and U0–U9 mapping.
+- [`02-architecture.md`](02-architecture.md) — target ownership, typed seams,
+  controller, security, export, and distribution architecture.
+- [`03-traces.md`](03-traces.md) — authoritative T0–T10 ledger; T0 is RED.
+- [`04-patch-plan.md`](04-patch-plan.md) — P0–P9 order and fixed verification
+  command interfaces.
+- [`docs/release/spec.md`](docs/release/spec.md) — preview release contract.
+- [`docs/release/trace.md`](docs/release/trace.md) — T10.R1–R7 release traces.
+- `docs/usable-mvp/{spec,trace,plan}.md` — frozen approval artifacts; do not
+  edit during P0 reconciliation.
+
+## Approved usable-MVP outcome
+
+When T0–T10 are Verified, a developer can use the Homebrew-installed
+`Dbotter Preview.app` to:
+
+- create/edit a non-secret MySQL or Redis profile with explicit None, Session,
+  or Environment credentials;
+- test an unsaved draft without config/cache/store/workspace side effects;
+- connect, disconnect, reconnect, delete, cancel, restart, and recover from
+  static typed errors truthfully;
+- browse paginated MySQL schemas/relations/columns and Redis keys/values;
+- execute an exact selected/current target, with MySQL user SQL restricted to
+  server prepared protocol and Redis commands restricted by the closed policy;
+- copy exact cells/rows and atomically export bounded CSV/TSV/JSON;
+- complete the same CLI and native AX journey with source/artifact/process/
+  receipt proof.
+
+Redis Required TLS verifies CA and hostname and never falls back to plaintext.
+MongoDB stays disabled/Planned. Query history, editable grids, transactions,
+SSH/proxy, import, ER diagrams, AI, keychain persistence, and stable publication
+are not part of this task.
+
+## P0 verification
+
+This documentation task intentionally changes no Rust source, tests, scripts,
+workflows, lockfiles, or approved artifacts. Verify the baseline with:
 
 ```sh
-brew install 2lab-ai/tap/dbotter
+shasum -a 256 docs/usable-mvp/spec.md docs/usable-mvp/trace.md docs/usable-mvp/plan.md
+git diff --check
+git status --short --untracked-files=all
+git diff -- 01-spec.md 02-architecture.md 03-traces.md 04-patch-plan.md \
+  docs/release/spec.md docs/release/trace.md README.md
 ```
 
-Rolling prerelease channel:
-
-```sh
-brew install 2lab-ai/tap/dbotter-preview
-```
-
-Both formulas install the `dbotter` executable, so only one should be linked
-at a time. Switch explicitly:
-
-```sh
-brew uninstall dbotter
-brew install 2lab-ai/tap/dbotter-preview
-
-# Return to stable
-brew uninstall dbotter-preview
-brew install 2lab-ai/tap/dbotter
-```
-
-`dbotter --version` identifies both the Cargo version and the immutable build:
+Expected frozen SHA-256 values:
 
 ```text
-dbotter 0.1.0 (preview 2026-07-14-0905-0123456789ab)
+4c78aa0b957814d0dbaf46e8938a93701e2f85f0a6bb88772ef06b1b1da90cf3  docs/usable-mvp/spec.md
+91bfbe89874e88e2c97c7252073cbf7348778192f2a6a349a68b903e1baceaa4  docs/usable-mvp/trace.md
+ad649d256286f2e8dd8fa630bba8b64bb9f3ac5e6c5930f7ef432d85d0e8bd97  docs/usable-mvp/plan.md
 ```
 
-## Release method
+## Implementation gates
 
-- Every push to `main`/`master` runs CI and publishes a
-  `preview-YYYY-MM-DD-HHMM-<sha12>` GitHub prerelease. The latest 15 previews
-  are retained. Install or upgrade it with
-  `brew upgrade 2lab-ai/tap/dbotter-preview` after the tap bump completes.
-- A stable release is intentionally operator-triggered. Update the version in
-  `Cargo.toml`, merge green CI, then create and push the exact matching tag
-  (for example Cargo `0.1.1` requires tag `v0.1.1`). The stable workflow
-  refuses a mismatch.
-- Both channels publish four desktop-capable macOS/Linux binaries plus
-  `SHA256SUMS`; release builds use all Cargo features, so `dbotter gui` is
-  available.
-
-The complete channel contract and end-to-end workflow are in
-[`docs/release/spec.md`](docs/release/spec.md) and
-[`docs/release/trace.md`](docs/release/trace.md).
+P1 and later must start from failing trace-derived contracts. The planned
+source/hermetic gate is:
 
 ```sh
-cargo run -- drivers
-DBOTTER_CONFIG=config/local.example.toml \
+./scripts/check-release-contract.sh
+./scripts/test-receipt-contract.sh
+cargo fmt --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-features --locked
+```
+
+The mandatory live interface, once P4/P5/P8 implement it, is:
+
+```sh
+docker compose -p dbotter-e2e up -d --wait mysql redis-auth redis-tls-auth
 DBOTTER_MYSQL_PASSWORD=dbotter-local-only \
-  cargo run -- check --profile mysql-local
+DBOTTER_REDIS_PASSWORD=dbotter-redis-local-only \
+  ./scripts/verify-live-contracts.sh --config config/local.example.toml
+DBOTTER_MYSQL_PASSWORD=dbotter-local-only \
+DBOTTER_REDIS_PASSWORD=dbotter-redis-local-only \
+  ./scripts/verify-local.sh --config config/local.example.toml
+jq -e '.assertions.overall == true' artifacts/receipt.json
 ```
 
-Desktop client:
+A missing command, fixture, certificate, environment value, or named assertion
+means its slice is not Verified. Do not replace it with an older demo command.
+
+## Preview install target
+
+P8/P9 will publish and explicitly bump:
 
 ```sh
-cargo run --features desktop -- gui
+brew update
+brew upgrade 2lab-ai/tap/dbotter-preview
 ```
 
-Local acceptance:
+The installed formula must contain `Dbotter Preview.app` with bundle id
+`ai.2lab.dbotter.preview`; `dbotter` must resolve to its post-sign executable.
+The installed proof uses separate exact commands:
 
 ```sh
-docker compose -p dbotter-e2e up -d --wait mysql redis
-DBOTTER_MYSQL_PASSWORD=dbotter-local-only ./scripts/verify-local.sh
+dbotter version --format json
+dbotter config-contract --format json
 ```
 
-The verifier creates one unique `run_id`, then exercises that exact id through
-dbotter and independently re-reads it through the official `mysql` and
-`redis-cli` clients inside the Compose containers. MySQL covers create,
-idempotent upsert, and select. Redis covers `SET ... EX`, `GET`, and `TTL`.
+Do not treat a currently available historical formula or prerelease as this
+outcome. Installation is complete only after the manifest-bound CLI and exact
+app-path/PID AX journey in `04-patch-plan.md` passes. This task publishes no
+stable release.
 
-The resulting `artifacts/receipt.json` includes host, toolchain, Git, Docker,
-Compose/service, sanitized profiles, named input fixtures with SHA-256
-fingerprints, parsed results/timing, official-client readback, and per-backend
-verdict evidence. Raw SQL, Redis commands, argv, and raw output streams are not
-serialized. It is valid only from a clean attached commit when the script exits
-zero and both backend verdicts are `pass`:
+## Security and contribution rules
 
-```sh
-jq '{run_id, mysql: .mysql.verdict, redis: .redis.verdict, mongodb}' \
-  artifacts/receipt.json
-```
-
-MongoDB remains opt-in and is not started by this acceptance path; the receipt
-records it as `prepared-not-run`. To stop only the two fixture services after
-inspection, without deleting project volumes or unrelated Compose resources:
-
-```sh
-docker compose -p dbotter-e2e stop mysql redis
-```
+- Persist no password/token value and never log credential-bearing URIs.
+- Never expose backend prose at public boundaries.
+- Sensitive request types remain non-serializable with redacted manual Debug.
+- UI state owns no live client; no lock crosses await; no production
+  `unwrap`/`expect`/`panic!`/`todo!`.
+- Update `03-traces.md` before changing cross-layer behavior.
+- Do not mark a capability ready without its same-change mandatory live proof.

@@ -1,222 +1,264 @@
-# dbotter — architecture
+# dbotter — usable MVP architecture
+
+Status: **approved target architecture; T0 RED, T1–T10 Not started.** Existing
+demo modules are migration inputs, not evidence that this architecture is
+implemented.
+
+Normative detail lives in `docs/usable-mvp/{spec,trace,plan}.md`. This document
+is the repository architecture entrypoint and must remain consistent with those
+frozen artifacts and the T0–T10 ledger in `03-traces.md`.
 
 ## Decision summary
 
-dbotter is one Rust package with a library and one binary. The headless CLI and
-desktop runtime both call `ApplicationService`; profile lookup, secret
-resolution, capability checks, connection creation, session reuse, ping, and
-execute are implemented there once. Catalog loading is not part of the current
-service or driver seam.
+dbotter remains one Rust package with a library and one binary. The native UI
+and headless CLI share `ApplicationService`; neither reimplements profile
+lookup, credential resolution, capability validation, connection lifecycle,
+typed resource browsing, execution, or public error conversion.
 
-## Runtime topology
+The UI owns pure/display state only. Live sessions, task registry, config
+writer, secrets, and filesystem export workers stay behind typed service and
+runtime boundaries. No lock crosses `.await`.
 
-```text
-headless CLI ---------------------------> ApplicationService
-                                                |
-eframe UI -> bounded UiCommand channel -> ui::runtime task
-   ^                                            |
-   |                                      ApplicationService
-   +------ bounded UiEvent channel --------------+
-                                                |
-                                   profile-keyed session cache
-                                      /                    \
-                               MySqlSession            RedisSession
-                                SQLx pool         connection manager
-```
-
-The CLI awaits the service directly. The desktop UI uses nonblocking
-`try_send`/`try_recv` at the render boundary; `src/ui/runtime.rs` consumes
-commands on Tokio and awaits the same service. `UiModel` owns snapshots,
-pending operation ids, statuses, and the latest `QueryResult`, but no database
-client. MongoDB has registry metadata only and cannot create a session.
-
-`ApplicationService` owns `Arc<RwLock<Config>>` and
-`Arc<RwLock<HashMap<ProfileId, CachedSession>>>`. It clones data while a lock is
-held, drops the guard, and only then awaits driver I/O. Each cache entry includes
-the complete non-secret profile used to connect, so a profile edit invalidates
-only changed or removed sessions.
-
-## File map
-
-Every path below exists in the current tree:
+## Target topology
 
 ```text
-.gitignore
-01-spec.md                       product contract
-02-architecture.md               this architecture
-03-traces.md                     current and explicitly deferred vertical traces
-04-patch-plan.md                 implementation/status plan
-AGENTS.md                        repository agent contract
-CLAUDE.md                        documentation entrypoint
-Cargo.lock
-Cargo.toml
-README.md                        build, desktop, and local acceptance runbook
-docker-compose.yml               MySQL + Redis; opt-in MongoDB fixture only
-justfile                         default and all-feature quality gates
-config/local.example.toml        non-secret local profiles
-scripts/verify-local.sh          live receipt producer and assertions
-scripts/receipt-security.sh      receipt fingerprints and leak detectors
-scripts/receipt-contract.jq      receipt-v2 structural/pass invariant contract
-scripts/test-receipt-contract.sh static receipt contract/security tests
-src/main.rs                      Tokio entrypoint and process error display
-src/lib.rs                       module exports
-src/cli.rs                       `gui`, `check`, `exec`, and `drivers`
-src/error.rs                     top-level `AppError`
-src/model.rs                     ids, profiles, descriptors, requests, results
-src/config.rs                    TOML load and atomic profile upsert
-src/secrets.rs                   environment secret resolution
-src/service.rs                   shared orchestration and session cache
-src/drivers/mod.rs               session enum, registry, and `DriverError`
-src/drivers/mysql.rs             connect/ping/SQL execute and cell decoding
-src/drivers/redis.rs             connect/ping/command execute and RESP mapping
-src/drivers/mongodb.rs           planned descriptor and unavailable error
-src/ui/mod.rs                    eframe startup and bounded bridge construction
-src/ui/adapter.rs                bounded command/event ports
-src/ui/runtime.rs                background Tokio-to-service bridge
-src/ui/model.rs                  pure snapshots and correlation-safe event fold
-src/ui/app.rs                    profile/editor/result rendering
-src/ui/profile_form.rs           profile validation and form state
-tests/contracts.rs               driver registry, wire names, error redaction
-tests/mysql_contract.rs          opt-in live MySQL contracts
-tests/service_contract.rs        service/cache/config contracts with fakes
+CLI commands --------------------------------------+
+                                                   v
+egui render -> bounded UiCommand ports -> runtime/controller -> ApplicationService
+     ^                |                      |               |       |
+     |                +-> control lane ------+               |       +-> config writer
+     |                                                       +----------> secret store
+     +<- bounded UiEvent lane <- correlated task registry <--+----------> session cache
+                                                             |             /        \
+                                                             |      MySQL prepared  Redis
+                                                             +-> typed Catalog/Keyspace seams
+                                                             +-> cooperative export worker
 ```
 
-`artifacts/receipt.json` is generated and ignored; it is not a source-tree file.
+Required capacities and scheduling are contractual:
 
-## Core types
+- serialized config mutation lane: 16;
+- network work lane: 32;
+- control lane for Cancel/Disconnect/Reconnect cleanup: 16;
+- UI event lane: 128;
+- one active network operation per profile generation, four process-wide;
+- biased controller order: control → mutation → work;
+- Shutdown has an independent watch signal.
 
-The current public shapes in `src/model.rs` are:
+## Identity, generations, and task ownership
+
+The closed identity domains are not interchangeable:
+
+- saved-profile work: `(ProfileId, ProfileGeneration, OperationId)`;
+- draft work and Create: `(DraftId, OperationId)`;
+- export: `(ResultId, OperationId)`;
+- global load/shutdown: `OperationId`.
+
+The registry shape is exact:
 
 ```rust
-enum DriverKind { MySql, Redis, MongoDb }
-enum DriverAvailability { Ready, Planned }
-bitflags DriverCapabilities { CONNECT, PING, SQL, COMMAND, DOCUMENT, CATALOG }
-enum QueryLanguage { Sql, RedisCommand, MongoDocument }
-
-struct ConnectionProfile {
-    id: String,
-    name: String,
-    driver: DriverKind,
-    host: String,
-    port: u16,
-    database: Option<String>,
-    username: Option<String>,
-    tls: TlsMode,
-    secret_env: Option<String>,
-}
-
-struct ExecuteRequest {
+struct RegisteredTask {
     operation_id: OperationId,
-    profile_id: ProfileId,
-    language: QueryLanguage,
-    text: String,
-    row_limit: u32,
-    timeout: Duration,
+    scope: TaskScope,
+    cancel: CancellationToken,
+    join: JoinHandle,
 }
 
-struct QueryResult {
-    columns: Vec<Column>,
-    rows: Vec<Vec<Cell>>,
-    affected_rows: u64,
-    last_insert_id: Option<u64>,
-    elapsed_ms: u128,
-    truncated: bool,
-    notices: Vec<String>,
+enum TaskScope {
+    Profile {
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        session_generation: Option<SessionGeneration>,
+    },
+    Draft { draft_id: DraftId },
+    Export { result_id: ResultId },
+    Global,
 }
 ```
 
-`ProfileId` and `OperationId` are newtypes. `ConnectionProfile.id` remains a
-serialized `String`; there is no editor-tab id type. Runtime credentials use
-`SecretString` and are never serializable.
+Only Profile scope contains profile/session generations. Runtime uses a
+process-monotonic generation allocator; Delete publishes a tombstone and a
+recreated id receives a greater generation. Cache entries are
+`{profile_generation, session_generation, connection_fingerprint, handle}`.
+Every eviction compare-matches both generations.
 
-Descriptors separate `capabilities` from `planned_capabilities`: MySQL is ready
-for connect/ping/SQL and plans catalog; Redis is ready for
-connect/ping/command; MongoDB has no ready capabilities and plans
-connect/ping/document/catalog. `reason` carries the planned explanation.
+## Config and secret ownership
 
-## Current driver and service seam
+`config::load_path(&Path)` is the only lower-level loader. Entrypoints resolve
+the path once using global `--config`, then `DBOTTER_CONFIG`, then the platform
+default.
 
-The injectable boundary used by service tests is defined in `src/service.rs`:
+Version 1 is read-only input. Before the first confirmed v1→v2 mutation, the
+writer creates fixed `<config>.v1.bak` with no-replace durability. Each
+Create/Update/Delete then reloads the exact path, applies a typed mutation,
+writes a 0600 same-directory temporary file, file-fsyncs, rechecks the input
+fingerprint, renames at the commit point, parent-fsyncs, reloads, and reconciles
+one of `NotCommitted`, `Committed`, or `CommittedDurabilityUnknown`.
+
+`ConnectionProfile` contains only non-secret fields and persisted
+`CredentialMode`. `SessionSecret` is non-serializable, redacted, and owned by
+`HashMap<ProfileId, Arc<SessionSecret>>`. UI-only
+`SessionCredentialIntent::{KeepCurrent, Replace, Forget}` maps to mutation-only
+`SessionSecretUpdate::{Keep, Replace, Clear}` after the config commit point.
+Environment mode stores a name only and exposes Available/Missing/Empty without
+the value.
+
+## Typed driver and resource seams
+
+The target driver boundary is split by semantics:
 
 ```rust
-#[async_trait]
-trait SessionConnector: Send + Sync {
-    async fn connect(
-        &self,
-        profile: &ConnectionProfile,
-        secret: Option<&SecretString>,
-        timeout: Duration,
-    ) -> Result<Arc<dyn SessionHandle>, DriverError>;
+trait ConnectionPing {
+    async fn ping(&self, timeout: Duration) -> Result<(), DriverError>;
 }
 
-#[async_trait]
-trait SessionHandle: Send + Sync {
-    async fn ping(&self, timeout: Duration) -> Result<(), DriverError>;
-    async fn execute(&self, request: &ExecuteRequest)
-        -> Result<QueryResult, DriverError>;
+trait MySqlPreparedExecution {
+    async fn execute_prepared(
+        &self,
+        request: &PreparedMySqlRequest,
+    ) -> Result<QueryResult, DriverError>;
+}
+
+trait RedisExecution {
+    async fn execute_command(
+        &self,
+        request: &RedisExecuteRequest,
+    ) -> Result<QueryResult, DriverError>;
+}
+
+trait CatalogBrowser {
+    async fn load_page(
+        &self,
+        request: &CatalogRequest,
+    ) -> Result<CatalogPage, DriverError>;
+}
+
+trait KeyspaceBrowser {
+    async fn scan_keys(
+        &self,
+        request: &RedisScanRequest,
+    ) -> Result<RedisKeyPage, DriverError>;
+    async fn inspect_key(
+        &self,
+        request: &RedisKeyInspectRequest,
+    ) -> Result<RedisValuePreview, DriverError>;
 }
 ```
 
-`DriverConnector` adapts that boundary to `drivers::connect`, which returns the
-current `Session::{MySql, Redis}` enum. There is no `Driver` trait,
-`DriverSession` trait, `CatalogSnapshot`, or `load_catalog` method today.
+MySQL user SQL has one entry: `PreparedMySqlRequest` through server
+`COM_STMT_PREPARE` and `COM_STMT_EXECUTE`. SQLx's negotiated
+`CLIENT_MULTI_STATEMENTS` capability is not a safety boundary. Source/trait
+contracts reject user-text use of `sqlx::raw_sql`,
+`Executor::execute(&str)`, `COM_QUERY`, or prepared-unsupported fallback.
+Static/bound catalog statements are prepared too.
 
-Catalog remains a planned MySQL capability. A future typed catalog request and
-snapshot may extend the seam, but the current UI only displays that catalog
-browsing is deferred and emits no catalog command. MongoDB's future execution
-seam must remain document-native rather than pretending BSON is SQL.
+MySQL `CATALOG` and Redis `KEYSPACE_BROWSE` are independent capability bits.
+Each stays planned until its hermetic and mandatory live contract turns green
+in the same reviewed change. MongoDB remains a Planned descriptor with a
+future document-native seam; it is never coerced into SQL.
 
-## Dependency choices
+## Runtime state and shutdown
 
-The manifest currently enables:
+`active_profiles`, tombstones, session cache, workspaces, secret store, and
+task registry are runtime-owned. UI folds only events whose exact identity is
+still current.
 
-- `tokio` with `rt-multi-thread`, `macros`, and `time`;
-- optional `eframe` and `egui_extras` behind `desktop`;
-- optional `mongodb` behind `mongodb` as a compile-only future adapter;
-- `sqlx` with Tokio, rustls ring/webpki, MySQL, chrono, JSON, and decimal;
-- `redis` with async Tokio and connection-manager support;
-- `async-trait`, `bitflags`, `chrono`, `clap`, `futures-util`,
-  `rust_decimal`, `secrecy`, `serde`, `serde_json`, `shell-words`, `sqlparser`,
-  `thiserror`, `toml`, `tracing`, and `tracing-subscriber`;
-- `tempfile` as the only direct dev dependency.
+- Reload performs an id-keyed diff. Unchanged retains state; added is fresh;
+  changed/removed fences then cancels, joins, evicts, and clears. An unreadable
+  reload enters Config uncertain and permits only Reload/Shutdown.
+- A runtime-neutral committed Edit may retag an idle proven handle. Active work
+  or connection-affecting edits evict it after the new-generation fence.
+- Cancel/timeout drops client waiting, joins, reports server state Unknown, and
+  evicts only the exact used session generation.
+- Async network work has a bounded abort grace. Blocking export checks
+  cancellation per row/chunk and Shutdown waits for actual worker/temp cleanup.
+- Registry/permit/temp cleanup precedes terminal event delivery, including
+  panic/`JoinError` and full/closed event-lane cases.
 
-`sqlparser` is used only for MySQL-aware statement-boundary tokenization. MySQL
-and SQLx still parse and execute SQL and provide result metadata.
+## UI architecture and accessibility
 
-## Concurrency and correlation
+`UiModel` owns profile-generation workspaces, editor text, pending ids,
+historical/current result snapshots, connection state, and public errors. It
+owns no client or secret value.
 
-- UI command and event channels are bounded. A full command channel returns
-  `SubmitError::Busy` without blocking the render thread.
-- Save, Test, and Execute carry `OperationId`; terminal events include the same
-  id and profile id. The pure fold ignores stale completion events.
-- The UI runtime processes its command stream sequentially. The service cache
-  is independently safe for concurrent CLI/test callers and reconciles a
-  duplicate connection race before insertion.
-- Connect, ping, and execute are timeout-bounded. There is no user cancellation
-  command, server-side cancellation, or close-profile operation in the MVP.
-- A successful profile save updates the on-disk config, service snapshot, and
-  cache before `ProfileSaved` is emitted.
+The form distinguishes Create from Update and holds a `DraftId`. Test uses
+temporary resources and has no path to config/cache/store/workspace mutation.
+Create conflict recovery uses `ConnectionId`; draft recovery emits
+`EditDraft`, while saved-profile recovery emits only safe ProfileId actions.
 
-## Error boundary
+The editor exposes `editor.target`, `editor.row_limit`, and `editor.timeout`.
+`FocusExecuteLimits` applies only to Execute. MySQL selection/caret extraction
+and Redis physical-line extraction are pure before typed dispatch.
 
-`ConfigError`, `SecretError`, `DriverError`, `ServiceError`, and `AppError` are
-the current typed layers. UI busy/disconnected conditions use `SubmitError` and
-terminal service failures use `UiEvent`; there is no `RuntimeError` type.
+All P0 widgets have stable author ids, roles, names, focus order, keyboard
+actions, enabled state, and non-color cues. Headless tests use egui 0.35
+`Context::run_ui(RawInput, …)`, call `enable_accesskit()`, and inspect
+`FullOutput.platform_output.accesskit_update`; installed automation verifies
+the same ids as macOS AXIdentifier values.
 
-`DriverError::MySql` and `DriverError::Redis` display stable redacted messages
-while retaining backend errors as sources. CLI/UI render the outer display
-message, not backend source text. Profile endpoints contain driver, host, and
-port only.
+## Public error and disclosure boundary
 
-## Config and secrets
+Internal errors convert through the exhaustive table in approved trace T8 to:
 
-Config schema version 1 stores only non-secret profile fields. An upsert reloads
-the current file, merges by profile id, writes a same-directory 0600 temporary
-file on Unix, calls `sync_all`, and renames it into place. Directory fsync is not
-implemented. Missing config files load as an empty version-1 config.
+```rust
+PublicOperationError {
+    operation: OperationKind,
+    category: ErrorCategory,
+    code: PublicCode,
+    summary: PublicSummary,
+    recovery: NonEmpty<RecoveryAction>,
+}
+```
 
-The local fixture uses `config/local.example.toml`; MySQL refers to
-`DBOTTER_MYSQL_PASSWORD` by name and Redis has no fixture password.
+Unknown backend values become static InternalFailure. Backend prose and secrets
+never cross the public boundary. User-owned editor/result/key/path values are
+allowed only in their intended rendered/AX value node and, after explicit user
+action, clipboard/export. Sensitive request types have manual redacted `Debug`
+and no `Serialize`.
+
+## Results, memory, and export
+
+Every result carries `ResultProvenance` with profile/generation/operation.
+Retained snapshot caps apply after driver decoding; transient row/RESP-frame
+allocation is disclosed. The exact `Cell`, clipboard, TSV, CSV, and canonical
+JSON mappings live in approved spec §9.
+
+Export owns `Arc<ResultSnapshot>`, streams without a second whole-result byte
+vector, uses a 0600 same-directory temporary file, file fsync, explicit
+no-overwrite/confirmed-replace commit, and parent fsync. Reveal actions carry
+safe ids, not paths. Runtime receipts contain no result digest or content.
+
+## Distribution architecture
+
+P8/P9 produce per-architecture signed `Dbotter Preview.app` bundles. Identity
+is measured after signing and linked through typed source/build/artifact/release/
+formula/install records. The installed CLI shim and exact launched PID must
+resolve to the manifest's post-sign executable before AX input.
+
+Binary identity and config compatibility are separate commands and schemas as
+specified in `01-spec.md`. Preview and stable workflows share the verification
+gate, but this task invokes preview only.
+
+## Planned file ownership
+
+Files listed below are expected by approved slices; absence before that slice is
+not a deviation and presence in the historical demo is not completion proof.
+
+| Slice | Primary ownership |
+|---|---|
+| P1 | `src/model.rs`, `src/config.rs`, `src/secrets.rs`, `src/public_error.rs`, `src/service.rs` |
+| P2 | `src/service.rs`, `src/ui/{adapter,runtime,model}.rs`, controller/service tests |
+| P3 | typed driver/resource traits, `PreparedMySqlRequest`, CLI/resource contracts |
+| P4 | `src/drivers/mysql_catalog.rs`, catalog service/UI/CLI/live tests |
+| P5 | Redis keyspace/TLS service/UI/CLI/live tests |
+| P6 | native form/editor/explorer/result/recovery UI and RawInput/AccessKit tests |
+| P7 | export encoders/filesystem policy and golden/failpoint tests |
+| P8 | verification scripts/workflows/package/manifest/receipt contracts |
+| P9 | reviewed merge, preview, tap, Brew install, installed proof |
+
+The exact expected file map is maintained per slice in
+`docs/usable-mvp/plan.md`. Do not claim a path exists or a capability is ready
+without checking the tree and its trace evidence.
 
 ## Licensing boundary
 

@@ -1,199 +1,220 @@
-# dbotter release vertical traces
+# dbotter — T10 preview release vertical trace
 
-The trace is the source of truth for the release implementation.
+Status: **P8/P9 Not started.** This trace refines main trace T10; it does not
+claim that historical workflows, prereleases, or formulas satisfy the approved
+contract.
 
-## Implementation status
+Normative anchors: approved trace T10, approved plan P8/P9 and §5–§7, and
+`docs/release/spec.md`.
 
-| Scenario | Status | Contract evidence |
-|---|---|---|
-| T1 CI validates a source commit | Implemented | `.github/workflows/ci.yml`, release contract script |
-| T2 preview commit becomes Homebrew-consumable prerelease | Implemented | `.github/workflows/preview.yml`, release contract script |
-| T3 stable tag becomes version-matched release | Implemented | `.github/workflows/release.yml`, release contract script |
-| T4 binary exposes immutable build identity | Implemented | `src/build_info.rs`, Rust tests |
+## Release ledger
 
-## T1 — CI validates a source commit
+| ID | Scenario | Status | Required evidence |
+|---|---|---|---|
+| T10.R1 | reusable verification gates one candidate source | Not started | source/hermetic/live/negative receipt |
+| T10.R2 | target builds become signed manifest-linked artifacts | Not started | build/package/codesign/plutil/hash |
+| T10.R3 | immutable preview dispatches an exact tap update | Not started | release/manifest/tap/monotonicity |
+| T10.R4 | Homebrew shim and installed CLI prove exact executable | Not started | brew/identity/config/check/exec/browse |
+| T10.R5 | exact installed app completes native AX journey | Not started | PID/AX/recovery/disclosure/export |
+| T10.R6 | final typed receipt closes the source→install chain | Not started | schema/leak/digest/provenance verdicts |
+| T10.R7 | repair-forward rollback preserves compatibility | Not started | higher version/config preflight/runbook |
 
-### 1. API Entry
+## T10.R1 — reusable verification gate
 
-GitHub Actions receives `pull_request` or a push to `main`/`master`. Repository
-read permission is sufficient.
+### Entry and identity
 
-### 2. Input
+CI receives a candidate SHA. Local preflight may use a clean attached commit;
+CI detached checkout is allowed only through `CiExpectedSha` with exact
+candidate equality. Required inputs are tracked and the checkout is clean
+before generated artifacts.
 
-Input is a checked-out commit containing `Cargo.lock`. Dependencies must resolve
-under `--locked`; the workflows and release contract must remain internally
-consistent.
+### Flow
 
-### 3. Layer Flow
+```text
+candidate source
+  -> exact six-field identity test
+  -> independent exact config-contract test
+  -> release/receipt contract tests
+  -> fmt + all-feature clippy/test
+  -> config/controller/export failpoints
+  -> RawInput/AccessKit/contrast/disclosure
+  -> mandatory Compose MySQL/Redis live matrix
+  -> source/build receipt
+```
 
-`GitHub event.sha → actions/checkout ref → Cargo source tree → fmt/clippy/test`
+The live matrix includes MySQL/Redis credential modes, MySQL prepared-only
+marker/no-fallback safety, paginated MySQL catalog, Redis SCAN/inspect/auth on
+plaintext and verified TLS, split CA/Host negatives, and zero plaintext
+fallback. A missing fixture/env/cert/assertion is failure.
 
-`workflow files → scripts/check-release-contract.sh → release invariants`
+### Side effects, errors, output
 
-The matrix runs on macOS and Ubuntu. All Rust gates use all features, so the
-same GUI/MongoDB feature surface shipped later is compiled and tested here.
+Only build/test caches, Compose fixture data, and generated local receipts may
+change. Any required failure blocks every build/publish/tap job. Output is a
+source-bound reusable-verification result and safe receipt; no release exists.
 
-### 4. Side Effects
+## T10.R2 — per-target build, macOS package, and manifest
 
-Cargo build/test caches may be updated. No release, tag, or tap state changes.
+### Entry and input
 
-### 5. Error Paths
+R1 green candidate SHA plus target matrix, package version, run id/attempt,
+signing context, exact config contract, and monotonic preview version.
 
-Formatting drift, a warning, a test failure, a lockfile mismatch, or a release
-contract mismatch fails the job. No publish job exists in the CI workflow.
+### Flow
 
-### 6. Output
+```text
+candidate SHA -> four target builds
+macOS target -> Dbotter Preview.app -> sign -> codesign verify
+post-sign executable + archive -> independent hashes
+all target records -> dbotter.preview-manifest.v1 -> schema/security validation
+```
 
-Both matrix jobs finish successfully and GitHub records a green CI result.
+The packaged/shim/installed executable identity schema remains six fields. The
+separate config contract remains exactly three fields. `plutil` verifies Cargo
+`x.y.z`, numeric `<run_id>.<run_attempt>`, and separation from the Homebrew
+version.
 
-### 7. Observability
+### Error and output
 
-Each gate has its own named workflow step and command output.
+Target mismatch, missing/extra identity field, config-contract disagreement,
+bad bundle id/version, unsigned bundle, swapped architecture, or false hash
+equality blocks publication. Output is a signed per-architecture artifact set
+and validated manifest linked to the candidate source.
 
-## T2 — preview commit becomes a Homebrew-consumable prerelease
+## T10.R3 — immutable preview and explicit tap update
 
-### 1. API Entry
+### Entry and input
 
-GitHub Actions receives a push to `main`/`master` or `workflow_dispatch`.
+Validated R2 manifest/artifacts and an increasing
+`YYYY.MM.DD.HHMMSS.<run_id>.<run_attempt>` version. Tag inputs include UTC
+seconds, run id/attempt, and short source SHA.
 
-### 2. Input
+### Flow
 
-The checked-out commit must be buildable with `Cargo.lock` and all Cargo
-features. Current UTC time and the full commit SHA are required.
+```text
+manifest + immutable assets -> GitHub preview release
+{tag,source_sha,version,manifest_url,manifest_sha256} -> tap dispatch
+tap: tag/source/manifest/arch/config-contract/version checks -> atomic formula update
+```
 
-### 3. Layer Flow
+### Errors, output, side effects
 
-`event commit → git rev-parse HEAD → full commit`
+Incomplete assets, failed gate, non-increasing version, missing explicit
+dispatch, tag/source disagreement, config-contract mismatch, or tap validation
+failure leaves T10 incomplete. A valid output is one immutable preview plus one
+explicitly validated formula commit. No stable tag/release is created.
 
-`UTC now → YYYY-MM-DD-HHMM + sha12 → build_id`
+## T10.R4 — Homebrew install and exact CLI proof
 
-`build_id → preview-<build_id> → Git tag/release tag`
+### Entry and input
 
-`DBOTTER_BUILD_CHANNEL=preview + DBOTTER_BUILD_ID=<build_id> → option_env! → dbotter --version`
+Validated tap commit, `brew update`, preview upgrade, isolated explicit config,
+and R2 manifest.
 
-`matrix.target → cargo --all-features binary → canonical asset name → release asset`
+### Flow
 
-`release assets → sha256sum → SHA256SUMS → GitHub prerelease`
+```text
+brew upgrade dbotter-preview
+  -> installed Dbotter Preview.app
+  -> bin/dbotter shim
+  -> realpath/device/inode/hash match post-sign manifest executable
+  -> version + config-contract
+  -> check + exec + MySQL browse + Redis browse/inspect
+```
 
-### 4. Side Effects
+### Errors and output
 
-Four build artifacts and one checksum manifest are uploaded to a GitHub
-prerelease. Preview releases beyond the newest 15 are deleted with their tags.
-When the optional tap token exists, `2lab-ai/homebrew-tap` `bump.yml` is
-dispatched after the release is published.
+Wrong app/shim target, stale executable, identity/config mismatch, wrong
+architecture, or any CLI contract failure blocks AX verification. Output is an
+installed-CLI evidence block containing safe metadata and verdicts only.
 
-### 5. Error Paths
+## T10.R5 — exact-app installed AX golden journey
 
-Any target build, artifact assembly, checksum, or release publication failure
-fails the workflow and prevents tap dispatch. A missing tap token only skips
-the immediate dispatch; it does not invalidate the published prerelease.
+### Entry and process proof
 
-### 6. Output
+Resolve:
 
-The GitHub release is marked prerelease, not latest, targets the exact input
-commit, and exposes all canonical assets plus `SHA256SUMS`.
+```sh
+APP_PATH="$(brew --prefix dbotter-preview)/Dbotter Preview.app"
+```
 
-### 7. Observability
+Terminate or reject stale `ai.2lab.dbotter.preview` processes. Launch that exact
+path with isolated config and prove PID executable realpath/device/inode/hash
+and bundle id before the first AX action.
 
-Release notes contain the build id, full commit, installation command, and the
-checksum manifest. Workflow logs show pruning and optional tap dispatch.
+### Journey
 
-## T3 — stable tag becomes a version-matched release
+The verifier reads each author id back as the same macOS AXIdentifier, then
+drives:
 
-### 1. API Entry
+1. first run, Create explicit-id ConnectionId recovery, auto-suffix, all
+   credential intents, draft Test, Save & Connect, and restart availability;
+2. MySQL catalog paging, exact scanner, prepared-only marker/no-fallback,
+   profile A→B target, Execute-limit focus, and single-submit;
+3. every Cell copy/TSV case and atomic CSV/TSV/JSON export with independent
+   byte verification;
+4. cancel/Unknown/exact eviction and reconnect;
+5. every reachable PublicSummary recovery plus unreachable rejection and
+   disclosure boundary;
+6. Redis SCAN/inspect/types/TTL/mutation/classifier;
+7. verified TLS CA versus Host recovery with CA preservation and no plaintext;
+8. active-operation Delete warning, tombstone order, shutdown, and restart.
 
-GitHub Actions receives a pushed tag matching `v*`.
+### Errors and output
 
-### 2. Input
+Wrong PID/app, missing AX id, action without real dispatch, label-only recovery,
+secret/backend prose leak, missing intended value node, protected-value leak,
+or incomplete journey is failure. Output is safe AX/action/verdict metadata, not
+user values or screenshots of result data.
 
-`GITHUB_REF_NAME` must be `v<version>`. `<version>` must exactly equal the root
-package version returned by `cargo metadata --no-deps`.
+## T10.R6 — final typed receipt
 
-### 3. Layer Flow
+### Flow and schema
 
-`GITHUB_REF_NAME → strip v → tag_version`
+Source, build, artifact, release, formula, install, CLI, live, AX, and external
+export-verifier evidence are linked into the approved typed receipt.
 
-`Cargo.toml → cargo metadata root package → cargo_version`
+It records exact identity/config objects, manifest/artifact ids, process/file
+metadata, safe codes/action/AX ids, counts, timings, and verdicts. It records no
+secret, backend prose, SQL/Redis text, result/key/CA/export-path value, exported
+bytes, or runtime content digest. Only the isolated seeded-verifier subsection
+has fixture id and expected/actual digest verdict.
 
-`tag_version == cargo_version → verified commit → four --all-features builds`
+### Acceptance
 
-`stable + v<cargo_version>-<sha12> → compile-time build identity`
+Receipt schema/negative fixtures reject provenance mismatch, false clean state,
+identity/config conflation, transformed-hash equality, missing live/AX/recovery/
+disclosure assertion, value leak, or digest-boundary violation. Overall pass is
+derived and all required verdicts must be true.
 
-`matrix.target → canonical asset → SHA256SUMS → normal GitHub release`
+## T10.R7 — repair-forward rollback
 
-### 4. Side Effects
+### Entry and flow
 
-A normal GitHub release is created for the already-pushed stable tag. No
-preview pruning occurs and no tap repository is directly changed.
+Select last-known-good source → run exact `config-contract` → compare with
+manifest/release/tap → build and verify a new strictly higher preview → publish
+new immutable tag/assets/manifest → atomically update tap → reinstall and rerun
+R4–R6.
 
-### 5. Error Paths
+The wrapper, not a direct old binary, presents the fixed backup runbook when
+preflight rejects compatibility.
 
-Version mismatch fails the preflight before the build matrix. Build, checksum,
-or publication failure prevents a complete stable release.
+### Prohibited outcomes
 
-### 6. Output
+No moved tag, replaced asset, reused artifact metadata, lowered formula version,
+silent binary swap, or direct old-binary recovery. A direct older binary only
+fails closed with `UnsupportedVersion`.
 
-The `v*` GitHub release has generated notes, four canonical binaries, and one
-checksum manifest. It is not marked prerelease.
+## Fixed command routing
 
-### 7. Observability
-
-Preflight logs both compared versions. Build jobs expose target and asset name;
-the publish job prints `SHA256SUMS`.
-
-## T4 — binary exposes immutable build identity
-
-### 1. API Entry
-
-The user runs `dbotter --version`.
-
-### 2. Input
-
-Compile-time Cargo version and optional compile-time environment variables
-`DBOTTER_BUILD_CHANNEL` and `DBOTTER_BUILD_ID`.
-
-### 3. Layer Flow
-
-`CARGO_PKG_VERSION → VERSION`
-
-`DBOTTER_BUILD_CHANNEL | absent → BUILD_CHANNEL | dev`
-
-`DBOTTER_BUILD_ID | absent → BUILD_ID | dev`
-
-`VERSION + BUILD_CHANNEL + BUILD_ID → clap version → stdout`
-
-### 4. Side Effects
-
-None.
-
-### 5. Error Paths
-
-Absent build variables resolve deterministically to `dev`; no runtime lookup
-can fail.
-
-### 6. Output
-
-One line: `dbotter <version> (<channel> <build-id>)` and exit status zero.
-
-### 7. Observability
-
-The version line itself is the build provenance marker used by operators.
-
-## File map
-
-- `docs/release/spec.md`
-- `docs/release/trace.md`
-- `.github/workflows/ci.yml`
-- `.github/workflows/preview.yml`
-- `.github/workflows/release.yml`
-- `scripts/check-release-contract.sh`
-- `scripts/package-version.sh`
-- `src/build_info.rs`
-- `src/lib.rs`
-- `src/cli.rs`
-- `Cargo.toml`
-- `README.md`
+Source/live/package/Homebrew/AX command blocks are exact in
+`04-patch-plan.md`. Each block is attached to the corresponding R1–R6 evidence
+record. Command absence or failure leaves the row Not started/RED; it does not
+authorize a weaker trace.
 
 ## Trace deviations
 
-None.
+P0 reconciled documentation only. There is no implementation deviation because
+P8/P9 have not started. Future deviations must be recorded before code with the
+affected T10.R id, source/manifest/config impact, rollback impact, and new
+contract evidence.
