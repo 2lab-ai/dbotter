@@ -7,14 +7,16 @@ use std::time::Duration;
 use eframe::egui;
 use egui_extras::{Column as TableColumn, TableBuilder};
 
+use crate::config::MigrationConsent;
 use crate::model::{
     CatalogRequest, Cell, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
     DEFAULT_REDIS_SCAN_COUNT, DraftId, DriverAvailability, DriverCapabilities, DriverKind,
-    OperationId, ProfileFieldId, ProfileGeneration, ProfileId, RedisKeyInspectRequest,
-    RedisScanRequest, RequestIdentity,
+    OperationId, OperationKind, ProfileFieldId, ProfileGeneration, ProfileId,
+    RedisKeyInspectRequest, RedisScanRequest, RequestIdentity, SessionCredentialIntent,
 };
+use crate::service::DeleteProfileRequest;
 
-use super::accessibility::named_author_id;
+use super::accessibility::{named_author_id, named_author_id_with_label};
 use super::adapter::{SubmitError, UiCommand, UiPort};
 use super::editor::{EditorIntent, EditorSurface};
 use super::layout::NativeLayout;
@@ -30,6 +32,27 @@ const EVENT_DRAIN_LIMIT: usize = 128;
 pub const DEFAULT_EXECUTE_ROW_LIMIT: u32 = 500;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActiveOperation {
+    operation_id: OperationId,
+    kind: OperationKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeleteConfirmation {
+    profile_id: ProfileId,
+    profile_generation: ProfileGeneration,
+    profile_name: String,
+    active_kind: Option<OperationKind>,
+    migration_confirmed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeleteDialogAction {
+    Cancel,
+    Confirm,
+}
+
 pub struct DbotterApp {
     port: UiPort,
     model: UiModel,
@@ -38,6 +61,8 @@ pub struct DbotterApp {
     editor_surface: EditorSurface,
     redis_explorer: RedisExplorer,
     first_run_driver: DriverKind,
+    active_operations: HashMap<ProfileId, ActiveOperation>,
+    delete_confirmation: Option<DeleteConfirmation>,
     next_draft_id: u64,
     pending_connect_after_refresh: Option<(ProfileId, OperationId)>,
 }
@@ -52,6 +77,8 @@ impl DbotterApp {
             editor_surface: EditorSurface::default(),
             redis_explorer: RedisExplorer::default(),
             first_run_driver: DriverKind::MySql,
+            active_operations: HashMap::new(),
+            delete_confirmation: None,
             next_draft_id: 1,
             pending_connect_after_refresh: None,
         };
@@ -70,6 +97,7 @@ impl DbotterApp {
 
     fn poll_events(&mut self) {
         for event in self.port.drain_events(EVENT_DRAIN_LIMIT) {
+            self.finish_active_operation(&event);
             self.fold_mysql_explorer_event(&event);
             self.redis_explorer.handle_event(&event);
             let profile_result = self
@@ -163,6 +191,68 @@ impl DbotterApp {
         }
     }
 
+    fn finish_active_operation(&mut self, event: &UiEvent) {
+        let terminal = match event {
+            UiEvent::ConnectionReady {
+                operation_id,
+                profile_id,
+                ..
+            }
+            | UiEvent::ConnectionClosed {
+                operation_id,
+                profile_id,
+                ..
+            }
+            | UiEvent::QueryFinished {
+                operation_id,
+                profile_id,
+                ..
+            }
+            | UiEvent::ExecuteUnavailable {
+                operation_id,
+                profile_id,
+                ..
+            }
+            | UiEvent::OperationFailed {
+                operation_id,
+                profile_id,
+                ..
+            }
+            | UiEvent::ProfileDeleted {
+                operation_id,
+                profile_id,
+                ..
+            } => Some((profile_id, *operation_id)),
+            UiEvent::CatalogPageLoaded { page, .. } => {
+                Some((&page.identity.profile_id, page.identity.operation_id))
+            }
+            UiEvent::CatalogPageFailed { request, .. } => {
+                Some((request.profile_id(), request.operation_id()))
+            }
+            UiEvent::RedisKeysLoaded { page, .. } => {
+                Some((&page.identity.profile_id, page.identity.operation_id))
+            }
+            UiEvent::RedisKeysFailed { request, .. } => {
+                Some((request.profile_id(), request.operation_id()))
+            }
+            UiEvent::RedisKeyInspected { preview, .. } => {
+                Some((&preview.identity.profile_id, preview.identity.operation_id))
+            }
+            UiEvent::RedisKeyInspectFailed { request, .. } => {
+                Some((request.profile_id(), request.operation_id()))
+            }
+            _ => None,
+        };
+        if let Some((profile_id, operation_id)) = terminal
+            && self
+                .active_operations
+                .get(profile_id)
+                .is_some_and(|active| active.operation_id == operation_id)
+        {
+            self.active_operations.remove(profile_id);
+        }
+    }
+
     fn fold_mysql_explorer_event(&mut self, event: &UiEvent) {
         match event {
             UiEvent::CatalogPageLoaded { page, .. } => {
@@ -215,6 +305,7 @@ impl DbotterApp {
             .profiles
             .iter()
             .find(|profile| profile.id == profile_id)
+            .cloned()
         else {
             self.model.status = "Unknown profile".to_owned();
             return;
@@ -223,8 +314,26 @@ impl DbotterApp {
             self.model.status = "Driver is planned and unavailable".to_owned();
             return;
         }
+        if self.model.active_generation(&profile_id) != Some(profile.generation) {
+            self.model.status = "The selected profile generation is stale.".to_owned();
+            return;
+        }
+        if profile.persisted.credential_mode == crate::model::CredentialMode::Session
+            && (!profile.has_current_session_secret
+                || matches!(
+                    self.model.connection_state(&profile_id),
+                    ConnectionState::NeedsCredential
+                ))
+        {
+            self.open_session_credential_prompt(profile_id);
+            return;
+        }
         if self.model.connection_state(&profile_id).is_pending() {
-            self.model.status = "Connection test is already pending".to_owned();
+            self.model.status = "Connection work is already pending".to_owned();
+            return;
+        }
+        if self.active_operations.contains_key(&profile_id) {
+            self.model.status = "Another operation is active for this connection".to_owned();
             return;
         }
         let profile_generation = profile.generation;
@@ -238,8 +347,111 @@ impl DbotterApp {
             Ok(()) => {
                 self.model
                     .connection_states
-                    .insert(profile_id, ConnectionState::Pending(operation_id));
-                self.model.status = "Testing connection…".to_owned();
+                    .insert(profile_id.clone(), ConnectionState::Pending(operation_id));
+                self.active_operations.insert(
+                    profile_id,
+                    ActiveOperation {
+                        operation_id,
+                        kind: OperationKind::ConnectProfile,
+                    },
+                );
+                self.model.status = "Connecting…".to_owned();
+            }
+            Err(error) => self.report_submit_error(error),
+        }
+    }
+
+    fn open_session_credential_prompt(&mut self, profile_id: ProfileId) {
+        let Some(profile) = self
+            .model
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            self.model.status = "Unknown profile".to_owned();
+            return;
+        };
+        if self.model.active_generation(&profile_id) != Some(profile.generation)
+            || profile.persisted.credential_mode != crate::model::CredentialMode::Session
+        {
+            self.model.status =
+                "The current profile cannot accept a session credential.".to_owned();
+            return;
+        }
+        let draft_id = self.allocate_draft_id();
+        let mut editor = ProfileEditor::edit(
+            draft_id,
+            &profile.persisted,
+            profile.generation,
+            profile.has_current_session_secret,
+        );
+        editor.select_session_intent(SessionCredentialIntent::Replace);
+        editor.request_focus(ProfileFieldId::SessionCredential);
+        self.profile_editor = Some(editor);
+        self.model.status = "Enter the session credential, then Save & Connect.".to_owned();
+    }
+
+    fn submit_disconnect(&mut self, profile_id: ProfileId) {
+        if self.model.is_config_uncertain() {
+            self.model.status = "Reload profiles before using connections.".to_owned();
+            return;
+        }
+        let Some(profile_generation) = self.model.active_generation(&profile_id) else {
+            self.model.status = "Unknown profile".to_owned();
+            return;
+        };
+        let operation_id = self.model.next_operation();
+        match self.port.try_submit(UiCommand::DisconnectProfile {
+            operation_id,
+            profile_id: profile_id.clone(),
+            profile_generation,
+        }) {
+            Ok(()) => {
+                self.model
+                    .connection_states
+                    .insert(profile_id.clone(), ConnectionState::Pending(operation_id));
+                self.active_operations.insert(
+                    profile_id,
+                    ActiveOperation {
+                        operation_id,
+                        kind: OperationKind::DisconnectProfile,
+                    },
+                );
+                self.model.status = "Disconnecting…".to_owned();
+            }
+            Err(error) => self.report_submit_error(error),
+        }
+    }
+
+    fn submit_reconnect(&mut self, profile_id: ProfileId) {
+        if self.model.is_config_uncertain() {
+            self.model.status = "Reload profiles before using connections.".to_owned();
+            return;
+        }
+        let Some(profile_generation) = self.model.active_generation(&profile_id) else {
+            self.model.status = "Unknown profile".to_owned();
+            return;
+        };
+        let operation_id = self.model.next_operation();
+        match self.port.try_submit(UiCommand::ReconnectProfile {
+            operation_id,
+            profile_id: profile_id.clone(),
+            profile_generation,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        }) {
+            Ok(()) => {
+                self.model
+                    .connection_states
+                    .insert(profile_id.clone(), ConnectionState::Pending(operation_id));
+                self.active_operations.insert(
+                    profile_id,
+                    ActiveOperation {
+                        operation_id,
+                        kind: OperationKind::ReconnectProfile,
+                    },
+                );
+                self.model.status = "Reconnecting…".to_owned();
             }
             Err(error) => self.report_submit_error(error),
         }
@@ -252,8 +464,10 @@ impl DbotterApp {
         }
         match intent {
             EditorIntent::Execute(intent) => {
+                let profile_id = intent.profile_id().clone();
+                let operation_kind = intent.operation_kind();
                 let workspace_key = super::model::WorkspaceKey::new(
-                    intent.profile_id().clone(),
+                    profile_id.clone(),
                     intent.profile_generation(),
                 );
                 if self.model.active_generation(intent.profile_id())
@@ -270,11 +484,23 @@ impl DbotterApp {
                     self.model.status = "Execute is already pending".to_owned();
                     return;
                 }
+                if self.active_operations.contains_key(&profile_id) {
+                    self.model.status =
+                        "Another operation is active for this connection".to_owned();
+                    return;
+                }
                 let operation_id = self.model.next_operation();
                 match self.port.try_submit(intent.into_ui_command(operation_id)) {
                     Ok(()) => {
                         self.model.workspace_mut(workspace_key).pending_execute =
                             Some(operation_id);
+                        self.active_operations.insert(
+                            profile_id,
+                            ActiveOperation {
+                                operation_id,
+                                kind: operation_kind,
+                            },
+                        );
                         self.model.status = "Executing…".to_owned();
                     }
                     Err(error) => self.report_submit_error(error),
@@ -322,6 +548,10 @@ impl DbotterApp {
         }
         if self.model.is_config_uncertain() {
             self.model.status = "Reload profiles before browsing the catalog.".to_owned();
+            return;
+        }
+        if self.active_operations.contains_key(&profile.id) {
+            self.model.status = "Another operation is active for this connection".to_owned();
             return;
         }
         let operation_id = self.model.next_operation();
@@ -375,6 +605,13 @@ impl DbotterApp {
                     .entry((profile.id.clone(), profile.generation))
                     .or_default()
                     .mark_submitted(request);
+                self.active_operations.insert(
+                    profile.id.clone(),
+                    ActiveOperation {
+                        operation_id,
+                        kind: OperationKind::BrowseMySql,
+                    },
+                );
                 self.model.status = "Loading MySQL catalog page…".to_owned();
             }
             Err(error) => self.report_submit_error(error),
@@ -429,6 +666,11 @@ impl DbotterApp {
                 .submission_failed("Redis keyspace browsing is unavailable.");
             return;
         }
+        if self.active_operations.contains_key(&profile.id) {
+            self.redis_explorer
+                .submission_failed("Another operation is active for this connection.");
+            return;
+        }
         let operation_id = self.model.next_operation();
         let identity = RequestIdentity::new(profile.id.clone(), profile.generation, operation_id);
         match intent {
@@ -448,6 +690,13 @@ impl DbotterApp {
                     Ok(()) => {
                         self.redis_explorer
                             .begin_scan(operation_id, filter, cursor, restart);
+                        self.active_operations.insert(
+                            profile.id.clone(),
+                            ActiveOperation {
+                                operation_id,
+                                kind: OperationKind::BrowseRedis,
+                            },
+                        );
                         self.model.status = "Scanning Redis keys…".to_owned();
                     }
                     Err(error) => {
@@ -466,6 +715,13 @@ impl DbotterApp {
                 match self.port.try_submit(UiCommand::InspectRedisKey(request)) {
                     Ok(()) => {
                         self.redis_explorer.begin_inspect(operation_id, key);
+                        self.active_operations.insert(
+                            profile.id.clone(),
+                            ActiveOperation {
+                                operation_id,
+                                kind: OperationKind::InspectRedis,
+                            },
+                        );
                         self.model.status = "Inspecting Redis key…".to_owned();
                     }
                     Err(error) => {
@@ -502,6 +758,142 @@ impl DbotterApp {
         self.profile_editor = Some(editor);
     }
 
+    fn open_delete_confirmation(&mut self, profile: &ProfileSnapshot) {
+        if self.model.is_config_uncertain() {
+            self.model.status = "Reload profiles before deleting.".to_owned();
+            return;
+        }
+        if self.model.active_generation(&profile.id) != Some(profile.generation) {
+            self.model.status = "The selected profile generation is stale.".to_owned();
+            return;
+        }
+        self.delete_confirmation = Some(DeleteConfirmation {
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            profile_name: profile.name.clone(),
+            active_kind: self
+                .active_operations
+                .get(&profile.id)
+                .map(|active| active.kind),
+            migration_confirmed: false,
+        });
+    }
+
+    fn cancel_delete_confirmation(&mut self) {
+        self.delete_confirmation = None;
+    }
+
+    fn confirm_delete_confirmation(&mut self) {
+        let Some(confirmation) = self.delete_confirmation.as_ref() else {
+            return;
+        };
+        if self.model.active_generation(&confirmation.profile_id)
+            != Some(confirmation.profile_generation)
+        {
+            self.delete_confirmation = None;
+            self.model.status = "The selected profile generation is stale.".to_owned();
+            return;
+        }
+        let profile_id = confirmation.profile_id.clone();
+        let profile_generation = confirmation.profile_generation;
+        let migration_consent =
+            MigrationConsent::from_confirmation(confirmation.migration_confirmed);
+        let operation_id = self.model.next_operation();
+        let request = DeleteProfileRequest {
+            profile_id: profile_id.clone(),
+            expected_generation: profile_generation,
+            operation_id,
+            migration_consent,
+        };
+        match self.port.try_submit(UiCommand::DeleteProfile(request)) {
+            Ok(()) => {
+                self.delete_confirmation = None;
+                self.model
+                    .connection_states
+                    .insert(profile_id.clone(), ConnectionState::Closing);
+                self.active_operations.insert(
+                    profile_id,
+                    ActiveOperation {
+                        operation_id,
+                        kind: OperationKind::DeleteProfile,
+                    },
+                );
+                self.model.status = "Deleting profile…".to_owned();
+            }
+            Err(error) => self.report_submit_error(error),
+        }
+    }
+
+    fn show_delete_confirmation(&mut self, root_ui: &mut egui::Ui) {
+        let Some(confirmation) = self.delete_confirmation.as_mut() else {
+            return;
+        };
+        let mut action = None;
+        egui::Window::new("Delete connection")
+            .collapsible(false)
+            .resizable(false)
+            .show(root_ui.ctx(), |ui| {
+                ui.heading(format!("Delete {}?", confirmation.profile_name));
+                ui.label("This removes the saved profile and its in-memory session credential.");
+                if let Some(kind) = confirmation.active_kind {
+                    let warning = format!(
+                        "{kind:?} is active. Dbotter will stop waiting; the server operation may continue."
+                    );
+                    named_author_id_with_label(
+                        ui.strong(warning.clone()),
+                        "profile.delete.active_warning",
+                        warning,
+                    );
+                    ui.strong("After confirmed deletion, server state will be reported as Unknown.");
+                }
+                let migration = ui.checkbox(
+                    &mut confirmation.migration_confirmed,
+                    "Allow a version-1 configuration migration with backup if required",
+                );
+                named_author_id(
+                    migration,
+                    "profile.delete.migration_confirm",
+                    "Confirm delete configuration migration backup",
+                );
+                ui.horizontal(|ui| {
+                    let cancel = ui.add_sized(
+                        [104.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                        egui::Button::new("Cancel"),
+                    );
+                    if named_author_id(
+                        cancel,
+                        "profile.delete.cancel",
+                        "Cancel profile deletion",
+                    )
+                    .clicked()
+                    {
+                        action = Some(DeleteDialogAction::Cancel);
+                    }
+                    let confirm = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("Delete profile").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::BLACK)
+                        .min_size(egui::vec2(144.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                    );
+                    if named_author_id(
+                        confirm,
+                        "profile.delete.confirm",
+                        "Confirm profile deletion",
+                    )
+                    .clicked()
+                    {
+                        action = Some(DeleteDialogAction::Confirm);
+                    }
+                });
+            });
+        match action {
+            Some(DeleteDialogAction::Cancel) => self.cancel_delete_confirmation(),
+            Some(DeleteDialogAction::Confirm) => self.confirm_delete_confirmation(),
+            None => {}
+        }
+    }
+
     fn show_native(&mut self, ui: &mut egui::Ui) {
         OpenAiTheme::apply(ui.ctx());
         if self.model.profile_load_succeeded()
@@ -519,6 +911,7 @@ impl DbotterApp {
             self.narrow_navigation(ui);
         }
         self.editor_and_results(ui);
+        self.show_delete_confirmation(ui);
     }
 
     fn show_first_run(&mut self, ui: &mut egui::Ui) {
@@ -695,21 +1088,69 @@ impl DbotterApp {
         }
         let state = self.model.connection_state(&profile.id).clone();
         let actions_enabled = !self.model.is_config_uncertain();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(connection_label(&state));
-            if ui
-                .add_enabled(
-                    actions_enabled && profile.is_ready() && !state.is_pending(),
-                    egui::Button::new("Test"),
-                )
-                .clicked()
-            {
-                self.submit_test(profile.id.clone());
+            match state {
+                ConnectionState::Disconnected | ConnectionState::Failed { .. } => {
+                    let connect = ui.add_enabled(
+                        actions_enabled && profile.is_ready(),
+                        egui::Button::new("Connect")
+                            .min_size(egui::vec2(104.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                    );
+                    if named_author_id(connect, "connection.connect", "Connect to profile")
+                        .clicked()
+                    {
+                        self.submit_test(profile.id.clone());
+                    }
+                }
+                ConnectionState::NeedsCredential => {
+                    let credential = ui.add_enabled(
+                        actions_enabled,
+                        egui::Button::new("Enter credential")
+                            .min_size(egui::vec2(144.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                    );
+                    if named_author_id(
+                        credential,
+                        "connection.credential.open",
+                        "Enter session credential",
+                    )
+                    .clicked()
+                    {
+                        self.open_session_credential_prompt(profile.id.clone());
+                    }
+                }
+                ConnectionState::Connected { .. } => {
+                    let disconnect = ui.add_enabled(
+                        actions_enabled,
+                        egui::Button::new("Disconnect")
+                            .min_size(egui::vec2(112.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                    );
+                    if named_author_id(disconnect, "connection.disconnect", "Disconnect profile")
+                        .clicked()
+                    {
+                        self.submit_disconnect(profile.id.clone());
+                    }
+                    let reconnect = ui.add_enabled(
+                        actions_enabled,
+                        egui::Button::new("Reconnect")
+                            .min_size(egui::vec2(112.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                    );
+                    if named_author_id(reconnect, "connection.reconnect", "Reconnect profile")
+                        .clicked()
+                    {
+                        self.submit_reconnect(profile.id.clone());
+                    }
+                }
+                ConnectionState::Pending(_) | ConnectionState::Closing => {}
             }
-            if ui
-                .add_enabled(actions_enabled, egui::Button::new("Edit"))
-                .clicked()
-            {
+        });
+        ui.horizontal_wrapped(|ui| {
+            let edit = ui.add_enabled(
+                actions_enabled,
+                egui::Button::new("Edit")
+                    .min_size(egui::vec2(88.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            if named_author_id(edit, "profile.edit", "Edit profile").clicked() {
                 let draft_id = self.allocate_draft_id();
                 self.profile_editor = Some(ProfileEditor::edit(
                     draft_id,
@@ -717,6 +1158,14 @@ impl DbotterApp {
                     profile.generation,
                     profile.has_current_session_secret,
                 ));
+            }
+            let delete = ui.add_enabled(
+                actions_enabled,
+                egui::Button::new("Delete")
+                    .min_size(egui::vec2(88.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            if named_author_id(delete, "profile.delete", "Delete profile").clicked() {
+                self.open_delete_confirmation(profile);
             }
         });
         if profile.availability == DriverAvailability::Planned {
@@ -1022,7 +1471,9 @@ fn display_cell(cell: &Cell) -> String {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{ConnectionState, DbotterApp, ProfileEditor};
+    use super::{
+        ActiveOperation, ConnectionState, DbotterApp, ProfileEditor, SessionCredentialIntent,
+    };
     use crate::model::{
         ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
         OperationKind, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
@@ -1249,6 +1700,418 @@ mod tests {
         let needs_credential = render_ids(ConnectionState::NeedsCredential, true);
         assert!(needs_credential.contains("connection.credential.open"));
         assert!(needs_credential.contains("profile.delete"));
+    }
+
+    #[test]
+    fn lifecycle_submits_exact_commands_and_sets_pending_only_after_acceptance() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+
+        app.submit_test(profile.id.clone());
+        let connect_operation = match service.try_next_command() {
+            Some(UiCommand::TestConnection {
+                operation_id,
+                profile_id,
+                profile_generation,
+                timeout_ms,
+            }) => {
+                assert_eq!(profile_id, profile.id);
+                assert_eq!(profile_generation, profile.generation);
+                assert_eq!(timeout_ms, super::DEFAULT_TIMEOUT_MS);
+                operation_id
+            }
+            _ => panic!("Connect must submit one exact non-secret TestConnection"),
+        };
+        assert_eq!(
+            app.model.connection_state(&profile.id),
+            &ConnectionState::Pending(connect_operation)
+        );
+        assert_eq!(
+            app.active_operations.get(&profile.id),
+            Some(&ActiveOperation {
+                operation_id: connect_operation,
+                kind: OperationKind::ConnectProfile,
+            })
+        );
+
+        assert!(service.try_emit(crate::ui::UiEvent::ConnectionReady {
+            operation_id: connect_operation,
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            session_generation: SessionGeneration(11),
+            elapsed_ms: 4,
+        }));
+        app.poll_events();
+        app.submit_disconnect(profile.id.clone());
+        let disconnect_operation = match service.try_next_command() {
+            Some(UiCommand::DisconnectProfile {
+                operation_id,
+                profile_id,
+                profile_generation,
+            }) => {
+                assert_eq!(profile_id, profile.id);
+                assert_eq!(profile_generation, profile.generation);
+                operation_id
+            }
+            _ => panic!("Disconnect must submit one exact control command"),
+        };
+        assert_eq!(
+            app.model.connection_state(&profile.id),
+            &ConnectionState::Pending(disconnect_operation)
+        );
+
+        assert!(service.try_emit(crate::ui::UiEvent::ConnectionClosed {
+            operation_id: disconnect_operation,
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            post_close: crate::ui::PostCloseState::Disconnected,
+        }));
+        app.poll_events();
+        app.submit_reconnect(profile.id.clone());
+        let reconnect_operation = match service.try_next_command() {
+            Some(UiCommand::ReconnectProfile {
+                operation_id,
+                profile_id,
+                profile_generation,
+                timeout_ms,
+            }) => {
+                assert_eq!(profile_id, profile.id);
+                assert_eq!(profile_generation, profile.generation);
+                assert_eq!(timeout_ms, super::DEFAULT_TIMEOUT_MS);
+                operation_id
+            }
+            _ => panic!("Reconnect must submit one exact control command"),
+        };
+        assert_eq!(
+            app.model.connection_state(&profile.id),
+            &ConnectionState::Pending(reconnect_operation)
+        );
+
+        for lifecycle in [
+            OperationKind::ConnectProfile,
+            OperationKind::DisconnectProfile,
+            OperationKind::ReconnectProfile,
+        ] {
+            let (ui_port, mut service) = bounded_ports(1);
+            let mut blocked = DbotterApp::new(ui_port);
+            assert!(service.try_next_command().is_some());
+            blocked.model.profiles = vec![profile.clone()];
+            blocked
+                .model
+                .active_generations
+                .insert(profile.id.clone(), profile.generation);
+            blocked.model.connection_states.insert(
+                profile.id.clone(),
+                ConnectionState::Connected {
+                    session_generation: SessionGeneration(12),
+                    elapsed_ms: 1,
+                },
+            );
+            let filler = match lifecycle {
+                OperationKind::ConnectProfile => UiCommand::TestConnection {
+                    operation_id: OperationId(800),
+                    profile_id: ProfileId("filler".to_owned()),
+                    profile_generation: ProfileGeneration(1),
+                    timeout_ms: 1,
+                },
+                OperationKind::DisconnectProfile | OperationKind::ReconnectProfile => {
+                    UiCommand::CancelOperation {
+                        operation_id: OperationId(801),
+                    }
+                }
+                _ => unreachable!("closed lifecycle fixture"),
+            };
+            assert_eq!(blocked.port.try_submit(filler), Ok(()));
+            match lifecycle {
+                OperationKind::ConnectProfile => {
+                    blocked
+                        .model
+                        .connection_states
+                        .insert(profile.id.clone(), ConnectionState::Disconnected);
+                    blocked.submit_test(profile.id.clone());
+                    assert_eq!(
+                        blocked.model.connection_state(&profile.id),
+                        &ConnectionState::Disconnected
+                    );
+                }
+                OperationKind::DisconnectProfile => {
+                    blocked.submit_disconnect(profile.id.clone());
+                    assert!(matches!(
+                        blocked.model.connection_state(&profile.id),
+                        ConnectionState::Connected { .. }
+                    ));
+                }
+                OperationKind::ReconnectProfile => {
+                    blocked.submit_reconnect(profile.id.clone());
+                    assert!(matches!(
+                        blocked.model.connection_state(&profile.id),
+                        ConnectionState::Connected { .. }
+                    ));
+                }
+                _ => unreachable!("closed lifecycle fixture"),
+            }
+            assert!(!blocked.active_operations.contains_key(&profile.id));
+        }
+    }
+
+    #[test]
+    fn session_prompt_updates_exact_generation_then_retries_non_secret_connect() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let mut session_profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        session_profile.persisted.credential_mode = CredentialMode::Session;
+        session_profile.has_current_session_secret = false;
+        app.model.profiles = vec![session_profile.clone()];
+        app.model
+            .active_generations
+            .insert(session_profile.id.clone(), session_profile.generation);
+        app.model
+            .connection_states
+            .insert(session_profile.id.clone(), ConnectionState::NeedsCredential);
+
+        app.submit_test(session_profile.id.clone());
+        assert!(service.try_next_command().is_none());
+        let editor = app
+            .profile_editor
+            .as_mut()
+            .expect("session credential editor");
+        assert_eq!(
+            editor.requested_focus(),
+            Some(ProfileFieldId::SessionCredential)
+        );
+        assert_eq!(
+            editor.session_intent(),
+            Some(SessionCredentialIntent::Replace)
+        );
+        editor.set_replacement_secret("memory-only-secret".to_owned());
+        let update_operation = app.model.next_operation();
+        assert!(matches!(
+            editor.try_save_with_connect(&app.port, update_operation, true),
+            super::SaveAttempt::Submitted(operation_id) if operation_id == update_operation
+        ));
+        let request = match service.try_next_command() {
+            Some(UiCommand::UpdateProfile(request)) => request,
+            _ => panic!("credential prompt must submit one exact profile update"),
+        };
+        assert_eq!(request.profile_id, session_profile.id);
+        assert_eq!(request.expected_generation, session_profile.generation);
+        assert_eq!(request.operation_id, update_operation);
+        assert_eq!(request.draft.credential_mode, CredentialMode::Session);
+        assert!(matches!(
+            &request.secret_update,
+            crate::secrets::SessionSecretUpdate::Replace(_)
+        ));
+        assert_eq!(
+            request.migration_consent,
+            super::MigrationConsent::Cancelled
+        );
+        assert!(!format!("{request:?}").contains("memory-only-secret"));
+
+        assert!(service.try_emit(crate::ui::UiEvent::ProfileSaved {
+            operation_id: update_operation,
+            profile_id: session_profile.id.clone(),
+            previous_generation: Some(session_profile.generation),
+            profile_generation: ProfileGeneration(2),
+            session_retained: false,
+            warning: None,
+        }));
+        app.poll_events();
+        let refresh_operation = match service.try_next_command() {
+            Some(UiCommand::RefreshProfiles { operation_id }) => operation_id,
+            _ => panic!("Save & Connect must refresh the accepted generation"),
+        };
+        assert!(service.try_next_command().is_none());
+        let mut refreshed = session_profile;
+        refreshed.generation = ProfileGeneration(2);
+        refreshed.has_current_session_secret = true;
+        assert!(service.try_emit(crate::ui::UiEvent::ProfilesLoaded {
+            operation_id: refresh_operation,
+            profiles: vec![refreshed.clone()],
+        }));
+        app.poll_events();
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::TestConnection {
+                profile_id,
+                profile_generation: ProfileGeneration(2),
+                ..
+            }) if profile_id == refreshed.id
+        ));
+    }
+
+    #[test]
+    fn rejected_credential_and_delete_submissions_keep_secret_and_pending_state_local() {
+        let (ui_port, mut service) = bounded_ports(1);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let mut session_profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        session_profile.persisted.credential_mode = CredentialMode::Session;
+        app.model.profiles = vec![session_profile.clone()];
+        app.model
+            .active_generations
+            .insert(session_profile.id.clone(), session_profile.generation);
+        app.open_session_credential_prompt(session_profile.id.clone());
+        let editor = app.profile_editor.as_mut().expect("credential editor");
+        editor.set_replacement_secret("still-local".to_owned());
+        assert_eq!(
+            app.port.try_submit(UiCommand::RefreshProfiles {
+                operation_id: OperationId(901),
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            editor.try_save_with_connect(&app.port, OperationId(902), true),
+            super::SaveAttempt::Busy
+        );
+        assert!(editor.replacement_is_set());
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::RefreshProfiles {
+                operation_id: OperationId(901)
+            })
+        ));
+        assert!(service.try_next_command().is_none());
+
+        let (ui_port, mut service) = bounded_ports(1);
+        let mut blocked_delete = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        blocked_delete.model.profiles = vec![profile.clone()];
+        blocked_delete
+            .model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        blocked_delete.open_delete_confirmation(&profile);
+        assert_eq!(
+            blocked_delete.port.try_submit(UiCommand::RefreshProfiles {
+                operation_id: OperationId(903),
+            }),
+            Ok(())
+        );
+        blocked_delete.confirm_delete_confirmation();
+        assert!(blocked_delete.delete_confirmation.is_some());
+        assert_eq!(
+            blocked_delete.model.connection_state(&profile.id),
+            &ConnectionState::Disconnected
+        );
+        assert!(!blocked_delete.active_operations.contains_key(&profile.id));
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::RefreshProfiles {
+                operation_id: OperationId(903)
+            })
+        ));
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn confirmed_delete_is_exact_cancel_is_pure_and_unknown_truth_is_visible() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        let workspace_key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.workspace_mut(workspace_key.clone()).editor_text =
+            "UPDATE inventory SET count = count + 1".to_owned();
+        let execute = build_execute_intent(
+            &profile,
+            app.model.workspace(&workspace_key).expect("workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("mutation intent");
+        app.submit_editor_intent(EditorIntent::Execute(execute));
+        let active_operation = match service.try_next_command() {
+            Some(UiCommand::Execute { operation_id, .. }) => operation_id,
+            _ => panic!("mutation must be active before delete opens"),
+        };
+        assert_eq!(
+            app.active_operations.get(&profile.id),
+            Some(&ActiveOperation {
+                operation_id: active_operation,
+                kind: OperationKind::ExecuteMutation,
+            })
+        );
+
+        app.open_delete_confirmation(&profile);
+        let context = Context::default();
+        context.enable_accesskit();
+        let output = context.run_ui(RawInput::default(), |ui| app.show_delete_confirmation(ui));
+        let warning = output
+            .platform_output
+            .accesskit_update
+            .expect("delete dialog AccessKit")
+            .nodes
+            .into_iter()
+            .find_map(|(_, node)| {
+                (node.author_id() == Some("profile.delete.active_warning"))
+                    .then(|| node.label().map(str::to_owned))
+            })
+            .flatten()
+            .expect("active delete warning");
+        assert_eq!(
+            warning,
+            "ExecuteMutation is active. Dbotter will stop waiting; the server operation may continue."
+        );
+
+        app.cancel_delete_confirmation();
+        assert!(service.try_next_command().is_none());
+        assert_eq!(
+            app.active_operations.get(&profile.id),
+            Some(&ActiveOperation {
+                operation_id: active_operation,
+                kind: OperationKind::ExecuteMutation,
+            })
+        );
+
+        app.open_delete_confirmation(&profile);
+        app.delete_confirmation
+            .as_mut()
+            .expect("delete confirmation")
+            .migration_confirmed = true;
+        app.confirm_delete_confirmation();
+        let delete_operation = match service.try_next_command() {
+            Some(UiCommand::DeleteProfile(request)) => {
+                assert_eq!(request.profile_id, profile.id);
+                assert_eq!(request.expected_generation, profile.generation);
+                assert_eq!(
+                    request.migration_consent,
+                    super::MigrationConsent::Confirmed
+                );
+                request.operation_id
+            }
+            _ => panic!("confirmed delete must submit exactly once"),
+        };
+        assert_eq!(
+            app.model.connection_state(&profile.id),
+            &ConnectionState::Closing
+        );
+        app.confirm_delete_confirmation();
+        assert!(service.try_next_command().is_none());
+
+        assert!(service.try_emit(crate::ui::UiEvent::ProfileDeleted {
+            operation_id: delete_operation,
+            profile_id: profile.id.clone(),
+            profile_generation: ProfileGeneration(profile.generation.0 + 1),
+            server_state_unknown: true,
+        }));
+        app.poll_events();
+        assert_eq!(
+            app.model.status,
+            "Profile deleted; server state is unknown."
+        );
     }
 
     #[test]

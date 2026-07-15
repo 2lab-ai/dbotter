@@ -13,6 +13,19 @@ pub fn named_author_id(
     response
 }
 
+pub fn named_author_id_with_label(
+    response: egui::Response,
+    value: &'static str,
+    name: String,
+) -> egui::Response {
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_author_id(value);
+        node.set_label(name);
+    });
+    draw_focus_ring(&response);
+    response
+}
+
 fn draw_focus_ring(response: &egui::Response) {
     if !response.has_focus() {
         return;

@@ -996,10 +996,15 @@ impl ProfileEditor {
                                 .id_salt(PROFILE_SESSION_REPLACEMENT_ID)
                                 .password(true),
                         );
-                        named_author_id(
+                        let response = named_author_id(
                             response,
                             PROFILE_SESSION_REPLACEMENT_ID,
                             "Replacement session credential",
+                        );
+                        request_field_focus(
+                            &response,
+                            ProfileFieldId::SessionCredential,
+                            &mut self.focus_field,
                         );
                         ui.small("Held only in a zeroizing in-memory buffer.");
                     } else if selected_intent == SessionCredentialIntent::KeepCurrent {
