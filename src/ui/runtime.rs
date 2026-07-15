@@ -1956,17 +1956,21 @@ async fn run_catalog_browse(
             result = &mut prepare => result.map_err(|error| error.public_summary()),
         }
     };
-    if let Err(summary) = prepared {
-        return catalog_failed_event(request, summary, None, None);
-    }
+    let token_key_context = match prepared {
+        Ok(context) => context,
+        Err(summary) => return catalog_failed_event(request, summary, None, None),
+    };
 
-    let token_key_result =
-        match await_pre_session_blocking(service.spawn_catalog_token_key_load(), cancel, deadline)
-            .await
-        {
-            Ok(result) => result,
-            Err(summary) => return catalog_failed_event(request, summary, None, None),
-        };
+    let token_key_result = match await_pre_session_blocking(
+        service.spawn_catalog_token_key_load(token_key_context),
+        cancel,
+        deadline,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(summary) => return catalog_failed_event(request, summary, None, None),
+    };
     let token_key = match token_key_result {
         Ok(token_key) => token_key,
         Err(error) => {

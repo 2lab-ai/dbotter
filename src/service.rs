@@ -17,7 +17,9 @@ use crate::config::{
     LoadedConfig, MigrationConsent, MutationOutcome, PostCommitObservation,
     PostCommitObservationError,
 };
-use crate::drivers::mysql_catalog::{CatalogTokenKey, CatalogTokenKeyStore};
+use crate::drivers::mysql_catalog::{
+    CatalogTokenKey, CatalogTokenKeyContext, CatalogTokenKeyStore,
+};
 use crate::drivers::{ConnectedResources, DriverError, Session};
 use crate::execution::{
     ExecutionLanguage, ExecutionTarget, ExecutionTargetError, ValidatedExecutionTarget,
@@ -611,6 +613,22 @@ impl From<&ConnectionProfile> for ConnectionFingerprint {
             secret_env: profile.secret_env.clone(),
             redis_ca_file: profile.redis_tls.ca_file.clone(),
         }
+    }
+}
+
+impl ConnectionFingerprint {
+    fn catalog_token_key_context(&self) -> CatalogTokenKeyContext {
+        CatalogTokenKeyContext::from_connection_fields(
+            self.driver,
+            &self.host,
+            self.port,
+            self.database.as_deref(),
+            self.username.as_deref(),
+            self.tls,
+            self.credential_mode,
+            self.secret_env.as_deref(),
+            self.redis_ca_file.as_deref(),
+        )
     }
 }
 
@@ -1931,8 +1949,8 @@ impl ApplicationService {
         &self,
         request: CatalogRequest,
     ) -> Result<CatalogPage, ServiceError> {
-        self.prepare_catalog_request(&request).await?;
-        let token_key = self.catalog_token_key().await?;
+        let token_key_context = self.prepare_catalog_request(&request).await?;
+        let token_key = self.catalog_token_key(token_key_context).await?;
         let lease = self
             .acquire_session_at(
                 request.operation_id(),
@@ -1949,24 +1967,31 @@ impl ApplicationService {
     pub(crate) async fn prepare_catalog_request(
         &self,
         request: &CatalogRequest,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<CatalogTokenKeyContext, ServiceError> {
         request.validate().map_err(service_request_error)?;
-        self.ensure_typed_resource_request(
-            request.identity(),
-            DriverKind::MySql,
-            DriverCapabilities::CATALOG,
-            "mysql catalog browsing",
-        )
-        .await
+        let connection_fingerprint = self
+            .ensure_typed_resource_request(
+                request.identity(),
+                DriverKind::MySql,
+                DriverCapabilities::CATALOG,
+                "mysql catalog browsing",
+            )
+            .await?;
+        Ok(connection_fingerprint.catalog_token_key_context())
     }
 
     pub(crate) fn spawn_catalog_token_key_load(
         &self,
+        context: CatalogTokenKeyContext,
     ) -> tokio::task::JoinHandle<Result<Arc<CatalogTokenKey>, ServiceError>> {
         let token_keys = Arc::clone(&self.catalog_token_keys);
         tokio::task::spawn_blocking(move || {
-            token_keys
+            let root_key = token_keys
                 .load_or_create()
+                .map_err(|_| ServiceError::CatalogTokenKeyUnavailable)?;
+            root_key
+                .derive_token_key(&context)
+                .map(Arc::new)
                 .map_err(|_| ServiceError::CatalogTokenKeyUnavailable)
         })
     }
@@ -1977,8 +2002,11 @@ impl ApplicationService {
         result.map_err(|_| ServiceError::CatalogTokenKeyUnavailable)?
     }
 
-    async fn catalog_token_key(&self) -> Result<Arc<CatalogTokenKey>, ServiceError> {
-        Self::finish_catalog_token_key_load(self.spawn_catalog_token_key_load().await)
+    async fn catalog_token_key(
+        &self,
+        context: CatalogTokenKeyContext,
+    ) -> Result<Arc<CatalogTokenKey>, ServiceError> {
+        Self::finish_catalog_token_key_load(self.spawn_catalog_token_key_load(context).await)
     }
 
     pub async fn scan_redis_keys(
@@ -2051,7 +2079,7 @@ impl ApplicationService {
         expected_driver: DriverKind,
         capability: DriverCapabilities,
         operation: &'static str,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<ConnectionFingerprint, ServiceError> {
         self.ensure_config_certain()?;
         let (profile, generation) = self.profile_with_generation(&identity.profile_id).await?;
         if generation != identity.profile_generation {
@@ -2077,7 +2105,7 @@ impl ApplicationService {
             }
             .into());
         }
-        Ok(())
+        Ok(ConnectionFingerprint::from(&profile))
     }
 
     async fn finish_resource_operation<T>(
@@ -3305,4 +3333,75 @@ fn ensure_ready(profile: &ConnectionProfile) -> Result<(), DriverError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod catalog_token_context_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_token_context_tracks_every_connection_fingerprint_field() {
+        let base = ConnectionFingerprint {
+            driver: DriverKind::MySql,
+            host: "127.0.0.1".to_owned(),
+            port: 3306,
+            database: Some("app".to_owned()),
+            username: Some("dbotter".to_owned()),
+            tls: TlsMode::Preferred,
+            credential_mode: CredentialMode::Environment,
+            secret_env: Some("DBOTTER_MYSQL_PASSWORD".to_owned()),
+            redis_ca_file: Some(PathBuf::from("/private/ca.pem")),
+        };
+        let base_context = base.catalog_token_key_context();
+        assert_eq!(
+            format!("{base_context:?}"),
+            "CatalogTokenKeyContext(<redacted>)"
+        );
+
+        let changed = [
+            ConnectionFingerprint {
+                driver: DriverKind::Redis,
+                ..base.clone()
+            },
+            ConnectionFingerprint {
+                host: "localhost".to_owned(),
+                ..base.clone()
+            },
+            ConnectionFingerprint {
+                port: 3307,
+                ..base.clone()
+            },
+            ConnectionFingerprint {
+                database: None,
+                ..base.clone()
+            },
+            ConnectionFingerprint {
+                username: None,
+                ..base.clone()
+            },
+            ConnectionFingerprint {
+                tls: TlsMode::Required,
+                ..base.clone()
+            },
+            ConnectionFingerprint {
+                credential_mode: CredentialMode::Session,
+                ..base.clone()
+            },
+            ConnectionFingerprint {
+                secret_env: None,
+                ..base.clone()
+            },
+            ConnectionFingerprint {
+                redis_ca_file: None,
+                ..base.clone()
+            },
+        ];
+        for fingerprint in changed {
+            assert_ne!(
+                fingerprint.catalog_token_key_context(),
+                base_context,
+                "every connection fingerprint field must scope catalog tokens"
+            );
+        }
+    }
 }

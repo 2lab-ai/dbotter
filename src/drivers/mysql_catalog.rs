@@ -20,17 +20,22 @@ use zeroize::Zeroizing;
 use crate::drivers::DriverError;
 use crate::model::{
     CatalogLevel, CatalogNode, CatalogNodeIdentity, CatalogNodeKind, CatalogPage, CatalogPageToken,
-    CatalogRequest, CatalogRetainedCounts, MAX_CATALOG_COLUMNS, MAX_CATALOG_COLUMNS_PER_RELATION,
-    MAX_CATALOG_RELATIONS, MAX_CATALOG_SCHEMAS, MAX_CATALOG_UTF8_BYTES, RequestValidationError,
+    CatalogRequest, CatalogRetainedCounts, CredentialMode, DriverKind, MAX_CATALOG_COLUMNS,
+    MAX_CATALOG_COLUMNS_PER_RELATION, MAX_CATALOG_RELATIONS, MAX_CATALOG_SCHEMAS,
+    MAX_CATALOG_UTF8_BYTES, RequestValidationError, TlsMode,
 };
 
 const TOKEN_VERSION: u8 = 1;
 const TOKEN_PREFIX: &str = "v1";
 const TOKEN_AUTHENTICATION_DOMAIN: &[u8] = b"dbotter:mysql-catalog-token:v1\0";
+const TOKEN_KEY_DERIVATION_DOMAIN: &[u8] = b"dbotter:mysql-catalog-token-key:v1\0";
+const TOKEN_KEY_CONTEXT_DOMAIN: &[u8] = b"dbotter:mysql-catalog-connection:v1\0";
 const TOKEN_KEY_BYTES: usize = 32;
 const TOKEN_KEY_SUFFIX: &str = ".catalog-integrity-key";
 
 static TOKEN_KEY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+const _: () = assert!(usize::BITS <= u64::BITS);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -48,12 +53,6 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct CatalogTokenKey(Zeroizing<[u8; TOKEN_KEY_BYTES]>);
 
 impl CatalogTokenKey {
-    pub(crate) fn generate() -> Result<Self, getrandom::Error> {
-        let mut key = Zeroizing::new([0_u8; TOKEN_KEY_BYTES]);
-        getrandom::fill(key.as_mut())?;
-        Ok(Self(key))
-    }
-
     fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, DriverError> {
         let mut mac = HmacSha256::new_from_slice(self.0.as_ref())
             .map_err(|_| DriverError::InvalidCatalogRequest)?;
@@ -77,6 +76,150 @@ impl CatalogTokenKey {
     }
 }
 
+/// A redacted digest of every connection-relevant profile field.
+///
+/// Only this fixed-size digest crosses the blocking key-load boundary. Raw
+/// profile values are never written into the sidecar or catalog token.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CatalogTokenKeyContext([u8; TOKEN_KEY_BYTES]);
+
+impl CatalogTokenKeyContext {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_connection_fields(
+        driver: DriverKind,
+        host: &str,
+        port: u16,
+        database: Option<&str>,
+        username: Option<&str>,
+        tls: TlsMode,
+        credential_mode: CredentialMode,
+        secret_env: Option<&str>,
+        redis_ca_file: Option<&Path>,
+    ) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(TOKEN_KEY_CONTEXT_DOMAIN);
+        update_context_field(&mut digest, 1, &[driver_context_tag(driver)]);
+        update_context_field(&mut digest, 2, host.as_bytes());
+        update_context_field(&mut digest, 3, &port.to_be_bytes());
+        update_optional_context_field(&mut digest, 4, database.map(str::as_bytes));
+        update_optional_context_field(&mut digest, 5, username.map(str::as_bytes));
+        update_context_field(&mut digest, 6, &[tls_context_tag(tls)]);
+        update_context_field(
+            &mut digest,
+            7,
+            &[credential_mode_context_tag(credential_mode)],
+        );
+        update_optional_context_field(&mut digest, 8, secret_env.map(str::as_bytes));
+        update_optional_path_context_field(&mut digest, 9, redis_ca_file);
+        let mut context = [0_u8; TOKEN_KEY_BYTES];
+        context.copy_from_slice(&digest.finalize());
+        Self(context)
+    }
+}
+
+impl fmt::Debug for CatalogTokenKeyContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CatalogTokenKeyContext(<redacted>)")
+    }
+}
+
+/// Persistent random root used only to derive profile-scoped signing keys.
+pub(crate) struct CatalogTokenRootKey(Zeroizing<[u8; TOKEN_KEY_BYTES]>);
+
+impl CatalogTokenRootKey {
+    fn generate() -> Result<Self, getrandom::Error> {
+        let mut key = Zeroizing::new([0_u8; TOKEN_KEY_BYTES]);
+        getrandom::fill(key.as_mut())?;
+        Ok(Self(key))
+    }
+
+    pub(crate) fn derive_token_key(
+        &self,
+        context: &CatalogTokenKeyContext,
+    ) -> Result<CatalogTokenKey, CatalogTokenKeyError> {
+        let mut mac =
+            HmacSha256::new_from_slice(self.0.as_ref()).map_err(|_| CatalogTokenKeyError)?;
+        mac.update(TOKEN_KEY_DERIVATION_DOMAIN);
+        mac.update(&context.0);
+        let derived = mac.finalize().into_bytes();
+        let mut key = Zeroizing::new([0_u8; TOKEN_KEY_BYTES]);
+        key.copy_from_slice(&derived);
+        Ok(CatalogTokenKey(key))
+    }
+
+    #[cfg(test)]
+    fn for_test(value: u8) -> Self {
+        Self(Zeroizing::new([value; TOKEN_KEY_BYTES]))
+    }
+}
+
+impl fmt::Debug for CatalogTokenRootKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CatalogTokenRootKey(<redacted>)")
+    }
+}
+
+fn update_context_field(digest: &mut Sha256, tag: u8, value: &[u8]) {
+    digest.update([tag]);
+    // The compile-time assertion above makes this conversion lossless while
+    // fixing the canonical length representation to eight big-endian bytes.
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn update_optional_context_field(digest: &mut Sha256, tag: u8, value: Option<&[u8]>) {
+    match value {
+        Some(value) => {
+            digest.update([tag, 1]);
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+        None => digest.update([tag, 0]),
+    }
+}
+
+#[cfg(unix)]
+fn update_optional_path_context_field(digest: &mut Sha256, tag: u8, value: Option<&Path>) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    update_optional_context_field(digest, tag, value.map(|path| path.as_os_str().as_bytes()));
+}
+
+#[cfg(not(unix))]
+fn update_optional_path_context_field(digest: &mut Sha256, tag: u8, value: Option<&Path>) {
+    match value {
+        Some(path) => {
+            let path = path.as_os_str().to_string_lossy();
+            update_optional_context_field(digest, tag, Some(path.as_bytes()));
+        }
+        None => update_optional_context_field(digest, tag, None),
+    }
+}
+
+const fn driver_context_tag(driver: DriverKind) -> u8 {
+    match driver {
+        DriverKind::MySql => 1,
+        DriverKind::Redis => 2,
+        DriverKind::MongoDb => 3,
+    }
+}
+
+const fn tls_context_tag(tls: TlsMode) -> u8 {
+    match tls {
+        TlsMode::Disabled => 1,
+        TlsMode::Preferred => 2,
+        TlsMode::Required => 3,
+    }
+}
+
+const fn credential_mode_context_tag(mode: CredentialMode) -> u8 {
+    match mode {
+        CredentialMode::None => 1,
+        CredentialMode::Session => 2,
+        CredentialMode::Environment => 3,
+    }
+}
+
 impl fmt::Debug for CatalogTokenKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("CatalogTokenKey(<redacted>)")
@@ -86,7 +229,7 @@ impl fmt::Debug for CatalogTokenKey {
 /// Lazy, race-safe owner of the private token-integrity sidecar for one config.
 pub(crate) struct CatalogTokenKeyStore {
     path: PathBuf,
-    cached: Mutex<Option<Arc<CatalogTokenKey>>>,
+    cached: Mutex<Option<Arc<CatalogTokenRootKey>>>,
 }
 
 impl CatalogTokenKeyStore {
@@ -99,7 +242,7 @@ impl CatalogTokenKeyStore {
         }
     }
 
-    pub(crate) fn load_or_create(&self) -> Result<Arc<CatalogTokenKey>, CatalogTokenKeyError> {
+    pub(crate) fn load_or_create(&self) -> Result<Arc<CatalogTokenRootKey>, CatalogTokenKeyError> {
         let mut cached = self.cached.lock().map_err(|_| CatalogTokenKeyError)?;
         if let Some(key) = cached.as_ref() {
             return Ok(Arc::clone(key));
@@ -126,7 +269,7 @@ impl fmt::Debug for CatalogTokenKeyError {
     }
 }
 
-fn load_or_create_token_key(path: &Path) -> std::io::Result<CatalogTokenKey> {
+fn load_or_create_token_key(path: &Path) -> std::io::Result<CatalogTokenRootKey> {
     if let Some(key) = read_token_key(path)? {
         return Ok(key);
     }
@@ -136,7 +279,7 @@ fn load_or_create_token_key(path: &Path) -> std::io::Result<CatalogTokenKey> {
         .filter(|value| !value.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(directory)?;
-    let candidate = CatalogTokenKey::generate()
+    let candidate = CatalogTokenRootKey::generate()
         .map_err(|_| std::io::Error::other("catalog token integrity entropy is unavailable"))?;
     let (temp_path, mut temp_file) = create_token_key_temp(directory)?;
     let cleanup = TokenKeyTempCleanup::new(temp_path.clone());
@@ -164,7 +307,7 @@ fn load_or_create_token_key(path: &Path) -> std::io::Result<CatalogTokenKey> {
     }
 }
 
-fn read_token_key(path: &Path) -> std::io::Result<Option<CatalogTokenKey>> {
+fn read_token_key(path: &Path) -> std::io::Result<Option<CatalogTokenRootKey>> {
     let link_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -194,7 +337,7 @@ fn read_token_key(path: &Path) -> std::io::Result<Option<CatalogTokenKey>> {
             "catalog token integrity key is invalid",
         ));
     }
-    Ok(Some(CatalogTokenKey(key)))
+    Ok(Some(CatalogTokenRootKey(key)))
 }
 
 fn create_token_key_temp(directory: &Path) -> std::io::Result<(PathBuf, fs::File)> {
@@ -1047,6 +1190,20 @@ mod tests {
         CatalogTokenKey::for_test(7)
     }
 
+    fn token_key_context(database: Option<&str>) -> CatalogTokenKeyContext {
+        CatalogTokenKeyContext::from_connection_fields(
+            DriverKind::MySql,
+            "127.0.0.1",
+            3306,
+            database,
+            Some("dbotter"),
+            TlsMode::Preferred,
+            CredentialMode::Environment,
+            Some("DBOTTER_MYSQL_PASSWORD"),
+            None,
+        )
+    }
+
     fn schema_request(generation: u64, token: Option<CatalogPageToken>) -> CatalogRequest {
         CatalogRequest::Schemas {
             identity: identity(generation),
@@ -1078,7 +1235,9 @@ mod tests {
         assert_eq!(format!("{store_a:?}"), "CatalogTokenKeyStore(<redacted>)");
         assert!(!store_a.path.exists(), "construction must not write");
 
-        let key_a = store_a.load_or_create().expect("create token key");
+        let root_a = store_a.load_or_create().expect("create token root key");
+        let context = token_key_context(Some("same_config"));
+        let key_a = root_a.derive_token_key(&context).expect("derive token key");
         let metadata = fs::metadata(&store_a.path).expect("token key metadata");
         assert_eq!(metadata.len(), TOKEN_KEY_BYTES as u64);
         #[cfg(unix)]
@@ -1088,7 +1247,10 @@ mod tests {
         }
 
         let store_b = CatalogTokenKeyStore::for_config_path(&config_path);
-        let key_b = store_b.load_or_create().expect("reload token key");
+        let root_b = store_b.load_or_create().expect("reload token root key");
+        let key_b = root_b
+            .derive_token_key(&context)
+            .expect("derive reloaded token key");
         let signed = key_a.sign(b"same-config").expect("sign same config");
         key_b
             .verify(b"same-config", &signed)
@@ -1096,8 +1258,38 @@ mod tests {
 
         let other_store =
             CatalogTokenKeyStore::for_config_path(&directory.path().join("other.toml"));
-        let other_key = other_store.load_or_create().expect("other config key");
+        let other_root = other_store.load_or_create().expect("other config root key");
+        let other_key = other_root
+            .derive_token_key(&context)
+            .expect("derive other config token key");
         assert!(other_key.verify(b"same-config", &signed).is_err());
+    }
+
+    #[test]
+    fn token_root_derives_stable_connection_scoped_redacted_keys() {
+        let root = CatalogTokenRootKey::for_test(23);
+        let first_context = token_key_context(Some("first"));
+        let same_context = token_key_context(Some("first"));
+        let changed_context = token_key_context(Some("second"));
+        assert_eq!(
+            format!("{first_context:?}"),
+            "CatalogTokenKeyContext(<redacted>)"
+        );
+        assert_eq!(format!("{root:?}"), "CatalogTokenRootKey(<redacted>)");
+
+        let first = root
+            .derive_token_key(&first_context)
+            .expect("derive first key");
+        let same = root
+            .derive_token_key(&same_context)
+            .expect("derive same key");
+        let changed = root
+            .derive_token_key(&changed_context)
+            .expect("derive changed key");
+        let signature = first.sign(b"profile-scoped").expect("sign profile data");
+        same.verify(b"profile-scoped", &signature)
+            .expect("same root and context reproduce key");
+        assert!(changed.verify(b"profile-scoped", &signature).is_err());
     }
 
     #[test]
@@ -1112,7 +1304,10 @@ mod tests {
                 thread::spawn(move || {
                     let store = CatalogTokenKeyStore::for_config_path(config_path.as_path());
                     barrier.wait();
-                    let key = store.load_or_create().expect("token key race load");
+                    let root = store.load_or_create().expect("token root key race load");
+                    let key = root
+                        .derive_token_key(&token_key_context(Some("race")))
+                        .expect("token key race derive");
                     key.sign(b"race").expect("token key race sign")
                 })
             })
