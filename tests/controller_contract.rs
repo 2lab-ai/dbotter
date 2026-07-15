@@ -16,8 +16,7 @@ use dbotter::model::{
     CredentialMode, DraftId, DriverKind, MySqlPublicErrorCode, OperationId, PreparedMySqlRequest,
     ProfileGeneration, ProfileId, QueryResult, RedisExecuteRequest, RedisKeyFilter, RedisKeyId,
     RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, RequestIdentity,
-    ResultId, ResultProvenance, ResultRetentionPolicy,
-    ResultSnapshot, SessionGeneration,
+    ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration,
 };
 use dbotter::secrets::{SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate};
 use dbotter::service::{
@@ -1213,8 +1212,12 @@ async fn p5_redis_scan_cancel_drops_driver_future_before_exact_session_close() {
             event,
             UiEvent::RedisKeysFailed {
                 request,
-                summary: dbotter::model::PublicSummary::OperationCancelled,
+                error,
+                session_generation: Some(_),
+                session_disposition: Some(SessionDisposition::Evict),
+                connection_outcome: ConnectionFailureOutcome::Disconnected,
             } if request.operation_id() == OperationId(213)
+                && error.summary == dbotter::model::PublicSummary::OperationCancelled
         )
     })
     .await;
@@ -1264,8 +1267,12 @@ async fn p5_redis_inspect_outer_timeout_drops_driver_future_before_exact_session
             event,
             UiEvent::RedisKeyInspectFailed {
                 request,
-                summary: dbotter::model::PublicSummary::OperationTimedOut,
+                error,
+                session_generation: Some(_),
+                session_disposition: Some(SessionDisposition::Evict),
+                connection_outcome: ConnectionFailureOutcome::Disconnected,
             } if request.operation_id() == OperationId(215)
+                && error.summary == dbotter::model::PublicSummary::OperationTimedOut
         )
     })
     .await;
@@ -1488,8 +1495,10 @@ async fn catalog_and_keyspace_commands_reach_independently_ready_resources() {
             event,
             UiEvent::RedisKeysFailed {
                 request,
-                summary: dbotter::model::PublicSummary::UnsupportedFeature,
+                error,
+                ..
             } if request.operation_id() == OperationId(203)
+                && error.summary == dbotter::model::PublicSummary::UnsupportedFeature
         )
     })
     .await;
@@ -1510,8 +1519,10 @@ async fn catalog_and_keyspace_commands_reach_independently_ready_resources() {
             event,
             UiEvent::RedisKeyInspectFailed {
                 request,
-                summary: dbotter::model::PublicSummary::UnsupportedFeature,
+                error,
+                ..
             } if request.operation_id() == OperationId(204)
+                && error.summary == dbotter::model::PublicSummary::UnsupportedFeature
         )
     })
     .await;

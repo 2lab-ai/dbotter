@@ -403,9 +403,9 @@ impl ServicePort {
             | UiEvent::RuntimeShutdown { operation_id } => *operation_id,
             UiEvent::CatalogPageLoaded { page, .. } => page.identity.operation_id,
             UiEvent::CatalogPageFailed { request, .. } => request.operation_id(),
-            UiEvent::RedisKeysLoaded { page } => page.identity.operation_id,
+            UiEvent::RedisKeysLoaded { page, .. } => page.identity.operation_id,
             UiEvent::RedisKeysFailed { request, .. } => request.operation_id(),
-            UiEvent::RedisKeyInspected { preview } => preview.identity.operation_id,
+            UiEvent::RedisKeyInspected { preview, .. } => preview.identity.operation_id,
             UiEvent::RedisKeyInspectFailed { request, .. } => request.operation_id(),
         };
         keys.remove(&ControlKey::Cancel(operation_id));

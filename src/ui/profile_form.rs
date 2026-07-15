@@ -6,14 +6,17 @@ use eframe::egui;
 
 use crate::config::MigrationConsent;
 use crate::model::{
-    ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileGeneration,
-    ProfileId, RedisTlsConfig, TlsMode,
+    ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileFieldId,
+    ProfileGeneration, ProfileId, RedisTlsConfig, TlsMode,
 };
 use crate::secrets::SessionSecretUpdate;
 use crate::service::{CreateProfileRequest, UpdateProfileRequest};
 
 use super::adapter::{SubmitError, UiCommand, UiPort};
 use super::model::UiEvent;
+
+const REDIS_CA_FILE_FIELD_ID: &str = "profile.redis_tls.ca_file";
+const REDIS_CA_FILE_PICK_ID: &str = "profile.redis_tls.ca_file.pick";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum EditorMode {
@@ -254,6 +257,7 @@ pub(super) enum FormAction {
     None,
     Save,
     Cancel,
+    PickRedisCaFile,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -282,6 +286,7 @@ pub(super) struct ProfileEditor {
     status: String,
     pending_save: Option<(OperationId, ProfileId)>,
     config_uncertain: bool,
+    focus_field: Option<ProfileFieldId>,
 }
 
 impl ProfileEditor {
@@ -295,6 +300,7 @@ impl ProfileEditor {
             status: "New profile".to_owned(),
             pending_save: None,
             config_uncertain: false,
+            focus_field: None,
         }
     }
 
@@ -317,7 +323,35 @@ impl ProfileEditor {
             status: "Editing profile".to_owned(),
             pending_save: None,
             config_uncertain: false,
+            focus_field: None,
         }
+    }
+
+    pub fn request_focus(&mut self, field: ProfileFieldId) {
+        self.focus_field = Some(field);
+    }
+
+    #[cfg(test)]
+    pub(super) fn requested_focus(&self) -> Option<ProfileFieldId> {
+        self.focus_field
+    }
+
+    pub fn bind_redis_ca_file(&mut self, path: PathBuf) {
+        if self.draft.driver != DriverKind::Redis || self.draft.tls != TlsMode::Required {
+            return;
+        }
+        self.draft.redis_ca_file = path.to_string_lossy().into_owned();
+        self.errors.redis_ca_file = None;
+        self.status = "Redis CA file selected".to_owned();
+        self.focus_field = Some(ProfileFieldId::RedisCaFile);
+    }
+
+    fn redis_ca_picker_visible(&self) -> bool {
+        self.draft.driver == DriverKind::Redis && self.draft.tls == TlsMode::Required
+    }
+
+    fn redis_ca_picker_enabled(&self) -> bool {
+        self.redis_ca_picker_visible() && !self.config_uncertain && self.pending_save.is_none()
     }
 
     pub fn pending_operation(&self) -> Option<OperationId> {
@@ -455,6 +489,7 @@ impl ProfileEditor {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) -> FormAction {
+        let mut pick_redis_ca_file = false;
         if self.config_uncertain {
             ui.disable();
         }
@@ -485,11 +520,13 @@ impl ProfileEditor {
             &mut self.draft.name,
             self.errors.name.as_deref(),
         );
-        text_field(
+        text_field_with_focus(
             ui,
             "Host",
             &mut self.draft.host,
             self.errors.host.as_deref(),
+            ProfileFieldId::Host,
+            &mut self.focus_field,
         );
         text_field(
             ui,
@@ -536,13 +573,27 @@ impl ProfileEditor {
                 "Preferred is a legacy Redis mode. Choose Disabled or Required before saving.",
             );
         }
-        if self.draft.driver == DriverKind::Redis && self.draft.tls == TlsMode::Required {
-            text_field(
-                ui,
-                "Redis CA file (optional; blank uses OS roots)",
-                &mut self.draft.redis_ca_file,
-                self.errors.redis_ca_file.as_deref(),
-            );
+        if self.redis_ca_picker_visible() {
+            let picker_enabled = self.redis_ca_picker_enabled();
+            ui.label("Redis CA file (optional; blank uses OS roots)");
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.draft.redis_ca_file)
+                        .id_source(REDIS_CA_FILE_FIELD_ID),
+                );
+                request_field_focus(response, ProfileFieldId::RedisCaFile, &mut self.focus_field);
+                let picker = ui
+                    .push_id(REDIS_CA_FILE_PICK_ID, |ui| {
+                        ui.add_enabled(picker_enabled, egui::Button::new("Choose…"))
+                    })
+                    .inner;
+                let keyboard_activated = picker.has_focus()
+                    && ui.input(|input| {
+                        input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+                    });
+                pick_redis_ca_file = picker.clicked() || (picker_enabled && keyboard_activated);
+            });
+            render_error(ui, self.errors.redis_ca_file.as_deref());
         }
 
         ui.label("Credential mode");
@@ -595,34 +646,40 @@ impl ProfileEditor {
             );
         }
         ui.separator();
-        ui.horizontal(|ui| {
-            let session_save_available = self.draft.credential_mode != CredentialMode::Session
-                || self.session_keep_available;
-            let save = ui
-                .add_enabled(
-                    self.pending_operation().is_none() && session_save_available,
-                    egui::Button::new("Save"),
-                )
-                .clicked();
-            let cancel = ui
-                .add_enabled(
-                    self.pending_operation().is_none(),
-                    egui::Button::new("Cancel"),
-                )
-                .clicked();
-            if self.pending_save.is_some() {
-                ui.spinner();
-            }
-            ui.label(&self.status);
-            if save {
-                FormAction::Save
-            } else if cancel {
-                FormAction::Cancel
-            } else {
-                FormAction::None
-            }
-        })
-        .inner
+        let footer_action = ui
+            .horizontal(|ui| {
+                let session_save_available = self.draft.credential_mode != CredentialMode::Session
+                    || self.session_keep_available;
+                let save = ui
+                    .add_enabled(
+                        self.pending_operation().is_none() && session_save_available,
+                        egui::Button::new("Save"),
+                    )
+                    .clicked();
+                let cancel = ui
+                    .add_enabled(
+                        self.pending_operation().is_none(),
+                        egui::Button::new("Cancel"),
+                    )
+                    .clicked();
+                if self.pending_save.is_some() {
+                    ui.spinner();
+                }
+                ui.label(&self.status);
+                if save {
+                    FormAction::Save
+                } else if cancel {
+                    FormAction::Cancel
+                } else {
+                    FormAction::None
+                }
+            })
+            .inner;
+        if pick_redis_ca_file {
+            FormAction::PickRedisCaFile
+        } else {
+            footer_action
+        }
     }
 }
 
@@ -691,6 +748,31 @@ fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String, error: Option<
     ui.label(label);
     ui.text_edit_singleline(value);
     render_error(ui, error);
+}
+
+fn text_field_with_focus(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    error: Option<&str>,
+    field: ProfileFieldId,
+    focus_field: &mut Option<ProfileFieldId>,
+) {
+    ui.label(label);
+    let response = ui.add(egui::TextEdit::singleline(value).id_source(field.focus_id()));
+    request_field_focus(response, field, focus_field);
+    render_error(ui, error);
+}
+
+fn request_field_focus(
+    response: egui::Response,
+    field: ProfileFieldId,
+    focus_field: &mut Option<ProfileFieldId>,
+) {
+    if *focus_field == Some(field) {
+        response.request_focus();
+        *focus_field = None;
+    }
 }
 
 fn render_error(ui: &mut egui::Ui, error: Option<&str>) {
@@ -854,6 +936,48 @@ mod tests {
         assert_eq!(legacy.redis_ca_file, "/tmp/persisted-hidden.pem");
         legacy.select_tls(TlsMode::Disabled);
         assert!(legacy.redis_ca_file.is_empty());
+    }
+
+    #[test]
+    fn required_redis_ca_picker_visibility_enabled_binding_and_focus_are_exact() {
+        let mut editor = valid_editor(DriverKind::Redis);
+        assert!(!editor.redis_ca_picker_visible());
+        assert!(!editor.redis_ca_picker_enabled());
+
+        editor.draft.select_tls(TlsMode::Required);
+        assert!(editor.redis_ca_picker_visible());
+        assert!(editor.redis_ca_picker_enabled());
+
+        editor.request_focus(crate::model::ProfileFieldId::Host);
+        assert_eq!(editor.focus_field, Some(crate::model::ProfileFieldId::Host));
+        editor.bind_redis_ca_file(std::path::PathBuf::from("/tmp/private-ca.pem"));
+        assert_eq!(editor.draft.redis_ca_file, "/tmp/private-ca.pem");
+        assert_eq!(
+            editor.focus_field,
+            Some(crate::model::ProfileFieldId::RedisCaFile)
+        );
+        assert!(!format!("{:?}", editor.draft).contains("private-ca.pem"));
+
+        editor.set_config_uncertain(true);
+        assert!(editor.redis_ca_picker_visible());
+        assert!(!editor.redis_ca_picker_enabled());
+    }
+
+    #[test]
+    fn required_redis_ca_picker_has_stable_keyboard_activation_contract() {
+        let source = include_str!("profile_form.rs");
+        for required in [
+            "profile.redis_tls.ca_file",
+            "profile.redis_tls.ca_file.pick",
+            "picker.has_focus()",
+            "egui::Key::Enter",
+            "egui::Key::Space",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing picker contract: {required}"
+            );
+        }
     }
 
     #[test]

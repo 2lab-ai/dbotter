@@ -1,15 +1,17 @@
 //! Native three-zone UI. Rendering and state folding perform no I/O.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui;
 use egui_extras::{Column as TableColumn, TableBuilder};
 
 use crate::model::{
-    CatalogRequest, Cell, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT, DraftId,
-    DEFAULT_REDIS_SCAN_COUNT, DriverAvailability, DriverCapabilities, DriverKind,
-    ProfileGeneration, ProfileId, RedisKeyInspectRequest, RedisScanRequest, RequestIdentity,
+    CatalogRequest, Cell, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
+    DEFAULT_REDIS_SCAN_COUNT, DraftId, DriverAvailability, DriverCapabilities, DriverKind,
+    ProfileFieldId, ProfileGeneration, ProfileId, RedisKeyInspectRequest, RedisScanRequest,
+    RequestIdentity,
 };
 
 use super::adapter::{SubmitError, UiCommand, UiPort};
@@ -305,6 +307,10 @@ impl DbotterApp {
     }
 
     fn submit_redis_intent(&mut self, intent: RedisExplorerIntent) {
+        if let RedisExplorerIntent::EditProfileField { profile_id, field } = &intent {
+            self.open_profile_editor_at(profile_id, *field);
+            return;
+        }
         if let RedisExplorerIntent::Cancel { operation_id } = &intent {
             let operation_id = *operation_id;
             match self
@@ -395,7 +401,30 @@ impl DbotterApp {
                 }
             }
             RedisExplorerIntent::Cancel { .. } => unreachable!("handled above"),
+            RedisExplorerIntent::EditProfileField { .. } => unreachable!("handled above"),
         }
+    }
+
+    fn open_profile_editor_at(&mut self, profile_id: &ProfileId, field: ProfileFieldId) {
+        let Some(profile) = self
+            .model
+            .profiles
+            .iter()
+            .find(|profile| &profile.id == profile_id)
+            .cloned()
+        else {
+            self.model.status = "The Redis profile is no longer available.".to_owned();
+            return;
+        };
+        let draft_id = self.allocate_draft_id();
+        let mut editor = ProfileEditor::edit(
+            draft_id,
+            &profile.persisted,
+            profile.generation,
+            profile.has_current_session_secret,
+        );
+        editor.request_focus(field);
+        self.profile_editor = Some(editor);
     }
 
     fn connections(&mut self, root_ui: &mut egui::Ui) {
@@ -541,6 +570,14 @@ impl DbotterApp {
                     }
                 }
                 FormAction::Cancel => self.profile_editor = None,
+                FormAction::PickRedisCaFile => {
+                    if let Some(path) = native_redis_ca_file_picker()
+                        && let Some(editor) = self.profile_editor.as_mut()
+                    {
+                        editor.bind_redis_ca_file(path);
+                        self.model.status = "Redis CA file selected".to_owned();
+                    }
+                }
                 FormAction::None => {}
             }
             return;
@@ -698,6 +735,28 @@ const fn submit_error_message(error: SubmitError) -> &'static str {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn native_redis_ca_file_picker() -> Option<PathBuf> {
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            "POSIX path of (choose file with prompt \"Choose a Redis TLS CA file\")",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim_end_matches(['\r', '\n']);
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_redis_ca_file_picker() -> Option<PathBuf> {
+    None
+}
+
 fn render_result(ui: &mut egui::Ui, result: &crate::model::ResultSnapshot) {
     ui.horizontal_wrapped(|ui| {
         ui.label(format!("{} rows", result.rows.len()));
@@ -768,7 +827,8 @@ mod tests {
     use super::DbotterApp;
     use crate::model::{
         ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
-        ProfileGeneration, ProfileId, RedisKeyFilter, RedisKeyId, RedisTlsConfig, TlsMode,
+        ProfileFieldId, ProfileGeneration, ProfileId, RedisKeyFilter, RedisKeyId, RedisTlsConfig,
+        TlsMode,
     };
     use crate::ui::adapter::{UiCommand, bounded_ports};
     use crate::ui::model::ProfileSnapshot;
@@ -899,6 +959,38 @@ mod tests {
         );
         assert_eq!(request.cursor, 41);
         assert_eq!(request.count_hint, crate::model::DEFAULT_REDIS_SCAN_COUNT);
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn redis_tls_recovery_focuses_only_the_typed_field_and_preserves_the_same_ca() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let mut redis = profile(DriverKind::Redis, DriverAvailability::Ready);
+        redis.persisted.tls = TlsMode::Required;
+        redis.persisted.redis_tls.ca_file = Some("/tmp/same-ca.pem".into());
+        app.model.profiles = vec![redis];
+
+        app.submit_redis_intent(RedisExplorerIntent::EditProfileField {
+            profile_id: ProfileId("profile".to_owned()),
+            field: ProfileFieldId::Host,
+        });
+        let host_editor = app.profile_editor.as_ref().expect("host editor");
+        assert_eq!(host_editor.requested_focus(), Some(ProfileFieldId::Host));
+        assert_eq!(host_editor.draft.redis_ca_file, "/tmp/same-ca.pem");
+
+        app.profile_editor = None;
+        app.submit_redis_intent(RedisExplorerIntent::EditProfileField {
+            profile_id: ProfileId("profile".to_owned()),
+            field: ProfileFieldId::RedisCaFile,
+        });
+        let ca_editor = app.profile_editor.as_ref().expect("CA editor");
+        assert_eq!(
+            ca_editor.requested_focus(),
+            Some(ProfileFieldId::RedisCaFile)
+        );
+        assert_eq!(ca_editor.draft.redis_ca_file, "/tmp/same-ca.pem");
         assert!(service.try_next_command().is_none());
     }
 

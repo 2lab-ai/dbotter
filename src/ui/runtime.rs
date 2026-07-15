@@ -14,9 +14,10 @@ use futures_util::FutureExt as _;
 
 use crate::config::CommitState;
 use crate::model::{
-    DraftId, OperationId, OperationKind, ProfileGeneration, ProfileId, PublicSummary, ResultId,
-    SessionGeneration,
+    DraftId, OperationId, OperationKind, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
+    RedisKeyInspectRequest, RedisScanRequest, ResultId, SessionGeneration,
 };
+use crate::public_error::{PublicOperationError, SafeContext};
 use crate::service::{
     ApplicationService, RuntimeCreateOutcome, RuntimeDeleteOutcome, RuntimeMutationFailure,
     RuntimeReloadOutcome, RuntimeUpdateOutcome, ServiceError, SessionDisposition, TestDraftRequest,
@@ -1644,9 +1645,11 @@ async fn run_profile_work(
         ProfileWork::BrowseCatalog { request } => {
             run_catalog_browse(service, request, cancel, messages).await
         }
-        ProfileWork::ScanRedisKeys { request } => run_redis_scan(service, request, cancel).await,
+        ProfileWork::ScanRedisKeys { request } => {
+            run_redis_scan(service, request, cancel, messages).await
+        }
         ProfileWork::InspectRedisKey { request } => {
-            run_redis_inspect(service, request, cancel).await
+            run_redis_inspect(service, request, cancel, messages).await
         }
     }
 }
@@ -2118,41 +2121,365 @@ fn catalog_failed_event(
 
 async fn run_redis_scan(
     service: &ApplicationService,
-    request: crate::model::RedisScanRequest,
+    request: RedisScanRequest,
     cancel: &CancellationToken,
+    messages: &mpsc::UnboundedSender<ControllerMessage>,
 ) -> UiEvent {
+    let operation_id = request.operation_id();
+    let profile_id = request.profile_id().clone();
+    let profile_generation = request.profile_generation();
+    let kind = OperationKind::BrowseRedis;
     let deadline = tokio::time::Instant::now() + request.timeout;
-    let operation = service.scan_redis_keys(request.clone());
-    tokio::pin!(operation);
-    let result = tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(PublicSummary::OperationCancelled),
-        () = tokio::time::sleep_until(deadline) => Err(PublicSummary::OperationTimedOut),
-        result = &mut operation => result.map_err(|error| error.public_summary()),
+    let prepared = {
+        let prepare = service.prepare_redis_scan_request(&request);
+        tokio::pin!(prepare);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err((PublicSummary::OperationCancelled, PublicCode::None)),
+            () = tokio::time::sleep_until(deadline) => {
+                Err((PublicSummary::OperationTimedOut, PublicCode::None))
+            }
+            result = &mut prepare => result.map_err(|error| error.public_error_parts()),
+        }
     };
-    match result {
-        Ok(page) => UiEvent::RedisKeysLoaded { page },
-        Err(summary) => UiEvent::RedisKeysFailed { request, summary },
+    if let Err((summary, code)) = prepared {
+        return failed_redis_resource_event(
+            RedisResourceRequest::Scan(request),
+            public_redis_resource_error(kind, profile_id, operation_id, summary, code),
+            None,
+            None,
+            connection_outcome_for_summary(summary),
+        );
+    }
+
+    let acquire = service.acquire_session_at(
+        operation_id,
+        profile_id.clone(),
+        profile_generation,
+        request.timeout,
+    );
+    tokio::pin!(acquire);
+    let lease = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return failed_redis_resource_event(
+                RedisResourceRequest::Scan(request),
+                public_redis_resource_error(
+                    kind,
+                    profile_id,
+                    operation_id,
+                    PublicSummary::OperationCancelled,
+                    PublicCode::None,
+                ),
+                None,
+                None,
+                ConnectionFailureOutcome::Unknown,
+            );
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            return failed_redis_resource_event(
+                RedisResourceRequest::Scan(request),
+                public_redis_resource_error(
+                    kind,
+                    profile_id,
+                    operation_id,
+                    PublicSummary::OperationTimedOut,
+                    PublicCode::None,
+                ),
+                None,
+                None,
+                ConnectionFailureOutcome::Unknown,
+            );
+        }
+        result = &mut acquire => match result {
+            Ok(lease) => lease,
+            Err(error) => {
+                let (summary, code) = error.public_error_parts();
+                return failed_redis_resource_event(
+                    RedisResourceRequest::Scan(request),
+                    public_redis_resource_error(
+                        kind,
+                        profile_id,
+                        operation_id,
+                        summary,
+                        code,
+                    ),
+                    None,
+                    None,
+                    connection_outcome_for_summary(summary),
+                );
+            }
+        }
+    };
+    let session_generation = lease.identity().session_generation;
+    let _ = messages.send(ControllerMessage::SessionAcquired {
+        operation_id,
+        session_generation,
+    });
+    tokio::task::yield_now().await;
+
+    enum ScanAttempt {
+        Driver(Result<crate::model::RedisKeyPage, crate::drivers::DriverError>),
+        Cancelled,
+        TimedOut,
+    }
+    let attempt = {
+        let scan = lease.scan_redis_keys(&request);
+        tokio::pin!(scan);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => ScanAttempt::Cancelled,
+            () = tokio::time::sleep_until(deadline) => ScanAttempt::TimedOut,
+            result = &mut scan => ScanAttempt::Driver(result),
+        }
+    };
+    let observation = service.observe_session(&lease, operation_id).await;
+    match (attempt, observation) {
+        (ScanAttempt::Driver(Ok(page)), Ok(())) => UiEvent::RedisKeysLoaded {
+            page,
+            session_generation,
+            session_disposition: SessionDisposition::Keep,
+        },
+        (ScanAttempt::Driver(Err(driver_error)), Ok(())) => {
+            let session_disposition = SessionDisposition::for_driver_error(&driver_error);
+            let service_error = ServiceError::from(driver_error);
+            let (summary, code) = service_error.public_error_parts();
+            if session_disposition == SessionDisposition::Evict {
+                service.evict_session_lease(&lease).await;
+            }
+            failed_redis_resource_event(
+                RedisResourceRequest::Scan(request),
+                public_redis_resource_error(kind, profile_id, operation_id, summary, code),
+                Some(session_generation),
+                Some(session_disposition),
+                connection_outcome_for_disposition(session_disposition),
+            )
+        }
+        (ScanAttempt::Cancelled, _) => {
+            service.evict_session_lease(&lease).await;
+            failed_redis_resource_event(
+                RedisResourceRequest::Scan(request),
+                public_redis_resource_error(
+                    kind,
+                    profile_id,
+                    operation_id,
+                    PublicSummary::OperationCancelled,
+                    PublicCode::None,
+                ),
+                Some(session_generation),
+                Some(SessionDisposition::Evict),
+                ConnectionFailureOutcome::Disconnected,
+            )
+        }
+        (ScanAttempt::TimedOut, _) => {
+            service.evict_session_lease(&lease).await;
+            failed_redis_resource_event(
+                RedisResourceRequest::Scan(request),
+                public_redis_resource_error(
+                    kind,
+                    profile_id,
+                    operation_id,
+                    PublicSummary::OperationTimedOut,
+                    PublicCode::None,
+                ),
+                Some(session_generation),
+                Some(SessionDisposition::Evict),
+                ConnectionFailureOutcome::Disconnected,
+            )
+        }
+        (ScanAttempt::Driver(_), Err(error)) => {
+            service.evict_session_lease(&lease).await;
+            let (summary, code) = error.public_error_parts();
+            failed_redis_resource_event(
+                RedisResourceRequest::Scan(request),
+                public_redis_resource_error(kind, profile_id, operation_id, summary, code),
+                Some(session_generation),
+                Some(SessionDisposition::Evict),
+                ConnectionFailureOutcome::Disconnected,
+            )
+        }
     }
 }
 
 async fn run_redis_inspect(
     service: &ApplicationService,
-    request: crate::model::RedisKeyInspectRequest,
+    request: RedisKeyInspectRequest,
     cancel: &CancellationToken,
+    messages: &mpsc::UnboundedSender<ControllerMessage>,
 ) -> UiEvent {
+    let operation_id = request.operation_id();
+    let profile_id = request.profile_id().clone();
+    let profile_generation = request.profile_generation();
+    let kind = OperationKind::InspectRedis;
     let deadline = tokio::time::Instant::now() + request.timeout;
-    let operation = service.inspect_redis_key(request.clone());
-    tokio::pin!(operation);
-    let result = tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(PublicSummary::OperationCancelled),
-        () = tokio::time::sleep_until(deadline) => Err(PublicSummary::OperationTimedOut),
-        result = &mut operation => result.map_err(|error| error.public_summary()),
+    let prepared = {
+        let prepare = service.prepare_redis_inspect_request(&request);
+        tokio::pin!(prepare);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err((PublicSummary::OperationCancelled, PublicCode::None)),
+            () = tokio::time::sleep_until(deadline) => {
+                Err((PublicSummary::OperationTimedOut, PublicCode::None))
+            }
+            result = &mut prepare => result.map_err(|error| error.public_error_parts()),
+        }
     };
-    match result {
-        Ok(preview) => UiEvent::RedisKeyInspected { preview },
-        Err(summary) => UiEvent::RedisKeyInspectFailed { request, summary },
+    if let Err((summary, code)) = prepared {
+        return failed_redis_resource_event(
+            RedisResourceRequest::Inspect(request),
+            public_redis_resource_error(kind, profile_id, operation_id, summary, code),
+            None,
+            None,
+            connection_outcome_for_summary(summary),
+        );
+    }
+
+    let acquire = service.acquire_session_at(
+        operation_id,
+        profile_id.clone(),
+        profile_generation,
+        request.timeout,
+    );
+    tokio::pin!(acquire);
+    let lease = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return failed_redis_resource_event(
+                RedisResourceRequest::Inspect(request),
+                public_redis_resource_error(
+                    kind,
+                    profile_id,
+                    operation_id,
+                    PublicSummary::OperationCancelled,
+                    PublicCode::None,
+                ),
+                None,
+                None,
+                ConnectionFailureOutcome::Unknown,
+            );
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            return failed_redis_resource_event(
+                RedisResourceRequest::Inspect(request),
+                public_redis_resource_error(
+                    kind,
+                    profile_id,
+                    operation_id,
+                    PublicSummary::OperationTimedOut,
+                    PublicCode::None,
+                ),
+                None,
+                None,
+                ConnectionFailureOutcome::Unknown,
+            );
+        }
+        result = &mut acquire => match result {
+            Ok(lease) => lease,
+            Err(error) => {
+                let (summary, code) = error.public_error_parts();
+                return failed_redis_resource_event(
+                    RedisResourceRequest::Inspect(request),
+                    public_redis_resource_error(
+                        kind,
+                        profile_id,
+                        operation_id,
+                        summary,
+                        code,
+                    ),
+                    None,
+                    None,
+                    connection_outcome_for_summary(summary),
+                );
+            }
+        }
+    };
+    let session_generation = lease.identity().session_generation;
+    let _ = messages.send(ControllerMessage::SessionAcquired {
+        operation_id,
+        session_generation,
+    });
+    tokio::task::yield_now().await;
+
+    enum InspectAttempt {
+        Driver(Result<crate::model::RedisValuePreview, crate::drivers::DriverError>),
+        Cancelled,
+        TimedOut,
+    }
+    let attempt = {
+        let inspect = lease.inspect_redis_key(&request);
+        tokio::pin!(inspect);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => InspectAttempt::Cancelled,
+            () = tokio::time::sleep_until(deadline) => InspectAttempt::TimedOut,
+            result = &mut inspect => InspectAttempt::Driver(result),
+        }
+    };
+    let observation = service.observe_session(&lease, operation_id).await;
+    match (attempt, observation) {
+        (InspectAttempt::Driver(Ok(preview)), Ok(())) => UiEvent::RedisKeyInspected {
+            preview,
+            session_generation,
+            session_disposition: SessionDisposition::Keep,
+        },
+        (InspectAttempt::Driver(Err(driver_error)), Ok(())) => {
+            let session_disposition = SessionDisposition::for_driver_error(&driver_error);
+            let service_error = ServiceError::from(driver_error);
+            let (summary, code) = service_error.public_error_parts();
+            if session_disposition == SessionDisposition::Evict {
+                service.evict_session_lease(&lease).await;
+            }
+            failed_redis_resource_event(
+                RedisResourceRequest::Inspect(request),
+                public_redis_resource_error(kind, profile_id, operation_id, summary, code),
+                Some(session_generation),
+                Some(session_disposition),
+                connection_outcome_for_disposition(session_disposition),
+            )
+        }
+        (InspectAttempt::Cancelled, _) => {
+            service.evict_session_lease(&lease).await;
+            failed_redis_resource_event(
+                RedisResourceRequest::Inspect(request),
+                public_redis_resource_error(
+                    kind,
+                    profile_id,
+                    operation_id,
+                    PublicSummary::OperationCancelled,
+                    PublicCode::None,
+                ),
+                Some(session_generation),
+                Some(SessionDisposition::Evict),
+                ConnectionFailureOutcome::Disconnected,
+            )
+        }
+        (InspectAttempt::TimedOut, _) => {
+            service.evict_session_lease(&lease).await;
+            failed_redis_resource_event(
+                RedisResourceRequest::Inspect(request),
+                public_redis_resource_error(
+                    kind,
+                    profile_id,
+                    operation_id,
+                    PublicSummary::OperationTimedOut,
+                    PublicCode::None,
+                ),
+                Some(session_generation),
+                Some(SessionDisposition::Evict),
+                ConnectionFailureOutcome::Disconnected,
+            )
+        }
+        (InspectAttempt::Driver(_), Err(error)) => {
+            service.evict_session_lease(&lease).await;
+            let (summary, code) = error.public_error_parts();
+            failed_redis_resource_event(
+                RedisResourceRequest::Inspect(request),
+                public_redis_resource_error(kind, profile_id, operation_id, summary, code),
+                Some(session_generation),
+                Some(SessionDisposition::Evict),
+                ConnectionFailureOutcome::Disconnected,
+            )
+        }
     }
 }
 
@@ -2960,6 +3287,71 @@ async fn snapshots(application: &ApplicationService) -> Result<Vec<ProfileSnapsh
     Ok(snapshots)
 }
 
+enum RedisResourceRequest {
+    Scan(RedisScanRequest),
+    Inspect(RedisKeyInspectRequest),
+}
+
+fn public_redis_resource_error(
+    kind: OperationKind,
+    profile_id: ProfileId,
+    operation_id: OperationId,
+    summary: PublicSummary,
+    code: PublicCode,
+) -> PublicOperationError {
+    PublicOperationError::new_or_internal(
+        kind,
+        summary,
+        code,
+        &SafeContext::profile(profile_id, operation_id),
+    )
+}
+
+fn connection_outcome_for_summary(summary: PublicSummary) -> ConnectionFailureOutcome {
+    match summary {
+        PublicSummary::CredentialRequired => ConnectionFailureOutcome::NeedsCredential,
+        PublicSummary::AuthenticationFailed
+        | PublicSummary::NetworkUnavailable
+        | PublicSummary::TlsVerificationFailed => ConnectionFailureOutcome::Disconnected,
+        PublicSummary::OperationCancelled | PublicSummary::OperationTimedOut => {
+            ConnectionFailureOutcome::Unknown
+        }
+        _ => ConnectionFailureOutcome::Preserve,
+    }
+}
+
+fn connection_outcome_for_disposition(disposition: SessionDisposition) -> ConnectionFailureOutcome {
+    match disposition {
+        SessionDisposition::Keep => ConnectionFailureOutcome::Preserve,
+        SessionDisposition::Evict => ConnectionFailureOutcome::Disconnected,
+    }
+}
+
+fn failed_redis_resource_event(
+    request: RedisResourceRequest,
+    error: PublicOperationError,
+    session_generation: Option<SessionGeneration>,
+    session_disposition: Option<SessionDisposition>,
+    connection_outcome: ConnectionFailureOutcome,
+) -> UiEvent {
+    match request {
+        RedisResourceRequest::Scan(request) => UiEvent::RedisKeysFailed {
+            request,
+            error,
+            session_generation,
+            session_disposition,
+            connection_outcome,
+        },
+        RedisResourceRequest::Inspect(request) => UiEvent::RedisKeyInspectFailed {
+            request,
+            error,
+            session_generation,
+            session_disposition,
+            connection_outcome,
+        },
+    }
+}
+
 fn failed_from_service(
     operation_id: OperationId,
     profile_id: ProfileId,
@@ -3049,8 +3441,38 @@ fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEven
             summary,
         },
         UiCommand::BrowseCatalog(request) => catalog_failed_event(request, summary, None, None),
-        UiCommand::ScanRedisKeys(request) => UiEvent::RedisKeysFailed { request, summary },
-        UiCommand::InspectRedisKey(request) => UiEvent::RedisKeyInspectFailed { request, summary },
+        UiCommand::ScanRedisKeys(request) => {
+            let error = public_redis_resource_error(
+                OperationKind::BrowseRedis,
+                request.profile_id().clone(),
+                request.operation_id(),
+                summary,
+                PublicCode::None,
+            );
+            failed_redis_resource_event(
+                RedisResourceRequest::Scan(request),
+                error,
+                None,
+                None,
+                connection_outcome_for_summary(summary),
+            )
+        }
+        UiCommand::InspectRedisKey(request) => {
+            let error = public_redis_resource_error(
+                OperationKind::InspectRedis,
+                request.profile_id().clone(),
+                request.operation_id(),
+                summary,
+                PublicCode::None,
+            );
+            failed_redis_resource_event(
+                RedisResourceRequest::Inspect(request),
+                error,
+                None,
+                None,
+                connection_outcome_for_summary(summary),
+            )
+        }
         UiCommand::CreateProfile(request) => UiEvent::ProfileSaveFailed {
             operation_id: request.operation_id,
             profile_id: request

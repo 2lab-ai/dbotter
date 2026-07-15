@@ -8,6 +8,7 @@ use crate::model::{
     RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, ResultSnapshot,
     SessionGeneration,
 };
+use crate::public_error::PublicOperationError;
 use crate::service::SessionDisposition;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,17 +156,27 @@ pub enum UiEvent {
     },
     RedisKeysLoaded {
         page: RedisKeyPage,
+        session_generation: SessionGeneration,
+        session_disposition: SessionDisposition,
     },
     RedisKeysFailed {
         request: RedisScanRequest,
-        summary: PublicSummary,
+        error: PublicOperationError,
+        session_generation: Option<SessionGeneration>,
+        session_disposition: Option<SessionDisposition>,
+        connection_outcome: ConnectionFailureOutcome,
     },
     RedisKeyInspected {
         preview: RedisValuePreview,
+        session_generation: SessionGeneration,
+        session_disposition: SessionDisposition,
     },
     RedisKeyInspectFailed {
         request: RedisKeyInspectRequest,
-        summary: PublicSummary,
+        error: PublicOperationError,
+        session_generation: Option<SessionGeneration>,
+        session_disposition: Option<SessionDisposition>,
+        connection_outcome: ConnectionFailureOutcome,
     },
     OperationFailed {
         operation_id: OperationId,
@@ -210,8 +221,10 @@ pub struct UiModel {
     pub catalog_retry: HashMap<ProfileId, CatalogRequest>,
     pub redis_key_pages: HashMap<ProfileId, RedisKeyPage>,
     pub redis_scan_retry: HashMap<ProfileId, RedisScanRequest>,
+    pub redis_scan_errors: HashMap<ProfileId, PublicOperationError>,
     pub redis_value_previews: HashMap<ProfileId, RedisValuePreview>,
     pub redis_inspect_retry: HashMap<ProfileId, RedisKeyInspectRequest>,
+    pub redis_inspect_errors: HashMap<ProfileId, PublicOperationError>,
     pub status: String,
     config_uncertain: bool,
     last_profiles_operation: Option<OperationId>,
@@ -234,8 +247,10 @@ impl Default for UiModel {
             catalog_retry: HashMap::new(),
             redis_key_pages: HashMap::new(),
             redis_scan_retry: HashMap::new(),
+            redis_scan_errors: HashMap::new(),
             redis_value_previews: HashMap::new(),
             redis_inspect_retry: HashMap::new(),
+            redis_inspect_errors: HashMap::new(),
             status: "Loading profiles…".to_owned(),
             config_uncertain: false,
             last_profiles_operation: None,
@@ -446,40 +461,89 @@ impl UiModel {
                     self.status = summary.message().to_owned();
                 }
             }
-            UiEvent::RedisKeysLoaded { page } => {
+            UiEvent::RedisKeysLoaded {
+                page,
+                session_generation,
+                session_disposition,
+            } => {
                 let profile_id = page.identity.profile_id.clone();
                 if self.event_is_current(&profile_id, page.identity.profile_generation) {
                     self.redis_scan_retry.remove(&profile_id);
-                    self.redis_key_pages.insert(profile_id, page);
+                    self.redis_scan_errors.remove(&profile_id);
+                    self.redis_key_pages.insert(profile_id.clone(), page);
+                    self.apply_redis_session_truth(
+                        profile_id,
+                        Some(session_generation),
+                        Some(session_disposition),
+                        ConnectionFailureOutcome::Preserve,
+                    );
                     self.status = "Redis keys loaded".to_owned();
                 }
             }
-            UiEvent::RedisKeysFailed { request, summary } => {
+            UiEvent::RedisKeysFailed {
+                request,
+                error,
+                session_generation,
+                session_disposition,
+                connection_outcome,
+            } => {
                 let profile_id = request.profile_id().clone();
                 if self.event_is_current(&profile_id, request.profile_generation()) {
                     if let Some(page) = self.redis_key_pages.get_mut(&profile_id) {
                         page.stale = true;
                     }
-                    self.redis_scan_retry.insert(profile_id, request);
-                    self.status = summary.message().to_owned();
+                    self.redis_scan_retry.insert(profile_id.clone(), request);
+                    self.status = error.summary.message().to_owned();
+                    self.redis_scan_errors.insert(profile_id.clone(), error);
+                    self.apply_redis_session_truth(
+                        profile_id,
+                        session_generation,
+                        session_disposition,
+                        connection_outcome,
+                    );
                 }
             }
-            UiEvent::RedisKeyInspected { preview } => {
+            UiEvent::RedisKeyInspected {
+                preview,
+                session_generation,
+                session_disposition,
+            } => {
                 let profile_id = preview.identity.profile_id.clone();
                 if self.event_is_current(&profile_id, preview.identity.profile_generation) {
                     self.redis_inspect_retry.remove(&profile_id);
-                    self.redis_value_previews.insert(profile_id, preview);
+                    self.redis_inspect_errors.remove(&profile_id);
+                    self.redis_value_previews
+                        .insert(profile_id.clone(), preview);
+                    self.apply_redis_session_truth(
+                        profile_id,
+                        Some(session_generation),
+                        Some(session_disposition),
+                        ConnectionFailureOutcome::Preserve,
+                    );
                     self.status = "Redis key inspected".to_owned();
                 }
             }
-            UiEvent::RedisKeyInspectFailed { request, summary } => {
+            UiEvent::RedisKeyInspectFailed {
+                request,
+                error,
+                session_generation,
+                session_disposition,
+                connection_outcome,
+            } => {
                 let profile_id = request.profile_id().clone();
                 if self.event_is_current(&profile_id, request.profile_generation()) {
                     if let Some(preview) = self.redis_value_previews.get_mut(&profile_id) {
                         preview.stale = true;
                     }
-                    self.redis_inspect_retry.insert(profile_id, request);
-                    self.status = summary.message().to_owned();
+                    self.redis_inspect_retry.insert(profile_id.clone(), request);
+                    self.status = error.summary.message().to_owned();
+                    self.redis_inspect_errors.insert(profile_id.clone(), error);
+                    self.apply_redis_session_truth(
+                        profile_id,
+                        session_generation,
+                        session_disposition,
+                        connection_outcome,
+                    );
                 }
             }
             UiEvent::OperationFailed {
@@ -580,6 +644,41 @@ impl UiModel {
         }
     }
 
+    fn apply_redis_session_truth(
+        &mut self,
+        profile_id: ProfileId,
+        session_generation: Option<SessionGeneration>,
+        session_disposition: Option<SessionDisposition>,
+        connection_outcome: ConnectionFailureOutcome,
+    ) {
+        match (session_generation, session_disposition) {
+            (Some(session_generation), Some(SessionDisposition::Keep)) => {
+                self.connection_states.insert(
+                    profile_id,
+                    ConnectionState::Connected {
+                        session_generation,
+                        elapsed_ms: 0,
+                    },
+                );
+            }
+            (_, Some(SessionDisposition::Evict)) => {
+                self.connection_states
+                    .insert(profile_id, ConnectionState::Disconnected);
+            }
+            _ => match connection_outcome {
+                ConnectionFailureOutcome::Preserve => {}
+                ConnectionFailureOutcome::Disconnected | ConnectionFailureOutcome::Unknown => {
+                    self.connection_states
+                        .insert(profile_id, ConnectionState::Disconnected);
+                }
+                ConnectionFailureOutcome::NeedsCredential => {
+                    self.connection_states
+                        .insert(profile_id, ConnectionState::NeedsCredential);
+                }
+            },
+        }
+    }
+
     fn accept_profiles_operation(&mut self, operation_id: OperationId) -> bool {
         if self
             .last_profiles_operation
@@ -662,8 +761,10 @@ impl UiModel {
         self.catalog_retry.remove(&profile_id);
         self.redis_key_pages.remove(&profile_id);
         self.redis_scan_retry.remove(&profile_id);
+        self.redis_scan_errors.remove(&profile_id);
         self.redis_value_previews.remove(&profile_id);
         self.redis_inspect_retry.remove(&profile_id);
+        self.redis_inspect_errors.remove(&profile_id);
         if self
             .pending_execute
             .as_ref()
@@ -773,10 +874,12 @@ mod tests {
     use crate::model::{
         CatalogLevel, CatalogPage, CatalogRequest, CatalogRetainedCounts, ConnectionProfile,
         CredentialMode, DriverAvailability, DriverKind, OperationId, OperationKind,
-        ProfileGeneration, ProfileId, PublicSummary, QueryResult, RedisKeyFilter, RedisKeyPage,
-        RedisScanConsistency, RedisScanRequest, RedisTlsConfig, RequestIdentity, ResultId,
-        ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
+        ProfileGeneration, ProfileId, PublicCode, PublicSummary, QueryResult, RedisKeyFilter,
+        RedisKeyPage, RedisScanConsistency, RedisScanRequest, RedisTlsConfig, RequestIdentity,
+        ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration,
+        TlsMode,
     };
+    use crate::public_error::{PublicOperationError, SafeContext};
     use crate::service::SessionDisposition;
 
     fn result(elapsed_ms: u128) -> ResultSnapshot {
@@ -868,7 +971,15 @@ mod tests {
         });
         model.fold(UiEvent::RedisKeysFailed {
             request: redis_request.clone(),
-            summary: PublicSummary::UnsupportedFeature,
+            error: PublicOperationError::new_or_internal(
+                OperationKind::BrowseRedis,
+                PublicSummary::UnsupportedFeature,
+                PublicCode::None,
+                &SafeContext::profile(profile_id.clone(), OperationId(11)),
+            ),
+            session_generation: None,
+            session_disposition: None,
+            connection_outcome: ConnectionFailureOutcome::Preserve,
         });
 
         assert!(model.catalog_pages[&profile_id].stale);
@@ -881,12 +992,81 @@ mod tests {
             session_generation: SessionGeneration(31),
             session_disposition: SessionDisposition::Keep,
         });
-        model.fold(UiEvent::RedisKeysLoaded { page: redis_page });
+        model.fold(UiEvent::RedisKeysLoaded {
+            page: redis_page,
+            session_generation: SessionGeneration(22),
+            session_disposition: SessionDisposition::Keep,
+        });
 
         assert!(!model.catalog_pages[&profile_id].stale);
         assert!(!model.catalog_retry.contains_key(&profile_id));
         assert!(!model.redis_key_pages[&profile_id].stale);
         assert!(!model.redis_scan_retry.contains_key(&profile_id));
+        assert_eq!(
+            model.connection_state(&profile_id),
+            &ConnectionState::Connected {
+                session_generation: SessionGeneration(22),
+                elapsed_ms: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn redis_failure_fold_uses_exact_session_disposition_and_retains_typed_code() {
+        let profile_id = ProfileId("redis-session-truth".to_owned());
+        let generation = ProfileGeneration(8);
+        let request = RedisScanRequest {
+            identity: RequestIdentity::new(profile_id.clone(), generation, OperationId(31)),
+            filter: RedisKeyFilter::LiteralPrefix(String::new()),
+            cursor: 0,
+            count_hint: 100,
+            timeout: Duration::from_secs(5),
+        };
+        let mut model = UiModel {
+            active_generations: [(profile_id.clone(), generation)].into(),
+            ..UiModel::default()
+        };
+
+        model.fold(UiEvent::RedisKeysFailed {
+            request: request.clone(),
+            error: PublicOperationError::new_or_internal(
+                OperationKind::BrowseRedis,
+                PublicSummary::ResourceStale,
+                PublicCode::None,
+                &SafeContext::profile(profile_id.clone(), OperationId(31)),
+            ),
+            session_generation: Some(SessionGeneration(41)),
+            session_disposition: Some(SessionDisposition::Keep),
+            connection_outcome: ConnectionFailureOutcome::Preserve,
+        });
+        assert_eq!(
+            model.connection_state(&profile_id),
+            &ConnectionState::Connected {
+                session_generation: SessionGeneration(41),
+                elapsed_ms: 0,
+            }
+        );
+
+        model.fold(UiEvent::RedisKeysFailed {
+            request,
+            error: PublicOperationError::new_or_internal(
+                OperationKind::BrowseRedis,
+                PublicSummary::TlsVerificationFailed,
+                PublicCode::TlsHostnameMismatch,
+                &SafeContext::profile(profile_id.clone(), OperationId(31)),
+            ),
+            session_generation: Some(SessionGeneration(41)),
+            session_disposition: Some(SessionDisposition::Evict),
+            connection_outcome: ConnectionFailureOutcome::Disconnected,
+        });
+        assert_eq!(
+            model.redis_scan_errors[&profile_id].code,
+            PublicCode::TlsHostnameMismatch
+        );
+        assert_eq!(
+            model.connection_state(&profile_id),
+            &ConnectionState::Disconnected
+        );
     }
 
     #[test]

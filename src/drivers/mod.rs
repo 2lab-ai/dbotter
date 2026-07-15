@@ -14,7 +14,7 @@ use secrecy::SecretString;
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionProfile, DriverDescriptor, DriverKind,
     MySqlPublicErrorCode, PreparedMySqlRequest, QueryResult, RedisExecuteRequest,
-    RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, TlsMode,
+    RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

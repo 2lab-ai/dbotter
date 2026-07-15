@@ -922,6 +922,32 @@ impl SessionLease {
             }),
         }
     }
+
+    pub(crate) async fn scan_redis_keys(
+        &self,
+        request: &RedisScanRequest,
+    ) -> Result<RedisKeyPage, DriverError> {
+        match self.connected_resources()? {
+            ConnectedResources::Redis { keyspace, .. } => keyspace.scan_keys(request).await,
+            _ => Err(DriverError::Unsupported {
+                driver: self.profile.driver,
+                operation: "mismatched keyspace resource".to_owned(),
+            }),
+        }
+    }
+
+    pub(crate) async fn inspect_redis_key(
+        &self,
+        request: &RedisKeyInspectRequest,
+    ) -> Result<RedisValuePreview, DriverError> {
+        match self.connected_resources()? {
+            ConnectedResources::Redis { keyspace, .. } => keyspace.inspect_key(request).await,
+            _ => Err(DriverError::Unsupported {
+                driver: self.profile.driver,
+                operation: "mismatched key inspection resource".to_owned(),
+            }),
+        }
+    }
 }
 
 struct ObservedMutationOutcome {
@@ -2061,6 +2087,24 @@ impl ApplicationService {
         &self,
         request: RedisScanRequest,
     ) -> Result<RedisKeyPage, ServiceError> {
+        self.prepare_redis_scan_request(&request).await?;
+        let lease = self
+            .acquire_session_at(
+                request.operation_id(),
+                request.profile_id().clone(),
+                request.profile_generation(),
+                request.timeout,
+            )
+            .await?;
+        let result = lease.scan_redis_keys(&request).await;
+        self.finish_resource_operation(&lease, request.operation_id(), result)
+            .await
+    }
+
+    pub(crate) async fn prepare_redis_scan_request(
+        &self,
+        request: &RedisScanRequest,
+    ) -> Result<(), ServiceError> {
         request.validate().map_err(service_request_error)?;
         self.ensure_typed_resource_request(
             request.identity(),
@@ -2068,7 +2112,15 @@ impl ApplicationService {
             DriverCapabilities::KEYSPACE_BROWSE,
             "redis keyspace browsing",
         )
-        .await?;
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn inspect_redis_key(
+        &self,
+        request: RedisKeyInspectRequest,
+    ) -> Result<RedisValuePreview, ServiceError> {
+        self.prepare_redis_inspect_request(&request).await?;
         let lease = self
             .acquire_session_at(
                 request.operation_id(),
@@ -2077,22 +2129,15 @@ impl ApplicationService {
                 request.timeout,
             )
             .await?;
-        let result = match lease.connected_resources() {
-            Ok(ConnectedResources::Redis { keyspace, .. }) => keyspace.scan_keys(&request).await,
-            Ok(_) => Err(DriverError::Unsupported {
-                driver: lease.profile.driver,
-                operation: "mismatched keyspace resource".to_owned(),
-            }),
-            Err(error) => Err(error),
-        };
+        let result = lease.inspect_redis_key(&request).await;
         self.finish_resource_operation(&lease, request.operation_id(), result)
             .await
     }
 
-    pub async fn inspect_redis_key(
+    pub(crate) async fn prepare_redis_inspect_request(
         &self,
-        request: RedisKeyInspectRequest,
-    ) -> Result<RedisValuePreview, ServiceError> {
+        request: &RedisKeyInspectRequest,
+    ) -> Result<(), ServiceError> {
         request.validate().map_err(service_request_error)?;
         self.ensure_typed_resource_request(
             request.identity(),
@@ -2100,25 +2145,8 @@ impl ApplicationService {
             DriverCapabilities::KEYSPACE_BROWSE,
             "redis key inspection",
         )
-        .await?;
-        let lease = self
-            .acquire_session_at(
-                request.operation_id(),
-                request.profile_id().clone(),
-                request.profile_generation(),
-                request.timeout,
-            )
-            .await?;
-        let result = match lease.connected_resources() {
-            Ok(ConnectedResources::Redis { keyspace, .. }) => keyspace.inspect_key(&request).await,
-            Ok(_) => Err(DriverError::Unsupported {
-                driver: lease.profile.driver,
-                operation: "mismatched key inspection resource".to_owned(),
-            }),
-            Err(error) => Err(error),
-        };
-        self.finish_resource_operation(&lease, request.operation_id(), result)
-            .await
+        .await
+        .map(|_| ())
     }
 
     async fn ensure_typed_resource_request(

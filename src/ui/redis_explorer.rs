@@ -7,9 +7,10 @@ use eframe::egui;
 
 use crate::drivers::redis_browser::RedisScanAccumulator;
 use crate::model::{
-    Cell, MAX_REDIS_FILTER_BYTES, OperationId, ProfileGeneration, ProfileId, PublicSummary,
+    Cell, MAX_REDIS_FILTER_BYTES, OperationId, ProfileFieldId, ProfileGeneration, ProfileId,
     RedisKeyFilter, RedisKeyId, RedisTtl, RedisValuePreview,
 };
+use crate::public_error::{PublicOperationError, RecoveryAction};
 
 use super::model::UiEvent;
 
@@ -40,6 +41,10 @@ pub(super) enum RedisExplorerIntent {
     },
     Cancel {
         operation_id: OperationId,
+    },
+    EditProfileField {
+        profile_id: ProfileId,
+        field: ProfileFieldId,
     },
 }
 
@@ -73,12 +78,12 @@ pub(super) struct RedisExplorer {
     scan: RedisScanAccumulator,
     pending_scan: Option<PendingScan>,
     scan_retry: Option<ScanRetry>,
-    scan_error: Option<PublicSummary>,
+    scan_error: Option<PublicOperationError>,
     selected_key: Option<RedisKeyId>,
     preview: Option<RedisValuePreview>,
     pending_inspect: Option<PendingInspect>,
     inspect_retry: Option<RedisKeyId>,
-    inspect_error: Option<PublicSummary>,
+    inspect_error: Option<PublicOperationError>,
     inspect_stale: bool,
     submit_error: Option<String>,
 }
@@ -161,7 +166,7 @@ impl RedisExplorer {
 
     pub fn handle_event(&mut self, event: &UiEvent) {
         match event {
-            UiEvent::RedisKeysLoaded { page }
+            UiEvent::RedisKeysLoaded { page, .. }
                 if self.matches_profile(
                     &page.identity.profile_id,
                     page.identity.profile_generation,
@@ -187,7 +192,7 @@ impl RedisExplorer {
                 self.scan_error = None;
                 self.submit_error = None;
             }
-            UiEvent::RedisKeysFailed { request, summary }
+            UiEvent::RedisKeysFailed { request, error, .. }
                 if self.matches_profile(request.profile_id(), request.profile_generation())
                     && self.pending_scan.as_ref().is_some_and(|pending| {
                         pending.operation_id == request.operation_id()
@@ -203,9 +208,9 @@ impl RedisExplorer {
                     cursor: request.cursor,
                     restart: pending.restart,
                 });
-                self.scan_error = Some(*summary);
+                self.scan_error = Some(error.clone());
             }
-            UiEvent::RedisKeyInspected { preview }
+            UiEvent::RedisKeyInspected { preview, .. }
                 if self.matches_profile(
                     &preview.identity.profile_id,
                     preview.identity.profile_generation,
@@ -222,7 +227,7 @@ impl RedisExplorer {
                 self.inspect_stale = preview.stale;
                 self.submit_error = None;
             }
-            UiEvent::RedisKeyInspectFailed { request, summary }
+            UiEvent::RedisKeyInspectFailed { request, error, .. }
                 if self.matches_profile(request.profile_id(), request.profile_generation())
                     && self.pending_inspect.as_ref().is_some_and(|pending| {
                         pending.operation_id == request.operation_id() && pending.key == request.key
@@ -230,7 +235,7 @@ impl RedisExplorer {
             {
                 self.pending_inspect = None;
                 self.inspect_retry = Some(request.key.clone());
-                self.inspect_error = Some(*summary);
+                self.inspect_error = Some(error.clone());
                 self.inspect_stale = self.preview.is_some();
             }
             UiEvent::ConfigUncertain { .. } => {
@@ -276,6 +281,22 @@ impl RedisExplorer {
                 cursor: retry.cursor,
                 restart: retry.restart,
             })
+    }
+
+    fn page_filter_matches_draft(&self) -> bool {
+        self.scan.filter() == &self.current_filter()
+    }
+
+    fn load_more_intent(&self) -> Option<RedisExplorerIntent> {
+        (self.pending_scan.is_none()
+            && !self.scan.is_complete()
+            && !self.scan.keys().is_empty()
+            && self.page_filter_matches_draft())
+        .then(|| RedisExplorerIntent::Scan {
+            filter: self.scan.filter().clone(),
+            cursor: self.scan.next_cursor(),
+            restart: false,
+        })
     }
 
     pub fn show(
@@ -425,8 +446,10 @@ fn render_scan_status(
                     operation_id: pending.operation_id,
                 });
             }
-        } else if let Some(error) = explorer.scan_error {
-            ui.label(egui::RichText::new(format!("Scan error: {}", error.message())).strong());
+        } else if let Some(error) = explorer.scan_error.as_ref() {
+            ui.label(
+                egui::RichText::new(format!("Scan error: {}", error.summary.message())).strong(),
+            );
         } else if explorer.scan.keys().is_empty() && !explorer.scan.is_complete() {
             ui.label("Status: ready to scan.");
         } else {
@@ -442,11 +465,43 @@ fn render_scan_status(
             ));
         }
     });
+    if let Some((profile_id, field)) = explorer
+        .scan_error
+        .as_ref()
+        .and_then(recovery_profile_field)
+        && ui
+            .push_id("redis.scan.edit_profile", |ui| {
+                secondary_button(ui, recovery_button_label(field), true)
+            })
+            .inner
+            .clicked()
+    {
+        *intent = Some(RedisExplorerIntent::EditProfileField { profile_id, field });
+    }
     if explorer.scan.skipped_oversize() > 0 || explorer.scan.truncated() {
         ui.label(format!(
             "Retention notice: {} oversize keys skipped; capped results are not selectable.",
             explorer.scan.skipped_oversize()
         ));
+    }
+}
+
+fn recovery_profile_field(error: &PublicOperationError) -> Option<(ProfileId, ProfileFieldId)> {
+    error
+        .recovery
+        .as_slice()
+        .iter()
+        .find_map(|action| match action {
+            RecoveryAction::EditProfile(profile_id, field) => Some((profile_id.clone(), *field)),
+            _ => None,
+        })
+}
+
+fn recovery_button_label(field: ProfileFieldId) -> &'static str {
+    match field {
+        ProfileFieldId::RedisCaFile => "Edit TLS CA file",
+        ProfileFieldId::Host => "Edit host",
+        _ => "Edit profile",
     }
 }
 
@@ -492,10 +547,8 @@ fn render_keys(
 
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
-        let can_load = actions_enabled
-            && explorer.pending_scan.is_none()
-            && !explorer.scan.is_complete()
-            && !explorer.scan.keys().is_empty();
+        let load_more = explorer.load_more_intent();
+        let can_load = actions_enabled && load_more.is_some();
         if ui
             .push_id("redis.load_more", |ui| {
                 secondary_button(ui, "Load more", can_load)
@@ -503,11 +556,7 @@ fn render_keys(
             .inner
             .clicked()
         {
-            *intent = Some(RedisExplorerIntent::Scan {
-                filter: explorer.scan.filter().clone(),
-                cursor: explorer.scan.next_cursor(),
-                restart: false,
-            });
+            *intent = load_more;
         }
         if explorer.scan_retry.is_some()
             && ui
@@ -520,6 +569,13 @@ fn render_keys(
             *intent = explorer.retry_scan_intent();
         }
     });
+    if !explorer.scan.keys().is_empty() && !explorer.page_filter_matches_draft() {
+        ui.label(
+            egui::RichText::new("Filter changed. Refresh before loading another SCAN page.")
+                .small()
+                .color(MUTED),
+        );
+    }
 }
 
 fn render_preview(
@@ -556,8 +612,23 @@ fn render_preview(
             }
         });
     }
-    if let Some(error) = explorer.inspect_error {
-        ui.label(egui::RichText::new(format!("Inspect error: {}", error.message())).strong());
+    if let Some(error) = explorer.inspect_error.as_ref() {
+        ui.label(
+            egui::RichText::new(format!("Inspect error: {}", error.summary.message())).strong(),
+        );
+    }
+    if let Some((profile_id, field)) = explorer
+        .inspect_error
+        .as_ref()
+        .and_then(recovery_profile_field)
+        && ui
+            .push_id("redis.inspect.edit_profile", |ui| {
+                secondary_button(ui, recovery_button_label(field), true)
+            })
+            .inner
+            .clicked()
+    {
+        *intent = Some(RedisExplorerIntent::EditProfileField { profile_id, field });
     }
 
     let inspect_enabled =
@@ -722,12 +793,14 @@ mod tests {
 
     use super::{RedisExplorer, RedisExplorerIntent};
     use crate::model::{
-        Cell, OperationId, ProfileGeneration, ProfileId, PublicSummary, RedisKeyEntry,
-        RedisKeyFilter, RedisKeyId, RedisKeyInspectRequest, RedisKeyPage, RedisScanConsistency,
-        RedisScanRequest, RedisTtl, RedisValuePreview, RedisValueType, RequestIdentity,
-        TransientAllocationQualification,
+        Cell, OperationId, OperationKind, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode,
+        PublicSummary, RedisKeyEntry, RedisKeyFilter, RedisKeyId, RedisKeyInspectRequest,
+        RedisKeyPage, RedisScanConsistency, RedisScanRequest, RedisTtl, RedisValuePreview,
+        RedisValueType, RequestIdentity, SessionGeneration, TransientAllocationQualification,
     };
-    use crate::ui::model::UiEvent;
+    use crate::public_error::{PublicOperationError, SafeContext};
+    use crate::service::SessionDisposition;
+    use crate::ui::model::{ConnectionFailureOutcome, UiEvent};
 
     fn identity(operation: u64) -> RequestIdentity {
         RequestIdentity::new(
@@ -782,6 +855,71 @@ mod tests {
         }
     }
 
+    fn loaded(page: RedisKeyPage) -> UiEvent {
+        UiEvent::RedisKeysLoaded {
+            page,
+            session_generation: SessionGeneration(9),
+            session_disposition: SessionDisposition::Keep,
+        }
+    }
+
+    fn inspected(preview: RedisValuePreview) -> UiEvent {
+        UiEvent::RedisKeyInspected {
+            preview,
+            session_generation: SessionGeneration(9),
+            session_disposition: SessionDisposition::Keep,
+        }
+    }
+
+    fn public_error(
+        kind: OperationKind,
+        operation_id: OperationId,
+        summary: PublicSummary,
+        code: PublicCode,
+    ) -> PublicOperationError {
+        PublicOperationError::new_or_internal(
+            kind,
+            summary,
+            code,
+            &SafeContext::profile(ProfileId("redis-ui".to_owned()), operation_id),
+        )
+    }
+
+    fn scan_failed(request: RedisScanRequest, summary: PublicSummary) -> UiEvent {
+        scan_failed_with_code(request, summary, PublicCode::None)
+    }
+
+    fn scan_failed_with_code(
+        request: RedisScanRequest,
+        summary: PublicSummary,
+        code: PublicCode,
+    ) -> UiEvent {
+        let operation_id = request.operation_id();
+        UiEvent::RedisKeysFailed {
+            request,
+            error: public_error(OperationKind::BrowseRedis, operation_id, summary, code),
+            session_generation: Some(SessionGeneration(9)),
+            session_disposition: Some(SessionDisposition::Evict),
+            connection_outcome: ConnectionFailureOutcome::Disconnected,
+        }
+    }
+
+    fn inspect_failed(request: RedisKeyInspectRequest, summary: PublicSummary) -> UiEvent {
+        let operation_id = request.operation_id();
+        UiEvent::RedisKeyInspectFailed {
+            request,
+            error: public_error(
+                OperationKind::InspectRedis,
+                operation_id,
+                summary,
+                PublicCode::None,
+            ),
+            session_generation: Some(SessionGeneration(9)),
+            session_disposition: Some(SessionDisposition::Keep),
+            connection_outcome: ConnectionFailureOutcome::Preserve,
+        }
+    }
+
     fn explorer() -> RedisExplorer {
         let mut explorer = RedisExplorer::default();
         explorer.set_profile(Some((
@@ -796,18 +934,69 @@ mod tests {
         let mut explorer = explorer();
         let filter = RedisKeyFilter::LiteralPrefix("p5:".to_owned());
         explorer.begin_scan(OperationId(1), filter.clone(), 0, true);
-        explorer.handle_event(&UiEvent::RedisKeysLoaded {
-            page: page(1, 41, &[b"p5:a", b"p5:\xff"]),
-        });
+        explorer.handle_event(&loaded(page(1, 41, &[b"p5:a", b"p5:\xff"])));
         assert_eq!(explorer.scan.keys().len(), 2);
         assert!(!explorer.scan.is_complete());
 
         explorer.begin_scan(OperationId(2), filter, 41, false);
-        explorer.handle_event(&UiEvent::RedisKeysLoaded {
-            page: page(2, 0, &[b"p5:a", b"p5:b"]),
-        });
+        explorer.handle_event(&loaded(page(2, 0, &[b"p5:a", b"p5:b"])));
         assert_eq!(explorer.scan.keys().len(), 3);
         assert!(explorer.scan.is_complete());
+    }
+
+    #[test]
+    fn load_more_never_reuses_a_cursor_after_the_draft_filter_changes() {
+        let mut explorer = explorer();
+        explorer.filter_text = "p5:".to_owned();
+        explorer.begin_scan(
+            OperationId(1),
+            RedisKeyFilter::LiteralPrefix("p5:".to_owned()),
+            0,
+            true,
+        );
+        explorer.handle_event(&loaded(page(1, 41, &[b"p5:a"])));
+        assert!(explorer.page_filter_matches_draft());
+        assert_eq!(
+            explorer.load_more_intent(),
+            Some(RedisExplorerIntent::Scan {
+                filter: RedisKeyFilter::LiteralPrefix("p5:".to_owned()),
+                cursor: 41,
+                restart: false,
+            })
+        );
+
+        explorer.filter_text = "other:".to_owned();
+        assert!(!explorer.page_filter_matches_draft());
+        assert_eq!(explorer.load_more_intent(), None);
+    }
+
+    #[test]
+    fn tls_ca_and_hostname_codes_route_to_only_their_exact_profile_fields() {
+        let ca_error = public_error(
+            OperationKind::BrowseRedis,
+            OperationId(21),
+            PublicSummary::TlsVerificationFailed,
+            PublicCode::RedisTlsCaUntrustedIssuer,
+        );
+        assert_eq!(
+            super::recovery_profile_field(&ca_error),
+            Some((
+                ProfileId("redis-ui".to_owned()),
+                ProfileFieldId::RedisCaFile,
+            ))
+        );
+
+        let host_error = public_error(
+            OperationKind::BrowseRedis,
+            OperationId(22),
+            PublicSummary::TlsVerificationFailed,
+            PublicCode::TlsHostnameMismatch,
+        );
+        assert_eq!(
+            super::recovery_profile_field(&host_error),
+            Some((ProfileId("redis-ui".to_owned()), ProfileFieldId::Host))
+        );
+        assert_ne!(ca_error.code, host_error.code);
     }
 
     #[test]
@@ -819,9 +1008,7 @@ mod tests {
             0,
             true,
         );
-        explorer.handle_event(&UiEvent::RedisKeysLoaded {
-            page: page(1, 0, &[b"p5:kept"]),
-        });
+        explorer.handle_event(&loaded(page(1, 0, &[b"p5:kept"])));
         explorer.begin_scan(
             OperationId(2),
             RedisKeyFilter::LiteralPrefix("new:".to_owned()),
@@ -832,10 +1019,7 @@ mod tests {
             filter: RedisKeyFilter::LiteralPrefix("new:".to_owned()),
             ..scan_request(2, 0)
         };
-        explorer.handle_event(&UiEvent::RedisKeysFailed {
-            request,
-            summary: PublicSummary::OperationTimedOut,
-        });
+        explorer.handle_event(&scan_failed(request, PublicSummary::OperationTimedOut));
 
         assert_eq!(explorer.scan.keys()[0].id.as_bytes(), b"p5:kept");
         assert!(explorer.scan.stale());
@@ -854,26 +1038,25 @@ mod tests {
         let mut explorer = explorer();
         let filter = RedisKeyFilter::LiteralPrefix("p5:".to_owned());
         explorer.begin_scan(OperationId(1), filter.clone(), 0, true);
-        explorer.handle_event(&UiEvent::RedisKeysLoaded {
-            page: page(1, 0, &[b"p5:cached"]),
-        });
+        explorer.handle_event(&loaded(page(1, 0, &[b"p5:cached"])));
 
         explorer.begin_scan(OperationId(2), filter, 0, true);
         explorer.cancel_submitted(OperationId(2));
-        explorer.handle_event(&UiEvent::RedisKeysFailed {
-            request: scan_request(2, 0),
-            summary: PublicSummary::OperationCancelled,
-        });
+        explorer.handle_event(&scan_failed(
+            scan_request(2, 0),
+            PublicSummary::OperationCancelled,
+        ));
 
         assert!(explorer.pending_scan.is_none());
         assert_eq!(explorer.scan.keys()[0].id.as_bytes(), b"p5:cached");
         assert!(explorer.scan.stale());
-        assert_eq!(explorer.scan_error, Some(PublicSummary::OperationCancelled));
+        assert_eq!(
+            explorer.scan_error.as_ref().map(|error| error.summary),
+            Some(PublicSummary::OperationCancelled)
+        );
         assert!(explorer.retry_scan_intent().is_some());
 
-        explorer.handle_event(&UiEvent::RedisKeysLoaded {
-            page: page(2, 0, &[b"p5:late"]),
-        });
+        explorer.handle_event(&loaded(page(2, 0, &[b"p5:late"])));
         assert_eq!(explorer.scan.keys().len(), 1, "late success is ignored");
     }
 
@@ -882,27 +1065,23 @@ mod tests {
         let mut explorer = explorer();
         let raw = RedisKeyId(vec![b'p', b'5', b':', 0xff]);
         explorer.begin_inspect(OperationId(7), raw.clone());
-        explorer.handle_event(&UiEvent::RedisKeyInspected {
-            preview: preview(6, raw.as_bytes(), "late"),
-        });
+        explorer.handle_event(&inspected(preview(6, raw.as_bytes(), "late")));
         assert!(explorer.preview.is_none(), "late operation is ignored");
-        explorer.handle_event(&UiEvent::RedisKeyInspected {
-            preview: preview(7, raw.as_bytes(), "current"),
-        });
+        explorer.handle_event(&inspected(preview(7, raw.as_bytes(), "current")));
         assert!(matches!(
             &explorer.preview.as_ref().expect("preview").items[0],
             Cell::Text(value) if value == "current"
         ));
 
         explorer.begin_inspect(OperationId(8), raw.clone());
-        explorer.handle_event(&UiEvent::RedisKeyInspectFailed {
-            request: RedisKeyInspectRequest {
+        explorer.handle_event(&inspect_failed(
+            RedisKeyInspectRequest {
                 identity: identity(8),
                 key: raw.clone(),
                 timeout: Duration::from_secs(5),
             },
-            summary: PublicSummary::ResourceStale,
-        });
+            PublicSummary::ResourceStale,
+        ));
         assert!(explorer.inspect_stale);
         assert_eq!(explorer.inspect_retry, Some(raw));
         assert!(explorer.preview.is_some());

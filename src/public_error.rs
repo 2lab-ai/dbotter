@@ -278,7 +278,7 @@ pub struct UnreachableRecovery {
     pub code: PublicCode,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PublicOperationError {
     pub operation: OperationKind,
     pub category: ErrorCategory,
@@ -309,6 +309,29 @@ impl PublicOperationError {
             code,
             summary,
             recovery,
+        })
+    }
+
+    /// Builds the requested public error, falling back to a safe internal row
+    /// if a newly introduced service pair has not yet been added to the
+    /// recovery matrix. This boundary never exposes the underlying error.
+    pub fn new_or_internal(
+        operation: OperationKind,
+        summary: PublicSummary,
+        code: PublicCode,
+        context: &SafeContext,
+    ) -> Self {
+        Self::new(operation, summary, code, context).unwrap_or_else(|_| {
+            let operation_id = context.operation_id();
+            let mut recovery = NonEmpty::new(RecoveryAction::RestartApplication);
+            recovery.push(RecoveryAction::DismissError(operation_id));
+            Self {
+                operation,
+                category: ErrorCategory::Internal,
+                code: PublicCode::None,
+                summary: PublicSummary::InternalFailure,
+                recovery,
+            }
         })
     }
 }
