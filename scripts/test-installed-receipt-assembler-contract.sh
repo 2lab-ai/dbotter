@@ -78,6 +78,7 @@ expect_reject cli-source cli '.cli.source_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 expect_reject cli-shim cli '.cli.shim.path = "/tmp/bin/dbotter"'
 expect_reject cli-resolved-app cli '.cli.app.resolved_path = .cli.app.path'
 expect_reject gui-driver gui '.gui.driver.source_sha256 = "invalid"'
+expect_reject gui-driver-source gui '.gui.driver.source_repo_path = "docs/usable-mvp/spec.md" | .gui.driver.source_sha256 = "4c78aa0b957814d0dbaf46e8938a93701e2f85f0a6bb88772ef06b1b1da90cf3"'
 expect_reject gui-source gui '.gui.source_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
 expect_reject gui-required-ax gui '.gui.ax_identifiers -= ["profile.connection_id"]'
 expect_reject p7-digest p7 '.p7.external_export_verifier[0].actual_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'

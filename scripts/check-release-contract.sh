@@ -69,6 +69,7 @@ for executable in \
   scripts/verify-hermetic.sh \
   scripts/verify-live-contracts.sh \
   scripts/verify-installed.sh \
+  scripts/build-native-ax-driver.sh \
   scripts/verify-installed-gui.sh \
   scripts/verify-local.sh; do
   test -x "$executable" || fail "$executable is missing or not executable"
@@ -81,6 +82,7 @@ for schema in \
   test -s "$schema" || fail "$schema is missing or empty"
 done
 test -s scripts/live_contract.py || fail "scripts/live_contract.py is missing or empty"
+test -s scripts/native-ax-driver.swift || fail "scripts/native-ax-driver.swift is missing or empty"
 
 package_version="$(./scripts/package-version.sh)"
 manifest_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -1)"
@@ -101,6 +103,8 @@ require_literal scripts/verify-hermetic.sh 'cargo clippy --all-targets --all-fea
 require_literal scripts/verify-hermetic.sh 'cargo test --all-features --locked'
 require_literal scripts/verify-hermetic.sh 'src/export.rs'
 require_literal scripts/verify-hermetic.sh 'tests/export_file_contract.rs'
+require_literal scripts/verify-hermetic.sh 'scripts/native-ax-driver.swift'
+require_literal scripts/verify-hermetic.sh 'scripts/build-native-ax-driver.sh'
 require_literal scripts/verify-live-contracts.sh 'p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli'
 require_literal scripts/verify-live-contracts.sh 'live_mysql_safety_receipt'
 require_literal scripts/verify-live-contracts.sh 'redis_live_receipt'
@@ -111,7 +115,8 @@ require_literal scripts/assemble-live-contract-receipt.py 'from live_contract im
 require_literal scripts/assemble-installed-receipt.py 'from live_contract import SUITES'
 require_literal scripts/verify-installed-gui.sh 'profile.connection_id'
 require_literal scripts/verify-installed-gui.sh 'result.export.json'
-require_literal scripts/verify-installed-gui.sh 'DBOTTER_AX_DRIVER'
+require_literal scripts/verify-installed-gui.sh 'dbotter.native-ax-observations.v1'
+require_literal scripts/verify-installed-gui.sh 'scripts/build-native-ax-driver.sh'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.p7-installed-evidence.v1'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.formula-install-evidence.v1'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.live-contract-receipt.v2'

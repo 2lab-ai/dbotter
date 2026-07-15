@@ -73,6 +73,8 @@ required_inputs=(
   scripts/test-installed-receipt-assembler-contract.sh
   scripts/assemble-installed-receipt.py
   scripts/verify-installed.sh
+  scripts/native-ax-driver.swift
+  scripts/build-native-ax-driver.sh
   scripts/verify-installed-gui.sh
   packaging/macos/Info.plist
   packaging/macos/stable-ax-identifiers.json

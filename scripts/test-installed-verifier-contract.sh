@@ -64,10 +64,28 @@ for deterministic_build in \
   swiftc \
   -no_uuid \
   cmp \
-  git\ ls-files; do
+  'ls-files --error-unmatch'; do
   grep -Fq -- "$deterministic_build" "$native_builder" \
     || fail "native AX driver builder omits deterministic pin: $deterministic_build"
 done
+if [ "$(uname -s)" = "Darwin" ]; then
+  native_temp=$(mktemp -d "${TMPDIR:-/tmp}/dbotter-native-ax-contract.XXXXXX")
+  cleanup_native() {
+    rm -f "$native_temp/driver-one" "$native_temp/driver-two"
+    rmdir "$native_temp" 2>/dev/null || true
+  }
+  trap cleanup_native 0 1 2 15
+  "$native_builder" --output "$native_temp/driver-one"
+  "$native_temp/driver-one" --help >/dev/null
+  "$native_builder" --output "$native_temp/driver-two"
+  cmp -s "$native_temp/driver-one" "$native_temp/driver-two" \
+    || fail "canonical native AX driver build is not reproducible"
+  if "$native_builder" --output "$native_temp/driver-one" >/dev/null 2>&1; then
+    fail "native AX driver builder replaced an existing output"
+  fi
+  cleanup_native
+  trap - 0 1 2 15
+fi
 for required_id in \
   connection.new \
   connection.new.mysql \
@@ -113,6 +131,9 @@ for fail_closed in \
   grep -Fq -- "$fail_closed" "$gui" || fail "GUI verifier omits fail-closed contract: $fail_closed"
 done
 
+grep -Fq -- 'cargo test --all-features --locked' "$gui" \
+  || fail "GUI verifier omits the source-backed verdict gate"
+
 for provenance in \
   'git ls-files --error-unmatch' \
   'receipt_sha256_file "$ax_driver"' \
@@ -123,6 +144,10 @@ for provenance in \
 done
 if grep -Fq -- 'DBOTTER_AX_DRIVER' "$gui"; then
   fail "GUI verifier still permits an arbitrary self-reporting AX driver"
+fi
+if grep -Fq -- 'all(.assertions[]; . == true)' "$gui" \
+  || grep -Fq -- 'dbotter.installed-gui-driver-evidence.v1' "$gui"; then
+  fail "GUI verifier still trusts driver-authored verdict booleans"
 fi
 grep -Fq -- 'installed GUI verifier checkout does not equal the manifest source SHA' "$gui" \
   || fail "GUI verifier is not source-bound"

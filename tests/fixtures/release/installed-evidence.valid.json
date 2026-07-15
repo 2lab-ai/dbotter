@@ -767,8 +767,8 @@
     "source_sha": "0123456789abcdef0123456789abcdef01234567",
     "driver": {
       "executable_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-      "source_repo_path": "scripts/verify-installed-gui.sh",
-      "source_sha256": "958d3815a888b354be963ba561ea922575899f81365d857920a04b3fba657e4b"
+      "source_repo_path": "scripts/native-ax-driver.swift",
+      "source_sha256": "9873fe3ad6b3fcbe3cdb8c5ff7e7cfb1db49b4253b80e04a73216daf4774f1d3"
     },
     "app_path": "/usr/local/opt/dbotter-preview/Dbotter Preview.app",
     "bundle_id": "ai.2lab.dbotter.preview",

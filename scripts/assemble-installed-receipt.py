@@ -38,6 +38,7 @@ CONFIG_CONTRACT = {
 }
 APP_BUNDLE_ID = "ai.2lab.dbotter.preview"
 ICON_SHA256 = "5548922d61e5d3bc0dda0abe795e8dd77afda63a763c5482815e262d718559bd"
+NATIVE_AX_DRIVER_SOURCE = "scripts/native-ax-driver.swift"
 REQUIRED_AX_IDS = {
     "connection.new",
     "connection.new.mysql",
@@ -560,6 +561,8 @@ def assemble(args: argparse.Namespace, documents: dict[str, Any]) -> dict[str, A
     require_sha256(driver["executable_sha256"], "gui.driver.executable_sha256")
     require_sha256(driver["source_sha256"], "gui.driver.source_sha256")
     source_repo_path = require_string(driver["source_repo_path"], "gui.driver.source_repo_path")
+    if source_repo_path != NATIVE_AX_DRIVER_SOURCE:
+        raise AssembleError("GUI evidence does not name the canonical native AX driver source")
     if (
         SAFE_REPO_PATH_RE.fullmatch(source_repo_path) is None
         or source_repo_path.startswith("/")
