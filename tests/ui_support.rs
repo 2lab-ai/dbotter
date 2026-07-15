@@ -20,3 +20,13 @@ fn runtime_does_not_hard_code_every_execute_as_a_mutation() {
     let source = include_str!("../src/ui/runtime.rs");
     assert!(!source.contains("kind: OperationKind::ExecuteMutation,"));
 }
+
+#[test]
+fn actual_app_owns_the_openai_theme_first_run_and_responsive_layout() {
+    let source = include_str!("../src/ui/app.rs");
+
+    assert!(source.contains("OpenAiTheme::apply(ui.ctx())"));
+    assert!(source.contains("NativeLayout::columns_for_width"));
+    assert!(source.contains("show_first_run"));
+    assert!(source.contains("connection.mongodb.planned"));
+}

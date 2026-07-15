@@ -922,7 +922,7 @@ mod tests {
     use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
     use crate::ui::model::{ProfileSnapshot, WorkspaceKey};
     use crate::ui::redis_explorer::RedisExplorerIntent;
-    use eframe::egui::{Context, Event, Key, Modifiers, RawInput};
+    use eframe::egui::{Context, Event, Key, Modifiers, RawInput, accesskit};
 
     fn profile(driver: DriverKind, availability: DriverAvailability) -> ProfileSnapshot {
         let persisted = ConnectionProfile {
@@ -1043,6 +1043,52 @@ mod tests {
             !cancel.is_disabled(),
             "Config uncertain must not trap the form"
         );
+    }
+
+    #[test]
+    fn actual_app_first_run_exposes_one_primary_action_and_driver_choices() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        let operation_id = match service.try_next_command() {
+            Some(UiCommand::RefreshProfiles { operation_id }) => operation_id,
+            _ => panic!("startup must request the exact profile list"),
+        };
+        assert!(service.try_emit(crate::ui::UiEvent::ProfilesLoaded {
+            operation_id,
+            profiles: Vec::new(),
+        }));
+        app.poll_events();
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let output = context.run_ui(RawInput::default(), |ui| {
+            app.connections(ui);
+            app.editor_and_results(ui);
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("actual first-run app frame must emit AccessKit");
+        let node = |author_id: &str| {
+            update
+                .nodes
+                .iter()
+                .find_map(|(_, node)| (node.author_id() == Some(author_id)).then_some(node))
+                .unwrap_or_else(|| panic!("missing actual first-run AX id {author_id}"))
+        };
+
+        assert_eq!(node("connection.new").role(), accesskit::Role::Button);
+        assert_eq!(
+            node("connection.new.mysql").role(),
+            accesskit::Role::RadioButton
+        );
+        assert_eq!(
+            node("connection.new.redis").role(),
+            accesskit::Role::RadioButton
+        );
+        let mongodb = node("connection.mongodb.planned");
+        assert_eq!(mongodb.role(), accesskit::Role::RadioButton);
+        assert!(mongodb.is_disabled());
     }
 
     #[test]
