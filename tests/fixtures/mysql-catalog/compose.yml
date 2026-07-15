@@ -1,0 +1,19 @@
+services:
+  mysql:
+    # The base fixture exports the application password as MYSQL_PWD for its
+    # health check.  A fresh official MySQL image also inherits that variable
+    # during bootstrap, where root intentionally still has an empty password.
+    # Keep bootstrap clean and scope the application password to the health
+    # check process below.
+    environment:
+      MYSQL_PWD: ""
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "MYSQL_PWD=$$MYSQL_PASSWORD mysqladmin ping --host=127.0.0.1 --user=dbotter --silent",
+        ]
+      retries: 120
+      start_period: 15s
+    volumes:
+      - ./tests/fixtures/mysql-catalog/init-catalog.sh:/docker-entrypoint-initdb.d/20-dbotter-catalog.sh:ro

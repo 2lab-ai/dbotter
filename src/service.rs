@@ -193,6 +193,10 @@ impl ServiceError {
             Self::Driver(DriverError::PreparedStatementUnsupported { .. }) => {
                 PublicCode::PreparedStatementUnsupported
             }
+            Self::Driver(DriverError::InvalidCatalogRequest) => PublicCode::Catalog,
+            Self::Driver(error) => error
+                .mysql_public_code()
+                .map_or(PublicCode::None, PublicCode::MySql),
             _ => PublicCode::None,
         };
         let summary = match self {
@@ -217,6 +221,13 @@ impl ServiceError {
             | Self::InvalidRequest { .. }
             | Self::ProfileIdConflict { .. }
             | Self::UnknownProfile(_) => PublicSummary::InvalidInput,
+            Self::Driver(DriverError::InvalidCatalogRequest) => PublicSummary::InvalidInput,
+            Self::Driver(error) if error.is_mysql_permission_denied() => {
+                PublicSummary::PermissionDenied
+            }
+            Self::Driver(error) if error.is_mysql_authentication_failed() => {
+                PublicSummary::AuthenticationFailed
+            }
             Self::Secret(SecretError::MissingEnv(_) | SecretError::EmptyEnv(_)) => {
                 PublicSummary::AuthenticationFailed
             }
@@ -725,7 +736,9 @@ pub enum SessionDisposition {
 impl SessionDisposition {
     pub fn for_driver_error(error: &DriverError) -> Self {
         match error {
-            DriverError::MySql(sqlx::Error::Database(_)) => Self::Keep,
+            DriverError::MySql(sqlx::Error::Database(_)) | DriverError::MySqlServer { .. } => {
+                Self::Keep
+            }
             DriverError::Redis(error) if matches!(error.kind(), redis::ErrorKind::Server(_)) => {
                 Self::Keep
             }
@@ -736,6 +749,7 @@ impl SessionDisposition {
                     Self::Evict
                 }
             }
+            DriverError::InvalidCatalogRequest => Self::Keep,
             DriverError::InvalidConfig { .. }
             | DriverError::Unavailable { .. }
             | DriverError::Timeout { .. }

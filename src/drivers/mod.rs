@@ -1,5 +1,6 @@
 pub mod mongodb;
 pub mod mysql;
+pub mod mysql_catalog;
 pub mod redis;
 
 use std::fmt;
@@ -11,8 +12,8 @@ use secrecy::SecretString;
 
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionProfile, DriverDescriptor, DriverKind,
-    PreparedMySqlRequest, QueryResult, RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage,
-    RedisScanRequest, RedisValuePreview, TlsMode,
+    MySqlPublicErrorCode, PreparedMySqlRequest, QueryResult, RedisExecuteRequest,
+    RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, TlsMode,
 };
 
 #[derive(thiserror::Error)]
@@ -32,6 +33,8 @@ pub enum DriverError {
         #[source]
         sqlx::Error,
     ),
+    #[error("mysql server rejected the operation")]
+    MySqlServer { code: MySqlPublicErrorCode },
     #[error("redis operation failed")]
     Redis(
         #[from]
@@ -42,6 +45,8 @@ pub enum DriverError {
     RedisParse(String),
     #[error("mysql server prepared protocol does not support this statement")]
     PreparedStatementUnsupported { session_healthy: bool },
+    #[error("mysql catalog request or page token is invalid")]
+    InvalidCatalogRequest,
     #[error("unsupported {driver} operation")]
     Unsupported {
         driver: DriverKind,
@@ -68,18 +73,46 @@ impl fmt::Debug for DriverError {
                 .field("seconds", seconds)
                 .finish(),
             Self::MySql(_) => formatter.write_str("MySql(<redacted>)"),
+            Self::MySqlServer { code } => formatter
+                .debug_struct("MySqlServer")
+                .field("code", code)
+                .finish(),
             Self::Redis(_) => formatter.write_str("Redis(<redacted>)"),
             Self::RedisParse(_) => formatter.write_str("RedisParse(<redacted>)"),
             Self::PreparedStatementUnsupported { session_healthy } => formatter
                 .debug_struct("PreparedStatementUnsupported")
                 .field("session_healthy", session_healthy)
                 .finish(),
+            Self::InvalidCatalogRequest => formatter.write_str("InvalidCatalogRequest"),
             Self::Unsupported { driver, .. } => formatter
                 .debug_struct("Unsupported")
                 .field("driver", driver)
                 .field("operation", &"<redacted>")
                 .finish(),
         }
+    }
+}
+
+impl DriverError {
+    pub fn mysql_public_code(&self) -> Option<MySqlPublicErrorCode> {
+        if let Self::MySqlServer { code } = self {
+            return Some(*code);
+        }
+        let Self::MySql(sqlx::Error::Database(database)) = self else {
+            return None;
+        };
+        let database = database.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()?;
+        MySqlPublicErrorCode::new(database.number(), database.code()?).ok()
+    }
+
+    pub fn is_mysql_permission_denied(&self) -> bool {
+        self.mysql_public_code()
+            .is_some_and(|code| matches!(code.errno(), 1044 | 1142 | 1143 | 1227 | 1370 | 1419))
+    }
+
+    pub fn is_mysql_authentication_failed(&self) -> bool {
+        self.mysql_public_code()
+            .is_some_and(|code| code.errno() == 1045)
     }
 }
 

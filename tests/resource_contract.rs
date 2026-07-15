@@ -133,7 +133,7 @@ fn redis_typed_execute_policy_is_constructor_bound_and_rechecked_before_io() {
 }
 
 #[test]
-fn catalog_and_keyspace_capabilities_are_independent_and_not_ready_in_p3() {
+fn catalog_is_ready_in_p4_while_keyspace_remains_independently_planned() {
     let model = source("src/model.rs");
     let mysql = &dbotter::drivers::mysql::DESCRIPTOR;
     let redis = &dbotter::drivers::redis::DESCRIPTOR;
@@ -144,12 +144,12 @@ fn catalog_and_keyspace_capabilities_are_independent_and_not_ready_in_p3() {
     );
     assert!(
         mysql
-            .planned_capabilities
+            .capabilities
             .contains(dbotter::model::DriverCapabilities::CATALOG)
     );
     assert!(
         !mysql
-            .capabilities
+            .planned_capabilities
             .contains(dbotter::model::DriverCapabilities::CATALOG)
     );
     assert!(

@@ -182,16 +182,20 @@ fn p3_user_text_and_resource_boundaries_are_structural() {
 }
 
 #[test]
-fn p3_production_ast_has_one_static_text_protocol_call_and_one_prepared_fetch() {
+fn p4_production_ast_has_one_static_text_protocol_call_and_only_prepared_fetches() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = vec![root.join("build.rs")];
     collect_rs(&root.join("src"), &mut files);
     let mut production = String::new();
     let mut mysql = String::new();
+    let mut mysql_catalog = String::new();
     for path in files {
         let tokens = production_tokens(&path);
         if path.ends_with("src/drivers/mysql.rs") {
             mysql = tokens.clone();
+        }
+        if path.ends_with("src/drivers/mysql_catalog.rs") {
+            mysql_catalog = tokens.clone();
         }
         production.push_str(&tokens);
     }
@@ -228,12 +232,19 @@ fn p3_production_ast_has_one_static_text_protocol_call_and_one_prepared_fetch() 
             "production AST contains a text-protocol escape hatch: {forbidden}"
         );
     }
-    assert_eq!(production.matches(".fetch_many(").count(), 1);
+    assert_eq!(production.matches(".fetch_many(").count(), 4);
     assert!(
         mysql.contains(
             "letquery=statement.query();letmutstream=(&mut*connection).fetch_many(query);"
         ),
-        "the only fetch must originate from the server-prepared statement"
+        "the user-text fetch must originate from the server-prepared statement"
+    );
+    assert_eq!(mysql_catalog.matches(".prepare(").count(), 3);
+    assert_eq!(mysql_catalog.matches(".fetch_many(").count(), 3);
+    assert_eq!(mysql_catalog.matches("statement.query()").count(), 3);
+    assert!(
+        !mysql_catalog.contains("sqlx::query(") && !mysql_catalog.contains("sqlx::raw_sql("),
+        "catalog browsing must use only its three static server-prepared statements"
     );
 }
 

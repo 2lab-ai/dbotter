@@ -808,7 +808,7 @@ mod tests {
 
         model.fold(UiEvent::CatalogPageFailed {
             request: catalog_request.clone(),
-            summary: PublicSummary::UnsupportedFeature,
+            summary: PublicSummary::PermissionDenied,
         });
         model.fold(UiEvent::RedisKeysFailed {
             request: redis_request.clone(),

@@ -13,7 +13,7 @@ use sqlx::{
     ValueRef as _,
 };
 
-use crate::drivers::DriverError;
+use crate::drivers::{DriverError, mysql_catalog};
 use crate::model::{
     CatalogPage, CatalogRequest, Cell, Column, ConnectionProfile, DriverAvailability,
     DriverCapabilities, DriverDescriptor, DriverKind, MAX_RESULT_BYTES, MAX_RESULT_CELL_BYTES,
@@ -30,14 +30,16 @@ pub const DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     languages: &[QueryLanguage::Sql],
     capabilities: DriverCapabilities::CONNECT
         .union(DriverCapabilities::PING)
-        .union(DriverCapabilities::SQL),
-    planned_capabilities: DriverCapabilities::CATALOG,
+        .union(DriverCapabilities::SQL)
+        .union(DriverCapabilities::CATALOG),
+    planned_capabilities: DriverCapabilities::empty(),
     reason: None,
 };
 
 #[derive(Clone)]
 pub struct MySqlSession {
     pool: sqlx::MySqlPool,
+    configured_database: Option<String>,
 }
 
 impl MySqlSession {
@@ -72,7 +74,10 @@ impl MySqlSession {
                 .connect_with(options),
         )
         .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            configured_database: profile.database.clone(),
+        })
     }
 
     pub async fn ping(&self, timeout: Duration) -> Result<(), DriverError> {
@@ -105,11 +110,8 @@ impl MySqlSession {
         })
     }
 
-    pub async fn load_page(&self, _request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
-        Err(DriverError::Unsupported {
-            driver: DriverKind::MySql,
-            operation: "catalog browsing is planned".to_owned(),
-        })
+    pub async fn load_page(&self, request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
+        mysql_catalog::load_page(&self.pool, self.configured_database.as_deref(), request).await
     }
 
     async fn execute_one(&self, text: &str, row_limit: u32) -> Result<QueryResult, DriverError> {

@@ -11,10 +11,11 @@ use dbotter::drivers::{
     CatalogBrowser, ConnectedResources, ConnectionPing, DriverError, MySqlPreparedExecution,
 };
 use dbotter::model::{
-    CatalogPage, CatalogRequest, ConnectionDraft, CredentialMode, DraftId, DriverKind, OperationId,
-    PreparedMySqlRequest, ProfileGeneration, ProfileId, QueryResult, RedisKeyFilter, RedisKeyId,
-    RedisKeyInspectRequest, RedisScanRequest, RequestIdentity, ResultId, ResultProvenance,
-    ResultRetentionPolicy, ResultSnapshot, SessionGeneration,
+    CatalogPage, CatalogRequest, ConnectionDraft, CredentialMode, DraftId, DriverKind,
+    MySqlPublicErrorCode, OperationId, PreparedMySqlRequest, ProfileGeneration, ProfileId,
+    QueryResult, RedisKeyFilter, RedisKeyId, RedisKeyInspectRequest, RedisScanRequest,
+    RequestIdentity, ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
+    SessionGeneration,
 };
 use dbotter::secrets::{SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate};
 use dbotter::service::{
@@ -1018,7 +1019,7 @@ async fn p3_driver_session_disposition_is_identical_in_cache_event_and_ui_outcom
 }
 
 #[tokio::test]
-async fn p3_typed_resource_commands_are_capability_gated_before_connector_invocation() {
+async fn p4_catalog_reaches_its_typed_resource_while_mismatches_and_keyspace_stay_gated() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");
     let connector = Arc::new(CountingConnector::default());
@@ -1056,7 +1057,7 @@ async fn p3_typed_resource_commands_are_capability_gated_before_connector_invoca
             event,
             UiEvent::CatalogPageFailed {
                 request,
-                summary: dbotter::model::PublicSummary::UnsupportedFeature,
+                summary: dbotter::model::PublicSummary::PermissionDenied,
             } if request.operation_id() == OperationId(202)
         )
     })
@@ -1132,7 +1133,7 @@ async fn p3_typed_resource_commands_are_capability_gated_before_connector_invoca
     })
     .await;
 
-    assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
+    assert_eq!(connector.connects.load(Ordering::SeqCst), 1);
     shutdown(&ui, runtime, OperationId(209)).await;
 }
 
@@ -3060,9 +3061,8 @@ impl MySqlPreparedExecution for CountingMySqlResources {
 #[async_trait]
 impl CatalogBrowser for CountingMySqlResources {
     async fn load_page(&self, _request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
-        Err(DriverError::Unsupported {
-            driver: DriverKind::MySql,
-            operation: "test catalog".to_owned(),
+        Err(DriverError::MySqlServer {
+            code: MySqlPublicErrorCode::new(1142, "42000").expect("valid injected permission code"),
         })
     }
 }

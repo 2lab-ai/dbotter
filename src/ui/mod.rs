@@ -1,6 +1,7 @@
 mod adapter;
 mod app;
 mod model;
+mod mysql_explorer;
 mod profile_form;
 mod runtime;
 #[cfg(test)]
@@ -13,6 +14,7 @@ pub use adapter::{
 pub use model::{
     ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot, UiEvent, UiModel,
 };
+pub use mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 pub use runtime::{RegisteredTask, RuntimeHandle, TaskScope, spawn_with_service};
 
 use crate::error::AppError;

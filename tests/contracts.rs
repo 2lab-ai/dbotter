@@ -17,6 +17,11 @@ fn all_three_driver_boundaries_are_registered() {
     );
     assert!(
         descriptors[0]
+            .capabilities
+            .contains(DriverCapabilities::CATALOG)
+    );
+    assert!(
+        !descriptors[0]
             .planned_capabilities
             .contains(DriverCapabilities::CATALOG)
     );

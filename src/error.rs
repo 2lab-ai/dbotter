@@ -48,8 +48,17 @@ impl AppError {
             Self::Service(error) => error.public_error_parts().0.message(),
             Self::InvalidInput | Self::UnknownProfile => PublicSummary::InvalidInput.message(),
             Self::Secret(_) => PublicSummary::CredentialRequired.message(),
+            Self::Driver(error) if error.is_mysql_permission_denied() => {
+                PublicSummary::PermissionDenied.message()
+            }
+            Self::Driver(error) if error.is_mysql_authentication_failed() => {
+                PublicSummary::AuthenticationFailed.message()
+            }
             Self::Driver(crate::drivers::DriverError::Timeout { .. }) => {
                 PublicSummary::OperationTimedOut.message()
+            }
+            Self::Driver(crate::drivers::DriverError::InvalidCatalogRequest) => {
+                PublicSummary::InvalidInput.message()
             }
             Self::Driver(
                 crate::drivers::DriverError::Unavailable { .. }

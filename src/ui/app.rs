@@ -1,14 +1,19 @@
 //! Native three-zone UI. Rendering and state folding perform no I/O.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use eframe::egui;
 use egui_extras::{Column as TableColumn, TableBuilder};
 
-use crate::model::{Cell, DraftId, DriverAvailability, DriverKind, ProfileId};
+use crate::model::{
+    CatalogRequest, Cell, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT, DraftId,
+    DriverAvailability, DriverKind, ProfileGeneration, ProfileId, RequestIdentity,
+};
 
 use super::adapter::{SubmitError, UiCommand, UiPort};
-use super::model::{ConnectionState, ProfileSnapshot, UiModel};
+use super::model::{ConnectionState, ProfileSnapshot, UiEvent, UiModel};
+use super::mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 use super::profile_form::{FormAction, ProfileEditor, ProfileEventResult, SaveAttempt};
 
 const EVENT_DRAIN_LIMIT: usize = 128;
@@ -18,6 +23,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub struct DbotterApp {
     port: UiPort,
     model: UiModel,
+    mysql_explorers: HashMap<(ProfileId, ProfileGeneration), MySqlExplorerState>,
     profile_editor: Option<ProfileEditor>,
     next_draft_id: u64,
 }
@@ -27,6 +33,7 @@ impl DbotterApp {
         let mut app = Self {
             port,
             model: UiModel::default(),
+            mysql_explorers: HashMap::new(),
             profile_editor: None,
             next_draft_id: 1,
         };
@@ -45,6 +52,7 @@ impl DbotterApp {
 
     fn poll_events(&mut self) {
         for event in self.port.drain_events(EVENT_DRAIN_LIMIT) {
+            self.fold_mysql_explorer_event(&event);
             let profile_result = self
                 .profile_editor
                 .as_mut()
@@ -79,8 +87,42 @@ impl DbotterApp {
             }
             self.model.fold(event);
         }
+        self.mysql_explorers.retain(|(profile_id, generation), _| {
+            self.model.active_generation(profile_id) == Some(*generation)
+        });
         if let Some(editor) = self.profile_editor.as_mut() {
             editor.set_config_uncertain(self.model.is_config_uncertain());
+        }
+    }
+
+    fn fold_mysql_explorer_event(&mut self, event: &UiEvent) {
+        match event {
+            UiEvent::CatalogPageLoaded { page } => {
+                let key = (
+                    page.identity.profile_id.clone(),
+                    page.identity.profile_generation,
+                );
+                self.mysql_explorers
+                    .entry(key)
+                    .or_default()
+                    .handle_loaded(page.clone());
+            }
+            UiEvent::CatalogPageFailed { request, summary } => {
+                let key = (request.profile_id().clone(), request.profile_generation());
+                self.mysql_explorers
+                    .entry(key)
+                    .or_default()
+                    .handle_failed(request.clone(), *summary);
+            }
+            UiEvent::ProfileDeleted {
+                profile_id,
+                profile_generation,
+                ..
+            } => {
+                self.mysql_explorers
+                    .remove(&(profile_id.clone(), *profile_generation));
+            }
+            _ => {}
         }
     }
 
@@ -184,10 +226,85 @@ impl DbotterApp {
         };
     }
 
+    fn submit_mysql_explorer_intent(
+        &mut self,
+        profile: &ProfileSnapshot,
+        intent: MySqlExplorerIntent,
+    ) {
+        if let MySqlExplorerIntent::InsertTemplate(template) = intent {
+            self.model.editor_text = template;
+            self.model.status = "Bounded SELECT template inserted; it was not executed".to_owned();
+            return;
+        }
+        if self.model.is_config_uncertain() {
+            self.model.status = "Reload profiles before browsing the catalog.".to_owned();
+            return;
+        }
+        let operation_id = self.model.next_operation();
+        let identity = RequestIdentity::new(profile.id.clone(), profile.generation, operation_id);
+        let request = match intent {
+            MySqlExplorerIntent::RefreshSchemas { prefix } => CatalogRequest::Schemas {
+                identity,
+                prefix,
+                page_token: None,
+                page_size: DEFAULT_CATALOG_PAGE_SIZE,
+                timeout: DEFAULT_CATALOG_TIMEOUT,
+            },
+            MySqlExplorerIntent::LoadMoreSchemas { prefix, token } => CatalogRequest::Schemas {
+                identity,
+                prefix,
+                page_token: Some(token),
+                page_size: DEFAULT_CATALOG_PAGE_SIZE,
+                timeout: DEFAULT_CATALOG_TIMEOUT,
+            },
+            MySqlExplorerIntent::LoadRelations {
+                schema,
+                prefix,
+                token,
+            } => CatalogRequest::Relations {
+                identity,
+                schema,
+                prefix,
+                page_token: token,
+                page_size: DEFAULT_CATALOG_PAGE_SIZE,
+                timeout: DEFAULT_CATALOG_TIMEOUT,
+            },
+            MySqlExplorerIntent::LoadColumns {
+                schema,
+                relation,
+                prefix,
+                token,
+            } => CatalogRequest::Columns {
+                identity,
+                schema,
+                relation,
+                prefix,
+                page_token: token,
+                page_size: DEFAULT_CATALOG_PAGE_SIZE,
+                timeout: DEFAULT_CATALOG_TIMEOUT,
+            },
+            MySqlExplorerIntent::Retry(request) => catalog_request_with_identity(request, identity),
+            MySqlExplorerIntent::InsertTemplate(_) => return,
+        };
+        match self
+            .port
+            .try_submit(UiCommand::BrowseCatalog(request.clone()))
+        {
+            Ok(()) => {
+                self.mysql_explorers
+                    .entry((profile.id.clone(), profile.generation))
+                    .or_default()
+                    .mark_submitted(request);
+                self.model.status = "Loading MySQL catalog page…".to_owned();
+            }
+            Err(error) => self.report_submit_error(error),
+        }
+    }
+
     fn connections(&mut self, root_ui: &mut egui::Ui) {
         egui::Panel::left("connections")
             .resizable(true)
-            .default_size(280.0)
+            .default_size(360.0)
             .show(root_ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.heading("Connections");
@@ -275,7 +392,17 @@ impl DbotterApp {
                 ),
             );
         }
-        ui.weak("Catalog browsing is deferred in this MVP");
+        if selected && profile.driver == DriverKind::MySql && profile.is_ready() {
+            ui.add_space(12.0);
+            let intents = self
+                .mysql_explorers
+                .entry((profile.id.clone(), profile.generation))
+                .or_default()
+                .show(ui);
+            for intent in intents {
+                self.submit_mysql_explorer_intent(profile, intent);
+            }
+        }
     }
 
     fn editor_and_results(&mut self, root_ui: &mut egui::Ui) {
@@ -376,6 +503,59 @@ impl eframe::App for DbotterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.connections(ui);
         self.editor_and_results(ui);
+    }
+}
+
+fn catalog_request_with_identity(
+    request: CatalogRequest,
+    identity: RequestIdentity,
+) -> CatalogRequest {
+    match request {
+        CatalogRequest::Schemas {
+            prefix,
+            page_token,
+            page_size,
+            timeout,
+            ..
+        } => CatalogRequest::Schemas {
+            identity,
+            prefix,
+            page_token,
+            page_size,
+            timeout,
+        },
+        CatalogRequest::Relations {
+            schema,
+            prefix,
+            page_token,
+            page_size,
+            timeout,
+            ..
+        } => CatalogRequest::Relations {
+            identity,
+            schema,
+            prefix,
+            page_token,
+            page_size,
+            timeout,
+        },
+        CatalogRequest::Columns {
+            schema,
+            relation,
+            prefix,
+            page_token,
+            page_size,
+            timeout,
+            ..
+        } => CatalogRequest::Columns {
+            identity,
+            schema,
+            relation,
+            prefix,
+            page_token,
+            page_size,
+            timeout,
+        },
     }
 }
 
