@@ -22,6 +22,10 @@ VERSION_RE = re.compile(
     r"^(?P<year>[0-9]{4})\.(?P<month>[0-9]{2})\.(?P<day>[0-9]{2})\."
     r"(?P<time>[0-9]{6})\.(?P<run>[1-9][0-9]*)\.(?P<attempt>[1-9][0-9]*)$"
 )
+LEGACY_BASELINE_RE = re.compile(
+    r"^(?P<year>[0-9]{4})\.(?P<month>[0-9]{2})\.(?P<day>[0-9]{2})\."
+    r"(?P<time>[0-9]{4})$"
+)
 SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -110,6 +114,39 @@ def version_tuple(value: str) -> tuple[int, ...]:
     return tuple(int(match[name]) for name in ("year", "month", "day", "time", "run", "attempt"))
 
 
+def baseline_version_tuple(value: str) -> tuple[int, ...]:
+    match = VERSION_RE.fullmatch(value)
+    if match is not None:
+        stamp = (
+            f'{match["year"]}-{match["month"]}-{match["day"]}T'
+            f'{match["time"][0:2]}:{match["time"][2:4]}:{match["time"][4:6]}Z'
+        )
+        try:
+            dt.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError as error:
+            raise ContractError("current version baseline is not a real UTC timestamp") from error
+        return version_tuple(value)
+    legacy = LEGACY_BASELINE_RE.fullmatch(value)
+    if legacy is None:
+        raise ContractError("current version baseline has an invalid format")
+    stamp = (
+        f'{legacy["year"]}-{legacy["month"]}-{legacy["day"]}T'
+        f'{legacy["time"][0:2]}:{legacy["time"][2:4]}:00Z'
+    )
+    try:
+        dt.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise ContractError("current version baseline is not a real UTC minute") from error
+    return (
+        int(legacy["year"]),
+        int(legacy["month"]),
+        int(legacy["day"]),
+        int(f'{legacy["time"]}00'),
+        0,
+        0,
+    )
+
+
 def validate_manifest(
     document: Any,
     *,
@@ -164,7 +201,7 @@ def validate_manifest(
         raise ContractError("manifest source_sha disagrees with expected source")
     if expected_tag is not None and tag != expected_tag:
         raise ContractError("manifest tag disagrees with expected tag")
-    if greater_than is not None and version_tuple(version) <= version_tuple(greater_than):
+    if greater_than is not None and version_tuple(version) <= baseline_version_tuple(greater_than):
         raise ContractError("preview version is not strictly greater than the current version")
 
     config = require_exact_object(manifest["config_contract"], CONFIG_KEYS, "config_contract")

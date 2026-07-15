@@ -13,9 +13,13 @@ VERSION_RE = re.compile(
     r"^(?P<year>[0-9]{4})\.(?P<month>[0-9]{2})\.(?P<day>[0-9]{2})\."
     r"(?P<time>[0-9]{6})\.(?P<run>[1-9][0-9]*)\.(?P<attempt>[1-9][0-9]*)$"
 )
+LEGACY_BASELINE_RE = re.compile(
+    r"^(?P<year>[0-9]{4})\.(?P<month>[0-9]{2})\.(?P<day>[0-9]{2})\."
+    r"(?P<time>[0-9]{4})$"
+)
 
 
-def parse(value: str) -> tuple[int, ...]:
+def parse_candidate(value: str) -> tuple[int, ...]:
     match = VERSION_RE.fullmatch(value)
     if match is None:
         raise ValueError(f"invalid preview version: {value}")
@@ -29,13 +33,35 @@ def parse(value: str) -> tuple[int, ...]:
     )
 
 
+def parse_baseline(value: str) -> tuple[int, ...]:
+    match = VERSION_RE.fullmatch(value)
+    if match is not None:
+        return parse_candidate(value)
+    legacy = LEGACY_BASELINE_RE.fullmatch(value)
+    if legacy is None:
+        raise ValueError(f"invalid preview version baseline: {value}")
+    stamp = (
+        f'{legacy["year"]}-{legacy["month"]}-{legacy["day"]}T'
+        f'{legacy["time"][0:2]}:{legacy["time"][2:4]}:00Z'
+    )
+    dt.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+    return (
+        int(legacy["year"]),
+        int(legacy["month"]),
+        int(legacy["day"]),
+        int(f'{legacy["time"]}00'),
+        0,
+        0,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--greater-than", required=True)
     args = parser.parse_args()
     try:
-        if parse(args.candidate) <= parse(args.greater_than):
+        if parse_candidate(args.candidate) <= parse_baseline(args.greater_than):
             raise ValueError("candidate preview version is not strictly increasing")
     except ValueError as error:
         print(f"preview version: {error}", file=sys.stderr)

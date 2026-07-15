@@ -56,6 +56,43 @@ fi
   --manifest "$valid_manifest" \
   --greater-than 2026.07.15.123455.123456789.1 >/dev/null
 
+./scripts/check-release-contract.sh \
+  --manifest "$valid_manifest" \
+  --greater-than 2026.07.14.1149 >/dev/null
+./scripts/check-preview-version.py \
+  --candidate 2026.07.15.123456.123456789.2 \
+  --greater-than 2026.07.14.1149 >/dev/null
+
+if ./scripts/check-preview-version.py \
+  --candidate 2026.07.15.123456.123456789.2 \
+  --greater-than 2026.07.16.0000 >/dev/null 2>&1; then
+  fail "non-increasing candidate against a legacy baseline was accepted"
+fi
+
+if ./scripts/check-preview-version.py \
+  --candidate 2026.07.15.123456.123456789.2 \
+  --greater-than 2026.07.14.2460 >/dev/null 2>&1; then
+  fail "impossible legacy baseline time was accepted"
+fi
+
+for invalid_baseline in \
+  2026.07.16.0000 \
+  2026.07.14.2460 \
+  2026.07.14.114900 \
+  2026.7.14.1149; do
+  if ./scripts/check-release-contract.sh \
+    --manifest "$valid_manifest" \
+    --greater-than "$invalid_baseline" >/dev/null 2>&1; then
+    fail "invalid or non-increasing legacy baseline was accepted: $invalid_baseline"
+  fi
+done
+
+if ./scripts/check-preview-version.py \
+  --candidate 2026.07.15.1234 \
+  --greater-than 2026.07.14.1149 >/dev/null 2>&1; then
+  fail "legacy candidate format was accepted"
+fi
+
 if ./scripts/check-release-contract.sh --unknown >/dev/null 2>&1; then
   fail "unknown release-contract argument was accepted"
 fi
