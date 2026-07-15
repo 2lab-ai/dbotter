@@ -48,6 +48,8 @@ required_inputs=(
   tests/ui_raw_input.rs
   tests/ui_accesskit.rs
   tests/ui_contrast.rs
+  tests/live_evidence_recorder.rs
+  tests/common/live_evidence.rs
   scripts/check-release-contract.sh
   scripts/test-release-contract.sh
   scripts/test-four-target-preview-contract.sh
