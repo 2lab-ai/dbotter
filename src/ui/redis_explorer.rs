@@ -243,6 +243,22 @@ impl RedisExplorer {
             })
     }
 
+    #[cfg(test)]
+    pub(super) fn test_workspace_keys(&self) -> Option<(&ProfileId, ProfileGeneration)> {
+        self.profile
+            .as_ref()
+            .map(|(profile_id, generation)| (profile_id, *generation))
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_retained_raw_keys(&self) -> Vec<Vec<u8>> {
+        self.scan
+            .keys()
+            .iter()
+            .map(|entry| entry.id.as_bytes().to_vec())
+            .collect()
+    }
+
     fn current_filter(&self) -> RedisKeyFilter {
         match self.filter_mode {
             FilterMode::LiteralPrefix => RedisKeyFilter::LiteralPrefix(self.filter_text.clone()),

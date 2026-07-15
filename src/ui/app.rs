@@ -2692,10 +2692,12 @@ mod tests {
     use crate::model::{
         ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
         OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode,
-        PublicSummary, RedisKeyFilter, RedisKeyId, RedisTlsConfig, SessionGeneration, TlsMode,
+        PublicSummary, RedisKeyEntry, RedisKeyFilter, RedisKeyId, RedisKeyPage,
+        RedisScanConsistency, RedisScanRequest, RedisTlsConfig, SessionGeneration, TlsMode,
     };
     use crate::public_error::{PublicOperationError, RecoveryAction, SafeContext};
-    use crate::ui::adapter::{UiCommand, bounded_ports};
+    use crate::service::SessionDisposition;
+    use crate::ui::adapter::{ServicePort, UiCommand, bounded_ports};
     use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
     use crate::ui::model::{ProfileSnapshot, WorkspaceKey};
     use crate::ui::redis_explorer::RedisExplorerIntent;
@@ -2731,6 +2733,104 @@ mod tests {
             has_current_session_secret: false,
             persisted,
         }
+    }
+
+    fn redis_profile(id: &str, generation: u64) -> ProfileSnapshot {
+        let mut profile = profile(DriverKind::Redis, DriverAvailability::Ready);
+        profile.id = ProfileId(id.to_owned());
+        profile.generation = ProfileGeneration(generation);
+        profile.name = id.to_owned();
+        profile.endpoint = format!("redis://{id}:6379");
+        profile.persisted.id = id.to_owned();
+        profile.persisted.name = id.to_owned();
+        profile
+    }
+
+    fn render_redis_explorer(app: &mut DbotterApp) {
+        let context = Context::default();
+        context.enable_accesskit();
+        let _ = context.run_ui(RawInput::default(), |ui| app.explorer_contents(ui));
+    }
+
+    fn redis_page(request: &RedisScanRequest, raw_key: &[u8]) -> RedisKeyPage {
+        RedisKeyPage {
+            identity: request.identity.clone(),
+            next_cursor: 0,
+            keys: vec![RedisKeyEntry::new(RedisKeyId(raw_key.to_vec()))],
+            retained_count: 1,
+            skipped_oversize: 0,
+            retained_bytes: raw_key.len(),
+            consistency: RedisScanConsistency::Weak,
+            truncated: false,
+            stale: false,
+        }
+    }
+
+    fn redis_keys_for(app: &DbotterApp, key: &WorkspaceKey) -> Option<Vec<Vec<u8>>> {
+        let (profile_id, generation) = app.redis_explorer.test_workspace_keys()?;
+        (profile_id == &key.profile_id && generation == key.profile_generation)
+            .then(|| app.redis_explorer.test_retained_raw_keys())
+    }
+
+    fn load_redis_key(
+        app: &mut DbotterApp,
+        service: &mut ServicePort,
+        key: &WorkspaceKey,
+        raw_key: &[u8],
+        session_generation: SessionGeneration,
+    ) {
+        app.model.selected_profile = Some(key.profile_id.clone());
+        render_redis_explorer(app);
+        app.submit_redis_intent(RedisExplorerIntent::Scan {
+            filter: RedisKeyFilter::LiteralPrefix(String::new()),
+            cursor: 0,
+            restart: true,
+        });
+        let request = match service.try_next_command() {
+            Some(UiCommand::ScanRedisKeys(request)) => request,
+            _ => panic!("exact Redis scan command"),
+        };
+        assert_eq!(request.profile_id(), &key.profile_id);
+        assert_eq!(request.profile_generation(), key.profile_generation);
+        assert!(service.try_emit(crate::ui::UiEvent::RedisKeysLoaded {
+            page: redis_page(&request, raw_key),
+            session_generation,
+            session_disposition: SessionDisposition::Keep,
+        }));
+        app.poll_events();
+    }
+
+    fn seed_two_redis_workspaces(
+        app: &mut DbotterApp,
+        service: &mut ServicePort,
+    ) -> (ProfileSnapshot, ProfileSnapshot, WorkspaceKey, WorkspaceKey) {
+        let alpha = redis_profile("redis-alpha", 1);
+        let beta = redis_profile("redis-beta", 1);
+        app.model.profiles = vec![alpha.clone(), beta.clone()];
+        app.model
+            .active_generations
+            .insert(alpha.id.clone(), alpha.generation);
+        app.model
+            .active_generations
+            .insert(beta.id.clone(), beta.generation);
+        let alpha_key = WorkspaceKey::new(alpha.id.clone(), alpha.generation);
+        let beta_key = WorkspaceKey::new(beta.id.clone(), beta.generation);
+        load_redis_key(
+            app,
+            service,
+            &alpha_key,
+            b"alpha:key",
+            SessionGeneration(11),
+        );
+        load_redis_key(app, service, &beta_key, b"beta:key", SessionGeneration(21));
+        load_redis_key(
+            app,
+            service,
+            &alpha_key,
+            b"alpha:key",
+            SessionGeneration(11),
+        );
+        (alpha, beta, alpha_key, beta_key)
     }
 
     fn prime_save_and_connect(
@@ -4372,6 +4472,263 @@ mod tests {
             }) if submitted == operation_id
         ));
         assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn redis_explorer_state_is_isolated_by_exact_workspace_key() {
+        let (ui, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let (_, _, alpha_key, beta_key) = seed_two_redis_workspaces(&mut app, &mut service);
+
+        assert_eq!(
+            redis_keys_for(&app, &alpha_key),
+            Some(vec![b"alpha:key".to_vec()])
+        );
+        assert_eq!(
+            redis_keys_for(&app, &beta_key),
+            Some(vec![b"beta:key".to_vec()]),
+            "switching profiles must not discard another exact workspace"
+        );
+    }
+
+    #[test]
+    fn redis_intent_never_falls_back_to_a_changed_global_selection() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let alpha = redis_profile("redis-alpha", 1);
+        let beta = redis_profile("redis-beta", 1);
+        app.model.profiles = vec![alpha.clone(), beta.clone()];
+        app.model
+            .active_generations
+            .insert(alpha.id.clone(), alpha.generation);
+        app.model
+            .active_generations
+            .insert(beta.id.clone(), beta.generation);
+
+        app.model.selected_profile = Some(alpha.id.clone());
+        render_redis_explorer(&mut app);
+        app.model.selected_profile = Some(beta.id.clone());
+        app.submit_redis_intent(RedisExplorerIntent::Scan {
+            filter: RedisKeyFilter::Glob("orders:*".to_owned()),
+            cursor: 0,
+            restart: true,
+        });
+
+        assert!(
+            service.try_next_command().is_none(),
+            "an intent bound to alpha must never be silently retargeted to selected beta"
+        );
+    }
+
+    #[test]
+    fn mismatched_redis_profile_generation_event_mutates_no_ui_state() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let profile = redis_profile("redis-current", 2);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.model.connection_states.insert(
+            profile.id.clone(),
+            ConnectionState::Connected {
+                session_generation: SessionGeneration(9),
+                elapsed_ms: 0,
+            },
+        );
+        app.model.selected_profile = Some(profile.id.clone());
+        render_redis_explorer(&mut app);
+        app.submit_redis_intent(RedisExplorerIntent::Scan {
+            filter: RedisKeyFilter::Glob("*".to_owned()),
+            cursor: 0,
+            restart: true,
+        });
+        let request = match service.try_next_command() {
+            Some(UiCommand::ScanRedisKeys(request)) => request,
+            _ => panic!("Redis scan command"),
+        };
+        let mut stale_page = redis_page(&request, b"stale-generation");
+        stale_page.identity.profile_generation = ProfileGeneration(1);
+        assert!(service.try_emit(crate::ui::UiEvent::RedisKeysLoaded {
+            page: stale_page,
+            session_generation: SessionGeneration(9),
+            session_disposition: SessionDisposition::Keep,
+        }));
+        app.poll_events();
+
+        assert!(
+            app.active_operations
+                .get(&profile.id)
+                .is_some_and(|active| {
+                    active.operation_id == request.operation_id()
+                        && active.profile_generation == profile.generation
+                })
+        );
+        assert_eq!(redis_keys_for(&app, &key), Some(Vec::new()));
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_none_or(|workspace| workspace.redis_key_page.is_none())
+        );
+    }
+
+    #[test]
+    fn mismatched_redis_session_generation_event_mutates_no_ui_state() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let profile = redis_profile("redis-current", 1);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.model.connection_states.insert(
+            profile.id.clone(),
+            ConnectionState::Connected {
+                session_generation: SessionGeneration(9),
+                elapsed_ms: 0,
+            },
+        );
+        app.model.selected_profile = Some(profile.id.clone());
+        render_redis_explorer(&mut app);
+        app.submit_redis_intent(RedisExplorerIntent::Scan {
+            filter: RedisKeyFilter::Glob("*".to_owned()),
+            cursor: 0,
+            restart: true,
+        });
+        let request = match service.try_next_command() {
+            Some(UiCommand::ScanRedisKeys(request)) => request,
+            _ => panic!("Redis scan command"),
+        };
+        assert!(service.try_emit(crate::ui::UiEvent::RedisKeysLoaded {
+            page: redis_page(&request, b"stale-session"),
+            session_generation: SessionGeneration(8),
+            session_disposition: SessionDisposition::Keep,
+        }));
+        app.poll_events();
+
+        assert!(
+            app.active_operations
+                .get(&profile.id)
+                .is_some_and(|active| {
+                    active.operation_id == request.operation_id()
+                        && active.profile_generation == profile.generation
+                })
+        );
+        assert_eq!(redis_keys_for(&app, &key), Some(Vec::new()));
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_none_or(|workspace| workspace.redis_key_page.is_none())
+        );
+        assert_eq!(
+            app.model.connection_state(&profile.id),
+            &ConnectionState::Connected {
+                session_generation: SessionGeneration(9),
+                elapsed_ms: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn redis_disconnect_and_reconnect_clear_only_the_exact_workspace() {
+        let (ui, mut service) = bounded_ports(8);
+        let mut disconnect_app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let (alpha, _, alpha_key, beta_key) =
+            seed_two_redis_workspaces(&mut disconnect_app, &mut service);
+        disconnect_app.submit_disconnect(alpha.id.clone());
+        let operation_id = match service.try_next_command() {
+            Some(UiCommand::DisconnectProfile { operation_id, .. }) => operation_id,
+            _ => panic!("disconnect command"),
+        };
+        assert!(service.try_emit(crate::ui::UiEvent::ConnectionClosed {
+            operation_id,
+            profile_id: alpha.id.clone(),
+            profile_generation: alpha.generation,
+            post_close: crate::ui::PostCloseState::Disconnected,
+        }));
+        disconnect_app.poll_events();
+        assert!(redis_keys_for(&disconnect_app, &alpha_key).is_none_or(|keys| keys.is_empty()));
+        assert_eq!(
+            redis_keys_for(&disconnect_app, &beta_key),
+            Some(vec![b"beta:key".to_vec()])
+        );
+
+        let (ui, mut service) = bounded_ports(8);
+        let mut reconnect_app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let (alpha, _, alpha_key, beta_key) =
+            seed_two_redis_workspaces(&mut reconnect_app, &mut service);
+        reconnect_app.submit_reconnect(alpha.id.clone());
+        let operation_id = match service.try_next_command() {
+            Some(UiCommand::ReconnectProfile { operation_id, .. }) => operation_id,
+            _ => panic!("reconnect command"),
+        };
+        assert!(service.try_emit(crate::ui::UiEvent::ConnectionReady {
+            operation_id,
+            profile_id: alpha.id.clone(),
+            profile_generation: alpha.generation,
+            session_generation: SessionGeneration(12),
+            elapsed_ms: 3,
+        }));
+        reconnect_app.poll_events();
+        assert!(redis_keys_for(&reconnect_app, &alpha_key).is_none_or(|keys| keys.is_empty()));
+        assert_eq!(
+            redis_keys_for(&reconnect_app, &beta_key),
+            Some(vec![b"beta:key".to_vec()])
+        );
+    }
+
+    #[test]
+    fn redis_delete_and_reload_prune_only_stale_exact_workspaces() {
+        let (ui, mut service) = bounded_ports(8);
+        let mut delete_app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let (alpha, _, alpha_key, beta_key) =
+            seed_two_redis_workspaces(&mut delete_app, &mut service);
+        assert!(service.try_emit(crate::ui::UiEvent::ProfileDeleted {
+            operation_id: OperationId(800),
+            profile_id: alpha.id.clone(),
+            profile_generation: ProfileGeneration(alpha.generation.0 + 1),
+            server_state_unknown: true,
+        }));
+        delete_app.poll_events();
+        render_redis_explorer(&mut delete_app);
+        assert!(redis_keys_for(&delete_app, &alpha_key).is_none());
+        assert_eq!(
+            redis_keys_for(&delete_app, &beta_key),
+            Some(vec![b"beta:key".to_vec()])
+        );
+
+        let (ui, mut service) = bounded_ports(8);
+        let mut reload_app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let (alpha, beta, alpha_key, beta_key) =
+            seed_two_redis_workspaces(&mut reload_app, &mut service);
+        let refreshed_alpha = redis_profile("redis-alpha", alpha.generation.0 + 1);
+        assert!(service.try_emit(crate::ui::UiEvent::ProfilesLoaded {
+            operation_id: OperationId(900),
+            profiles: vec![refreshed_alpha.clone(), beta],
+        }));
+        reload_app.poll_events();
+        render_redis_explorer(&mut reload_app);
+        let refreshed_alpha_key =
+            WorkspaceKey::new(refreshed_alpha.id.clone(), refreshed_alpha.generation);
+        assert!(redis_keys_for(&reload_app, &alpha_key).is_none());
+        assert_eq!(
+            redis_keys_for(&reload_app, &refreshed_alpha_key),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            redis_keys_for(&reload_app, &beta_key),
+            Some(vec![b"beta:key".to_vec()])
+        );
     }
 
     #[test]
