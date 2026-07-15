@@ -1315,6 +1315,8 @@ fn render_error(ui: &mut egui::Ui, error: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         DraftTestAttempt, ProfileDraft, ProfileEditor, ProfileEventResult, SaveAttempt,
         environment_availability_label,
@@ -1327,6 +1329,7 @@ mod tests {
     use crate::secrets::{EnvironmentAvailability, SessionSecretUpdate};
     use crate::ui::adapter::{DraftTestIntent, UiCommand, bounded_ports};
     use crate::ui::model::UiEvent;
+    use eframe::egui::{Context, RawInput, accesskit};
 
     fn valid_editor(driver: DriverKind) -> ProfileEditor {
         let mut editor = ProfileEditor::new(DraftId(101), driver);
@@ -1334,6 +1337,172 @@ mod tests {
         editor.draft.id = "local-profile".to_owned();
         editor.draft.name = "Local profile".to_owned();
         editor
+    }
+
+    fn profile_accesskit_update(editor: &mut ProfileEditor) -> accesskit::TreeUpdate {
+        let context = Context::default();
+        context.enable_accesskit();
+        context
+            .run_ui(RawInput::default(), |ui| {
+                let _ = editor.show(ui);
+            })
+            .platform_output
+            .accesskit_update
+            .expect("actual ProfileEditor must emit AccessKit")
+    }
+
+    fn author_node<'a>(
+        update: &'a accesskit::TreeUpdate,
+        author_id: &str,
+    ) -> (accesskit::NodeId, &'a accesskit::Node) {
+        update
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| {
+                (node.author_id() == Some(author_id)).then_some((*node_id, node))
+            })
+            .unwrap_or_else(|| panic!("missing actual ProfileEditor AX id {author_id}"))
+    }
+
+    fn author_order(update: &accesskit::TreeUpdate) -> Vec<String> {
+        fn visit(
+            node_id: accesskit::NodeId,
+            nodes: &HashMap<accesskit::NodeId, &accesskit::Node>,
+            order: &mut Vec<String>,
+        ) {
+            let Some(node) = nodes.get(&node_id) else {
+                return;
+            };
+            if let Some(author_id) = node.author_id() {
+                order.push(author_id.to_owned());
+            }
+            for child in node.children() {
+                visit(*child, nodes, order);
+            }
+        }
+
+        let nodes = update
+            .nodes
+            .iter()
+            .map(|(node_id, node)| (*node_id, node))
+            .collect::<HashMap<_, _>>();
+        let root = update.tree.as_ref().expect("AccessKit tree root").root;
+        let mut order = Vec::new();
+        visit(root, &nodes, &mut order);
+        order
+    }
+
+    #[test]
+    fn actual_profile_editor_accesskit_uses_frozen_ids_states_order_and_focus() {
+        let mut editor = valid_editor(DriverKind::Redis);
+        editor.draft.select_tls(TlsMode::Required);
+        editor.select_credential_mode(CredentialMode::Session);
+        editor.request_focus(crate::model::ProfileFieldId::Host);
+
+        let update = profile_accesskit_update(&mut editor);
+        let expected_order = [
+            "profile.connection_id",
+            "profile.host",
+            "profile.redis_tls.ca_file",
+            "profile.redis_tls.ca_file.pick",
+            "profile.credential.session.keep",
+            "profile.credential.session.replace",
+            "profile.credential.session.forget",
+        ];
+        let actual_order = author_order(&update);
+        let positions = expected_order.map(|author_id| {
+            actual_order
+                .iter()
+                .position(|actual| actual == author_id)
+                .unwrap_or_else(|| panic!("missing ordered AX id {author_id}"))
+        });
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let (connection_id, connection_node) = author_node(&update, expected_order[0]);
+        assert_eq!(connection_node.role(), accesskit::Role::TextInput);
+        assert!(!connection_node.is_disabled());
+        let (host_id, host_node) = author_node(&update, expected_order[1]);
+        assert_eq!(host_node.role(), accesskit::Role::TextInput);
+        assert_eq!(update.focus, host_id);
+        assert_ne!(connection_id, host_id);
+        assert_eq!(
+            author_node(&update, expected_order[2]).1.role(),
+            accesskit::Role::TextInput
+        );
+        assert_eq!(
+            author_node(&update, expected_order[3]).1.role(),
+            accesskit::Role::Button
+        );
+        let keep = author_node(&update, expected_order[4]).1;
+        let replace = author_node(&update, expected_order[5]).1;
+        let forget = author_node(&update, expected_order[6]).1;
+        assert_eq!(keep.role(), accesskit::Role::RadioButton);
+        assert_eq!(replace.role(), accesskit::Role::RadioButton);
+        assert_eq!(forget.role(), accesskit::Role::RadioButton);
+        assert!(keep.is_disabled(), "Keep is unavailable for a new profile");
+        assert!(!replace.is_disabled());
+        assert!(!forget.is_disabled());
+    }
+
+    #[test]
+    fn config_uncertain_actual_profile_editor_keeps_cancel_enabled() {
+        let mut editor = valid_editor(DriverKind::MySql);
+        editor.set_config_uncertain(true);
+        let update = profile_accesskit_update(&mut editor);
+
+        for disabled in ["profile.test_draft", "profile.save", "profile.save_connect"] {
+            assert!(author_node(&update, disabled).1.is_disabled(), "{disabled}");
+        }
+        assert!(
+            !author_node(&update, "profile.cancel").1.is_disabled(),
+            "Cancel must remain an enabled escape route"
+        );
+    }
+
+    #[test]
+    fn environment_probe_state_clears_when_the_name_changes() {
+        let mut editor = valid_editor(DriverKind::MySql);
+        editor.select_credential_mode(CredentialMode::Environment);
+        editor.draft.secret_env = "DBOTTER_FIRST_ENV".to_owned();
+        let _ = editor.probe_environment_availability();
+        assert!(editor.environment_availability.is_some());
+
+        editor.draft.secret_env = "DBOTTER_SECOND_ENV".to_owned();
+        let _ = profile_accesskit_update(&mut editor);
+        assert_eq!(editor.environment_availability, None);
+    }
+
+    #[test]
+    fn busy_and_disconnected_draft_test_have_visible_status() {
+        let (busy_ui, mut busy_service) = bounded_ports(1);
+        assert_eq!(
+            busy_ui.try_submit(UiCommand::TestConnection {
+                operation_id: OperationId(230),
+                profile_id: ProfileId("busy".to_owned()),
+                profile_generation: ProfileGeneration(1),
+                timeout_ms: 1_000,
+            }),
+            Ok(())
+        );
+        let mut busy_editor = valid_editor(DriverKind::MySql);
+        assert_eq!(
+            busy_editor.try_test_draft(&busy_ui, OperationId(231)),
+            DraftTestAttempt::Busy
+        );
+        assert_eq!(
+            busy_editor.status(),
+            "Service is busy; draft was not submitted"
+        );
+        assert!(busy_service.try_next_command().is_some());
+
+        let (disconnected_ui, disconnected_service) = bounded_ports(1);
+        drop(disconnected_service);
+        let mut disconnected_editor = valid_editor(DriverKind::MySql);
+        assert_eq!(
+            disconnected_editor.try_test_draft(&disconnected_ui, OperationId(232)),
+            DraftTestAttempt::Disconnected
+        );
+        assert_eq!(disconnected_editor.status(), "Service is unavailable");
     }
 
     #[test]
@@ -1622,6 +1791,16 @@ mod tests {
             Some(crate::model::ProfileFieldId::RedisCaFile)
         );
         assert!(!format!("{:?}", editor.draft).contains("private-ca.pem"));
+
+        let (ui, _service) = bounded_ports(1);
+        assert_eq!(
+            editor.try_test_draft(&ui, OperationId(240)),
+            DraftTestAttempt::Submitted(OperationId(240))
+        );
+        assert!(
+            !editor.redis_ca_picker_enabled(),
+            "the CA picker must disable while a draft test is pending"
+        );
 
         editor.set_config_uncertain(true);
         assert!(editor.redis_ca_picker_visible());

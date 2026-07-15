@@ -888,12 +888,13 @@ fn display_cell(cell: &Cell) -> String {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::DbotterApp;
+    use super::{DbotterApp, ProfileEditor};
     use crate::model::{
         ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
-        ProfileFieldId, ProfileGeneration, ProfileId, RedisKeyFilter, RedisKeyId, RedisTlsConfig,
-        TlsMode,
+        OperationKind, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
+        RedisKeyFilter, RedisKeyId, RedisTlsConfig, TlsMode,
     };
+    use crate::public_error::{PublicOperationError, SafeContext};
     use crate::ui::adapter::{UiCommand, bounded_ports};
     use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
     use crate::ui::model::{ProfileSnapshot, WorkspaceKey};
@@ -930,6 +931,169 @@ mod tests {
             has_current_session_secret: false,
             persisted,
         }
+    }
+
+    fn prime_save_and_connect(
+        app: &mut DbotterApp,
+        service: &mut crate::ui::adapter::ServicePort,
+    ) -> (ProfileId, OperationId) {
+        let mut editor = ProfileEditor::new(DraftId(401), DriverKind::MySql);
+        editor.draft.name = "Profile".to_owned();
+        let save_operation = app.model.next_operation();
+        assert!(matches!(
+            editor.try_save_with_connect(&app.port, save_operation, true),
+            crate::ui::profile_form::SaveAttempt::Submitted(operation)
+                if operation == save_operation
+        ));
+        app.profile_editor = Some(editor);
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::CreateProfile(request)) if request.operation_id == save_operation
+        ));
+        let profile_id = ProfileId("profile".to_owned());
+        assert!(service.try_emit(crate::ui::UiEvent::ProfileSaved {
+            operation_id: save_operation,
+            profile_id: profile_id.clone(),
+            previous_generation: None,
+            profile_generation: ProfileGeneration(1),
+            session_retained: false,
+            warning: None,
+        }));
+        app.poll_events();
+        let Some(UiCommand::RefreshProfiles { operation_id }) = service.try_next_command() else {
+            panic!("Save & Connect must submit an exact follow-up refresh");
+        };
+        (profile_id, operation_id)
+    }
+
+    fn reload_failure(operation_id: OperationId) -> PublicOperationError {
+        PublicOperationError::new_or_internal(
+            OperationKind::ReloadConfiguration,
+            PublicSummary::NetworkUnavailable,
+            PublicCode::None,
+            &SafeContext::global(operation_id),
+        )
+    }
+
+    #[test]
+    fn actual_app_profile_editor_exposes_frozen_ids_and_config_cancel_escape() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let mut editor = ProfileEditor::new(DraftId(400), DriverKind::Redis);
+        editor.draft.name = "Redis Profile".to_owned();
+        editor.draft.select_tls(TlsMode::Required);
+        editor.select_credential_mode(CredentialMode::Session);
+        editor.set_config_uncertain(true);
+        app.profile_editor = Some(editor);
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let output = context.run_ui(RawInput::default(), |ui| app.editor_and_results(ui));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("actual app profile frame must emit AccessKit");
+        for expected in [
+            "profile.connection_id",
+            "profile.host",
+            "profile.redis_tls.ca_file",
+            "profile.redis_tls.ca_file.pick",
+            "profile.credential.session.keep",
+            "profile.credential.session.replace",
+            "profile.credential.session.forget",
+        ] {
+            assert!(
+                update
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.author_id() == Some(expected)),
+                "missing actual app AX id {expected}"
+            );
+        }
+        let cancel = update
+            .nodes
+            .iter()
+            .find_map(|(_, node)| (node.author_id() == Some("profile.cancel")).then_some(node))
+            .expect("actual app Cancel node");
+        assert!(
+            !cancel.is_disabled(),
+            "Config uncertain must not trap the form"
+        );
+    }
+
+    #[test]
+    fn failed_save_connect_refresh_clears_follow_up_before_unrelated_reload() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let (_profile_id, refresh_operation) = prime_save_and_connect(&mut app, &mut service);
+
+        let error = reload_failure(refresh_operation);
+        assert!(service.try_emit(crate::ui::UiEvent::ProfilesFailed {
+            operation_id: refresh_operation,
+            summary: error.summary,
+            error,
+        }));
+        app.poll_events();
+        assert!(service.try_emit(crate::ui::UiEvent::ProfilesLoaded {
+            operation_id: OperationId(refresh_operation.0 + 1),
+            profiles: vec![profile(DriverKind::MySql, DriverAvailability::Ready)],
+        }));
+        app.poll_events();
+
+        assert!(
+            service.try_next_command().is_none(),
+            "an unrelated later reload must not silently connect"
+        );
+    }
+
+    #[test]
+    fn busy_save_connect_refresh_submit_does_not_arm_a_later_reload() {
+        let (ui_port, mut service) = bounded_ports(1);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+
+        let mut editor = ProfileEditor::new(DraftId(402), DriverKind::MySql);
+        editor.draft.name = "Profile".to_owned();
+        let save_operation = app.model.next_operation();
+        assert!(matches!(
+            editor.try_save_with_connect(&app.port, save_operation, true),
+            crate::ui::profile_form::SaveAttempt::Submitted(_)
+        ));
+        app.profile_editor = Some(editor);
+        assert!(service.try_next_command().is_some());
+        assert_eq!(
+            app.port.try_submit(UiCommand::RefreshProfiles {
+                operation_id: OperationId(999),
+            }),
+            Ok(())
+        );
+        assert!(service.try_emit(crate::ui::UiEvent::ProfileSaved {
+            operation_id: save_operation,
+            profile_id: ProfileId("profile".to_owned()),
+            previous_generation: None,
+            profile_generation: ProfileGeneration(1),
+            session_retained: false,
+            warning: None,
+        }));
+        app.poll_events();
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::RefreshProfiles {
+                operation_id: OperationId(999)
+            })
+        ));
+
+        assert!(service.try_emit(crate::ui::UiEvent::ProfilesLoaded {
+            operation_id: OperationId(1_000),
+            profiles: vec![profile(DriverKind::MySql, DriverAvailability::Ready)],
+        }));
+        app.poll_events();
+        assert!(
+            service.try_next_command().is_none(),
+            "a failed follow-up submit must not arm an unrelated later reload"
+        );
     }
 
     #[test]
