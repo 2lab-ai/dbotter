@@ -63,6 +63,7 @@ required_inputs=(
   scripts/build-icns.py
   scripts/test-workflow-contract.sh
   scripts/check-workflow-graph.rb
+  scripts/test-live-evidence-contract.sh
   scripts/test-installed-verifier-contract.sh
   scripts/test-installed-receipt-assembler-contract.sh
   scripts/assemble-installed-receipt.py
@@ -87,6 +88,7 @@ done
 ./scripts/test-installed-receipt-contract.sh
 ./scripts/test-macos-package-contract.sh
 ./scripts/test-workflow-contract.sh
+./scripts/test-live-evidence-contract.sh
 ./scripts/test-installed-verifier-contract.sh
 ./scripts/test-installed-receipt-assembler-contract.sh
 ./scripts/test-receipt-contract.sh
