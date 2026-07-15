@@ -1,16 +1,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    DraftId, OperationId, ProfileGeneration, ProfileId, ResultId, SessionGeneration,
+    DraftId, OperationId, ProfileGeneration, ProfileId, PublicSummary, ResultId, SessionGeneration,
 };
 
 use super::runtime::{
     DraftPermitRegistry, ProfilePermitRegistry, RegisteredTask, TaskClass, TaskRegistry, TaskScope,
-    join_registered_for_shutdown_with_grace,
+    await_pre_session_blocking, join_registered_for_shutdown_with_grace,
 };
 
 struct DropFlag(Arc<AtomicBool>);
@@ -18,6 +19,59 @@ struct DropFlag(Arc<AtomicBool>);
 impl Drop for DropFlag {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_session_blocking_cancel_and_timeout_return_before_running_worker_finishes() {
+    for cancel_first in [true, false] {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            let (lock, condition) = &*worker_gate;
+            let mut released = lock.lock().expect("blocking gate lock");
+            while !*released {
+                released = condition.wait(released).expect("blocking gate wait");
+            }
+            let _ = finished_tx.send(());
+        });
+        started_rx.await.expect("blocking worker started");
+
+        let cancel = CancellationToken::new();
+        let (deadline, expected) = if cancel_first {
+            cancel.cancel();
+            (
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                PublicSummary::OperationCancelled,
+            )
+        } else {
+            (
+                tokio::time::Instant::now() + Duration::from_millis(10),
+                PublicSummary::OperationTimedOut,
+            )
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            await_pre_session_blocking(task, &cancel, deadline),
+        )
+        .await
+        .expect("pre-session terminal remains responsive");
+        assert_eq!(result.expect_err("cancel or timeout"), expected);
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let (lock, condition) = &*gate;
+        *lock.lock().expect("release gate lock") = true;
+        condition.notify_all();
+        tokio::time::timeout(Duration::from_secs(1), &mut finished_rx)
+            .await
+            .expect("detached idempotent worker finishes")
+            .expect("blocking worker completion signal");
     }
 }
 

@@ -1960,6 +1960,20 @@ async fn run_catalog_browse(
         return catalog_failed_event(request, summary, None, None);
     }
 
+    let token_key_result =
+        match await_pre_session_blocking(service.spawn_catalog_token_key_load(), cancel, deadline)
+            .await
+        {
+            Ok(result) => result,
+            Err(summary) => return catalog_failed_event(request, summary, None, None),
+        };
+    let token_key = match token_key_result {
+        Ok(token_key) => token_key,
+        Err(error) => {
+            return catalog_failed_event(request, error.public_summary(), None, None);
+        }
+    };
+
     let acquire = service.acquire_session_at(operation_id, profile_id, profile_generation, timeout);
     tokio::pin!(acquire);
     let lease = tokio::select! {
@@ -2000,7 +2014,7 @@ async fn run_catalog_browse(
         TimedOut,
     }
     let attempt = {
-        let browse = lease.load_catalog_page(&request, service.catalog_token_key());
+        let browse = lease.load_catalog_page(&request, token_key.as_ref());
         tokio::pin!(browse);
         tokio::select! {
             biased;
@@ -2058,6 +2072,29 @@ async fn run_catalog_browse(
                 Some(SessionDisposition::Evict),
             )
         }
+    }
+}
+
+pub(super) async fn await_pre_session_blocking<T: Send + 'static>(
+    mut task: JoinHandle<T>,
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> Result<T, PublicSummary> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            // `abort` prevents work that has not started. A running
+            // `spawn_blocking` may finish the idempotent 32-byte sidecar
+            // publish after this handle is dropped, but it has no database,
+            // session, event, or UI side effects.
+            task.abort();
+            Err(PublicSummary::OperationCancelled)
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            task.abort();
+            Err(PublicSummary::OperationTimedOut)
+        }
+        result = &mut task => result.map_err(|_| PublicSummary::InternalFailure),
     }
 }
 

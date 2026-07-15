@@ -477,10 +477,12 @@ async fn p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli() {
     assert!(cli_page.get("query_text").is_none());
     assert_eq!(cli_page["nodes"].as_array().expect("CLI nodes").len(), 2);
 
+    let cli_pagination_config = directory.path().join("cli-pagination.toml");
+    fs::copy(&config_path, &cli_pagination_config).expect("copy CLI pagination config");
     let cli_first = Command::new(env!("CARGO_BIN_EXE_dbotter"))
         .args([
             "--config",
-            config_path.to_string_lossy().as_ref(),
+            cli_pagination_config.to_string_lossy().as_ref(),
             "browse",
             "mysql",
             "relations",
@@ -517,7 +519,7 @@ async fn p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli() {
     let cli_second = Command::new(env!("CARGO_BIN_EXE_dbotter"))
         .args([
             "--config",
-            config_path.to_string_lossy().as_ref(),
+            cli_pagination_config.to_string_lossy().as_ref(),
             "browse",
             "mysql",
             "relations",

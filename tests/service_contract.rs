@@ -67,6 +67,46 @@ fn prepared_unsupported_retains_only_a_typed_proven_healthy_session() {
     );
 }
 
+#[test]
+fn catalog_integrity_key_is_lazy_and_uses_the_internal_browse_error_row() {
+    let directory = tempfile::tempdir().expect("catalog key lazy tempdir");
+    let path = directory.path().join("config.toml");
+    let original = b"version = 2\nprofiles = []\n";
+    fs::write(&path, original).expect("catalog key lazy config");
+
+    let service = ApplicationService::load_path(&path).expect("load service without key write");
+    drop(service);
+    assert_eq!(fs::read(&path).expect("unchanged config bytes"), original);
+    assert_eq!(
+        fs::read_dir(directory.path())
+            .expect("lazy key directory")
+            .filter_map(Result::ok)
+            .count(),
+        1,
+        "ApplicationService construction must not create the sidecar"
+    );
+
+    let error = ServiceError::CatalogTokenKeyUnavailable;
+    assert_eq!(
+        error.public_error_parts(),
+        (PublicSummary::InternalFailure, PublicCode::None)
+    );
+    assert_eq!(format!("{error:?}"), "CatalogTokenKeyUnavailable");
+    assert_eq!(
+        error.to_string(),
+        "catalog token integrity key is unavailable"
+    );
+    assert!(
+        recovery_for(
+            OperationKind::BrowseMySql,
+            PublicSummary::InternalFailure,
+            PublicCode::None,
+            &SafeContext::profile(ProfileId("catalog".to_owned()), OperationId(8)),
+        )
+        .is_ok()
+    );
+}
+
 #[async_trait]
 impl CurrentGenerationTestExt for ApplicationService {
     async fn check(

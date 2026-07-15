@@ -75,6 +75,7 @@ fn p4_catalog_queries_are_three_static_prepared_binary_keyset_plans() {
 fn p4_opaque_tokens_are_context_bound_and_integrity_checked() {
     let catalog = source("src/drivers/mysql_catalog.rs");
     let service = source("src/service.rs");
+    let runtime = source("src/ui/runtime.rs");
     let manifest = source("Cargo.toml");
 
     for required in [
@@ -117,6 +118,30 @@ fn p4_opaque_tokens_are_context_bound_and_integrity_checked() {
     assert!(
         !service.contains("CatalogTokenKey::generate"),
         "ApplicationService construction must not generate a process-local key"
+    );
+    assert!(
+        service.contains("spawn_catalog_token_key_load")
+            && service.contains("tokio::task::spawn_blocking")
+            && service.contains("CatalogTokenKeyUnavailable")
+            && service.contains("PublicSummary::InternalFailure"),
+        "sidecar I/O must use a typed blocking/internal-failure service path"
+    );
+    let browse = runtime
+        .split("async fn run_catalog_browse")
+        .nth(1)
+        .expect("catalog runtime function");
+    assert!(
+        browse
+            .find("spawn_catalog_token_key_load")
+            .expect("pre-session key load")
+            < browse
+                .find("acquire_session_at")
+                .expect("catalog session acquisition"),
+        "catalog key loading must finish or cancel before session acquisition"
+    );
+    assert!(
+        browse.contains("await_pre_session_blocking"),
+        "cancel/timeout must stay responsive while sidecar I/O is blocking"
     );
     assert!(
         catalog.contains("CatalogTokenKey(<redacted>)") && !catalog.contains("fn token_digest("),

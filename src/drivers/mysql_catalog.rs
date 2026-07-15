@@ -2,6 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs;
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use chrono::{SecondsFormat, Utc};
@@ -23,13 +28,16 @@ const TOKEN_VERSION: u8 = 1;
 const TOKEN_PREFIX: &str = "v1";
 const TOKEN_AUTHENTICATION_DOMAIN: &[u8] = b"dbotter:mysql-catalog-token:v1\0";
 const TOKEN_KEY_BYTES: usize = 32;
+const TOKEN_KEY_SUFFIX: &str = ".catalog-integrity-key";
+
+static TOKEN_KEY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Process-local capability used only to authenticate catalog continuations.
+/// Secret capability used only to authenticate catalog continuations.
 ///
-/// The key is generated once per [`crate::service::ApplicationService`], shared
-/// only by clones of that service, zeroized on final drop, and never serialized.
+/// The key is loaded lazily from a private per-config sidecar, zeroized on final
+/// drop, and never serialized through an application data model.
 ///
 /// ```compile_fail
 /// use dbotter::drivers::mysql_catalog::CatalogTokenKey;
@@ -72,6 +80,222 @@ impl CatalogTokenKey {
 impl fmt::Debug for CatalogTokenKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("CatalogTokenKey(<redacted>)")
+    }
+}
+
+/// Lazy, race-safe owner of the private token-integrity sidecar for one config.
+pub(crate) struct CatalogTokenKeyStore {
+    path: PathBuf,
+    cached: Mutex<Option<Arc<CatalogTokenKey>>>,
+}
+
+impl CatalogTokenKeyStore {
+    pub(crate) fn for_config_path(config_path: &Path) -> Self {
+        let mut path = config_path.as_os_str().to_os_string();
+        path.push(TOKEN_KEY_SUFFIX);
+        Self {
+            path: PathBuf::from(path),
+            cached: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn load_or_create(&self) -> Result<Arc<CatalogTokenKey>, CatalogTokenKeyError> {
+        let mut cached = self.cached.lock().map_err(|_| CatalogTokenKeyError)?;
+        if let Some(key) = cached.as_ref() {
+            return Ok(Arc::clone(key));
+        }
+        let key = Arc::new(load_or_create_token_key(&self.path).map_err(|_| CatalogTokenKeyError)?);
+        *cached = Some(Arc::clone(&key));
+        Ok(key)
+    }
+}
+
+impl fmt::Debug for CatalogTokenKeyStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CatalogTokenKeyStore(<redacted>)")
+    }
+}
+
+#[derive(thiserror::Error)]
+#[error("catalog token integrity key is unavailable")]
+pub(crate) struct CatalogTokenKeyError;
+
+impl fmt::Debug for CatalogTokenKeyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CatalogTokenKeyError")
+    }
+}
+
+fn load_or_create_token_key(path: &Path) -> std::io::Result<CatalogTokenKey> {
+    if let Some(key) = read_token_key(path)? {
+        return Ok(key);
+    }
+
+    let directory = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(directory)?;
+    let candidate = CatalogTokenKey::generate().map_err(std::io::Error::other)?;
+    let (temp_path, mut temp_file) = create_token_key_temp(directory)?;
+    let cleanup = TokenKeyTempCleanup::new(temp_path.clone());
+    temp_file.write_all(candidate.0.as_ref())?;
+    temp_file.flush()?;
+    temp_file.sync_all()?;
+    drop(temp_file);
+
+    match rename_token_key_no_replace(&temp_path, path) {
+        Ok(()) => {
+            cleanup.disarm();
+            sync_token_key_directory(directory)?;
+            Ok(candidate)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            sync_token_key_directory(directory)?;
+            read_token_key(path)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "catalog token integrity key is unavailable",
+                )
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_token_key(path: &Path) -> std::io::Result<Option<CatalogTokenKey>> {
+    let link_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !link_metadata.file_type().is_file() || !token_key_mode_is_private(&link_metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "catalog token integrity key is invalid",
+        ));
+    }
+
+    let mut file = open_token_key_no_follow(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.file_type().is_file() || !token_key_mode_is_private(&opened_metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "catalog token integrity key is invalid",
+        ));
+    }
+    let mut key = Zeroizing::new([0_u8; TOKEN_KEY_BYTES]);
+    file.read_exact(key.as_mut())?;
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "catalog token integrity key is invalid",
+        ));
+    }
+    Ok(Some(CatalogTokenKey(key)))
+}
+
+fn create_token_key_temp(directory: &Path) -> std::io::Result<(PathBuf, fs::File)> {
+    for _ in 0..16 {
+        let sequence = TOKEN_KEY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            ".dbotter-catalog-integrity-key.tmp.{}.{}",
+            std::process::id(),
+            sequence
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "catalog token integrity temporary file unavailable",
+    ))
+}
+
+#[cfg(unix)]
+fn token_key_mode_is_private(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    metadata.permissions().mode() & 0o7777 == 0o600
+}
+
+#[cfg(not(unix))]
+fn token_key_mode_is_private(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn open_token_key_no_follow(path: &Path) -> std::io::Result<fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::openat(
+        rustix::fs::CWD,
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(fs::File::from)
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn open_token_key_no_follow(path: &Path) -> std::io::Result<fs::File> {
+    fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn rename_token_key_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        from,
+        rustix::fs::CWD,
+        to,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn rename_token_key_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::hard_link(from, to)?;
+    fs::remove_file(from)
+}
+
+fn sync_token_key_directory(directory: &Path) -> std::io::Result<()> {
+    fs::File::open(directory)?.sync_all()
+}
+
+struct TokenKeyTempCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TokenKeyTempCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TokenKeyTempCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -803,6 +1027,8 @@ fn u64_to_usize(value: u64) -> Result<usize, DriverError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::Duration;
 
     use super::*;
@@ -844,6 +1070,93 @@ mod tests {
     }
 
     #[test]
+    fn token_key_store_is_lazy_private_persistent_and_config_scoped() {
+        let directory = tempfile::tempdir().expect("token key tempdir");
+        let config_path = directory.path().join("config.toml");
+        let store_a = CatalogTokenKeyStore::for_config_path(&config_path);
+        assert_eq!(format!("{store_a:?}"), "CatalogTokenKeyStore(<redacted>)");
+        assert!(!store_a.path.exists(), "construction must not write");
+
+        let key_a = store_a.load_or_create().expect("create token key");
+        let metadata = fs::metadata(&store_a.path).expect("token key metadata");
+        assert_eq!(metadata.len(), TOKEN_KEY_BYTES as u64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        }
+
+        let store_b = CatalogTokenKeyStore::for_config_path(&config_path);
+        let key_b = store_b.load_or_create().expect("reload token key");
+        let signed = key_a.sign(b"same-config").expect("sign same config");
+        key_b
+            .verify(b"same-config", &signed)
+            .expect("same-config service accepts persisted key");
+
+        let other_store =
+            CatalogTokenKeyStore::for_config_path(&directory.path().join("other.toml"));
+        let other_key = other_store.load_or_create().expect("other config key");
+        assert!(other_key.verify(b"same-config", &signed).is_err());
+    }
+
+    #[test]
+    fn concurrent_first_use_publishes_one_complete_key_and_cleans_temps() {
+        let directory = tempfile::tempdir().expect("token key race tempdir");
+        let config_path = Arc::new(directory.path().join("config.toml"));
+        let barrier = Arc::new(Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let config_path = Arc::clone(&config_path);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let store = CatalogTokenKeyStore::for_config_path(config_path.as_path());
+                    barrier.wait();
+                    let key = store.load_or_create().expect("token key race load");
+                    key.sign(b"race").expect("token key race sign")
+                })
+            })
+            .collect::<Vec<_>>();
+        let signatures = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("token key race thread"))
+            .collect::<Vec<_>>();
+        assert!(signatures.windows(2).all(|pair| pair[0] == pair[1]));
+
+        let store = CatalogTokenKeyStore::for_config_path(config_path.as_path());
+        assert_eq!(fs::metadata(&store.path).expect("published key").len(), 32);
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("race directory")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".dbotter-catalog-integrity-key.tmp")
+                })
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_key_sidecar_rejects_symlinks_even_to_private_exact_length_files() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = tempfile::tempdir().expect("token key symlink tempdir");
+        let target = directory.path().join("target-key");
+        fs::write(&target, [9_u8; TOKEN_KEY_BYTES]).expect("write private target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .expect("set private target mode");
+        let store = CatalogTokenKeyStore::for_config_path(&directory.path().join("config.toml"));
+        symlink(&target, &store.path).expect("create token key symlink");
+
+        assert!(store.load_or_create().is_err());
+        assert_eq!(fs::read(&target).expect("target remains"), [9_u8; 32]);
+    }
+
+    #[test]
     fn page_size_plus_one_proves_more_and_token_uses_last_retained_key() {
         let request = schema_request(4, None);
         let token_key = token_key();
@@ -869,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn token_key_debug_is_static_and_cross_service_authentication_fails_closed() {
+    fn token_key_debug_is_static_and_different_config_keys_fail_closed() {
         let request = schema_request(4, None);
         let service_a = CatalogTokenKey::for_test(17);
         let service_b = CatalogTokenKey::for_test(18);
@@ -941,8 +1254,8 @@ mod tests {
         };
         assert!(decode_page_token(&different_page_size, &valid, &token_key).is_err());
 
-        let other_service_key = CatalogTokenKey::for_test(8);
-        assert!(decode_page_token(&request, &valid, &other_service_key).is_err());
+        let different_config_key = CatalogTokenKey::for_test(8);
+        assert!(decode_page_token(&request, &valid, &different_config_key).is_err());
     }
 
     #[test]

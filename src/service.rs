@@ -17,7 +17,7 @@ use crate::config::{
     LoadedConfig, MigrationConsent, MutationOutcome, PostCommitObservation,
     PostCommitObservationError,
 };
-use crate::drivers::mysql_catalog::CatalogTokenKey;
+use crate::drivers::mysql_catalog::{CatalogTokenKey, CatalogTokenKeyStore};
 use crate::drivers::{ConnectedResources, DriverError, Session};
 use crate::execution::{
     ExecutionLanguage, ExecutionTarget, ExecutionTargetError, ValidatedExecutionTarget,
@@ -99,6 +99,8 @@ pub enum ServiceError {
     ConfigTaskFailed,
     #[error("configuration mutation lane is closed")]
     MutationLaneClosed,
+    #[error("catalog token integrity key is unavailable")]
+    CatalogTokenKeyUnavailable,
     #[error(transparent)]
     PostCommitObservation(#[from] PostCommitObservationError),
     #[error("configuration state is uncertain; reload the exact configured path")]
@@ -162,6 +164,7 @@ impl fmt::Debug for ServiceError {
                 .finish(),
             Self::ConfigTaskFailed => formatter.write_str("ConfigTaskFailed"),
             Self::MutationLaneClosed => formatter.write_str("MutationLaneClosed"),
+            Self::CatalogTokenKeyUnavailable => formatter.write_str("CatalogTokenKeyUnavailable"),
             Self::PostCommitObservation(error) => formatter
                 .debug_tuple("PostCommitObservation")
                 .field(error)
@@ -247,7 +250,9 @@ impl ServiceError {
             Self::Driver(_) => PublicSummary::NetworkUnavailable,
             Self::Config(_) => PublicSummary::ConfigWriteNotCommitted,
             Self::PostCommitObservation(_) => PublicSummary::CommittedDurabilityUnknown,
-            Self::ConfigTaskFailed | Self::MutationLaneClosed => PublicSummary::InternalFailure,
+            Self::ConfigTaskFailed
+            | Self::MutationLaneClosed
+            | Self::CatalogTokenKeyUnavailable => PublicSummary::InternalFailure,
         };
         (summary, code)
     }
@@ -553,7 +558,7 @@ pub struct ApplicationService {
     connector: Arc<dyn SessionConnector>,
     environment: Arc<dyn SecretResolver>,
     session_secrets: Arc<SessionSecretStore>,
-    catalog_token_key: Arc<CatalogTokenKey>,
+    catalog_token_keys: Arc<CatalogTokenKeyStore>,
     next_generation: Arc<AtomicU64>,
     next_session_generation: Arc<AtomicU64>,
     next_result_id: Arc<AtomicU64>,
@@ -906,13 +911,7 @@ impl ApplicationService {
             generations.insert(ProfileId(profile.id.clone()), ProfileGeneration(next));
             next = next.saturating_add(1);
         }
-        let catalog_token_key =
-            Arc::new(
-                CatalogTokenKey::generate().map_err(|_| DriverError::Unavailable {
-                    driver: DriverKind::MySql,
-                    reason: "catalog token entropy unavailable",
-                })?,
-            );
+        let catalog_token_keys = Arc::new(CatalogTokenKeyStore::for_config_path(&path));
         Ok(Self {
             config_path: Arc::new(path),
             state: Arc::new(RwLock::new(ServiceState {
@@ -927,7 +926,7 @@ impl ApplicationService {
             connector,
             environment,
             session_secrets,
-            catalog_token_key,
+            catalog_token_keys,
             next_generation: Arc::new(AtomicU64::new(next)),
             next_session_generation: Arc::new(AtomicU64::new(1)),
             next_result_id: Arc::new(AtomicU64::new(1)),
@@ -1933,6 +1932,7 @@ impl ApplicationService {
         request: CatalogRequest,
     ) -> Result<CatalogPage, ServiceError> {
         self.prepare_catalog_request(&request).await?;
+        let token_key = self.catalog_token_key().await?;
         let lease = self
             .acquire_session_at(
                 request.operation_id(),
@@ -1941,9 +1941,7 @@ impl ApplicationService {
                 request.timeout(),
             )
             .await?;
-        let result = lease
-            .load_catalog_page(&request, self.catalog_token_key())
-            .await;
+        let result = lease.load_catalog_page(&request, token_key.as_ref()).await;
         self.finish_resource_operation(&lease, request.operation_id(), result)
             .await
     }
@@ -1962,8 +1960,25 @@ impl ApplicationService {
         .await
     }
 
-    pub(crate) fn catalog_token_key(&self) -> &CatalogTokenKey {
-        self.catalog_token_key.as_ref()
+    pub(crate) fn spawn_catalog_token_key_load(
+        &self,
+    ) -> tokio::task::JoinHandle<Result<Arc<CatalogTokenKey>, ServiceError>> {
+        let token_keys = Arc::clone(&self.catalog_token_keys);
+        tokio::task::spawn_blocking(move || {
+            token_keys
+                .load_or_create()
+                .map_err(|_| ServiceError::CatalogTokenKeyUnavailable)
+        })
+    }
+
+    pub(crate) fn finish_catalog_token_key_load(
+        result: Result<Result<Arc<CatalogTokenKey>, ServiceError>, tokio::task::JoinError>,
+    ) -> Result<Arc<CatalogTokenKey>, ServiceError> {
+        result.map_err(|_| ServiceError::CatalogTokenKeyUnavailable)?
+    }
+
+    async fn catalog_token_key(&self) -> Result<Arc<CatalogTokenKey>, ServiceError> {
+        Self::finish_catalog_token_key_load(self.spawn_catalog_token_key_load().await)
     }
 
     pub async fn scan_redis_keys(
