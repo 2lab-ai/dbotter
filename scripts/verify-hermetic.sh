@@ -50,6 +50,7 @@ required_inputs=(
   tests/ui_contrast.rs
   tests/live_evidence_recorder.rs
   tests/common/live_evidence.rs
+  tests/live_mysql_safety.rs
   scripts/check-release-contract.sh
   scripts/test-release-contract.sh
   scripts/test-four-target-preview-contract.sh

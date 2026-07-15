@@ -3384,9 +3384,13 @@ fn ensure_connector_tls_support(
 }
 
 fn connection_error(profile: &ConnectionProfile, error: DriverError) -> ServiceError {
-    if let DriverError::Redis(redis) = &error
-        && redis.kind() == redis::ErrorKind::AuthenticationFailed
-    {
+    let authentication_failed = error.is_mysql_authentication_failed()
+        || matches!(
+            &error,
+            DriverError::Redis(redis)
+                if redis.kind() == redis::ErrorKind::AuthenticationFailed
+        );
+    if authentication_failed {
         let code = match profile.credential_mode {
             CredentialMode::Session => PublicCode::SessionCredential,
             CredentialMode::Environment => PublicCode::CredentialEnvironmentName,

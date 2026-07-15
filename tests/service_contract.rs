@@ -15,8 +15,9 @@ use dbotter::drivers::{
 };
 use dbotter::model::{
     CatalogPage, CatalogRequest, ConnectionDraft, CredentialMode, DraftId, DriverKind,
-    ExecuteRequest, OperationId, OperationKind, PreparedMySqlRequest, ProfileFieldId,
-    ProfileGeneration, ProfileId, PublicCode, PublicSummary, QueryLanguage, QueryResult, TlsMode,
+    ExecuteRequest, MySqlPublicErrorCode, OperationId, OperationKind, PreparedMySqlRequest,
+    ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary, QueryLanguage,
+    QueryResult, TlsMode,
 };
 use dbotter::public_error::{RecoveryAction, SafeContext, recovery_for};
 use dbotter::secrets::{
@@ -65,6 +66,96 @@ fn prepared_unsupported_retains_only_a_typed_proven_healthy_session() {
         service_error.public_code(),
         PublicCode::PreparedStatementUnsupported
     );
+}
+
+#[tokio::test]
+async fn mysql_authentication_failure_maps_to_the_exact_credential_source_and_action() {
+    for (credential_mode, expected_code, expected_action) in [
+        (
+            CredentialMode::Session,
+            PublicCode::SessionCredential,
+            RecoveryAction::OpenCredentialPrompt(ProfileId("auth-session".to_owned())),
+        ),
+        (
+            CredentialMode::Environment,
+            PublicCode::CredentialEnvironmentName,
+            RecoveryAction::EditProfile(
+                ProfileId("auth-environment".to_owned()),
+                ProfileFieldId::CredentialEnvironmentName,
+            ),
+        ),
+    ] {
+        let directory = tempfile::tempdir().expect("MySQL auth contract tempdir");
+        let path = directory.path().join("config.toml");
+        let profile_id = match credential_mode {
+            CredentialMode::Session => ProfileId("auth-session".to_owned()),
+            CredentialMode::Environment => ProfileId("auth-environment".to_owned()),
+            CredentialMode::None => unreachable!(),
+        };
+        let mut profile = dbotter::model::ConnectionProfile::from_draft(
+            profile_id.0.clone(),
+            draft(DriverKind::MySql),
+        );
+        profile.credential_mode = credential_mode;
+        profile.secret_env =
+            (credential_mode == CredentialMode::Environment).then(|| "EXACT_ENV_NAME".to_owned());
+        fs::write(
+            &path,
+            toml::to_string(&Config {
+                version: 2,
+                profiles: vec![profile],
+            })
+            .expect("serialize MySQL auth profile"),
+        )
+        .expect("write MySQL auth profile");
+        let secrets = Arc::new(SessionSecretStore::default());
+        if credential_mode == CredentialMode::Session {
+            secrets
+                .apply(
+                    &profile_id,
+                    SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(
+                        "contract-session-secret".to_owned(),
+                    ))),
+                )
+                .expect("install contract Session secret");
+        }
+        let service = ApplicationService::with_dependencies(
+            &path,
+            Arc::new(MySqlAuthenticationFailureConnector),
+            Arc::new(FixedEnvironment::default()),
+            secrets,
+            ConfigWriter::default(),
+        )
+        .expect("MySQL auth contract service");
+        let generation = service
+            .profile_generation(&profile_id)
+            .await
+            .expect("MySQL auth profile generation");
+        let error = service
+            .check_at(
+                OperationId(69),
+                profile_id.clone(),
+                generation,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("injected MySQL authentication must fail");
+        assert_eq!(
+            error.public_error_parts(),
+            (PublicSummary::AuthenticationFailed, expected_code)
+        );
+        assert_eq!(
+            recovery_for(
+                OperationKind::ConnectProfile,
+                error.public_summary(),
+                error.public_code(),
+                &SafeContext::profile(profile_id, OperationId(69)),
+            )
+            .expect("MySQL authentication recovery")
+            .as_slice(),
+            &[expected_action]
+        );
+    }
 }
 
 #[test]
@@ -201,6 +292,22 @@ struct FakeConnector {
     saw_secret: AtomicBool,
     session: Arc<FakeSession>,
     redis_tls: bool,
+}
+
+struct MySqlAuthenticationFailureConnector;
+
+#[async_trait]
+impl SessionConnector for MySqlAuthenticationFailureConnector {
+    async fn connect(
+        &self,
+        _profile: &dbotter::model::ConnectionProfile,
+        _secret: Option<&SessionSecret>,
+        _timeout: Duration,
+    ) -> Result<Arc<dyn SessionHandle>, DriverError> {
+        Err(DriverError::MySqlServer {
+            code: MySqlPublicErrorCode::new(1045, "28000").expect("valid MySQL auth code"),
+        })
+    }
 }
 
 struct EndpointSecretConnector {

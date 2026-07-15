@@ -88,11 +88,22 @@ mysql_catalog_cases="$(cases_from_ids \
 mysql_safety_cases="$(cases_from_ids \
   mysql.auth.environment.available.correct \
   mysql.auth.environment.available.wrong \
+  mysql.auth.environment.available.wrong.action \
+  mysql.auth.environment.available.wrong.code \
+  mysql.auth.environment.available.wrong.recovery \
   mysql.auth.environment.empty \
+  mysql.auth.environment.empty.action \
+  mysql.auth.environment.empty.code \
+  mysql.auth.environment.empty.recovery \
   mysql.auth.environment.missing \
-  mysql.auth.recovery \
+  mysql.auth.environment.missing.action \
+  mysql.auth.environment.missing.code \
+  mysql.auth.environment.missing.recovery \
   mysql.auth.session.correct \
   mysql.auth.session.wrong \
+  mysql.auth.session.wrong.action \
+  mysql.auth.session.wrong.code \
+  mysql.auth.session.wrong.recovery \
   mysql.execute.mutation \
   mysql.execute.read \
   mysql.marker.current_target.absent \
@@ -100,6 +111,7 @@ mysql_safety_cases="$(cases_from_ids \
   mysql.marker.explicit_selection.absent \
   mysql.marker.explicit_selection.prepare_only_rejected \
   mysql.marker.explicit_selection.ui_rejected \
+  mysql.prepared_unsupported.error \
   mysql.prepared_unsupported.no_raw_fallback \
   mysql.prepared_unsupported.session_retained \
   mysql.prepared_unsupported.static_recovery)"
@@ -154,7 +166,7 @@ make_suite \
   mysql_safety \
   live_mysql_safety_receipt \
   "$mysql_safety_cases" \
-  '{"auth_failures":4,"marker_rows_after":0,"prepared_attempts":2,"prepared_unsupported_attempts":1,"raw_fallback_attempts":0,"statements_executed":2}' \
+  '{"auth_failures":4,"marker_prepared_attempts":2,"marker_rows_after":0,"prepared_unsupported_attempts":1,"raw_fallback_attempts":0,"statements_executed":2}' \
   "$tmp_dir/mysql-safety.json"
 make_suite \
   redis \
