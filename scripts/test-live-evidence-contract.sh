@@ -81,8 +81,10 @@ mysql_catalog_cases="$(cases_from_ids \
   mysql.catalog.relation.view \
   mysql.catalog.schema.scope \
   mysql.catalog.schema.visibility \
-  mysql.catalog.token.integrity_rejected \
-  mysql.catalog.token.stale_generation_rejected)"
+  mysql.catalog.token.cross_config_rejected \
+  mysql.catalog.token.stale_connection_rejected \
+  mysql.catalog.token.stale_generation_rejected \
+  mysql.catalog.token.tampered_rejected)"
 mysql_safety_cases="$(cases_from_ids \
   mysql.auth.environment.available.correct \
   mysql.auth.environment.available.wrong \
