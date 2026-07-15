@@ -39,6 +39,21 @@ pub fn named_dynamic_author_id(
     response
 }
 
+pub fn named_dynamic_value_author_id(
+    response: egui::Response,
+    author_id: String,
+    name: String,
+    value: String,
+) -> egui::Response {
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_author_id(author_id);
+        node.set_label(name);
+        node.set_value(value);
+    });
+    draw_focus_ring(&response);
+    response
+}
+
 fn draw_focus_ring(response: &egui::Response) {
     if !response.has_focus() {
         return;

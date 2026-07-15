@@ -12,6 +12,7 @@ use crate::model::{
 };
 use crate::public_error::PublicOperationError;
 
+use super::accessibility::named_dynamic_value_author_id;
 use super::model::UiEvent;
 
 const BLACK: egui::Color32 = egui::Color32::BLACK;
@@ -469,16 +470,21 @@ fn render_keys(
         .show(ui, |ui| {
             for (index, entry) in explorer.scan.keys().iter().enumerate() {
                 let selected = explorer.selected_key.as_ref() == Some(&entry.id);
+                let display = bounded_text(&entry.display, 96);
                 let response = ui
                     .push_id(("redis.key", index), |ui| {
-                        ui.selectable_label(selected, bounded_text(&entry.display, 96))
+                        ui.selectable_label(selected, &display)
                     })
                     .inner;
-                response.clone().on_hover_text(format!(
-                    "Raw key · {} bytes\nhex: {}",
-                    entry.id.as_bytes().len(),
-                    bounded_text(&entry.hex, 256)
-                ));
+                let response = named_dynamic_value_author_id(
+                    response,
+                    format!("redis.key.{index}"),
+                    format!("Redis key {}", index + 1),
+                    display,
+                );
+                response
+                    .clone()
+                    .on_hover_text("Select this key to inspect its bounded preview.");
                 if response.clicked() {
                     clicked = Some(entry.id.clone());
                 }

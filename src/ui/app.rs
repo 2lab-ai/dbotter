@@ -23,7 +23,10 @@ use crate::public_error::{
 use crate::secrets::ReplacementSecretBuffer;
 use crate::service::DeleteProfileRequest;
 
-use super::accessibility::{named_author_id, named_author_id_with_label, named_dynamic_author_id};
+use super::accessibility::{
+    named_author_id, named_author_id_with_label, named_dynamic_author_id,
+    named_dynamic_value_author_id,
+};
 use super::adapter::{SubmitError, UiCommand, UiPort};
 use super::editor::{
     EDITOR_INPUT_ID, EDITOR_ROW_LIMIT_ID, EDITOR_TIMEOUT_ID, EditorIntent, EditorSurface,
@@ -2923,11 +2926,19 @@ fn render_result(ui: &mut egui::Ui, result: &crate::model::ResultSnapshot) {
         })
         .body(|body| {
             body.rows(22.0, result.rows.len(), |mut row| {
-                let cells = &result.rows[row.index()];
+                let row_index = row.index();
+                let cells = &result.rows[row_index];
                 for index in 0..column_count {
                     row.col(|ui| match cells.get(index) {
                         Some(cell) => {
-                            ui.label(display_cell(cell));
+                            let value = display_cell(cell);
+                            let response = ui.label(&value);
+                            named_dynamic_value_author_id(
+                                response,
+                                format!("result.cell.{row_index}.{index}"),
+                                format!("Result row {} column {}", row_index + 1, index + 1),
+                                value,
+                            );
                         }
                         None => {
                             ui.strong("Error: <missing>");
@@ -4579,26 +4590,26 @@ mod tests {
         let mut author_ids = HashMap::new();
         let mut focused_execute = false;
         for frame in 0..16 {
-            let events = (frame > 0)
-                .then(|| {
-                    vec![
-                        Event::Key {
-                            key: Key::Tab,
-                            physical_key: Some(Key::Tab),
-                            pressed: true,
-                            repeat: false,
-                            modifiers: Modifiers::default(),
-                        },
-                        Event::Key {
-                            key: Key::Tab,
-                            physical_key: Some(Key::Tab),
-                            pressed: false,
-                            repeat: false,
-                            modifiers: Modifiers::default(),
-                        },
-                    ]
-                })
-                .unwrap_or_default();
+            let events = if frame > 0 {
+                vec![
+                    Event::Key {
+                        key: Key::Tab,
+                        physical_key: Some(Key::Tab),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::default(),
+                    },
+                    Event::Key {
+                        key: Key::Tab,
+                        physical_key: Some(Key::Tab),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: Modifiers::default(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
             let output = context.run_ui(
                 RawInput {
                     events,
@@ -4639,6 +4650,11 @@ mod tests {
             author_ids.get(&settled_update.focus).map(String::as_str),
             Some("editor.execute"),
             "keyboard focus readback must settle on the exact action id"
+        );
+        assert_eq!(
+            context.memory(|memory| memory.focused().map(|id| id.accesskit_id())),
+            Some(settled_update.focus),
+            "AccessKit focus readback must match egui keyboard focus"
         );
 
         let _ = context.run_ui(

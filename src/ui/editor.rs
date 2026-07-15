@@ -320,6 +320,7 @@ impl EditorSurface {
         let editor_output = egui::TextEdit::multiline(&mut workspace.editor_text)
             .id_salt(EDITOR_INPUT_ID)
             .code_editor()
+            .lock_focus(false)
             .desired_rows(12)
             .desired_width(f32::INFINITY)
             .interactive(enabled)
@@ -378,18 +379,24 @@ impl EditorSurface {
             });
             ui.vertical(|ui| {
                 ui.label("Action");
-                let execute = ui.add_enabled(
-                    execute_enabled,
-                    egui::Button::new(egui::RichText::new("Execute").color(egui::Color32::WHITE))
-                        .fill(egui::Color32::BLACK)
-                        .min_size(egui::vec2(112.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
-                );
-                execute_clicked = named_author_id(
+                let execute = ui
+                    .push_id(EDITOR_EXECUTE_ID, |ui| {
+                        ui.add_enabled(
+                            execute_enabled,
+                            egui::Button::new(
+                                egui::RichText::new("Execute").color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::BLACK)
+                            .min_size(egui::vec2(112.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                        )
+                    })
+                    .inner;
+                let execute = named_author_id(
                     execute,
                     EDITOR_EXECUTE_ID,
                     "Execute selected or current target",
-                )
-                .clicked();
+                );
+                execute_clicked = execute.clicked();
             });
             if workspace.pending_execute.is_some() {
                 ui.vertical(|ui| {
