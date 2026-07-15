@@ -84,6 +84,9 @@ fn p4_opaque_tokens_are_context_bound_and_integrity_checked() {
         "decode_page_token",
         "Hmac<Sha256>",
         "verify_slice",
+        "TOKEN_KEY_DERIVATION_DOMAIN",
+        "CatalogTokenKeyContext",
+        "derive_token_key",
         "profile_fingerprint",
         "profile_generation",
         "parent_fingerprint",
@@ -122,6 +125,7 @@ fn p4_opaque_tokens_are_context_bound_and_integrity_checked() {
     assert!(
         service.contains("spawn_catalog_token_key_load")
             && service.contains("tokio::task::spawn_blocking")
+            && service.contains("catalog_token_key_context")
             && service.contains("CatalogTokenKeyUnavailable")
             && service.contains("PublicSummary::InternalFailure"),
         "sidecar I/O must use a typed blocking/internal-failure service path"

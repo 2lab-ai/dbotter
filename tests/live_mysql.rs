@@ -234,6 +234,34 @@ async fn p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli() {
     assert_eq!(cross_config.public_summary(), PublicSummary::InvalidInput);
     assert_eq!(cross_config.public_code(), PublicCode::Catalog);
 
+    let original_config = fs::read_to_string(&config_path).expect("read original live config");
+    let rewritten_config = original_config.replacen(
+        "database = \"dbotter_allowed\"",
+        "database = \"information_schema\"",
+        1,
+    );
+    assert_ne!(rewritten_config, original_config);
+    fs::write(&config_path, &rewritten_config).expect("rewrite same-path connection data");
+    let rewritten_service =
+        ApplicationService::load_path(&config_path).expect("same-path rewritten service");
+    let stale_connection_token = relations(
+        &rewritten_service,
+        "catalog-scoped",
+        "dbotter_allowed",
+        Some("bulk_"),
+        first.next_token.clone(),
+        17,
+        3_003,
+    )
+    .await
+    .expect_err("same-path connection fingerprint change must reject old token");
+    assert_eq!(
+        stale_connection_token.public_summary(),
+        PublicSummary::InvalidInput
+    );
+    assert_eq!(stale_connection_token.public_code(), PublicCode::Catalog);
+    fs::write(&config_path, original_config).expect("restore original live config");
+
     let catalog_relations = relations(
         &service,
         "catalog-scoped",
