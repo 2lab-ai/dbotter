@@ -1107,6 +1107,31 @@ impl ApplicationService {
             .map_err(ServiceError::Secret)
     }
 
+    pub(crate) async fn store_session_credential_exact(
+        &self,
+        operation_id: OperationId,
+        profile_id: &ProfileId,
+        expected_generation: ProfileGeneration,
+        secret: Arc<SessionSecret>,
+    ) -> Result<(), ServiceError> {
+        self.ensure_config_certain()?;
+        let _permit = self
+            .mutation_lane
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ServiceError::MutationLaneClosed)?;
+        self.ensure_config_certain()?;
+        self.ensure_generation(profile_id, expected_generation, operation_id)
+            .await?;
+        if self.profile(profile_id).await?.credential_mode != CredentialMode::Session {
+            return Err(ProfileValidationError::field(ProfileFieldId::CredentialMode).into());
+        }
+        self.session_secrets
+            .apply(profile_id, SessionSecretUpdate::Replace(secret))
+            .map_err(ServiceError::Secret)
+    }
+
     pub(crate) async fn needs_session_credential(
         &self,
         profile_id: &ProfileId,

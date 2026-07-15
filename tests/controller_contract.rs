@@ -141,6 +141,84 @@ async fn cache_identity_uses_profile_and_session_generations_for_compare_remove(
 }
 
 #[tokio::test]
+async fn store_credentials_is_generation_checked_and_emits_one_typed_terminal_event() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let service = test_service(&path, Arc::new(CountingConnector::default()));
+    let mut request = create_request("credential-store", OperationId(3_000));
+    request.draft.credential_mode = CredentialMode::Session;
+    request.secret_update = SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(
+        "initial-session-secret".to_owned(),
+    )));
+    let created = service
+        .create_profile(request)
+        .await
+        .expect("session profile");
+    let (mut ui, service_port) = bounded_ports(4);
+    let runtime = spawn_with_service(service_port, service.clone());
+
+    ui.try_submit(UiCommand::StoreCredentials {
+        operation_id: OperationId(3_001),
+        profile_id: created.profile_id.clone(),
+        profile_generation: created.profile_generation,
+        source_operation: dbotter::model::OperationKind::ConnectProfile,
+        secret: Arc::new(SessionSecret::new("replacement-session-secret".to_owned())),
+    })
+    .expect("store command");
+    let event = wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::CredentialsStored {
+                operation_id: OperationId(3_001),
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(matches!(
+        event,
+        UiEvent::CredentialsStored {
+            profile_id,
+            profile_generation,
+            ..
+        } if profile_id == created.profile_id
+            && profile_generation == created.profile_generation
+    ));
+    assert!(
+        service
+            .has_current_session_secret(&created.profile_id)
+            .expect("secret availability")
+    );
+
+    ui.try_submit(UiCommand::StoreCredentials {
+        operation_id: OperationId(3_002),
+        profile_id: created.profile_id.clone(),
+        profile_generation: ProfileGeneration(created.profile_generation.0 + 1),
+        source_operation: dbotter::model::OperationKind::ConnectProfile,
+        secret: Arc::new(SessionSecret::new("stale-session-secret".to_owned())),
+    })
+    .expect("stale store command");
+    let event = wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::CredentialsStoreFailed {
+                operation_id: OperationId(3_002),
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(matches!(
+        event,
+        UiEvent::CredentialsStoreFailed {
+            summary: dbotter::model::PublicSummary::ResourceStale,
+            ..
+        }
+    ));
+    shutdown(&ui, runtime, OperationId(3_003)).await;
+}
+
+#[tokio::test]
 async fn cached_fingerprint_debug_is_redacted_and_stale_disconnect_cannot_remove_replacement() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");

@@ -425,6 +425,10 @@ impl ProfileEditor {
         self.focus_field = Some(field);
     }
 
+    pub(super) const fn draft_id(&self) -> DraftId {
+        self.draft_id
+    }
+
     fn credential_context(&self) -> CredentialEditContext {
         match self.mode {
             EditorMode::Add => CredentialEditContext::Create,

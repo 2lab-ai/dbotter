@@ -1,6 +1,7 @@
 //! Native three-zone UI. Rendering and state folding perform no I/O.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,14 +12,21 @@ use crate::config::MigrationConsent;
 use crate::model::{
     CatalogRequest, Cell, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
     DEFAULT_REDIS_SCAN_COUNT, DraftId, DriverAvailability, DriverCapabilities, DriverKind,
-    OperationId, OperationKind, ProfileFieldId, ProfileGeneration, ProfileId, PublicSummary,
-    RedisKeyInspectRequest, RedisScanRequest, RequestIdentity, SessionCredentialIntent,
+    OperationId, OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration, ProfileId,
+    PublicCode, PublicSummary, RedisKeyInspectRequest, RedisScanRequest, RequestIdentity,
 };
+use crate::public_error::{
+    PublicOperationError, RecoveryAction, RecoveryCommand, RecoveryCommandDispatcher,
+    dispatch_recovery,
+};
+use crate::secrets::ReplacementSecretBuffer;
 use crate::service::DeleteProfileRequest;
 
-use super::accessibility::{named_author_id, named_author_id_with_label};
+use super::accessibility::{named_author_id, named_author_id_with_label, named_dynamic_author_id};
 use super::adapter::{SubmitError, UiCommand, UiPort};
-use super::editor::{EditorIntent, EditorSurface};
+use super::editor::{
+    EDITOR_INPUT_ID, EDITOR_ROW_LIMIT_ID, EDITOR_TIMEOUT_ID, EditorIntent, EditorSurface,
+};
 use super::layout::NativeLayout;
 use super::model::{ConnectionState, ProfileSnapshot, UiEvent, UiModel};
 use super::mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
@@ -29,6 +37,7 @@ use super::redis_explorer::{RedisExplorer, RedisExplorerIntent};
 use super::theme::OpenAiTheme;
 
 const EVENT_DRAIN_LIMIT: usize = 128;
+const RETRY_RECIPE_LIMIT: usize = 64;
 pub const DEFAULT_EXECUTE_ROW_LIMIT: u32 = 500;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -45,6 +54,136 @@ struct PendingDelete {
     profile_generation: ProfileGeneration,
     prior_active: Option<ActiveOperation>,
     prior_finished: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RetryRecipe {
+    Connect {
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        timeout_ms: u64,
+    },
+    Reconnect {
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        timeout_ms: u64,
+    },
+    Catalog(CatalogRequest),
+    RedisScan {
+        request: RedisScanRequest,
+        restart: bool,
+    },
+    RedisInspect(RedisKeyInspectRequest),
+}
+
+impl RetryRecipe {
+    fn profile_id(&self) -> &ProfileId {
+        match self {
+            Self::Connect { profile_id, .. } | Self::Reconnect { profile_id, .. } => profile_id,
+            Self::Catalog(request) => request.profile_id(),
+            Self::RedisScan { request, .. } => request.profile_id(),
+            Self::RedisInspect(request) => request.profile_id(),
+        }
+    }
+
+    const fn profile_generation(&self) -> ProfileGeneration {
+        match self {
+            Self::Connect {
+                profile_generation, ..
+            }
+            | Self::Reconnect {
+                profile_generation, ..
+            } => *profile_generation,
+            Self::Catalog(request) => request.profile_generation(),
+            Self::RedisScan { request, .. } => request.profile_generation(),
+            Self::RedisInspect(request) => request.profile_generation(),
+        }
+    }
+
+    const fn operation_kind(&self) -> OperationKind {
+        match self {
+            Self::Connect { .. } => OperationKind::ConnectProfile,
+            Self::Reconnect { .. } => OperationKind::ReconnectProfile,
+            Self::Catalog(_) => OperationKind::BrowseMySql,
+            Self::RedisScan { .. } => OperationKind::BrowseRedis,
+            Self::RedisInspect(_) => OperationKind::InspectRedis,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RetryRecipeRegistry {
+    recipes: HashMap<OperationRecipeId, RetryRecipe>,
+    order: VecDeque<OperationRecipeId>,
+}
+
+impl RetryRecipeRegistry {
+    fn register(&mut self, operation_id: OperationId, recipe: RetryRecipe) -> OperationRecipeId {
+        let recipe_id = OperationRecipeId(operation_id.0);
+        if self.recipes.insert(recipe_id, recipe).is_some() {
+            self.order.retain(|existing| *existing != recipe_id);
+        }
+        self.order.push_back(recipe_id);
+        while self.order.len() > RETRY_RECIPE_LIMIT {
+            if let Some(expired) = self.order.pop_front() {
+                self.recipes.remove(&expired);
+            }
+        }
+        recipe_id
+    }
+
+    fn contains(&self, recipe_id: OperationRecipeId) -> bool {
+        self.recipes.contains_key(&recipe_id)
+    }
+
+    fn get(&self, recipe_id: OperationRecipeId) -> Option<&RetryRecipe> {
+        self.recipes.get(&recipe_id)
+    }
+
+    fn take(&mut self, recipe_id: OperationRecipeId) -> Option<RetryRecipe> {
+        self.order.retain(|existing| *existing != recipe_id);
+        self.recipes.remove(&recipe_id)
+    }
+
+    fn remove(&mut self, recipe_id: OperationRecipeId) {
+        let _ = self.take(recipe_id);
+    }
+
+    fn retain_current(&mut self, generations: &HashMap<ProfileId, ProfileGeneration>) {
+        self.recipes.retain(|_, recipe| {
+            generations.get(recipe.profile_id()).copied() == Some(recipe.profile_generation())
+        });
+        self.order
+            .retain(|recipe_id| self.recipes.contains_key(recipe_id));
+    }
+
+    fn clear(&mut self) {
+        self.recipes.clear();
+        self.order.clear();
+    }
+}
+
+struct CredentialPrompt {
+    profile_id: ProfileId,
+    profile_generation: ProfileGeneration,
+    source_operation: OperationKind,
+    retry_recipe_id: Option<OperationRecipeId>,
+    store_operation_id: Option<OperationId>,
+    secret: ReplacementSecretBuffer,
+    status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VisibleError {
+    operation_id: OperationId,
+    error: PublicOperationError,
+}
+
+#[derive(Clone, Copy)]
+struct RecoveryDispatchContext {
+    source_operation_id: OperationId,
+    source_operation: OperationKind,
+    code: PublicCode,
 }
 
 const fn delete_failure_is_known_non_committed(summary: PublicSummary) -> bool {
@@ -82,6 +221,10 @@ pub struct DbotterApp {
     first_run_driver: DriverKind,
     active_operations: HashMap<ProfileId, ActiveOperation>,
     pending_deletes: HashMap<ProfileId, PendingDelete>,
+    retry_recipes: RetryRecipeRegistry,
+    credential_prompt: Option<CredentialPrompt>,
+    common_error: Option<VisibleError>,
+    recovery_dispatch_context: Option<RecoveryDispatchContext>,
     delete_confirmation: Option<DeleteConfirmation>,
     next_draft_id: u64,
     pending_connect_after_refresh: Option<(ProfileId, OperationId)>,
@@ -99,6 +242,10 @@ impl DbotterApp {
             first_run_driver: DriverKind::MySql,
             active_operations: HashMap::new(),
             pending_deletes: HashMap::new(),
+            retry_recipes: RetryRecipeRegistry::default(),
+            credential_prompt: None,
+            common_error: None,
+            recovery_dispatch_context: None,
             delete_confirmation: None,
             next_draft_id: 1,
             pending_connect_after_refresh: None,
@@ -117,7 +264,10 @@ impl DbotterApp {
     }
 
     fn poll_events(&mut self) {
-        for event in self.port.drain_events(EVENT_DRAIN_LIMIT) {
+        for mut event in self.port.drain_events(EVENT_DRAIN_LIMIT) {
+            self.attach_retry_recipe(&mut event);
+            self.capture_common_error(&event);
+            let credential_retry = self.handle_credential_terminal(&event);
             self.finish_active_operation(&event);
             self.fold_mysql_explorer_event(&event);
             self.redis_explorer.handle_event(&event);
@@ -203,6 +353,9 @@ impl DbotterApp {
                     self.submit_test(profile_id);
                 }
             }
+            if let Some((recipe_id, source_operation)) = credential_retry {
+                self.retry_recipe(recipe_id, Some(source_operation));
+            }
         }
         self.mysql_explorers.retain(|(profile_id, generation), _| {
             self.model.active_generation(profile_id) == Some(*generation)
@@ -213,6 +366,203 @@ impl DbotterApp {
         }
     }
 
+    fn attach_retry_recipe(&self, event: &mut UiEvent) {
+        match event {
+            UiEvent::OperationFailed {
+                operation_id,
+                profile_id,
+                kind,
+                summary,
+                error,
+                ..
+            } => {
+                let recipe_id = OperationRecipeId(operation_id.0);
+                if self
+                    .retry_recipes
+                    .get(recipe_id)
+                    .is_some_and(|recipe| recipe.operation_kind() == *kind)
+                {
+                    *error = PublicOperationError::new_or_internal(
+                        *kind,
+                        *summary,
+                        error.code,
+                        &crate::public_error::SafeContext::profile_with_recipe(
+                            profile_id.clone(),
+                            *operation_id,
+                            recipe_id,
+                        ),
+                    );
+                }
+            }
+            UiEvent::CatalogPageFailed {
+                request,
+                summary,
+                error,
+                ..
+            } => {
+                let recipe_id = OperationRecipeId(request.operation_id().0);
+                if self.retry_recipes.contains(recipe_id) {
+                    *error = PublicOperationError::new_or_internal(
+                        OperationKind::BrowseMySql,
+                        *summary,
+                        error.code,
+                        &crate::public_error::SafeContext::profile_with_recipe(
+                            request.profile_id().clone(),
+                            request.operation_id(),
+                            recipe_id,
+                        ),
+                    );
+                }
+            }
+            UiEvent::RedisKeysFailed { request, error, .. } => {
+                let recipe_id = OperationRecipeId(request.operation_id().0);
+                if self.retry_recipes.contains(recipe_id) {
+                    *error = PublicOperationError::new_or_internal(
+                        OperationKind::BrowseRedis,
+                        error.summary,
+                        error.code,
+                        &crate::public_error::SafeContext::profile_with_recipe(
+                            request.profile_id().clone(),
+                            request.operation_id(),
+                            recipe_id,
+                        ),
+                    );
+                }
+            }
+            UiEvent::RedisKeyInspectFailed { request, error, .. } => {
+                let recipe_id = OperationRecipeId(request.operation_id().0);
+                if self.retry_recipes.contains(recipe_id) {
+                    *error = PublicOperationError::new_or_internal(
+                        OperationKind::InspectRedis,
+                        error.summary,
+                        error.code,
+                        &crate::public_error::SafeContext::profile_with_recipe(
+                            request.profile_id().clone(),
+                            request.operation_id(),
+                            recipe_id,
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn capture_common_error(&mut self, event: &UiEvent) {
+        let visible = match event {
+            UiEvent::ProfilesFailed {
+                operation_id,
+                error,
+                ..
+            }
+            | UiEvent::ProfileCreateFailed {
+                operation_id,
+                error,
+                ..
+            }
+            | UiEvent::ProfileUpdateFailed {
+                operation_id,
+                error,
+                ..
+            }
+            | UiEvent::DraftOperationFailed {
+                operation_id,
+                error,
+                ..
+            }
+            | UiEvent::CredentialsStoreFailed {
+                operation_id,
+                error,
+                ..
+            } => Some(VisibleError {
+                operation_id: *operation_id,
+                error: error.clone(),
+            }),
+            UiEvent::OperationFailed {
+                operation_id,
+                kind,
+                error,
+                ..
+            } if !matches!(
+                kind,
+                OperationKind::ExecuteRead | OperationKind::ExecuteMutation
+            ) =>
+            {
+                Some(VisibleError {
+                    operation_id: *operation_id,
+                    error: error.clone(),
+                })
+            }
+            UiEvent::ConfigUncertain { .. } | UiEvent::RuntimeShutdown { .. } => {
+                self.common_error = None;
+                None
+            }
+            _ => None,
+        };
+        if let Some(visible) = visible {
+            self.common_error = Some(visible);
+        }
+    }
+
+    fn handle_credential_terminal(
+        &mut self,
+        event: &UiEvent,
+    ) -> Option<(OperationRecipeId, OperationKind)> {
+        if matches!(
+            event,
+            UiEvent::ConfigUncertain { .. } | UiEvent::RuntimeShutdown { .. }
+        ) {
+            self.cancel_credential_prompt();
+            return None;
+        }
+        let (operation_id, profile_id, profile_generation, stored) = match event {
+            UiEvent::CredentialsStored {
+                operation_id,
+                profile_id,
+                profile_generation,
+            } => (*operation_id, profile_id, *profile_generation, true),
+            UiEvent::CredentialsStoreFailed {
+                operation_id,
+                profile_id,
+                profile_generation,
+                ..
+            } => (*operation_id, profile_id, *profile_generation, false),
+            UiEvent::OperationFailed {
+                operation_id,
+                profile_id,
+                profile_generation,
+                ..
+            } if self
+                .credential_prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.store_operation_id == Some(*operation_id)) =>
+            {
+                (*operation_id, profile_id, *profile_generation, false)
+            }
+            _ => return None,
+        };
+        let matches_prompt = self.credential_prompt.as_ref().is_some_and(|prompt| {
+            prompt.store_operation_id == Some(operation_id)
+                && prompt.profile_id == *profile_id
+                && prompt.profile_generation == profile_generation
+        });
+        if !matches_prompt {
+            return None;
+        }
+        let prompt = self.credential_prompt.take()?;
+        let retry = prompt.retry_recipe_id;
+        if !stored
+            || self.model.active_generation(profile_id) != Some(profile_generation)
+            || self.model.is_config_uncertain()
+        {
+            if let Some(recipe_id) = retry {
+                self.retry_recipes.remove(recipe_id);
+            }
+            return None;
+        }
+        retry.map(|recipe_id| (recipe_id, prompt.source_operation))
+    }
+
     fn finish_active_operation(&mut self, event: &UiEvent) {
         if matches!(
             event,
@@ -220,6 +570,7 @@ impl DbotterApp {
         ) {
             self.active_operations.clear();
             self.pending_deletes.clear();
+            self.retry_recipes.clear();
             return;
         }
         let terminal = match event {
@@ -316,6 +667,15 @@ impl DbotterApp {
             {
                 self.active_operations.remove(profile_id);
             }
+            if !matches!(
+                event,
+                UiEvent::OperationFailed { .. }
+                    | UiEvent::CatalogPageFailed { .. }
+                    | UiEvent::RedisKeysFailed { .. }
+                    | UiEvent::RedisKeyInspectFailed { .. }
+            ) {
+                self.retry_recipes.remove(OperationRecipeId(operation_id.0));
+            }
         }
     }
 
@@ -326,6 +686,13 @@ impl DbotterApp {
         self.pending_deletes.retain(|profile_id, pending| {
             self.model.active_generation(profile_id) == Some(pending.profile_generation)
         });
+        self.retry_recipes
+            .retain_current(&self.model.active_generations);
+        if self.credential_prompt.as_ref().is_some_and(|prompt| {
+            self.model.active_generation(&prompt.profile_id) != Some(prompt.profile_generation)
+        }) {
+            self.cancel_credential_prompt();
+        }
     }
 
     fn fold_mysql_explorer_event(&mut self, event: &UiEvent) {
@@ -411,15 +778,37 @@ impl DbotterApp {
             self.model.status = "Another operation is active for this connection".to_owned();
             return;
         }
-        let profile_generation = profile.generation;
+        self.submit_connect_exact(profile_id, profile.generation, DEFAULT_TIMEOUT_MS);
+    }
+
+    fn submit_connect_exact(
+        &mut self,
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        timeout_ms: u64,
+    ) {
+        if self.model.connection_state(&profile_id).is_pending()
+            || self.active_operations.contains_key(&profile_id)
+        {
+            self.model.status = "Connection work is already pending".to_owned();
+            return;
+        }
         let operation_id = self.model.next_operation();
         match self.port.try_submit(UiCommand::TestConnection {
             operation_id,
             profile_id: profile_id.clone(),
             profile_generation,
-            timeout_ms: DEFAULT_TIMEOUT_MS,
+            timeout_ms,
         }) {
             Ok(()) => {
+                self.retry_recipes.register(
+                    operation_id,
+                    RetryRecipe::Connect {
+                        profile_id: profile_id.clone(),
+                        profile_generation,
+                        timeout_ms,
+                    },
+                );
                 self.model
                     .connection_states
                     .insert(profile_id.clone(), ConnectionState::Pending(operation_id));
@@ -455,17 +844,175 @@ impl DbotterApp {
                 "The current profile cannot accept a session credential.".to_owned();
             return;
         }
-        let draft_id = self.allocate_draft_id();
-        let mut editor = ProfileEditor::edit(
-            draft_id,
-            &profile.persisted,
-            profile.generation,
-            profile.has_current_session_secret,
+        let recipe_seed = self.model.next_operation();
+        let recipe_id = self.retry_recipes.register(
+            recipe_seed,
+            RetryRecipe::Connect {
+                profile_id: profile_id.clone(),
+                profile_generation: profile.generation,
+                timeout_ms: DEFAULT_TIMEOUT_MS,
+            },
         );
-        editor.select_session_intent(SessionCredentialIntent::Replace);
-        editor.request_focus(ProfileFieldId::SessionCredential);
-        self.profile_editor = Some(editor);
-        self.model.status = "Enter the session credential, then Save & Connect.".to_owned();
+        self.open_credential_prompt_for(
+            profile_id,
+            profile.generation,
+            OperationKind::ConnectProfile,
+            Some(recipe_id),
+        );
+    }
+
+    fn open_credential_prompt_for(
+        &mut self,
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        source_operation: OperationKind,
+        retry_recipe_id: Option<OperationRecipeId>,
+    ) {
+        if self.model.active_generation(&profile_id) != Some(profile_generation) {
+            if let Some(recipe_id) = retry_recipe_id {
+                self.retry_recipes.remove(recipe_id);
+            }
+            self.model.status = "The selected profile generation is stale.".to_owned();
+            return;
+        }
+        let accepts_session = self.model.profiles.iter().any(|profile| {
+            profile.id == profile_id
+                && profile.generation == profile_generation
+                && profile.persisted.credential_mode == crate::model::CredentialMode::Session
+        });
+        if !accepts_session {
+            if let Some(recipe_id) = retry_recipe_id {
+                self.retry_recipes.remove(recipe_id);
+            }
+            self.model.status =
+                "The current profile cannot accept a session credential.".to_owned();
+            return;
+        }
+        self.cancel_credential_prompt();
+        self.credential_prompt = Some(CredentialPrompt {
+            profile_id,
+            profile_generation,
+            source_operation,
+            retry_recipe_id,
+            store_operation_id: None,
+            secret: ReplacementSecretBuffer::default(),
+            status: "Enter the credential for this app session.".to_owned(),
+        });
+        self.model.status = "Enter the protected session credential.".to_owned();
+    }
+
+    fn cancel_credential_prompt(&mut self) {
+        if let Some(prompt) = self.credential_prompt.take()
+            && let Some(recipe_id) = prompt.retry_recipe_id
+        {
+            self.retry_recipes.remove(recipe_id);
+        }
+    }
+
+    fn submit_credential_prompt(&mut self) {
+        let Some(mut prompt) = self.credential_prompt.take() else {
+            return;
+        };
+        if prompt.store_operation_id.is_some() {
+            self.credential_prompt = Some(prompt);
+            return;
+        }
+        if self.model.is_config_uncertain()
+            || self.model.active_generation(&prompt.profile_id) != Some(prompt.profile_generation)
+        {
+            if let Some(recipe_id) = prompt.retry_recipe_id {
+                self.retry_recipes.remove(recipe_id);
+            }
+            self.model.status = "Reload profiles before storing credentials.".to_owned();
+            return;
+        }
+        if prompt.secret.is_empty() {
+            prompt.status = "Enter a session credential.".to_owned();
+            self.credential_prompt = Some(prompt);
+            return;
+        }
+        let permit = match self.port.try_reserve_mutation() {
+            Ok(permit) => permit,
+            Err(error) => {
+                if let Some(recipe_id) = prompt.retry_recipe_id {
+                    self.retry_recipes.remove(recipe_id);
+                }
+                self.model.status = match error {
+                    SubmitError::Busy => "Service is busy; command was not submitted".to_owned(),
+                    SubmitError::Disconnected => "Service is unavailable".to_owned(),
+                };
+                return;
+            }
+        };
+        let secret = match prompt.secret.take_for_save() {
+            Ok(secret) => secret,
+            Err(_) => {
+                prompt.status = "Enter a session credential.".to_owned();
+                self.credential_prompt = Some(prompt);
+                return;
+            }
+        };
+        let operation_id = self.model.next_operation();
+        let command = UiCommand::StoreCredentials {
+            operation_id,
+            profile_id: prompt.profile_id.clone(),
+            profile_generation: prompt.profile_generation,
+            source_operation: prompt.source_operation,
+            secret,
+        };
+        match permit.submit(command) {
+            Ok(()) => {
+                prompt.store_operation_id = Some(operation_id);
+                prompt.status = "Storing credential…".to_owned();
+                self.credential_prompt = Some(prompt);
+                self.model.status = "Storing protected session credential…".to_owned();
+            }
+            Err(error) => {
+                if let Some(recipe_id) = prompt.retry_recipe_id {
+                    self.retry_recipes.remove(recipe_id);
+                }
+                self.report_submit_error(error);
+            }
+        }
+    }
+
+    fn retry_recipe(
+        &mut self,
+        recipe_id: OperationRecipeId,
+        expected_operation: Option<OperationKind>,
+    ) {
+        let Some(recipe) = self.retry_recipes.take(recipe_id) else {
+            self.model.status = "That retry is no longer available.".to_owned();
+            return;
+        };
+        if expected_operation.is_some_and(|expected| expected != recipe.operation_kind()) {
+            self.model.status = "The retry does not match this error.".to_owned();
+            return;
+        }
+        if self.model.is_config_uncertain()
+            || self.model.active_generation(recipe.profile_id())
+                != Some(recipe.profile_generation())
+        {
+            self.model.status = "The retry recipe is stale.".to_owned();
+            return;
+        }
+        match recipe {
+            RetryRecipe::Connect {
+                profile_id,
+                profile_generation,
+                timeout_ms,
+            } => self.submit_connect_exact(profile_id, profile_generation, timeout_ms),
+            RetryRecipe::Reconnect {
+                profile_id,
+                profile_generation,
+                timeout_ms,
+            } => self.submit_reconnect_exact(profile_id, profile_generation, timeout_ms),
+            RetryRecipe::Catalog(request) => self.retry_catalog_request(request),
+            RetryRecipe::RedisScan { request, restart } => {
+                self.retry_redis_scan(request, restart);
+            }
+            RetryRecipe::RedisInspect(request) => self.retry_redis_inspect(request),
+        }
     }
 
     fn submit_disconnect(&mut self, profile_id: ProfileId) {
@@ -510,14 +1057,37 @@ impl DbotterApp {
             self.model.status = "Unknown profile".to_owned();
             return;
         };
+        self.submit_reconnect_exact(profile_id, profile_generation, DEFAULT_TIMEOUT_MS);
+    }
+
+    fn submit_reconnect_exact(
+        &mut self,
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        timeout_ms: u64,
+    ) {
+        if self.model.connection_state(&profile_id).is_pending()
+            || self.active_operations.contains_key(&profile_id)
+        {
+            self.model.status = "Connection work is already pending".to_owned();
+            return;
+        }
         let operation_id = self.model.next_operation();
         match self.port.try_submit(UiCommand::ReconnectProfile {
             operation_id,
             profile_id: profile_id.clone(),
             profile_generation,
-            timeout_ms: DEFAULT_TIMEOUT_MS,
+            timeout_ms,
         }) {
             Ok(()) => {
+                self.retry_recipes.register(
+                    operation_id,
+                    RetryRecipe::Reconnect {
+                        profile_id: profile_id.clone(),
+                        profile_generation,
+                        timeout_ms,
+                    },
+                );
                 self.model
                     .connection_states
                     .insert(profile_id.clone(), ConnectionState::Pending(operation_id));
@@ -613,6 +1183,207 @@ impl DbotterApp {
         };
     }
 
+    fn dispatch_error_recovery(
+        &mut self,
+        operation_id: OperationId,
+        error: &PublicOperationError,
+        action: RecoveryAction,
+    ) {
+        if !error.recovery.as_slice().contains(&action) {
+            self.model.status = "That recovery action is not available.".to_owned();
+            return;
+        }
+        if error.operation == OperationKind::ExecuteMutation
+            && matches!(action, RecoveryAction::Retry(_))
+        {
+            self.model.status =
+                "Data-changing execution is never retried automatically.".to_owned();
+            return;
+        }
+        self.recovery_dispatch_context = Some(RecoveryDispatchContext {
+            source_operation_id: operation_id,
+            source_operation: error.operation,
+            code: error.code,
+        });
+        let result = dispatch_recovery(action, self);
+        self.recovery_dispatch_context = None;
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    fn dispatch_recovery_command(&mut self, command: RecoveryCommand) {
+        let context = self.recovery_dispatch_context;
+        match command {
+            RecoveryCommand::OpenCredentialEditor(profile_id) => {
+                let Some(profile_generation) = self.model.active_generation(&profile_id) else {
+                    self.model.status = "The selected profile is no longer available.".to_owned();
+                    return;
+                };
+                let (source_operation, retry_recipe_id) =
+                    context.map_or((OperationKind::ConnectProfile, None), |context| {
+                        let recipe_id = OperationRecipeId(context.source_operation_id.0);
+                        let retry = self.retry_recipes.get(recipe_id).and_then(|recipe| {
+                            (recipe.operation_kind() == context.source_operation
+                                && recipe.profile_id() == &profile_id
+                                && recipe.profile_generation() == profile_generation)
+                                .then_some(recipe_id)
+                        });
+                        (context.source_operation, retry)
+                    });
+                self.open_credential_prompt_for(
+                    profile_id,
+                    profile_generation,
+                    source_operation,
+                    retry_recipe_id,
+                );
+            }
+            RecoveryCommand::FocusDraftField(draft_id, field) => {
+                if let Some(editor) = self.profile_editor.as_mut()
+                    && editor.draft_id() == draft_id
+                {
+                    editor.request_focus(field);
+                } else {
+                    self.model.status = "That draft is no longer open.".to_owned();
+                }
+            }
+            RecoveryCommand::FocusProfileField(profile_id, field) => {
+                self.open_profile_editor_at(&profile_id, field);
+            }
+            RecoveryCommand::RetryRecipe(recipe_id) => {
+                self.retry_recipe(recipe_id, context.map(|value| value.source_operation));
+            }
+            RecoveryCommand::FocusStatementEditor(profile_id) => {
+                if self.model.active_generation(&profile_id).is_some() {
+                    self.model.selected_profile = Some(profile_id);
+                    self.editor_surface.request_focus(EDITOR_INPUT_ID);
+                }
+            }
+            RecoveryCommand::FocusExecutionLimits(profile_id) => {
+                if self.model.active_generation(&profile_id).is_some() {
+                    self.model.selected_profile = Some(profile_id);
+                    let control_id = match context.map(|value| value.code) {
+                        Some(PublicCode::TimeoutInput) => EDITOR_TIMEOUT_ID,
+                        Some(PublicCode::RowLimit) | None => EDITOR_ROW_LIMIT_ID,
+                        Some(_) => EDITOR_ROW_LIMIT_ID,
+                    };
+                    self.editor_surface.request_focus(control_id);
+                }
+            }
+            RecoveryCommand::ReloadConfiguredPath => self.submit_refresh(),
+            RecoveryCommand::ReconnectProfile(profile_id) => self.submit_reconnect(profile_id),
+            RecoveryCommand::CancelRunningOperation(operation_id) => {
+                match self
+                    .port
+                    .try_submit(UiCommand::CancelOperation { operation_id })
+                {
+                    Ok(()) => {
+                        self.model.status = format!("Cancelling operation {}…", operation_id.0);
+                    }
+                    Err(error) => self.report_submit_error(error),
+                }
+            }
+            RecoveryCommand::ClearProfileCatalog(profile_id) => {
+                if let Some(generation) = self.model.active_generation(&profile_id) {
+                    if let Some(explorer) = self
+                        .mysql_explorers
+                        .get_mut(&(profile_id.clone(), generation))
+                    {
+                        explorer.clear();
+                    }
+                    let workspace = self
+                        .model
+                        .workspace_mut(super::model::WorkspaceKey::new(profile_id, generation));
+                    workspace.catalog_page = None;
+                    workspace.catalog_retry = None;
+                    workspace.catalog_error = None;
+                    self.model.status = "Catalog cleared.".to_owned();
+                }
+            }
+            RecoveryCommand::RestartProfileRedisScan(profile_id) => {
+                let request = self
+                    .model
+                    .active_generation(&profile_id)
+                    .and_then(|generation| {
+                        self.model
+                            .workspace(&super::model::WorkspaceKey::new(
+                                profile_id.clone(),
+                                generation,
+                            ))
+                            .and_then(|workspace| workspace.redis_scan_retry.clone())
+                    });
+                if let Some(mut request) = request {
+                    request.cursor = 0;
+                    self.retry_redis_scan(request, true);
+                } else {
+                    self.model.status = "That Redis scan is no longer available.".to_owned();
+                }
+            }
+            RecoveryCommand::ChooseResultExportDestination(_result_id) => {
+                self.model.status = "Export destination selection is not available yet.".to_owned();
+            }
+            RecoveryCommand::RevealResultExportDestination(_result_id) => {
+                self.model.status = "No committed export destination is available.".to_owned();
+            }
+            RecoveryCommand::RevealConfiguredMigrationBackup => {
+                self.model.status = "Migration backup reveal requested.".to_owned();
+            }
+            RecoveryCommand::RestartApplication => {
+                let operation_id = self.model.next_operation();
+                match self
+                    .port
+                    .try_submit(UiCommand::ShutdownRuntime { operation_id })
+                {
+                    Ok(()) => self.model.status = "Restart requested; shutting down…".to_owned(),
+                    Err(error) => self.report_submit_error(error),
+                }
+            }
+            RecoveryCommand::DismissOperationError(operation_id) => {
+                self.dismiss_operation_error(operation_id);
+            }
+        }
+    }
+
+    fn dismiss_operation_error(&mut self, operation_id: OperationId) {
+        self.retry_recipes.remove(OperationRecipeId(operation_id.0));
+        if self
+            .common_error
+            .as_ref()
+            .is_some_and(|visible| visible.operation_id == operation_id)
+        {
+            self.common_error = None;
+        }
+        for workspace in self.model.workspaces.values_mut() {
+            if workspace
+                .catalog_retry
+                .as_ref()
+                .is_some_and(|request| request.operation_id() == operation_id)
+            {
+                workspace.catalog_error = None;
+            }
+            if workspace
+                .redis_scan_retry
+                .as_ref()
+                .is_some_and(|request| request.operation_id() == operation_id)
+            {
+                workspace.redis_scan_error = None;
+            }
+            if workspace
+                .redis_inspect_retry
+                .as_ref()
+                .is_some_and(|request| request.operation_id() == operation_id)
+            {
+                workspace.redis_inspect_error = None;
+            }
+        }
+        for explorer in self.mysql_explorers.values_mut() {
+            explorer.dismiss_error();
+        }
+        self.redis_explorer.dismiss_errors();
+        self.model.status = "Error dismissed.".to_owned();
+    }
+
     fn submit_mysql_explorer_intent(
         &mut self,
         profile: &ProfileSnapshot,
@@ -679,6 +1450,8 @@ impl DbotterApp {
             .try_submit(UiCommand::BrowseCatalog(request.clone()))
         {
             Ok(()) => {
+                self.retry_recipes
+                    .register(operation_id, RetryRecipe::Catalog(request.clone()));
                 self.mysql_explorers
                     .entry((profile.id.clone(), profile.generation))
                     .or_default()
@@ -698,10 +1471,6 @@ impl DbotterApp {
     }
 
     fn submit_redis_intent(&mut self, intent: RedisExplorerIntent) {
-        if let RedisExplorerIntent::EditProfileField { profile_id, field } = &intent {
-            self.open_profile_editor_at(profile_id, *field);
-            return;
-        }
         if let RedisExplorerIntent::Cancel { operation_id } = &intent {
             let operation_id = *operation_id;
             match self
@@ -765,8 +1534,18 @@ impl DbotterApp {
                     count_hint: DEFAULT_REDIS_SCAN_COUNT,
                     timeout: Duration::from_secs(5),
                 };
-                match self.port.try_submit(UiCommand::ScanRedisKeys(request)) {
+                match self
+                    .port
+                    .try_submit(UiCommand::ScanRedisKeys(request.clone()))
+                {
                     Ok(()) => {
+                        self.retry_recipes.register(
+                            operation_id,
+                            RetryRecipe::RedisScan {
+                                request: request.clone(),
+                                restart,
+                            },
+                        );
                         self.redis_explorer
                             .begin_scan(operation_id, filter, cursor, restart);
                         self.active_operations.insert(
@@ -792,8 +1571,13 @@ impl DbotterApp {
                     key: key.clone(),
                     timeout: Duration::from_secs(5),
                 };
-                match self.port.try_submit(UiCommand::InspectRedisKey(request)) {
+                match self
+                    .port
+                    .try_submit(UiCommand::InspectRedisKey(request.clone()))
+                {
                     Ok(()) => {
+                        self.retry_recipes
+                            .register(operation_id, RetryRecipe::RedisInspect(request.clone()));
                         self.redis_explorer.begin_inspect(operation_id, key);
                         self.active_operations.insert(
                             profile.id.clone(),
@@ -813,7 +1597,134 @@ impl DbotterApp {
                 }
             }
             RedisExplorerIntent::Cancel { .. } => unreachable!("handled above"),
-            RedisExplorerIntent::EditProfileField { .. } => unreachable!("handled above"),
+        }
+    }
+
+    fn retry_catalog_request(&mut self, request: CatalogRequest) {
+        let profile_id = request.profile_id().clone();
+        let profile_generation = request.profile_generation();
+        if self.active_operations.contains_key(&profile_id) {
+            self.model.status = "Another operation is active for this connection".to_owned();
+            return;
+        }
+        let operation_id = self.model.next_operation();
+        let request = catalog_request_with_identity(
+            request,
+            RequestIdentity::new(profile_id.clone(), profile_generation, operation_id),
+        );
+        match self
+            .port
+            .try_submit(UiCommand::BrowseCatalog(request.clone()))
+        {
+            Ok(()) => {
+                self.retry_recipes
+                    .register(operation_id, RetryRecipe::Catalog(request.clone()));
+                self.mysql_explorers
+                    .entry((profile_id.clone(), profile_generation))
+                    .or_default()
+                    .mark_submitted(request);
+                self.active_operations.insert(
+                    profile_id,
+                    ActiveOperation {
+                        operation_id,
+                        profile_generation,
+                        kind: OperationKind::BrowseMySql,
+                    },
+                );
+                self.model.status = "Retrying MySQL catalog page…".to_owned();
+            }
+            Err(error) => self.report_submit_error(error),
+        }
+    }
+
+    fn retry_redis_scan(&mut self, request: RedisScanRequest, restart: bool) {
+        let profile_id = request.profile_id().clone();
+        let profile_generation = request.profile_generation();
+        if self.active_operations.contains_key(&profile_id) {
+            self.model.status = "Another operation is active for this connection".to_owned();
+            return;
+        }
+        let operation_id = self.model.next_operation();
+        let request = RedisScanRequest {
+            identity: RequestIdentity::new(profile_id.clone(), profile_generation, operation_id),
+            filter: request.filter,
+            cursor: request.cursor,
+            count_hint: request.count_hint,
+            timeout: request.timeout,
+        };
+        match self
+            .port
+            .try_submit(UiCommand::ScanRedisKeys(request.clone()))
+        {
+            Ok(()) => {
+                self.retry_recipes.register(
+                    operation_id,
+                    RetryRecipe::RedisScan {
+                        request: request.clone(),
+                        restart,
+                    },
+                );
+                self.redis_explorer.begin_scan(
+                    operation_id,
+                    request.filter.clone(),
+                    request.cursor,
+                    restart,
+                );
+                self.active_operations.insert(
+                    profile_id,
+                    ActiveOperation {
+                        operation_id,
+                        profile_generation,
+                        kind: OperationKind::BrowseRedis,
+                    },
+                );
+                self.model.status = "Retrying Redis scan…".to_owned();
+            }
+            Err(error) => {
+                self.redis_explorer
+                    .submission_failed(submit_error_message(error));
+                self.report_submit_error(error);
+            }
+        }
+    }
+
+    fn retry_redis_inspect(&mut self, request: RedisKeyInspectRequest) {
+        let profile_id = request.profile_id().clone();
+        let profile_generation = request.profile_generation();
+        if self.active_operations.contains_key(&profile_id) {
+            self.model.status = "Another operation is active for this connection".to_owned();
+            return;
+        }
+        let operation_id = self.model.next_operation();
+        let request = RedisKeyInspectRequest {
+            identity: RequestIdentity::new(profile_id.clone(), profile_generation, operation_id),
+            key: request.key,
+            timeout: request.timeout,
+        };
+        match self
+            .port
+            .try_submit(UiCommand::InspectRedisKey(request.clone()))
+        {
+            Ok(()) => {
+                self.retry_recipes
+                    .register(operation_id, RetryRecipe::RedisInspect(request.clone()));
+                self.redis_explorer
+                    .begin_inspect(operation_id, request.key.clone());
+                self.active_operations.insert(
+                    profile_id,
+                    ActiveOperation {
+                        operation_id,
+                        profile_generation,
+                        kind: OperationKind::InspectRedis,
+                    },
+                );
+                self.model.status = "Retrying Redis inspection…".to_owned();
+            }
+            Err(error) => {
+                self.redis_explorer
+                    .submission_failed(submit_error_message(error));
+                self.report_submit_error(error);
+            }
         }
     }
 
@@ -985,6 +1896,70 @@ impl DbotterApp {
         }
     }
 
+    fn show_credential_prompt(&mut self, root_ui: &mut egui::Ui) {
+        let Some(prompt) = self.credential_prompt.as_mut() else {
+            return;
+        };
+        let pending = prompt.store_operation_id.is_some();
+        let mut cancel = false;
+        let mut submit = false;
+        egui::Window::new("Session credential")
+            .collapsible(false)
+            .resizable(false)
+            .show(root_ui.ctx(), |ui| {
+                ui.set_min_width(360.0);
+                ui.heading("Enter credential");
+                ui.label("Stored only in this running app session.");
+                ui.add_space(12.0);
+                ui.label("Credential");
+                let credential = ui.add_enabled(
+                    !pending,
+                    egui::TextEdit::singleline(prompt.secret.as_mut_string())
+                        .id_salt("connection.credential.value")
+                        .password(true)
+                        .desired_width(f32::INFINITY),
+                );
+                named_author_id(
+                    credential,
+                    "connection.credential.value",
+                    "Protected session credential",
+                );
+                ui.small(&prompt.status);
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let cancel_button = ui.add_sized(
+                        [104.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                        egui::Button::new("Cancel"),
+                    );
+                    cancel = named_author_id(
+                        cancel_button,
+                        "connection.credential.cancel",
+                        "Cancel credential entry",
+                    )
+                    .clicked();
+                    let store_button = ui.add_enabled(
+                        !pending,
+                        egui::Button::new(
+                            egui::RichText::new("Store & continue").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::BLACK)
+                        .min_size(egui::vec2(160.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                    );
+                    submit = named_author_id(
+                        store_button,
+                        "connection.credential.store",
+                        "Store credential for this app session",
+                    )
+                    .clicked();
+                });
+            });
+        if cancel {
+            self.cancel_credential_prompt();
+        } else if submit {
+            self.submit_credential_prompt();
+        }
+    }
+
     fn show_native(&mut self, ui: &mut egui::Ui) {
         OpenAiTheme::apply(ui.ctx());
         if self.model.profile_load_succeeded()
@@ -1003,6 +1978,7 @@ impl DbotterApp {
         }
         self.editor_and_results(ui);
         self.show_delete_confirmation(ui);
+        self.show_credential_prompt(ui);
     }
 
     fn show_first_run(&mut self, ui: &mut egui::Ui) {
@@ -1132,6 +2108,7 @@ impl DbotterApp {
 
     fn explorer_contents(&mut self, ui: &mut egui::Ui) {
         let selected = self.model.selected_profile_snapshot().cloned();
+        let mut recovery = None;
         match selected {
             Some(profile) if profile.driver == DriverKind::MySql && profile.is_ready() => {
                 self.redis_explorer.set_profile(None);
@@ -1143,6 +2120,18 @@ impl DbotterApp {
                 for intent in intents {
                     self.submit_mysql_explorer_intent(&profile, intent);
                 }
+                let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+                let visible = self.model.workspace(&key).and_then(|workspace| {
+                    Some(VisibleError {
+                        operation_id: workspace.catalog_retry.as_ref()?.operation_id(),
+                        error: workspace.catalog_error.clone()?,
+                    })
+                });
+                if let Some(visible) = visible
+                    && let Some(action) = render_recovery_error(ui, "catalog", &visible)
+                {
+                    recovery = Some((visible, action));
+                }
             }
             Some(profile) if profile.driver == DriverKind::Redis && profile.is_ready() => {
                 self.redis_explorer
@@ -1153,6 +2142,36 @@ impl DbotterApp {
                 {
                     self.submit_redis_intent(intent);
                 }
+                let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+                let (scan, inspect) =
+                    self.model
+                        .workspace(&key)
+                        .map_or((None, None), |workspace| {
+                            let scan = workspace.redis_scan_retry.as_ref().and_then(|request| {
+                                Some(VisibleError {
+                                    operation_id: request.operation_id(),
+                                    error: workspace.redis_scan_error.clone()?,
+                                })
+                            });
+                            let inspect =
+                                workspace.redis_inspect_retry.as_ref().and_then(|request| {
+                                    Some(VisibleError {
+                                        operation_id: request.operation_id(),
+                                        error: workspace.redis_inspect_error.clone()?,
+                                    })
+                                });
+                            (scan, inspect)
+                        });
+                if let Some(visible) = scan
+                    && let Some(action) = render_recovery_error(ui, "redis_scan", &visible)
+                {
+                    recovery = Some((visible, action));
+                }
+                if let Some(visible) = inspect
+                    && let Some(action) = render_recovery_error(ui, "redis_inspect", &visible)
+                {
+                    recovery = Some((visible, action));
+                }
             }
             Some(profile) => {
                 self.redis_explorer.set_profile(None);
@@ -1162,6 +2181,9 @@ impl DbotterApp {
                 self.redis_explorer.set_profile(None);
                 ui.weak("Select a connection to browse resources.");
             }
+        }
+        if let Some((visible, action)) = recovery {
+            self.dispatch_error_recovery(visible.operation_id, &visible.error, action);
         }
     }
 
@@ -1349,6 +2371,7 @@ impl DbotterApp {
             return;
         }
         let mut editor_intent = None;
+        let mut recovery = None;
         egui::CentralPanel::default().show(root_ui, |ui| {
             let selected_workspace_key = self.model.selected_workspace_key();
             if let Some(profile) = self.model.selected_profile_snapshot().cloned() {
@@ -1367,6 +2390,11 @@ impl DbotterApp {
             ui.horizontal(|ui| {
                 ui.label(&self.model.status);
             });
+            if let Some(visible) = self.common_error.clone()
+                && let Some(action) = render_recovery_error(ui, "common", &visible)
+            {
+                recovery = Some((visible, action));
+            }
             ui.separator();
             ui.heading("Results");
             if let Some(result) = selected_workspace_key
@@ -1382,6 +2410,18 @@ impl DbotterApp {
         if let Some(intent) = editor_intent {
             self.submit_editor_intent(intent);
         }
+        if let Some((visible, action)) = recovery {
+            self.dispatch_error_recovery(visible.operation_id, &visible.error, action);
+        }
+    }
+}
+
+impl RecoveryCommandDispatcher for DbotterApp {
+    type Error = Infallible;
+
+    fn dispatch(&mut self, command: RecoveryCommand) -> Result<(), Self::Error> {
+        self.dispatch_recovery_command(command);
+        Ok(())
     }
 }
 
@@ -1461,6 +2501,89 @@ fn connection_label(state: &ConnectionState) -> String {
             format!("● Failed · {}", summary.message())
         }
         ConnectionState::Closing => "◌ Closing…".to_owned(),
+    }
+}
+
+fn render_recovery_error(
+    ui: &mut egui::Ui,
+    surface: &'static str,
+    visible: &VisibleError,
+) -> Option<RecoveryAction> {
+    let mut clicked = None;
+    egui::Frame::new()
+        .fill(egui::Color32::WHITE)
+        .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK))
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.strong(visible.error.summary.message());
+            ui.small(format!("Category: {:?}", visible.error.category));
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                for action in visible.error.recovery.as_slice() {
+                    if visible.error.operation == OperationKind::ExecuteMutation
+                        && matches!(action, RecoveryAction::Retry(_))
+                    {
+                        continue;
+                    }
+                    let label = recovery_action_label(action);
+                    let response = ui.add(
+                        egui::Button::new(label)
+                            .min_size(egui::vec2(112.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                    );
+                    let response = named_dynamic_author_id(
+                        response,
+                        format!("recovery.{surface}.{}", recovery_action_slug(action)),
+                        label,
+                    );
+                    if response.clicked() {
+                        clicked = Some(action.clone());
+                    }
+                }
+            });
+        });
+    clicked
+}
+
+const fn recovery_action_slug(action: &RecoveryAction) -> &'static str {
+    match action {
+        RecoveryAction::OpenCredentialPrompt(_) => "open_credential",
+        RecoveryAction::EditDraft(_, _) => "edit_draft",
+        RecoveryAction::EditProfile(_, _) => "edit_profile",
+        RecoveryAction::Retry(_) => "retry",
+        RecoveryAction::FocusEditor(_) => "focus_editor",
+        RecoveryAction::FocusExecuteLimits(_) => "focus_limits",
+        RecoveryAction::ReloadConfiguration => "reload",
+        RecoveryAction::Reconnect(_) => "reconnect",
+        RecoveryAction::CancelOperation(_) => "cancel",
+        RecoveryAction::ClearCatalog(_) => "clear_catalog",
+        RecoveryAction::RestartRedisScan(_) => "restart_redis_scan",
+        RecoveryAction::ChooseExportDestination(_) => "choose_export",
+        RecoveryAction::RevealExportDestination(_) => "reveal_export",
+        RecoveryAction::RevealMigrationBackup => "reveal_backup",
+        RecoveryAction::RestartApplication => "restart_app",
+        RecoveryAction::DismissError(_) => "dismiss",
+    }
+}
+
+const fn recovery_action_label(action: &RecoveryAction) -> &'static str {
+    match action {
+        RecoveryAction::OpenCredentialPrompt(_) => "Enter credential",
+        RecoveryAction::EditDraft(_, _) => "Edit draft",
+        RecoveryAction::EditProfile(_, _) => "Edit profile",
+        RecoveryAction::Retry(_) => "Retry",
+        RecoveryAction::FocusEditor(_) => "Review statement",
+        RecoveryAction::FocusExecuteLimits(_) => "Review limits",
+        RecoveryAction::ReloadConfiguration => "Reload profiles",
+        RecoveryAction::Reconnect(_) => "Reconnect",
+        RecoveryAction::CancelOperation(_) => "Cancel operation",
+        RecoveryAction::ClearCatalog(_) => "Clear catalog",
+        RecoveryAction::RestartRedisScan(_) => "Restart scan",
+        RecoveryAction::ChooseExportDestination(_) => "Choose destination",
+        RecoveryAction::RevealExportDestination(_) => "Show destination",
+        RecoveryAction::RevealMigrationBackup => "Show backup",
+        RecoveryAction::RestartApplication => "Restart Dbotter",
+        RecoveryAction::DismissError(_) => "Dismiss",
     }
 }
 
@@ -1983,14 +3106,21 @@ mod tests {
         prompt.secret =
             crate::secrets::ReplacementSecretBuffer::new("memory-only-secret".to_owned());
         app.submit_credential_prompt();
-        let store_operation = match service.try_next_command() {
-            Some(UiCommand::StoreCredentials {
+        let store_command = service
+            .try_next_command()
+            .expect("credential prompt must submit one command");
+        assert!(
+            !format!("{store_command:?}").contains("memory-only-secret"),
+            "credential commands must redact their protected payload"
+        );
+        let store_operation = match store_command {
+            UiCommand::StoreCredentials {
                 operation_id,
                 profile_id,
                 profile_generation,
                 source_operation,
                 ..
-            }) => {
+            } => {
                 assert_eq!(profile_id, session_profile.id);
                 assert_eq!(profile_generation, session_profile.generation);
                 assert_eq!(source_operation, OperationKind::ConnectProfile);
@@ -2039,6 +3169,56 @@ mod tests {
     }
 
     #[test]
+    fn typed_open_credential_recovery_opens_prompt_only_with_the_exact_retry_recipe() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let mut session_profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        session_profile.persisted.credential_mode = CredentialMode::Session;
+        session_profile.has_current_session_secret = true;
+        app.model.profiles = vec![session_profile.clone()];
+        app.model
+            .active_generations
+            .insert(session_profile.id.clone(), session_profile.generation);
+
+        app.submit_test(session_profile.id.clone());
+        let operation_id = match service.try_next_command() {
+            Some(UiCommand::TestConnection { operation_id, .. }) => operation_id,
+            _ => panic!("connect command"),
+        };
+        let recipe_id = OperationRecipeId(operation_id.0);
+        let error = PublicOperationError::new_or_internal(
+            OperationKind::ConnectProfile,
+            PublicSummary::AuthenticationFailed,
+            PublicCode::SessionCredential,
+            &SafeContext::profile_with_recipe(session_profile.id.clone(), operation_id, recipe_id),
+        );
+        assert!(service.try_emit(crate::ui::UiEvent::OperationFailed {
+            operation_id,
+            profile_id: session_profile.id.clone(),
+            profile_generation: session_profile.generation,
+            session_generation: None,
+            kind: OperationKind::ConnectProfile,
+            summary: error.summary,
+            error: error.clone(),
+            session_disposition: None,
+            connection_outcome: crate::ui::ConnectionFailureOutcome::NeedsCredential,
+        }));
+        app.poll_events();
+
+        let action = RecoveryAction::OpenCredentialPrompt(session_profile.id.clone());
+        app.dispatch_error_recovery(operation_id, &error, action);
+
+        assert!(app.profile_editor.is_none(), "secret entry is prompt-only");
+        let prompt = app.credential_prompt.as_ref().expect("credential prompt");
+        assert_eq!(prompt.profile_id, session_profile.id);
+        assert_eq!(prompt.profile_generation, session_profile.generation);
+        assert_eq!(prompt.source_operation, OperationKind::ConnectProfile);
+        assert_eq!(prompt.retry_recipe_id, Some(recipe_id));
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
     fn credential_cancel_store_failure_and_generation_change_never_retry() {
         let (ui_port, mut service) = bounded_ports(4);
         let mut app = DbotterApp::new(ui_port);
@@ -2074,6 +3254,40 @@ mod tests {
             profile_id: session_profile.id.clone(),
             profile_generation: session_profile.generation,
         }));
+        app.poll_events();
+        assert!(app.credential_prompt.is_none());
+        assert!(service.try_next_command().is_none());
+
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        app.model.profiles = vec![session_profile.clone()];
+        app.model
+            .active_generations
+            .insert(session_profile.id.clone(), session_profile.generation);
+        app.open_session_credential_prompt(session_profile.id.clone());
+        app.credential_prompt.as_mut().expect("prompt").secret =
+            crate::secrets::ReplacementSecretBuffer::new("failed-secret".to_owned());
+        app.submit_credential_prompt();
+        let store_operation = match service.try_next_command() {
+            Some(UiCommand::StoreCredentials { operation_id, .. }) => operation_id,
+            _ => panic!("StoreCredentials command"),
+        };
+        let error = PublicOperationError::new_or_internal(
+            OperationKind::UpdateProfile,
+            PublicSummary::ResourceStale,
+            PublicCode::ProfileStale,
+            &SafeContext::profile(session_profile.id.clone(), store_operation),
+        );
+        assert!(
+            service.try_emit(crate::ui::UiEvent::CredentialsStoreFailed {
+                operation_id: store_operation,
+                profile_id: session_profile.id.clone(),
+                profile_generation: session_profile.generation,
+                summary: error.summary,
+                error,
+            })
+        );
         app.poll_events();
         assert!(app.credential_prompt.is_none());
         assert!(service.try_next_command().is_none());
@@ -2161,6 +3375,35 @@ mod tests {
         assert_eq!(retried.profile_id(), request.profile_id());
         assert_eq!(retried.profile_generation(), request.profile_generation());
         assert_ne!(retried.operation_id(), request.operation_id());
+
+        let retried_recipe_id = OperationRecipeId(retried.operation_id().0);
+        let retried_error = PublicOperationError::new_or_internal(
+            OperationKind::BrowseMySql,
+            PublicSummary::ResourceStale,
+            PublicCode::None,
+            &SafeContext::profile_with_recipe(
+                mysql.id.clone(),
+                retried.operation_id(),
+                retried_recipe_id,
+            ),
+        );
+        assert!(service.try_emit(crate::ui::UiEvent::CatalogPageFailed {
+            request: retried,
+            summary: retried_error.summary,
+            error: retried_error.clone(),
+            session_generation: None,
+            session_disposition: None,
+        }));
+        app.poll_events();
+        app.model
+            .active_generations
+            .insert(mysql.id.clone(), ProfileGeneration(mysql.generation.0 + 1));
+        app.dispatch_error_recovery(
+            OperationId(retried_recipe_id.0),
+            &retried_error,
+            RecoveryAction::Retry(retried_recipe_id),
+        );
+        assert!(service.try_next_command().is_none());
 
         let (ui_port, mut service) = bounded_ports(8);
         let mut app = DbotterApp::new(ui_port);
@@ -2380,6 +3623,25 @@ mod tests {
         };
         app.dispatch_error_recovery(operation_id, &forged, RecoveryAction::Retry(recipe_id));
         assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn retry_recipe_registry_is_bounded_and_expires_the_oldest_recipe() {
+        let mut registry = super::RetryRecipeRegistry::default();
+        let profile_id = ProfileId("bounded-recipes".to_owned());
+        for value in 1..=(super::RETRY_RECIPE_LIMIT as u64 + 1) {
+            registry.register(
+                OperationId(value),
+                super::RetryRecipe::Connect {
+                    profile_id: profile_id.clone(),
+                    profile_generation: ProfileGeneration(1),
+                    timeout_ms: 30_000,
+                },
+            );
+        }
+        assert_eq!(registry.recipes.len(), super::RETRY_RECIPE_LIMIT);
+        assert!(!registry.contains(OperationRecipeId(1)));
+        assert!(registry.contains(OperationRecipeId(super::RETRY_RECIPE_LIMIT as u64 + 1)));
     }
 
     #[test]
@@ -3048,19 +4310,33 @@ mod tests {
         redis.persisted.redis_tls.ca_file = Some("/tmp/same-ca.pem".into());
         app.model.profiles = vec![redis];
 
-        app.submit_redis_intent(RedisExplorerIntent::EditProfileField {
-            profile_id: ProfileId("profile".to_owned()),
-            field: ProfileFieldId::Host,
-        });
+        let host_operation = OperationId(41);
+        let host_error = PublicOperationError::new_or_internal(
+            OperationKind::BrowseRedis,
+            PublicSummary::TlsVerificationFailed,
+            PublicCode::TlsHostnameMismatch,
+            &SafeContext::profile(ProfileId("profile".to_owned()), host_operation),
+        );
+        let host_action =
+            RecoveryAction::EditProfile(ProfileId("profile".to_owned()), ProfileFieldId::Host);
+        app.dispatch_error_recovery(host_operation, &host_error, host_action);
         let host_editor = app.profile_editor.as_ref().expect("host editor");
         assert_eq!(host_editor.requested_focus(), Some(ProfileFieldId::Host));
         assert_eq!(host_editor.draft.redis_ca_file, "/tmp/same-ca.pem");
 
         app.profile_editor = None;
-        app.submit_redis_intent(RedisExplorerIntent::EditProfileField {
-            profile_id: ProfileId("profile".to_owned()),
-            field: ProfileFieldId::RedisCaFile,
-        });
+        let ca_operation = OperationId(42);
+        let ca_error = PublicOperationError::new_or_internal(
+            OperationKind::BrowseRedis,
+            PublicSummary::TlsVerificationFailed,
+            PublicCode::RedisTlsCaUntrustedIssuer,
+            &SafeContext::profile(ProfileId("profile".to_owned()), ca_operation),
+        );
+        let ca_action = RecoveryAction::EditProfile(
+            ProfileId("profile".to_owned()),
+            ProfileFieldId::RedisCaFile,
+        );
+        app.dispatch_error_recovery(ca_operation, &ca_error, ca_action);
         let ca_editor = app.profile_editor.as_ref().expect("CA editor");
         assert_eq!(
             ca_editor.requested_focus(),

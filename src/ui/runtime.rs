@@ -14,8 +14,9 @@ use futures_util::FutureExt as _;
 
 use crate::config::CommitState;
 use crate::model::{
-    DraftId, OperationId, OperationKind, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
-    RedisKeyInspectRequest, RedisScanRequest, ResultId, SessionGeneration,
+    DraftId, OperationId, OperationKind, OperationRecipeId, ProfileGeneration, ProfileId,
+    PublicCode, PublicSummary, RedisKeyInspectRequest, RedisScanRequest, ResultId,
+    SessionGeneration,
 };
 use crate::public_error::{PublicOperationError, SafeContext};
 use crate::service::{
@@ -2706,6 +2707,24 @@ fn start_mutation(
                 kind: OperationKind::DeleteProfile,
             },
         ),
+        UiCommand::StoreCredentials {
+            operation_id,
+            profile_id,
+            profile_generation,
+            ..
+        } => (
+            *operation_id,
+            TaskScope::Profile {
+                profile_id: profile_id.clone(),
+                profile_generation: *profile_generation,
+                session_generation: None,
+            },
+            FailureContext::Profile {
+                profile_id: profile_id.clone(),
+                profile_generation: *profile_generation,
+                kind: OperationKind::UpdateProfile,
+            },
+        ),
         _ => {
             registry.release_reservation(reservation);
             return false;
@@ -2798,6 +2817,36 @@ async fn run_mutation(service: &ApplicationService, command: UiCommand) -> TaskO
                 previous_generation,
                 result: Box::new(service.delete_profile_for_runtime(request).await),
             }
+        }
+        UiCommand::StoreCredentials {
+            operation_id,
+            profile_id,
+            profile_generation,
+            source_operation: _,
+            secret,
+        } => {
+            let result = service
+                .store_session_credential_exact(
+                    operation_id,
+                    &profile_id,
+                    profile_generation,
+                    secret,
+                )
+                .await;
+            let event = match result {
+                Ok(()) => UiEvent::CredentialsStored {
+                    operation_id,
+                    profile_id,
+                    profile_generation,
+                },
+                Err(error) => credentials_store_failed_event(
+                    operation_id,
+                    profile_id,
+                    profile_generation,
+                    &error,
+                ),
+            };
+            TaskOutput::Event(Box::new(event))
         }
         other => TaskOutput::Event(Box::new(failure_for_unavailable(
             other,
@@ -3496,11 +3545,26 @@ fn public_profile_error(
     summary: PublicSummary,
     code: PublicCode,
 ) -> PublicOperationError {
-    PublicOperationError::new_or_internal(
+    let context = if runtime_operation_has_retry_recipe(kind) {
+        SafeContext::profile_with_recipe(
+            profile_id,
+            operation_id,
+            OperationRecipeId(operation_id.0),
+        )
+    } else {
+        SafeContext::profile(profile_id, operation_id)
+    };
+    PublicOperationError::new_or_internal(kind, summary, code, &context)
+}
+
+const fn runtime_operation_has_retry_recipe(kind: OperationKind) -> bool {
+    matches!(
         kind,
-        summary,
-        code,
-        &SafeContext::profile(profile_id, operation_id),
+        OperationKind::ConnectProfile
+            | OperationKind::ReconnectProfile
+            | OperationKind::BrowseMySql
+            | OperationKind::BrowseRedis
+            | OperationKind::InspectRedis
     )
 }
 
@@ -3565,6 +3629,44 @@ fn profile_update_failed_event(
         profile_id,
         profile_generation,
         summary,
+        error,
+    }
+}
+
+fn credentials_store_failed_event(
+    operation_id: OperationId,
+    profile_id: ProfileId,
+    profile_generation: ProfileGeneration,
+    service_error: &ServiceError,
+) -> UiEvent {
+    let (summary, code) = service_error.public_error_parts();
+    credentials_store_failed_event_with_parts(
+        operation_id,
+        profile_id,
+        profile_generation,
+        summary,
+        code,
+    )
+}
+
+fn credentials_store_failed_event_with_parts(
+    operation_id: OperationId,
+    profile_id: ProfileId,
+    profile_generation: ProfileGeneration,
+    summary: PublicSummary,
+    code: PublicCode,
+) -> UiEvent {
+    let error = PublicOperationError::new_or_internal(
+        OperationKind::UpdateProfile,
+        summary,
+        code,
+        &SafeContext::profile(profile_id.clone(), operation_id),
+    );
+    UiEvent::CredentialsStoreFailed {
+        operation_id,
+        profile_id,
+        profile_generation,
+        summary: error.summary,
         error,
     }
 }
@@ -3794,6 +3896,18 @@ fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEven
             None,
             OperationKind::DeleteProfile,
             summary,
+        ),
+        UiCommand::StoreCredentials {
+            operation_id,
+            profile_id,
+            profile_generation,
+            ..
+        } => credentials_store_failed_event_with_parts(
+            operation_id,
+            profile_id,
+            profile_generation,
+            summary,
+            PublicCode::None,
         ),
         UiCommand::TestConnection {
             operation_id,

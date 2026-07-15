@@ -108,6 +108,13 @@ pub enum UiCommand {
     CreateProfile(CreateProfileRequest),
     UpdateProfile(UpdateProfileRequest),
     DeleteProfile(DeleteProfileRequest),
+    StoreCredentials {
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        source_operation: OperationKind,
+        secret: Arc<SessionSecret>,
+    },
     TestConnection {
         operation_id: OperationId,
         profile_id: ProfileId,
@@ -156,6 +163,7 @@ impl UiCommand {
             | Self::CancelOperation { operation_id }
             | Self::DisconnectProfile { operation_id, .. }
             | Self::ReconnectProfile { operation_id, .. }
+            | Self::StoreCredentials { operation_id, .. }
             | Self::ShutdownRuntime { operation_id } => *operation_id,
             Self::BrowseCatalog(request) => request.operation_id(),
             Self::ScanRedisKeys(request) => request.operation_id(),
@@ -173,7 +181,8 @@ impl UiCommand {
             Self::RefreshProfiles { .. }
             | Self::CreateProfile(_)
             | Self::UpdateProfile(_)
-            | Self::DeleteProfile(_) => CommandLane::Mutation,
+            | Self::DeleteProfile(_)
+            | Self::StoreCredentials { .. } => CommandLane::Mutation,
             Self::TestConnection { .. }
             | Self::TestDraftConnection(_)
             | Self::PrepareDraftConnectionTest(_)
@@ -207,6 +216,20 @@ impl fmt::Debug for UiCommand {
             Self::DeleteProfile(request) => formatter
                 .debug_tuple("UiCommand::DeleteProfile")
                 .field(request)
+                .finish(),
+            Self::StoreCredentials {
+                operation_id,
+                profile_id,
+                profile_generation,
+                source_operation,
+                ..
+            } => formatter
+                .debug_struct("UiCommand::StoreCredentials")
+                .field("operation_id", operation_id)
+                .field("profile_id", profile_id)
+                .field("profile_generation", profile_generation)
+                .field("source_operation", source_operation)
+                .field("secret", &"<redacted>")
                 .finish(),
             Self::TestConnection {
                 operation_id,
@@ -490,6 +513,8 @@ impl ServicePort {
             | UiEvent::ProfileSaved { operation_id, .. }
             | UiEvent::ProfileCreateFailed { operation_id, .. }
             | UiEvent::ProfileUpdateFailed { operation_id, .. }
+            | UiEvent::CredentialsStored { operation_id, .. }
+            | UiEvent::CredentialsStoreFailed { operation_id, .. }
             | UiEvent::ConnectionReady { operation_id, .. }
             | UiEvent::ConnectionClosed { operation_id, .. }
             | UiEvent::DraftConnectionReady { operation_id, .. }

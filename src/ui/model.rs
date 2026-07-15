@@ -166,6 +166,18 @@ pub enum UiEvent {
         summary: PublicSummary,
         error: PublicOperationError,
     },
+    CredentialsStored {
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+    },
+    CredentialsStoreFailed {
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        summary: PublicSummary,
+        error: PublicOperationError,
+    },
     ConnectionReady {
         operation_id: OperationId,
         profile_id: ProfileId,
@@ -442,6 +454,37 @@ impl UiModel {
             UiEvent::ProfileCreateFailed { error, .. }
             | UiEvent::ProfileUpdateFailed { error, .. } => {
                 self.status = error.summary.message().to_owned();
+            }
+            UiEvent::CredentialsStored {
+                profile_id,
+                profile_generation,
+                ..
+            } => {
+                if self.event_is_current(&profile_id, profile_generation) {
+                    if let Some(profile) =
+                        self.profiles.iter_mut().find(|item| item.id == profile_id)
+                    {
+                        profile.has_current_session_secret = true;
+                    }
+                    if matches!(
+                        self.connection_states.get(&profile_id),
+                        Some(ConnectionState::NeedsCredential)
+                    ) {
+                        self.connection_states
+                            .insert(profile_id, ConnectionState::Disconnected);
+                    }
+                    self.status = "Session credential stored.".to_owned();
+                }
+            }
+            UiEvent::CredentialsStoreFailed {
+                profile_id,
+                profile_generation,
+                error,
+                ..
+            } => {
+                if self.event_is_current(&profile_id, profile_generation) {
+                    self.status = error.summary.message().to_owned();
+                }
             }
             UiEvent::ConnectionReady {
                 operation_id,

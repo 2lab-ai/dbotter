@@ -149,6 +149,10 @@ impl MySqlExplorerState {
         self.retention.clear();
     }
 
+    pub fn dismiss_error(&mut self) {
+        self.last_error = None;
+    }
+
     pub fn is_pending(&self) -> bool {
         !self.pending.is_empty()
     }
@@ -252,12 +256,6 @@ impl MySqlExplorerState {
                             egui::RichText::new("The previous page is retained and marked stale.")
                                 .color(OPENAI_INK_60),
                         );
-                        if let Some(request) = self.retry.clone()
-                            && secondary_button(ui, "Retry exact page", !self.is_pending())
-                                .clicked()
-                        {
-                            intents.push(MySqlExplorerIntent::Retry(request));
-                        }
                     }
 
                     ui.add_space(12.0);

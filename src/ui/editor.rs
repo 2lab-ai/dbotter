@@ -277,9 +277,14 @@ pub struct EditorSurface {
     active_workspace: Option<WorkspaceKey>,
     cursor: Option<EditorCursor>,
     validation_error: Option<EditorValidationError>,
+    requested_focus: Option<&'static str>,
 }
 
 impl EditorSurface {
+    pub fn request_focus(&mut self, control_id: &'static str) {
+        self.requested_focus = Some(control_id);
+    }
+
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -407,6 +412,22 @@ impl EditorSurface {
                 .is_some_and(egui::Response::changed);
         if controls_changed {
             self.validation_error = None;
+        }
+
+        if let Some(control_id) = self.requested_focus.take() {
+            match control_id {
+                EDITOR_ROW_LIMIT_ID => {
+                    if let Some(response) = &row_response {
+                        response.request_focus();
+                    }
+                }
+                EDITOR_TIMEOUT_ID => {
+                    if let Some(response) = &timeout_response {
+                        response.request_focus();
+                    }
+                }
+                _ => editor_response.request_focus(),
+            }
         }
 
         let intent = if cancel_clicked {
