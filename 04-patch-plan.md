@@ -1,8 +1,8 @@
 # dbotter — usable MVP implementation and conformance plan
 
-Status: **P0 documentation baseline complete. P1, P2, P3, and P4 are
-independently reviewed GREEN, including P4 mandatory live evidence. T0 remains
-RED overall; T1–T5/T8/T9 are Implementing; P5–P9 and T6/T7/T10 are Not started.**
+Status: **P0 documentation baseline complete. P1, P2, P3, P4, and P5 are
+independently reviewed GREEN, including both mandatory live slices. T0 remains
+RED overall; T1–T6/T8/T9 are Implementing; P6–P9 and T7/T10 are Not started.**
 
 This file routes implementation work. The full ordered plan is frozen at
 `docs/usable-mvp/plan.md`; this repository-facing ledger must not weaken it.
@@ -52,7 +52,7 @@ substitute for a slice's RED/GREEN/live/installed evidence.
 | P2 | generations/cache/controller/reload/shutdown | T2, T3, T9 | GREEN (independently reviewed foundation) |
 | P3 | typed prepared execution/resource/result/CLI seams | T4, shared T5/T6 | GREEN (independently reviewed foundation) |
 | P4 | lazy paginated MySQL catalog | T5 | GREEN (independently reviewed; hermetic + mandatory live) |
-| P5 | Redis SCAN/inspect and verified Required TLS | T6 | Not started |
+| P5 | Redis SCAN/inspect and verified Required TLS | T6 | GREEN (mandatory Redis live receipt passed) |
 | P6 | profile-scoped native UI/recovery/accessibility | T0–T6, T8, T9 | Not started |
 | P7 | exact copy and streaming atomic export | T7 | Not started |
 | P8 | live gates/receipts/workflows/bundles/tap contract | T10 | Not started |
@@ -162,8 +162,8 @@ The independently reviewed P2 checkpoint implemented and proved:
 P2 is GREEN only for that runtime foundation. T2, T3, and T9 remain
 Implementing because P6 native/RawInput/AccessKit and installed AX evidence
 remain. No P6 visual-style implementation is claimed. P3 is now independently
-reviewed GREEN; P4 has since reached its local GREEN/live checkpoint, while
-P5–P9 remain Not started.
+reviewed GREEN; P4 and P5 have since reached their local GREEN/live
+checkpoints, while P6–P9 remain Not started.
 
 Checkpoint gates passed:
 
@@ -212,9 +212,9 @@ The independently reviewed P3 checkpoint implemented and proved:
   P4 has since made only `CATALOG` ready with mandatory live proof.
 
 T4 is Implementing because its P3 hermetic core is GREEN while P6 RawInput/AX
-and mandatory execute proof remain. T5 is now Implementing with P4
-independently reviewed GREEN; T6 remains Not started and P3 provides only its
-shared seam.
+and mandatory execute proof remain. T5 is Implementing because P4 is
+independently reviewed GREEN while P6 remains; T6 is Implementing because P5
+is GREEN while P6 remains.
 
 Checkpoint gates passed:
 
@@ -318,12 +318,40 @@ d7a7f9b7d2032c4bdf4d1d77a9d6013d5053a04599fed1c23ac0872e950ac2e2  tests snapshot
 4d4a8dd94668954b110946b6442a4ad7fca41c06bc85cd8ad831a1fd5ff616da  target/release/dbotter
 ```
 
-## P5 — remaining live-gated Redis resource slice
+## P5 — Redis resource slice independently reviewed GREEN checkpoint
 
-- P5 implements T6's SCAN/inspect/raw identity/TTL/bounds/classifier and
-  verified Required TLS/auth matrix. `KEYSPACE_BROWSE` becomes ready only with
-  that proof. CA failure, Host failure, and plaintext-fallback counts are
-  separate assertions.
+- P5 implemented T6's SCAN/inspect/raw identity/TTL/bounds/classifier,
+  component-local Redis UI, and verified Required TLS/auth matrix.
+  `KEYSPACE_BROWSE` is ready with that proof. CA failure, Host failure, and
+  plaintext-fallback counts are separate assertions.
+
+P5 checkpoint gates passed:
+
+```sh
+cargo fmt --all -- --check
+git diff --check
+./scripts/check-release-contract.sh
+./scripts/test-receipt-contract.sh
+cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+cargo test --locked --offline --all-targets --all-features
+cargo test --doc --locked --offline --all-features
+cargo build --release --locked --offline --all-features
+./scripts/verify-live-redis.sh
+```
+
+The checkpoint passed 257 regular tests, 18 doctests, and the mandatory Redis
+Docker receipt 1/1. The source+test checkpoint snapshot is
+`1f8d890b908e12c102dab40177e822add41102fbd3024a6aee2736dbd897e266`.
+
+```text
+2e8ea5b91f85b0a29fb6adedb42b82729ede12692d2591d9ad13fd1ee35a9acf  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
+7ac4923aded6ca15200600877dc271ee9b85468f4bab6ceb7ccb817c97724621  tests snapshot (tests)
+92ad9489b06892bae519b3ec2316b24c4dfed2a9c11e53b37ede5ee64ba3af0c  target/release/dbotter
+```
+
+T6 remains Implementing until P6 supplies the complete profile workspace
+RawInput/AccessKit disclosure and installed AX journey. P5's OpenAI-style
+component UI is not a substitute for that remaining proof.
 
 ## P6/P7 — installed-journey UI and output
 
@@ -337,8 +365,8 @@ P4–P7 UI authoring follows the local `ui-ux` OpenAI design reference translate
 to egui: true white/black neutrals, black inverted primary actions, sharp
 corners, no gradients or decorative shadows, generous whitespace, precise
 alignment, visible keyboard focus, and field-local error/loading states. Color
-never carries meaning alone. P4 applies these rules to its Explorer component;
-this is not a P6 native/AX visual-completion claim.
+never carries meaning alone. P4 and P5 apply these rules to their Explorer
+components; this is not a P6 native/AX visual-completion claim.
 
 P7 implements exact `clipboard_scalar`, `tsv_field`, CSV/TSV/canonical JSON,
 immutable provenance, streaming export, 0600/no-clobber/confirmed-replace,
@@ -358,9 +386,9 @@ higher preview after exact config-contract preflight; tags/assets are immutable.
 ## Fixed verification interfaces
 
 The following commands are the full interfaces for later slice claims. P1,
-P2, P3, and P4 passed checkpoint subsets are recorded above. A missing command or
-failure is evidence that its owning slice is not Verified, not permission to
-weaken the contract.
+P2, P3, P4, and P5 passed checkpoint subsets are recorded above. A missing
+command or failure is evidence that its owning slice is not Verified, not
+permission to weaken the contract.
 
 ### Source and hermetic
 

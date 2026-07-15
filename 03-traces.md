@@ -1,10 +1,9 @@
 # dbotter — authoritative vertical trace index
 
-Status: **P1, P2, P3, and P4 are independently reviewed GREEN. P4's MySQL
-catalog mandatory live gate is GREEN; T5 remains Implementing for P6
-native/installed accessibility evidence. T0 remains RED overall; T1–T5, T8,
-and T9 are Implementing; T6, T7, and T10 are Not started.** Update this document before
-changing cross-layer behavior.
+Status: **P1, P2, P3, P4, and P5 are independently reviewed GREEN. The P4
+MySQL catalog and P5 Redis mandatory live gates are GREEN. T0 remains RED
+overall; T1–T6, T8, and T9 are Implementing; T7 and T10 are Not started.**
+Update this document before changing cross-layer behavior.
 
 The frozen normative trace is `docs/usable-mvp/trace.md` at SHA-256
 `91bfbe89874e88e2c97c7252073cbf7348778192f2a6a349a68b903e1baceaa4`.
@@ -36,7 +35,7 @@ Allowed implementation states are `Not started`, `RED`, `Implementing`,
 | T3 | controller, reload, connect/disconnect/reconnect/shutdown | P2/P6 | Implementing (P2 core GREEN; P6 native/AX remains; not fully GREEN/Verified) | state/cache/race/shutdown/AX |
 | T4 | exact target, prepared-only execute, cancel | P3/P6 | Implementing (P3 hermetic core GREEN; P6 RawInput/AX and mandatory live proof remain) | scanner/source/live/RawInput |
 | T5 | lazy paginated MySQL catalog | P4/P6 | Implementing (P4 review fixes and hermetic/live/CLI/UI core independently GREEN; P6 native/installed AX remains) | hermetic + mandatory live + CLI |
-| T6 | Redis SCAN/inspect and verified TLS | P5/P6 | Not started (P3 shared typed seam only) | hermetic + auth/TLS live + CLI |
+| T6 | Redis SCAN/inspect and verified TLS | P5/P6 | Implementing (P5 hermetic/auth-TLS-live/CLI GREEN; P6 full RawInput/AccessKit remains) | hermetic + auth/TLS live + CLI + AX |
 | T7 | result/copy/streaming atomic export | P7 | Not started | byte goldens/filesystem failpoints |
 | T8 | static errors, total recovery, accessibility | P1/P6 | Implementing (P1 core GREEN; P6 remains) | Cartesian table/RawInput/AccessKit |
 | T9 | restart and credential availability | P1/P2/P6 | Implementing (P1/P2 core GREEN; P6 remains) | restart contract + installed AX |
@@ -255,10 +254,11 @@ d7a7f9b7d2032c4bdf4d1d77a9d6013d5053a04599fed1c23ac0872e950ac2e2  tests snapshot
 
 ## T6 — Redis SCAN/inspect and verified Required TLS
 
-Status: **Not started** — P3 supplies only the independently reviewed typed
-scan/inspect/raw-key/service/CLI seam and closed execute policy while keeping
-`KEYSPACE_BROWSE` planned. P5/P6 still own verified TLS, live proof, and UI.
-Contract source: frozen trace T6; slices P5/P6.
+Status: **Implementing** — P5's hermetic driver/service/controller/CLI slice and
+mandatory plaintext/TLS live receipt are GREEN, and `KEYSPACE_BROWSE` is ready.
+P6 still owns the complete profile-scoped RawInput/AccessKit and installed AX
+journey, so T6 is not yet Verified. Contract source: frozen trace T6; slices
+P5/P6.
 
 `RedisScanRequest` preserves LiteralPrefix versus Glob; raw bytes are identity
 and display is separate. SCAN cursor `0` alone means complete. Inspect supports
@@ -271,10 +271,23 @@ edit/focus; hostname mismatch maps only to Host edit/focus and preserves CA.
 Neither reaches plaintext. The closed execute classifier rejects all approved
 blocking/subscription/replication/wait families before session acquisition.
 
-RED owner/evidence: pure request/classifier/cap tests; binary key/race/TTL
-tests; mandatory SCAN/type/mutation/auth live matrix on plaintext and verified
-TLS; split CA/Host negative and plaintext-fallback counter; installed CLI
-`browse redis`/`inspect redis`.
+P5 GREEN evidence:
+
+- LiteralPrefix/Glob wire separation, cursor/filter binding, raw-byte identity,
+  oversize exclusion, caps, representative command families, and no `KEYS`;
+- scoped prepare→lease→driver-drop→observe→exact-evict lifecycle for SCAN
+  cancellation and inspect timeout, with typed public error code plus exact
+  session generation/disposition carried through events and `UiModel`;
+- Required TLS CA picker/value binding with stable ids, keyboard activation,
+  field-local focus/error behavior, CA-only versus Host-only recovery, same-CA
+  preservation, and no value leakage through Debug/status/receipt boundaries;
+- mandatory Docker receipt covering multi-page SCAN, binary/oversize keys, all
+  six representative types, TTL, truncation, mutation, plaintext and verified
+  TLS Session/Environment auth matrices, split CA/hostname negatives, zero
+  plaintext fallback, and headless browse/inspect base64 round trips.
+
+Remaining owner/evidence: P6 full workspace RawInput/AccessKit disclosure and
+installed AX journey. The existing P5 component UI does not claim that work.
 
 ## T7 — profile result, exact copy, and streaming export
 
@@ -472,7 +485,7 @@ DBOTTER_MYSQL_PASSWORD=dbotter-local-only \
   cargo test --locked --offline --all-features --test live_mysql -- --ignored
 ```
 
-Remaining P5–P8 integrated mandatory live gate:
+Remaining P8 integrated mandatory live gate:
 
 ```sh
 docker compose -p dbotter-e2e up -d --wait mysql redis-auth redis-tls-auth
@@ -491,13 +504,13 @@ trace row before that row may become Verified.
 
 ## Conformance record
 
-P0 changed documentation only. The independently reviewed P1, P2, P3, and P4
-foundations are GREEN, but no complete native journey is claimed
+P0 changed documentation only. The independently reviewed P1, P2, P3, P4,
+and P5 foundations/slices are GREEN, but no complete native journey is claimed
 GREEN: T0 remains RED; T1/T8 remain Implementing for P6; T2/T3/T9 remain
 Implementing for P6 native/AX evidence; T4 remains Implementing for P6
-RawInput/AX plus execute live proof; and T5 remains Implementing for P6 native
-AX. T6, T7, and T10, and slices P5–P9, remain Not
-started.
+RawInput/AX plus execute live proof; and T5/T6 remain Implementing for P6
+native/installed accessibility evidence. T7 and T10, and slices P6–P9, remain
+Not started.
 Any production deviation is recorded here before code with an ADDED/MODIFIED/
 REMOVED/RENAMED classification, affected trace ids, migration impact, and
 contract evidence.

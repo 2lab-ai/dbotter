@@ -5,8 +5,8 @@ Redis preview. MongoDB remains honestly Planned.
 
 ## Current status
 
-The approved contract and P1/P2/P3/P4 foundations are
-complete at this branch point:
+The approved contract and P1/P2/P3/P4/P5 foundations and resource slices are
+complete at this checkpoint:
 
 - P0 repository documentation baseline: complete;
 - P1 config/profile/credential/public-error foundation: independently reviewed
@@ -17,6 +17,8 @@ complete at this branch point:
   GREEN;
 - P4 lazy paginated MySQL catalog: review fixes, hermetic gates, and mandatory
   live gates independently reviewed GREEN;
+- P5 Redis SCAN/inspect, Required TLS, auth matrix, CLI, and component-local UI:
+  GREEN with mandatory Docker live proof;
 - T0 overall: RED because P6 first-run RawInput/AccessKit proof is missing; the
   P1 config portion is GREEN;
 - T1 and T8: Implementing with P1 core GREEN and P6 remaining;
@@ -27,16 +29,17 @@ complete at this branch point:
   mandatory live proof remaining;
 - T5: Implementing with P4's catalog/CLI/Explorer/live review fixes GREEN
   and only P6 native/installed AX remaining;
-- T6: Not started; P5 retains Redis keyspace/TLS capability and live-proof
-  ownership;
+- T6: Implementing with the P5 hermetic/live/CLI core GREEN and P6 full
+  RawInput/AccessKit journey remaining; it is not yet Verified;
 - T9: Implementing with P1/P2 core GREEN and P6 remaining;
-- T7 and T10, and slices P5–P9: Not started.
+- T7 and T10, and slices P6–P9: Not started.
 
-The P3 checkpoint is evidence for its hermetic typed execution/resource
-foundation only. P4 keeps MySQL `CATALOG` ready with its mandatory live
-proof and review-fix contracts; Redis `KEYSPACE_BROWSE` remains planned for P5.
-The P4 Explorer applies the local OpenAI component reference, while P6 native
-RawInput/AccessKit and installed AX work remain future work.
+The P3 checkpoint remains evidence for its shared typed execution/resource
+foundation only. P4 keeps MySQL `CATALOG` ready with mandatory live proof and
+review-fix contracts; P5 makes Redis `KEYSPACE_BROWSE` ready with mandatory
+plaintext/TLS/auth/browse/inspect/CLI live proof. P6 native accessibility and
+the complete installed AX journey remain future work; P4/P5 currently include
+only their component-local Explorer UI and recovery controls.
 Historical demo code and release machinery remain **not** proof of the
 remaining usable MVP or of an installed/verified preview.
 
@@ -76,9 +79,9 @@ MongoDB stays disabled/Planned. Query history, editable grids, transactions,
 SSH/proxy, import, ER diagrams, AI, keychain persistence, and stable publication
 are not part of this task.
 
-## P3 checkpoint verification
+## P5 checkpoint verification
 
-The cumulative P1/P2/P3 checkpoint passed the following local gates:
+The cumulative P1/P2/P3/P5 checkpoint passed the following local gates:
 
 ```sh
 cargo fmt --all -- --check
@@ -89,22 +92,27 @@ cargo clippy --locked --offline --all-targets --all-features -- -D warnings
 cargo test --locked --offline --all-targets --all-features
 cargo test --doc --locked --offline --all-features
 cargo build --release --locked --offline --all-features
+./scripts/verify-live-redis.sh
 ```
 
-The final run passed 227 regular tests and 18 doctests. Focused counts were lib
-51/51, controller 46/46, service 37/37, source 6/6, execution 16/16, resource
-10/10, and prepared-only MySQL 3/3. Formatting, diff, release-contract,
-receipt, strict Clippy, all-target/all-feature tests, doctests, and the release
-build passed. Two independent final reviewers each reported `NO P3 BLOCKER`
-against source+test review snapshot
-`599917d1507df767b5b873a6d52d914d9646b9135fa51671282b4f0b884d5ecb`.
+The final run passed 257 regular tests and 18 doctests. Focused counts were lib
+67/67, controller 48/48, service 37/37, Redis contract 11/11, source 6/6,
+execution 16/16, and resource 10/10. The mandatory ignored Redis Docker receipt
+also passed 1/1 when invoked through `verify-live-redis.sh`: multi-page SCAN,
+binary and oversize keys, six representative types, TTL, bounded truncation,
+mutation, plaintext/TLS Session and Environment authentication, disjoint
+CA/Host negatives with CA preservation, zero plaintext fallback, and CLI
+base64 round trips. Formatting, diff, release-contract, receipt, strict
+Clippy, all-target/all-feature tests, doctests, and the release build passed.
+The source+test checkpoint snapshot is
+`1f8d890b908e12c102dab40177e822add41102fbd3024a6aee2736dbd897e266`.
 
 Checkpoint SHA-256 values:
 
 ```text
-59a348c8a5e7f4bc63a15631cdac7be14444aebc57c84fb34ebbcb795692fec7  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
-1b7a9ca40dea4994126f101dfcab1fc33fa6019b773627699c77e24167ac5b95  tests snapshot (tests)
-9e43c9732be5a642873063f91a75364f9ad7f310735b17accaa3c24be0f95556  target/release/dbotter
+2e8ea5b91f85b0a29fb6adedb42b82729ede12692d2591d9ad13fd1ee35a9acf  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
+7ac4923aded6ca15200600877dc271ee9b85468f4bab6ceb7ccb817c97724621  tests snapshot (tests)
+92ad9489b06892bae519b3ec2316b24c4dfed2a9c11e53b37ede5ee64ba3af0c  target/release/dbotter
 ```
 
 The snapshots are reproducible with the tracked-plus-untracked file list in
@@ -182,7 +190,13 @@ DBOTTER_MYSQL_PASSWORD=dbotter-local-only \
   cargo test --locked --offline --all-features --test live_mysql -- --ignored
 ```
 
-The remaining integrated live interface for P5/P8 is:
+The implemented P5 Redis live interface is:
+
+```sh
+./scripts/verify-live-redis.sh
+```
+
+The combined mandatory live interface for P8 remains:
 
 ```sh
 docker compose -p dbotter-e2e up -d --wait mysql redis-auth redis-tls-auth
