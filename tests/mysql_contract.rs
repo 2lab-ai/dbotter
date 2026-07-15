@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-use dbotter::drivers::{self, DriverError, Session};
+use dbotter::drivers::{self, DriverError, MySqlPreparedExecution, Session};
 use dbotter::model::{
-    Cell, ConnectionProfile, CredentialMode, DriverKind, ExecuteRequest, OperationId, ProfileId,
-    QueryLanguage, QueryResult, RedisTlsConfig, TlsMode,
+    Cell, ConnectionProfile, CredentialMode, DriverKind, OperationId, PreparedMySqlRequest,
+    ProfileGeneration, ProfileId, QueryResult, RedisTlsConfig, RequestIdentity, TlsMode,
 };
 use secrecy::SecretString;
 
@@ -40,11 +40,13 @@ async fn mysql_session() -> Session {
 
 async fn execute(session: &Session, text: &str) -> Result<QueryResult, DriverError> {
     session
-        .execute(&ExecuteRequest {
-            operation_id: OperationId(1),
-            profile_id: ProfileId("mysql-contract".to_owned()),
-            language: QueryLanguage::Sql,
-            text: text.to_owned(),
+        .execute_prepared(&PreparedMySqlRequest {
+            identity: RequestIdentity::new(
+                ProfileId("mysql-contract".to_owned()),
+                ProfileGeneration(1),
+                OperationId(1),
+            ),
+            statement: text.to_owned(),
             row_limit: 10,
             timeout: Duration::from_secs(10),
         })
@@ -83,22 +85,42 @@ async fn leading_comments_and_quoted_semicolons_are_one_row_query() {
 }
 
 #[tokio::test]
-async fn multiple_statements_are_rejected_before_either_can_execute() {
+async fn multiple_statements_are_rejected_by_prepare_without_executing_either() {
     if !live_contract_enabled() {
         return;
     }
     let session = mysql_session().await;
-    let error = execute(&session, "SELECT 1; SELECT 2")
-        .await
-        .expect_err("multiple statements must be rejected locally");
+    execute(
+        &session,
+        "DROP TABLE IF EXISTS dbotter_prepared_only_marker",
+    )
+    .await
+    .expect("drop prepared-only marker fixture");
+    execute(
+        &session,
+        "CREATE TABLE dbotter_prepared_only_marker (marker VARCHAR(32) PRIMARY KEY)",
+    )
+    .await
+    .expect("create prepared-only marker fixture");
 
-    assert!(matches!(
-        error,
-        DriverError::InvalidConfig {
-            driver: DriverKind::MySql,
-            message
-        } if message == "exactly one MySQL statement is required"
-    ));
+    let error = execute(
+        &session,
+        "INSERT INTO dbotter_prepared_only_marker VALUES ('first'); INSERT INTO dbotter_prepared_only_marker VALUES ('second')",
+    )
+        .await
+        .expect_err("server prepare must reject multiple statements");
+    assert!(matches!(error, DriverError::MySql(_)));
+
+    let result = execute(
+        &session,
+        "SELECT marker FROM dbotter_prepared_only_marker ORDER BY marker",
+    )
+    .await
+    .expect("inspect prepared-only marker fixture");
+    assert!(
+        result.rows.is_empty(),
+        "neither statement may be resubmitted"
+    );
 }
 
 #[tokio::test]
@@ -216,15 +238,19 @@ async fn cte_update_is_a_mutation() {
 }
 
 #[tokio::test]
-async fn unsupported_prepare_uses_validated_raw_fallback() {
+async fn unsupported_prepare_returns_static_typed_error_without_resubmit() {
     if !live_contract_enabled() {
         return;
     }
     let session = mysql_session().await;
-    let result = execute(&session, "USE dbotter")
+    let error = execute(&session, "USE dbotter")
         .await
-        .expect("USE should execute through the MySQL 1295 raw fallback");
+        .expect_err("USE is unsupported by the server prepared protocol");
 
-    assert!(result.columns.is_empty());
-    assert!(result.rows.is_empty());
+    assert!(matches!(
+        error,
+        DriverError::PreparedStatementUnsupported {
+            session_healthy: true
+        }
+    ));
 }

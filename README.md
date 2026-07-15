@@ -5,12 +5,14 @@ Redis preview. MongoDB remains honestly Planned.
 
 ## Current status
 
-The approved contract and P1/P2 foundations are complete at this checkpoint:
+The approved contract and P1/P2/P3 foundations are complete at this checkpoint:
 
 - P0 repository documentation baseline: complete;
 - P1 config/profile/credential/public-error foundation: independently reviewed
   GREEN;
 - P2 generations/cache/controller/reload/shutdown: independently reviewed
+  GREEN;
+- P3 typed prepared execution/resource/result/CLI seams: independently reviewed
   GREEN;
 - T0 overall: RED because P6 first-run RawInput/AccessKit proof is missing; the
   P1 config portion is GREEN;
@@ -18,13 +20,19 @@ The approved contract and P1/P2 foundations are complete at this checkpoint:
 - T2: Implementing with P1/P2 core GREEN and P6 remaining;
 - T3: Implementing with P2 core GREEN and P6 native/AX work remaining; it is
   not fully GREEN or Verified;
+- T4: Implementing with the P3 hermetic core GREEN and P6 RawInput/AX plus
+  mandatory live proof remaining;
+- T5 and T6: Not started; P3 supplies only their shared typed seams while P4
+  and P5 retain the capability and live-proof owners;
 - T9: Implementing with P1/P2 core GREEN and P6 remaining;
-- T4–T7 and T10, and slices P3–P9: Not started.
+- T7 and T10, and slices P4–P9: Not started.
 
-The P2 checkpoint is evidence for its bounded runtime foundation only. Execute
-remains fail-closed until P3, and P6 native accessibility and visual work remain
-future work. Historical demo code and release machinery remain **not** proof of
-the remaining usable MVP or of an installed/verified preview.
+The P3 checkpoint is evidence for its hermetic typed execution/resource
+foundation only. MySQL `CATALOG` and Redis `KEYSPACE_BROWSE` remain planned and
+off until P4/P5 supply mandatory live proof in their reviewed changes. P6
+native accessibility and OpenAI-style visual work remain future work.
+Historical demo code and release machinery remain **not** proof of the
+remaining usable MVP or of an installed/verified preview.
 
 ## Contract map
 
@@ -62,9 +70,9 @@ MongoDB stays disabled/Planned. Query history, editable grids, transactions,
 SSH/proxy, import, ER diagrams, AI, keychain persistence, and stable publication
 are not part of this task.
 
-## P2 checkpoint verification
+## P3 checkpoint verification
 
-The cumulative P1/P2 checkpoint passed the following local gates:
+The cumulative P1/P2/P3 checkpoint passed the following local gates:
 
 ```sh
 cargo fmt --all -- --check
@@ -77,19 +85,20 @@ cargo test --doc --locked --offline --all-features
 cargo build --release --locked --offline --all-features
 ```
 
-The final run passed 188 regular tests and 12 doctests. Focused counts were
-lib 48/48, controller 42/42, service 36/36, and source 4/4. Formatting, diff,
-release-contract, receipt, strict Clippy, all-target/all-feature tests,
-doctests, and the release build passed. Two independent final reviewers each
-reported `NO P2 BLOCKER` against source+test review snapshot
-`e987bbf1d8a7f919cf53b95e882e0fa7b072d4226d7bb5e99e5e06d4dda65378`.
+The final run passed 227 regular tests and 18 doctests. Focused counts were lib
+51/51, controller 46/46, service 37/37, source 6/6, execution 16/16, resource
+10/10, and prepared-only MySQL 3/3. Formatting, diff, release-contract,
+receipt, strict Clippy, all-target/all-feature tests, doctests, and the release
+build passed. Two independent final reviewers each reported `NO P3 BLOCKER`
+against source+test review snapshot
+`599917d1507df767b5b873a6d52d914d9646b9135fa51671282b4f0b884d5ecb`.
 
 Checkpoint SHA-256 values:
 
 ```text
-279757012280ab7bdcb90b547242114c80efcff3b64c26b7dcff4e3abb78fa9d  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
-467982ee06068fe8fee669cc20e43ca05b1a0f72129c69137743c70d3eecce1b  tests snapshot (tests)
-65ec73f1138587364005a1304fdd55006f85813283390fb3fd0f32f746183f3e  target/release/dbotter
+59a348c8a5e7f4bc63a15631cdac7be14444aebc57c84fb34ebbcb795692fec7  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
+1b7a9ca40dea4994126f101dfcab1fc33fa6019b773627699c77e24167ac5b95  tests snapshot (tests)
+9e43c9732be5a642873063f91a75364f9ad7f310735b17accaa3c24be0f95556  target/release/dbotter
 ```
 
 The snapshots are reproducible with the tracked-plus-untracked file list in

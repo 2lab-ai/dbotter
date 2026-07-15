@@ -7,10 +7,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dbotter::config::{ConfigWriter, MigrationConsent, MutationFailpoint, MutationFaultInjector};
-use dbotter::drivers::DriverError;
+use dbotter::drivers::{
+    CatalogBrowser, ConnectedResources, ConnectionPing, DriverError, MySqlPreparedExecution,
+};
 use dbotter::model::{
-    ConnectionDraft, CredentialMode, DraftId, DriverKind, ExecuteRequest, OperationId,
-    ProfileGeneration, ProfileId, QueryResult, SessionGeneration,
+    CatalogPage, CatalogRequest, ConnectionDraft, CredentialMode, DraftId, DriverKind, OperationId,
+    PreparedMySqlRequest, ProfileGeneration, ProfileId, QueryResult, RedisKeyFilter, RedisKeyId,
+    RedisKeyInspectRequest, RedisScanRequest, RequestIdentity, ResultId, ResultProvenance,
+    ResultRetentionPolicy, ResultSnapshot, SessionGeneration,
 };
 use dbotter::secrets::{SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate};
 use dbotter::service::{
@@ -765,7 +769,7 @@ async fn controller_enforces_one_per_profile_and_four_global_without_spawning_bu
 }
 
 #[tokio::test]
-async fn p2_execute_fails_closed_before_session_until_typed_p3_classifier_exists() {
+async fn p3_invalid_execute_targets_fail_before_session_acquisition() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");
     let connector = Arc::new(CountingConnector::default());
@@ -790,21 +794,21 @@ async fn p2_execute_fails_closed_before_session_until_typed_p3_classifier_exists
             mysql.profile_id,
             mysql.profile_generation,
             dbotter::model::QueryLanguage::Sql,
-            "UPDATE accounts SET enabled = 0",
+            "SELECT 1; SELECT 2;",
         ),
         (
             OperationId(183),
             redis.profile_id.clone(),
             redis.profile_generation,
             dbotter::model::QueryLanguage::RedisCommand,
-            "SET sentinel value",
+            "SUBSCRIBE sentinel",
         ),
         (
             OperationId(184),
             redis.profile_id,
             redis.profile_generation,
             dbotter::model::QueryLanguage::RedisCommand,
-            "DEL sentinel",
+            "XREAD BLOCK 0 STREAMS sentinel 0",
         ),
     ] {
         ui.try_submit(UiCommand::Execute {
@@ -816,13 +820,13 @@ async fn p2_execute_fails_closed_before_session_until_typed_p3_classifier_exists
             row_limit: 100,
             timeout_ms: 1_000,
         })
-        .expect("disabled execute reaches controller");
+        .expect("invalid execute reaches controller");
         wait_for_event(&mut ui, |event| {
             matches!(
                 event,
-                UiEvent::ExecuteUnavailable {
+                UiEvent::OperationFailed {
                     operation_id: actual,
-                    summary: dbotter::model::PublicSummary::UnsupportedFeature,
+                    summary: dbotter::model::PublicSummary::InvalidInput,
                     ..
                 } if *actual == operation_id
             )
@@ -831,6 +835,305 @@ async fn p2_execute_fails_closed_before_session_until_typed_p3_classifier_exists
     }
     assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
     shutdown(&ui, runtime, OperationId(189)).await;
+}
+
+#[tokio::test]
+async fn p3_valid_execute_reaches_typed_prepared_resource_and_retains_exact_provenance() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let connector = Arc::new(CountingConnector::default());
+    let service = test_service(&path, connector.clone());
+    let profile = service
+        .create_profile(create_request("mysql-p3-execute", OperationId(190)))
+        .await
+        .expect("mysql profile");
+    let (mut ui, service_port) = controller_ports();
+    let runtime = spawn_with_service(service_port, service);
+
+    ui.try_submit(UiCommand::Execute {
+        operation_id: OperationId(191),
+        profile_id: profile.profile_id.clone(),
+        profile_generation: profile.profile_generation,
+        language: dbotter::model::QueryLanguage::Sql,
+        text: "SELECT 1".to_owned(),
+        row_limit: 500,
+        timeout_ms: 1_000,
+    })
+    .expect("execute submits");
+    let finished = wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::QueryFinished {
+                operation_id: OperationId(191),
+                profile_id,
+                profile_generation,
+                ..
+            } if profile_id == &profile.profile_id
+                && *profile_generation == profile.profile_generation
+        )
+    })
+    .await;
+    let UiEvent::QueryFinished { result, .. } = finished else {
+        panic!("expected query result");
+    };
+    assert_eq!(result.provenance.operation_id, OperationId(191));
+    assert_eq!(result.provenance.profile_id, profile.profile_id);
+    assert_eq!(
+        result.provenance.profile_generation,
+        profile.profile_generation
+    );
+    assert_eq!(result.provenance.driver, DriverKind::MySql);
+    assert_eq!(connector.connects.load(Ordering::SeqCst), 1);
+    assert_eq!(connector.executes.load(Ordering::SeqCst), 1);
+    shutdown(&ui, runtime, OperationId(199)).await;
+}
+
+#[tokio::test]
+async fn p3_execute_cancel_drops_driver_future_before_exact_session_close() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let session = Arc::new(ExecuteTestSession::new(ExecuteResourceBehavior::Blocked));
+    let service = test_service_with_connector(
+        &path,
+        Arc::new(ExecuteTestConnector {
+            session: session.clone(),
+        }),
+    );
+    let profile = service
+        .create_profile(create_request("mysql-p3-cancel", OperationId(210)))
+        .await
+        .expect("mysql profile");
+    let (mut ui, service_port) = controller_ports();
+    let runtime = spawn_with_service(service_port, service);
+
+    ui.try_submit(UiCommand::Execute {
+        operation_id: OperationId(211),
+        profile_id: profile.profile_id,
+        profile_generation: profile.profile_generation,
+        language: dbotter::model::QueryLanguage::Sql,
+        text: "SELECT 1".to_owned(),
+        row_limit: 500,
+        timeout_ms: 5_000,
+    })
+    .expect("execute submits");
+    session.resources.wait_until_started().await;
+    ui.try_submit(UiCommand::CancelOperation {
+        operation_id: OperationId(211),
+    })
+    .expect("cancel submits");
+    wait_for_event(&mut ui, |event| terminal_is(event, OperationId(211), true)).await;
+
+    assert!(session.resources.execute_dropped.load(Ordering::SeqCst));
+    assert!(
+        !session.close_before_execute_drop.load(Ordering::SeqCst),
+        "the driver future must release its connection before pool/session close"
+    );
+    assert_eq!(session.closes.load(Ordering::SeqCst), 1);
+    shutdown(&ui, runtime, OperationId(219)).await;
+}
+
+#[tokio::test]
+async fn p3_driver_session_disposition_is_identical_in_cache_event_and_ui_outcome() {
+    for (index, session_healthy) in [true, false].into_iter().enumerate() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("config.toml");
+        let session = Arc::new(ExecuteTestSession::new(
+            ExecuteResourceBehavior::PreparedUnsupported { session_healthy },
+        ));
+        let service = test_service_with_connector(
+            &path,
+            Arc::new(ExecuteTestConnector {
+                session: session.clone(),
+            }),
+        );
+        let create_operation = OperationId(220 + index as u64 * 10);
+        let execute_operation = OperationId(create_operation.0 + 1);
+        let profile = service
+            .create_profile(create_request(
+                &format!("mysql-p3-disposition-{index}"),
+                create_operation,
+            ))
+            .await
+            .expect("mysql profile");
+        let profile_id = profile.profile_id.clone();
+        let (mut ui, service_port) = controller_ports();
+        let runtime = spawn_with_service(service_port, service.clone());
+
+        ui.try_submit(UiCommand::Execute {
+            operation_id: execute_operation,
+            profile_id,
+            profile_generation: profile.profile_generation,
+            language: dbotter::model::QueryLanguage::Sql,
+            text: "USE dbotter".to_owned(),
+            row_limit: 500,
+            timeout_ms: 1_000,
+        })
+        .expect("execute submits");
+        let terminal = wait_for_event(&mut ui, |event| {
+            matches!(
+                event,
+                UiEvent::OperationFailed {
+                    operation_id,
+                    summary: dbotter::model::PublicSummary::UnsupportedFeature,
+                    ..
+                } if *operation_id == execute_operation
+            )
+        })
+        .await;
+        let expected_disposition = if session_healthy {
+            SessionDisposition::Keep
+        } else {
+            SessionDisposition::Evict
+        };
+        let expected_outcome = if session_healthy {
+            ConnectionFailureOutcome::Preserve
+        } else {
+            ConnectionFailureOutcome::Disconnected
+        };
+        let UiEvent::OperationFailed {
+            session_disposition,
+            connection_outcome,
+            ..
+        } = terminal
+        else {
+            panic!("operation failure expected");
+        };
+        assert_eq!(session_disposition, Some(expected_disposition));
+        assert_eq!(connection_outcome, expected_outcome);
+        assert_eq!(
+            service.cached_session_count().await,
+            usize::from(session_healthy)
+        );
+        assert_eq!(
+            session.closes.load(Ordering::SeqCst),
+            usize::from(!session_healthy)
+        );
+        shutdown(
+            &ui,
+            runtime,
+            OperationId(create_operation.0.saturating_add(9)),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn p3_typed_resource_commands_are_capability_gated_before_connector_invocation() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let connector = Arc::new(CountingConnector::default());
+    let service = test_service(&path, connector.clone());
+    let mysql = service
+        .create_profile(create_request("mysql-p3-resource", OperationId(200)))
+        .await
+        .expect("mysql profile");
+    let mut redis_create = create_request("redis-p3-resource", OperationId(201));
+    redis_create.draft = ConnectionDraft::for_driver(DriverKind::Redis);
+    redis_create.draft.name = "redis-p3-resource".to_owned();
+    redis_create.draft.credential_mode = CredentialMode::None;
+    let redis = service
+        .create_profile(redis_create)
+        .await
+        .expect("redis profile");
+    let (mut ui, service_port) = controller_ports();
+    let runtime = spawn_with_service(service_port, service);
+
+    let catalog = CatalogRequest::Schemas {
+        identity: RequestIdentity::new(
+            mysql.profile_id.clone(),
+            mysql.profile_generation,
+            OperationId(202),
+        ),
+        prefix: None,
+        page_token: None,
+        page_size: 50,
+        timeout: Duration::from_secs(5),
+    };
+    ui.try_submit(UiCommand::BrowseCatalog(catalog))
+        .expect("catalog submits");
+    wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::CatalogPageFailed {
+                request,
+                summary: dbotter::model::PublicSummary::UnsupportedFeature,
+            } if request.operation_id() == OperationId(202)
+        )
+    })
+    .await;
+
+    let mismatched_catalog = CatalogRequest::Schemas {
+        identity: RequestIdentity::new(
+            redis.profile_id.clone(),
+            redis.profile_generation,
+            OperationId(205),
+        ),
+        prefix: None,
+        page_token: None,
+        page_size: 50,
+        timeout: Duration::from_secs(5),
+    };
+    ui.try_submit(UiCommand::BrowseCatalog(mismatched_catalog))
+        .expect("mismatched catalog submits");
+    wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::CatalogPageFailed {
+                request,
+                summary: dbotter::model::PublicSummary::InvalidInput,
+            } if request.operation_id() == OperationId(205)
+        )
+    })
+    .await;
+
+    let scan = RedisScanRequest {
+        identity: RequestIdentity::new(
+            redis.profile_id.clone(),
+            redis.profile_generation,
+            OperationId(203),
+        ),
+        filter: RedisKeyFilter::LiteralPrefix("receipt:".to_owned()),
+        cursor: 0,
+        count_hint: 100,
+        timeout: Duration::from_secs(5),
+    };
+    ui.try_submit(UiCommand::ScanRedisKeys(scan))
+        .expect("scan submits");
+    wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::RedisKeysFailed {
+                request,
+                summary: dbotter::model::PublicSummary::UnsupportedFeature,
+            } if request.operation_id() == OperationId(203)
+        )
+    })
+    .await;
+
+    let inspect = RedisKeyInspectRequest {
+        identity: RequestIdentity::new(
+            redis.profile_id,
+            redis.profile_generation,
+            OperationId(204),
+        ),
+        key: RedisKeyId(b"receipt:marker".to_vec()),
+        timeout: Duration::from_secs(5),
+    };
+    ui.try_submit(UiCommand::InspectRedisKey(inspect))
+        .expect("inspect submits");
+    wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::RedisKeyInspectFailed {
+                request,
+                summary: dbotter::model::PublicSummary::UnsupportedFeature,
+            } if request.operation_id() == OperationId(204)
+        )
+    })
+    .await;
+
+    assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
+    shutdown(&ui, runtime, OperationId(209)).await;
 }
 
 #[tokio::test]
@@ -2727,7 +3030,42 @@ async fn stale_reconnect_cannot_evict_a_newer_profile_generation_session() {
 }
 
 #[derive(Default)]
-struct CountingSession;
+struct CountingSession {
+    executes: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct CountingMySqlResources {
+    executes: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ConnectionPing for CountingMySqlResources {
+    async fn ping(&self, _timeout: Duration) -> Result<(), DriverError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MySqlPreparedExecution for CountingMySqlResources {
+    async fn execute_prepared(
+        &self,
+        _request: &PreparedMySqlRequest,
+    ) -> Result<QueryResult, DriverError> {
+        self.executes.fetch_add(1, Ordering::SeqCst);
+        Ok(empty_driver_result())
+    }
+}
+
+#[async_trait]
+impl CatalogBrowser for CountingMySqlResources {
+    async fn load_page(&self, _request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
+        Err(DriverError::Unsupported {
+            driver: DriverKind::MySql,
+            operation: "test catalog".to_owned(),
+        })
+    }
+}
 
 #[async_trait]
 impl SessionHandle for CountingSession {
@@ -2735,15 +3073,14 @@ impl SessionHandle for CountingSession {
         Ok(())
     }
 
-    async fn execute(&self, _request: &ExecuteRequest) -> Result<QueryResult, DriverError> {
-        Ok(QueryResult {
-            columns: Vec::new(),
-            rows: Vec::new(),
-            affected_rows: 0,
-            last_insert_id: None,
-            elapsed_ms: 0,
-            truncated: false,
-            notices: Vec::new(),
+    fn connected_resources(&self) -> Option<ConnectedResources> {
+        let resources = Arc::new(CountingMySqlResources {
+            executes: self.executes.clone(),
+        });
+        Some(ConnectedResources::MySql {
+            ping: resources.clone(),
+            execution: resources.clone(),
+            catalog: resources,
         })
     }
 }
@@ -2751,6 +3088,7 @@ impl SessionHandle for CountingSession {
 #[derive(Default)]
 struct CountingConnector {
     connects: AtomicUsize,
+    executes: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -2762,7 +3100,142 @@ impl SessionConnector for CountingConnector {
         _timeout: Duration,
     ) -> Result<Arc<dyn SessionHandle>, DriverError> {
         self.connects.fetch_add(1, Ordering::SeqCst);
-        Ok(Arc::new(CountingSession))
+        Ok(Arc::new(CountingSession {
+            executes: self.executes.clone(),
+        }))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExecuteResourceBehavior {
+    Blocked,
+    PreparedUnsupported { session_healthy: bool },
+}
+
+struct ExecuteDropGuard(Arc<AtomicBool>);
+
+impl Drop for ExecuteDropGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+struct ExecuteTestResources {
+    behavior: ExecuteResourceBehavior,
+    started: AtomicBool,
+    started_notify: tokio::sync::Notify,
+    execute_dropped: Arc<AtomicBool>,
+}
+
+impl ExecuteTestResources {
+    fn new(behavior: ExecuteResourceBehavior) -> Self {
+        Self {
+            behavior,
+            started: AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
+            execute_dropped: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    async fn wait_until_started(&self) {
+        while !self.started.load(Ordering::SeqCst) {
+            self.started_notify.notified().await;
+        }
+    }
+}
+
+#[async_trait]
+impl ConnectionPing for ExecuteTestResources {
+    async fn ping(&self, _timeout: Duration) -> Result<(), DriverError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MySqlPreparedExecution for ExecuteTestResources {
+    async fn execute_prepared(
+        &self,
+        _request: &PreparedMySqlRequest,
+    ) -> Result<QueryResult, DriverError> {
+        match self.behavior {
+            ExecuteResourceBehavior::Blocked => {
+                let _guard = ExecuteDropGuard(self.execute_dropped.clone());
+                self.started.store(true, Ordering::SeqCst);
+                self.started_notify.notify_waiters();
+                std::future::pending::<()>().await;
+                Ok(empty_driver_result())
+            }
+            ExecuteResourceBehavior::PreparedUnsupported { session_healthy } => {
+                Err(DriverError::PreparedStatementUnsupported { session_healthy })
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl CatalogBrowser for ExecuteTestResources {
+    async fn load_page(&self, _request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
+        Err(DriverError::Unsupported {
+            driver: DriverKind::MySql,
+            operation: "test catalog".to_owned(),
+        })
+    }
+}
+
+struct ExecuteTestSession {
+    resources: Arc<ExecuteTestResources>,
+    closes: AtomicUsize,
+    close_before_execute_drop: AtomicBool,
+}
+
+impl ExecuteTestSession {
+    fn new(behavior: ExecuteResourceBehavior) -> Self {
+        Self {
+            resources: Arc::new(ExecuteTestResources::new(behavior)),
+            closes: AtomicUsize::new(0),
+            close_before_execute_drop: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionHandle for ExecuteTestSession {
+    async fn ping(&self, _timeout: Duration) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    fn connected_resources(&self) -> Option<ConnectedResources> {
+        Some(ConnectedResources::MySql {
+            ping: self.resources.clone(),
+            execution: self.resources.clone(),
+            catalog: self.resources.clone(),
+        })
+    }
+
+    async fn close(&self) -> Result<(), DriverError> {
+        if matches!(self.resources.behavior, ExecuteResourceBehavior::Blocked)
+            && !self.resources.execute_dropped.load(Ordering::SeqCst)
+        {
+            self.close_before_execute_drop.store(true, Ordering::SeqCst);
+        }
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct ExecuteTestConnector {
+    session: Arc<ExecuteTestSession>,
+}
+
+#[async_trait]
+impl SessionConnector for ExecuteTestConnector {
+    async fn connect(
+        &self,
+        _profile: &dbotter::model::ConnectionProfile,
+        _secret: Option<&SessionSecret>,
+        _timeout: Duration,
+    ) -> Result<Arc<dyn SessionHandle>, DriverError> {
+        Ok(self.session.clone())
     }
 }
 
@@ -2810,10 +3283,6 @@ impl SessionHandle for OrderingSession {
         Ok(())
     }
 
-    async fn execute(&self, _request: &ExecuteRequest) -> Result<QueryResult, DriverError> {
-        Ok(empty_query_result())
-    }
-
     async fn close(&self) -> Result<(), DriverError> {
         if !self.ping_dropped.load(Ordering::SeqCst) {
             self.close_before_ping_drop.store(true, Ordering::SeqCst);
@@ -2854,7 +3323,7 @@ impl SessionConnector for CollateralConnector {
         if profile.id == self.blocked_profile {
             Ok(self.blocked.clone())
         } else {
-            Ok(Arc::new(CountingSession))
+            Ok(Arc::new(CountingSession::default()))
         }
     }
 }
@@ -2884,7 +3353,7 @@ impl SessionConnector for PreLeaseConnector {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             self.first_connect.wait().await;
         }
-        Ok(Arc::new(CountingSession))
+        Ok(Arc::new(CountingSession::default()))
     }
 }
 
@@ -2954,10 +3423,6 @@ impl SessionHandle for CloseBarrierSession {
         }
     }
 
-    async fn execute(&self, _request: &ExecuteRequest) -> Result<QueryResult, DriverError> {
-        Ok(empty_query_result())
-    }
-
     async fn close(&self) -> Result<(), DriverError> {
         self.close_started.store(true, Ordering::SeqCst);
         self.close_started_notify.notify_waiters();
@@ -2993,7 +3458,7 @@ impl SessionConnector for ReplacementRaceConnector {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             Ok(self.old_session.clone())
         } else {
-            Ok(Arc::new(CountingSession))
+            Ok(Arc::new(CountingSession::default()))
         }
     }
 }
@@ -3046,18 +3511,6 @@ impl SessionHandle for ScriptedSession {
             }
             SessionBehavior::Panic => panic!("injected session panic"),
         }
-    }
-
-    async fn execute(&self, _request: &ExecuteRequest) -> Result<QueryResult, DriverError> {
-        Ok(QueryResult {
-            columns: Vec::new(),
-            rows: Vec::new(),
-            affected_rows: 0,
-            last_insert_id: None,
-            elapsed_ms: 0,
-            truncated: false,
-            notices: Vec::new(),
-        })
     }
 
     async fn close(&self) -> Result<(), DriverError> {
@@ -3328,7 +3781,7 @@ fn draft_for_test() -> ConnectionDraft {
     draft
 }
 
-fn empty_query_result() -> QueryResult {
+fn empty_driver_result() -> QueryResult {
     QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
@@ -3336,8 +3789,25 @@ fn empty_query_result() -> QueryResult {
         last_insert_id: None,
         elapsed_ms: 0,
         truncated: false,
-        notices: Vec::new(),
+        backend_notices_present: false,
     }
+}
+
+fn empty_query_result() -> ResultSnapshot {
+    let raw = empty_driver_result();
+    ResultSnapshot::retain(
+        raw,
+        ResultProvenance {
+            result_id: ResultId(1),
+            profile_id: ProfileId("snapshot".to_owned()),
+            profile_generation: ProfileGeneration(1),
+            operation_id: OperationId(1),
+            driver: DriverKind::MySql,
+            completed_at_unix_ms: 0,
+            duration_ms: 0,
+        },
+        ResultRetentionPolicy::mysql(500),
+    )
 }
 
 fn snapshot(profile_id: ProfileId, generation: ProfileGeneration) -> ProfileSnapshot {

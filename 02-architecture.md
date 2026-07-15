@@ -1,8 +1,8 @@
 # dbotter — usable MVP architecture
 
-Status: **approved target architecture with the P1 and P2 foundations
-independently reviewed GREEN. T0 remains RED overall; T1, T2, T3, T8, and T9
-are Implementing; T4–T7 and T10 are Not started.**
+Status: **approved target architecture with the P1, P2, and P3 foundations
+independently reviewed GREEN. T0 remains RED overall; T1, T2, T3, T4, T8, and
+T9 are Implementing; T5–T7 and T10 are Not started.**
 
 Normative detail lives in `docs/usable-mvp/{spec,trace,plan}.md`. This document
 is the repository architecture entrypoint and must remain consistent with those
@@ -19,7 +19,7 @@ The UI owns pure/display state only. Live sessions, task registry, config
 writer, secrets, and filesystem export workers stay behind typed service and
 runtime boundaries. No lock crosses `.await`.
 
-### P1/P2 checkpoint boundary
+### P1/P2/P3 checkpoint boundary
 
 P1 implements the config/profile mutation and reconciliation foundation,
 credential storage/resolution types, atomic observed-state and session-cache
@@ -33,8 +33,17 @@ runtime shutdown. Reserve-before-spawn, coalesced control, one-profile/four-
 global permits, exact event correlation, network-only two-second abort, and
 durable mutation/export joins are part of that GREEN boundary. P2 does not
 complete P6 native/RawInput/AccessKit or visual work, so T2/T3/T9 remain
-Implementing rather than fully GREEN or Verified. P3 is still Not started and
-Execute remains fail-closed.
+Implementing rather than fully GREEN or Verified.
+
+P3 implements and independently proves the typed backend-specific execution,
+catalog, keyspace, bounded result, CLI, and controller seams. MySQL user text
+has one prepared-only entry and no prepared-rejection fallback; Redis command
+policy is constructor-bound and rechecked before I/O; decode and retained
+result budgets are explicit; cancellation drops client work before exact
+session eviction; and one typed session disposition reaches cache, event, and
+UI outcome. T4 is therefore Implementing with its P3 hermetic core GREEN. P4,
+P5, and P6 still own live catalog/keyspace capabilities and native RawInput/AX
+work, so no complete T4–T6 or visual journey is claimed.
 
 ## Target topology
 
@@ -192,14 +201,14 @@ still current.
 - Registry/permit/temp cleanup precedes terminal event delivery, including
   panic/`JoinError` and full/closed event-lane cases.
 
-The P2 source+test review is bound to snapshot
-`e987bbf1d8a7f919cf53b95e882e0fa7b072d4226d7bb5e99e5e06d4dda65378`;
-two independent reviewers each reported `NO P2 BLOCKER`. Its reproducible
+The P3 source+test review is bound to snapshot
+`599917d1507df767b5b873a6d52d914d9646b9135fa51671282b4f0b884d5ecb`;
+two independent reviewers each reported `NO P3 BLOCKER`. Its reproducible
 production, test, and release-binary SHA-256 values are
-`279757012280ab7bdcb90b547242114c80efcff3b64c26b7dcff4e3abb78fa9d`,
-`467982ee06068fe8fee669cc20e43ca05b1a0f72129c69137743c70d3eecce1b`,
-and `65ec73f1138587364005a1304fdd55006f85813283390fb3fd0f32f746183f3e`.
-The checkpoint passed 188 regular tests and 12 doctests, strict locked/offline
+`59a348c8a5e7f4bc63a15631cdac7be14444aebc57c84fb34ebbcb795692fec7`,
+`1b7a9ca40dea4994126f101dfcab1fc33fa6019b773627699c77e24167ac5b95`,
+and `9e43c9732be5a642873063f91a75364f9ad7f310735b17accaa3c24be0f95556`.
+The checkpoint passed 227 regular tests and 18 doctests, strict locked/offline
 Clippy, formatting, diff, release-contract, receipt, all-target/all-feature
 tests, and the release build.
 

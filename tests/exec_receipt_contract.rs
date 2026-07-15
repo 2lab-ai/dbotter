@@ -1,11 +1,12 @@
 use dbotter::model::{
-    Cell, Column, DriverKind, ExecOutput, ExecReceipt, OperationId, ProfileId, QueryResult,
+    Cell, Column, DriverKind, ExecOutput, ExecReceipt, OperationId, ProfileGeneration, ProfileId,
+    QueryResult, ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
 };
 
 #[test]
 fn execution_receipt_contains_only_safe_metadata_while_cli_output_is_explicitly_value_bearing() {
     let sentinel = "user-result-value-sentinel";
-    let result = QueryResult {
+    let raw = QueryResult {
         columns: vec![Column {
             name: "value".to_owned(),
             type_name: "TEXT".to_owned(),
@@ -15,8 +16,21 @@ fn execution_receipt_contains_only_safe_metadata_while_cli_output_is_explicitly_
         last_insert_id: None,
         elapsed_ms: 17,
         truncated: false,
-        notices: Vec::new(),
+        backend_notices_present: false,
     };
+    let result = ResultSnapshot::retain(
+        raw,
+        ResultProvenance {
+            result_id: ResultId(1),
+            profile_id: ProfileId("profile".to_owned()),
+            profile_generation: ProfileGeneration(1),
+            operation_id: OperationId(7),
+            driver: DriverKind::MySql,
+            completed_at_unix_ms: 0,
+            duration_ms: 17,
+        },
+        ResultRetentionPolicy::mysql(500),
+    );
     let receipt = ExecReceipt::from_result(
         "ok",
         OperationId(7),

@@ -3,8 +3,10 @@
 use std::collections::HashMap;
 
 use crate::model::{
-    ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
-    OperationKind, ProfileGeneration, ProfileId, PublicSummary, QueryResult, SessionGeneration,
+    CatalogPage, CatalogRequest, ConnectionProfile, CredentialMode, DraftId, DriverAvailability,
+    DriverKind, OperationId, OperationKind, ProfileGeneration, ProfileId, PublicSummary,
+    RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, ResultSnapshot,
+    SessionGeneration,
 };
 use crate::service::SessionDisposition;
 
@@ -138,7 +140,28 @@ pub enum UiEvent {
         profile_id: ProfileId,
         profile_generation: ProfileGeneration,
         session_generation: SessionGeneration,
-        result: QueryResult,
+        result: ResultSnapshot,
+    },
+    CatalogPageLoaded {
+        page: CatalogPage,
+    },
+    CatalogPageFailed {
+        request: CatalogRequest,
+        summary: PublicSummary,
+    },
+    RedisKeysLoaded {
+        page: RedisKeyPage,
+    },
+    RedisKeysFailed {
+        request: RedisScanRequest,
+        summary: PublicSummary,
+    },
+    RedisKeyInspected {
+        preview: RedisValuePreview,
+    },
+    RedisKeyInspectFailed {
+        request: RedisKeyInspectRequest,
+        summary: PublicSummary,
     },
     OperationFailed {
         operation_id: OperationId,
@@ -178,7 +201,13 @@ pub struct UiModel {
     pub connection_states: HashMap<ProfileId, ConnectionState>,
     pub editor_text: String,
     pub pending_execute: Option<(OperationId, ProfileId, ProfileGeneration)>,
-    pub result: Option<QueryResult>,
+    pub result: Option<ResultSnapshot>,
+    pub catalog_pages: HashMap<ProfileId, CatalogPage>,
+    pub catalog_retry: HashMap<ProfileId, CatalogRequest>,
+    pub redis_key_pages: HashMap<ProfileId, RedisKeyPage>,
+    pub redis_scan_retry: HashMap<ProfileId, RedisScanRequest>,
+    pub redis_value_previews: HashMap<ProfileId, RedisValuePreview>,
+    pub redis_inspect_retry: HashMap<ProfileId, RedisKeyInspectRequest>,
     pub status: String,
     config_uncertain: bool,
     last_profiles_operation: Option<OperationId>,
@@ -197,6 +226,12 @@ impl Default for UiModel {
             editor_text: String::new(),
             pending_execute: None,
             result: None,
+            catalog_pages: HashMap::new(),
+            catalog_retry: HashMap::new(),
+            redis_key_pages: HashMap::new(),
+            redis_scan_retry: HashMap::new(),
+            redis_value_previews: HashMap::new(),
+            redis_inspect_retry: HashMap::new(),
             status: "Loading profiles…".to_owned(),
             config_uncertain: false,
             last_profiles_operation: None,
@@ -363,7 +398,7 @@ impl UiModel {
                         == Some(&(operation_id, profile_id.clone(), profile_generation))
                 {
                     self.pending_execute = None;
-                    self.status = format!("Query finished in {} ms", result.elapsed_ms);
+                    self.status = format!("Query finished in {} ms", result.provenance.duration_ms);
                     self.result = Some(result);
                     self.connection_states.insert(
                         profile_id,
@@ -372,6 +407,60 @@ impl UiModel {
                             elapsed_ms: 0,
                         },
                     );
+                }
+            }
+            UiEvent::CatalogPageLoaded { page } => {
+                let profile_id = page.identity.profile_id.clone();
+                if self.event_is_current(&profile_id, page.identity.profile_generation) {
+                    self.catalog_retry.remove(&profile_id);
+                    self.catalog_pages.insert(profile_id, page);
+                    self.status = "Catalog page loaded".to_owned();
+                }
+            }
+            UiEvent::CatalogPageFailed { request, summary } => {
+                let profile_id = request.profile_id().clone();
+                if self.event_is_current(&profile_id, request.profile_generation()) {
+                    if let Some(page) = self.catalog_pages.get_mut(&profile_id) {
+                        page.stale = true;
+                    }
+                    self.catalog_retry.insert(profile_id, request);
+                    self.status = summary.message().to_owned();
+                }
+            }
+            UiEvent::RedisKeysLoaded { page } => {
+                let profile_id = page.identity.profile_id.clone();
+                if self.event_is_current(&profile_id, page.identity.profile_generation) {
+                    self.redis_scan_retry.remove(&profile_id);
+                    self.redis_key_pages.insert(profile_id, page);
+                    self.status = "Redis keys loaded".to_owned();
+                }
+            }
+            UiEvent::RedisKeysFailed { request, summary } => {
+                let profile_id = request.profile_id().clone();
+                if self.event_is_current(&profile_id, request.profile_generation()) {
+                    if let Some(page) = self.redis_key_pages.get_mut(&profile_id) {
+                        page.stale = true;
+                    }
+                    self.redis_scan_retry.insert(profile_id, request);
+                    self.status = summary.message().to_owned();
+                }
+            }
+            UiEvent::RedisKeyInspected { preview } => {
+                let profile_id = preview.identity.profile_id.clone();
+                if self.event_is_current(&profile_id, preview.identity.profile_generation) {
+                    self.redis_inspect_retry.remove(&profile_id);
+                    self.redis_value_previews.insert(profile_id, preview);
+                    self.status = "Redis key inspected".to_owned();
+                }
+            }
+            UiEvent::RedisKeyInspectFailed { request, summary } => {
+                let profile_id = request.profile_id().clone();
+                if self.event_is_current(&profile_id, request.profile_generation()) {
+                    if let Some(preview) = self.redis_value_previews.get_mut(&profile_id) {
+                        preview.stale = true;
+                    }
+                    self.redis_inspect_retry.insert(profile_id, request);
+                    self.status = summary.message().to_owned();
                 }
             }
             UiEvent::OperationFailed {
@@ -516,6 +605,12 @@ impl UiModel {
         self.active_generations.remove(&profile_id);
         self.profiles.retain(|profile| profile.id != profile_id);
         self.connection_states.remove(&profile_id);
+        self.catalog_pages.remove(&profile_id);
+        self.catalog_retry.remove(&profile_id);
+        self.redis_key_pages.remove(&profile_id);
+        self.redis_scan_retry.remove(&profile_id);
+        self.redis_value_previews.remove(&profile_id);
+        self.redis_inspect_retry.remove(&profile_id);
         if self
             .pending_execute
             .as_ref()
@@ -616,26 +711,122 @@ impl UiModel {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot, UiEvent,
         UiModel,
     };
     use crate::model::{
-        ConnectionProfile, CredentialMode, DriverAvailability, DriverKind, OperationId,
-        OperationKind, ProfileGeneration, ProfileId, PublicSummary, QueryResult, RedisTlsConfig,
-        SessionGeneration, TlsMode,
+        CatalogLevel, CatalogPage, CatalogRequest, CatalogRetainedCounts, ConnectionProfile,
+        CredentialMode, DriverAvailability, DriverKind, OperationId, OperationKind,
+        ProfileGeneration, ProfileId, PublicSummary, QueryResult, RedisKeyFilter, RedisKeyPage,
+        RedisScanConsistency, RedisScanRequest, RedisTlsConfig, RequestIdentity, ResultId,
+        ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
     };
 
-    fn result(elapsed_ms: u128) -> QueryResult {
-        QueryResult {
+    fn result(elapsed_ms: u128) -> ResultSnapshot {
+        let raw = QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
             affected_rows: 0,
             last_insert_id: None,
             elapsed_ms,
             truncated: false,
-            notices: Vec::new(),
+            backend_notices_present: false,
+        };
+        ResultSnapshot::retain(
+            raw,
+            ResultProvenance {
+                result_id: ResultId(1),
+                profile_id: ProfileId("mysql-local".to_owned()),
+                profile_generation: ProfileGeneration(1),
+                operation_id: OperationId(1),
+                driver: DriverKind::MySql,
+                completed_at_unix_ms: 0,
+                duration_ms: elapsed_ms,
+            },
+            ResultRetentionPolicy::mysql(500),
+        )
+    }
+
+    fn identity(operation_id: u64) -> RequestIdentity {
+        RequestIdentity {
+            profile_id: ProfileId("mysql-local".to_owned()),
+            profile_generation: ProfileGeneration(1),
+            operation_id: OperationId(operation_id),
         }
+    }
+
+    #[test]
+    fn resource_failures_preserve_last_pages_as_stale_and_success_clears_retry() {
+        let profile_id = ProfileId("mysql-local".to_owned());
+        let generation = ProfileGeneration(1);
+        let catalog_request = CatalogRequest::Schemas {
+            identity: identity(10),
+            prefix: None,
+            page_token: None,
+            page_size: 100,
+            timeout: Duration::from_secs(5),
+        };
+        let redis_request = RedisScanRequest {
+            identity: identity(11),
+            filter: RedisKeyFilter::LiteralPrefix(String::new()),
+            cursor: 0,
+            count_hint: 100,
+            timeout: Duration::from_secs(5),
+        };
+        let catalog_page = CatalogPage {
+            identity: identity(10),
+            level: CatalogLevel::Schemas,
+            parent: None,
+            nodes: Vec::new(),
+            next_token: None,
+            retained_counts: CatalogRetainedCounts::default(),
+            retained_utf8_bytes: 0,
+            truncated: false,
+            stale: false,
+            loaded_at: "2026-07-15T00:00:00Z".to_owned(),
+        };
+        let redis_page = RedisKeyPage {
+            identity: identity(11),
+            next_cursor: 0,
+            keys: Vec::new(),
+            retained_count: 0,
+            skipped_oversize: 0,
+            retained_bytes: 0,
+            consistency: RedisScanConsistency::Weak,
+            truncated: false,
+            stale: false,
+        };
+        let mut model = UiModel {
+            active_generations: [(profile_id.clone(), generation)].into(),
+            catalog_pages: [(profile_id.clone(), catalog_page.clone())].into(),
+            redis_key_pages: [(profile_id.clone(), redis_page.clone())].into(),
+            ..UiModel::default()
+        };
+
+        model.fold(UiEvent::CatalogPageFailed {
+            request: catalog_request.clone(),
+            summary: PublicSummary::UnsupportedFeature,
+        });
+        model.fold(UiEvent::RedisKeysFailed {
+            request: redis_request.clone(),
+            summary: PublicSummary::UnsupportedFeature,
+        });
+
+        assert!(model.catalog_pages[&profile_id].stale);
+        assert_eq!(model.catalog_retry[&profile_id], catalog_request);
+        assert!(model.redis_key_pages[&profile_id].stale);
+        assert_eq!(model.redis_scan_retry[&profile_id], redis_request);
+
+        model.fold(UiEvent::CatalogPageLoaded { page: catalog_page });
+        model.fold(UiEvent::RedisKeysLoaded { page: redis_page });
+
+        assert!(!model.catalog_pages[&profile_id].stale);
+        assert!(!model.catalog_retry.contains_key(&profile_id));
+        assert!(!model.redis_key_pages[&profile_id].stale);
+        assert!(!model.redis_scan_retry.contains_key(&profile_id));
     }
 
     #[test]
@@ -661,7 +852,13 @@ mod tests {
             model.pending_execute.map(|pending| pending.0),
             Some(OperationId(2))
         );
-        assert_eq!(model.result.as_ref().map(|value| value.elapsed_ms), Some(7));
+        assert_eq!(
+            model
+                .result
+                .as_ref()
+                .map(|value| value.provenance.duration_ms),
+            Some(7)
+        );
     }
 
     #[test]

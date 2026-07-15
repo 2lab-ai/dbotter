@@ -310,6 +310,7 @@ fn execute_debug_omits_user_text() {
     let request = ExecuteRequest {
         operation_id: OperationId(7),
         profile_id: ProfileId("profile".to_owned()),
+        profile_generation: dbotter::model::ProfileGeneration(1),
         language: QueryLanguage::Sql,
         text: "SELECT 'top-secret-sentinel'".to_owned(),
         row_limit: 10,

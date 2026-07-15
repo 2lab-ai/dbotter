@@ -1,8 +1,8 @@
 # dbotter — usable MVP implementation and conformance plan
 
-Status: **P0 documentation baseline complete. P1 and P2 foundations are
-independently reviewed GREEN. T0 remains RED overall; T1/T2/T3/T8/T9 are
-Implementing; P3–P9 and T4–T7/T10 are Not started.**
+Status: **P0 documentation baseline complete. P1, P2, and P3 foundations are
+independently reviewed GREEN. T0 remains RED overall; T1/T2/T3/T4/T8/T9 are
+Implementing; P4–P9 and T5–T7/T10 are Not started.**
 
 This file routes implementation work. The full ordered plan is frozen at
 `docs/usable-mvp/plan.md`; this repository-facing ledger must not weaken it.
@@ -50,7 +50,7 @@ substitute for a slice's RED/GREEN/live/installed evidence.
 | P0 | approve/reconcile repository and release contracts | all routing | Complete (docs) |
 | P1 | config/profile/credential/public-error foundation | T0, T1, T2, T8, T9 | GREEN (independently reviewed foundation) |
 | P2 | generations/cache/controller/reload/shutdown | T2, T3, T9 | GREEN (independently reviewed foundation) |
-| P3 | typed prepared execution/resource/result/CLI seams | T4, shared T5/T6 | Not started |
+| P3 | typed prepared execution/resource/result/CLI seams | T4, shared T5/T6 | GREEN (independently reviewed foundation) |
 | P4 | lazy paginated MySQL catalog | T5 | Not started |
 | P5 | Redis SCAN/inspect and verified Required TLS | T6 | Not started |
 | P6 | profile-scoped native UI/recovery/accessibility | T0–T6, T8, T9 | Not started |
@@ -161,8 +161,8 @@ The independently reviewed P2 checkpoint implemented and proved:
 
 P2 is GREEN only for that runtime foundation. T2, T3, and T9 remain
 Implementing because P6 native/RawInput/AccessKit and installed AX evidence
-remain. No P6 visual-style implementation is claimed. P3–P9 remain Not started;
-Execute remains fail-closed before session acquisition.
+remain. No P6 visual-style implementation is claimed. P3 is now independently
+reviewed GREEN; P4–P9 remain Not started.
 
 Checkpoint gates passed:
 
@@ -192,12 +192,54 @@ two independent reviewers each returned `NO P2 BLOCKER`.
 
 ## P3 — typed execution/resource seam
 
-Introduce the split `ConnectionPing`, `MySqlPreparedExecution`,
-`RedisExecution`, `CatalogBrowser`, and `KeyspaceBrowser` seams plus bounded
-snapshots and stable headless contracts. Remove any existing user-text
-`sqlx::raw_sql`, `Executor::execute(&str)`, `COM_QUERY`, or prepared-unsupported
-fallback. A source/trait test enforces the ban. Static/bound catalog statements
-remain prepared.
+The independently reviewed P3 checkpoint implemented and proved:
+
+- split `ConnectionPing`, `MySqlPreparedExecution`, `RedisExecution`,
+  `CatalogBrowser`, and `KeyspaceBrowser` seams with backend/resource-specific
+  request and outcome types;
+- pure exact-target MySQL and Redis parsing, a single server-prepared MySQL
+  user-text entry, and a production-wide structural ban on raw/text fallback;
+- constructor-bound and driver-rechecked closed Redis execute policy, including
+  blocking option forms before I/O;
+- bounded decode and retained result snapshots with exact provenance,
+  truncation notices, raw Redis identity separation, and no serializable raw
+  backend result/prose boundary;
+- exact cancel drop-before-close, one typed session disposition through cache,
+  event, and UI outcome, stale prior-page retention, and stable headless CLI
+  parser/JSON schemas;
+- independent planned `CATALOG` and `KEYSPACE_BROWSE` bits that remain off for
+  P4/P5 mandatory live proof.
+
+T4 is Implementing because its P3 hermetic core is GREEN while P6 RawInput/AX
+and mandatory live proof remain. T5/T6 remain Not started; P3 provides only
+their shared seams.
+
+Checkpoint gates passed:
+
+```sh
+cargo fmt --all -- --check
+git diff --check
+./scripts/check-release-contract.sh
+sh scripts/test-receipt-contract.sh
+cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+cargo test --locked --offline --all-targets --all-features
+cargo test --locked --offline --all-features --doc
+cargo build --locked --offline --release --all-features
+```
+
+Evidence: 227 regular tests plus 18 doctests passed; focused totals were lib
+51/51, controller 46/46, service 37/37, source 6/6, execution 16/16, resource
+10/10, and prepared-only MySQL 3/3. Formatting, diff, release-contract,
+receipt, strict Clippy, all-target/all-feature tests, doctests, and release
+build passed. The final source+test review snapshot was
+`599917d1507df767b5b873a6d52d914d9646b9135fa51671282b4f0b884d5ecb`;
+two independent reviewers each returned `NO P3 BLOCKER`.
+
+```text
+59a348c8a5e7f4bc63a15631cdac7be14444aebc57c84fb34ebbcb795692fec7  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
+1b7a9ca40dea4994126f101dfcab1fc33fa6019b773627699c77e24167ac5b95  tests snapshot (tests)
+9e43c9732be5a642873063f91a75364f9ad7f310735b17accaa3c24be0f95556  target/release/dbotter
+```
 
 ## P4/P5 — live-gated resource slices
 
@@ -217,6 +259,13 @@ contrast, disclosure, Delete warning, and restart. Required ids include
 `profile.connection_id`, `profile.host`, Redis CA controls, all Session intent
 controls, `editor.target`, `editor.row_limit`, and `editor.timeout`.
 
+P4–P7 UI authoring follows the local `ui-ux` OpenAI design reference translated
+to egui: true white/black neutrals, black inverted primary actions, sharp
+corners, no gradients or decorative shadows, generous whitespace, precise
+alignment, visible keyboard focus, and field-local error/loading states. Color
+never carries meaning alone. This is a forward implementation constraint, not
+a P3 visual-completion claim.
+
 P7 implements exact `clipboard_scalar`, `tsv_field`, CSV/TSV/canonical JSON,
 immutable provenance, streaming export, 0600/no-clobber/confirmed-replace,
 fsync/rename/dir-fsync, cancellation, and independent seeded verification.
@@ -234,10 +283,10 @@ higher preview after exact config-contract preflight; tags/assets are immutable.
 
 ## Fixed verification interfaces
 
-The following commands are the full interfaces for later slice claims. P1 and
-P2 passed checkpoint subsets are recorded above. A missing command or failure
-is evidence that its owning slice is not Verified, not permission to weaken
-the contract.
+The following commands are the full interfaces for later slice claims. P1,
+P2, and P3 passed checkpoint subsets are recorded above. A missing command or
+failure is evidence that its owning slice is not Verified, not permission to
+weaken the contract.
 
 ### Source and hermetic
 

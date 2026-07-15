@@ -3,12 +3,16 @@ pub mod mysql;
 pub mod redis;
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use secrecy::SecretString;
 
 use crate::model::{
-    ConnectionProfile, DriverDescriptor, DriverKind, ExecuteRequest, QueryResult, TlsMode,
+    CatalogPage, CatalogRequest, ConnectionProfile, DriverDescriptor, DriverKind,
+    PreparedMySqlRequest, QueryResult, RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage,
+    RedisScanRequest, RedisValuePreview, TlsMode,
 };
 
 #[derive(thiserror::Error)]
@@ -36,6 +40,8 @@ pub enum DriverError {
     ),
     #[error("redis command could not be parsed")]
     RedisParse(String),
+    #[error("mysql server prepared protocol does not support this statement")]
+    PreparedStatementUnsupported { session_healthy: bool },
     #[error("unsupported {driver} operation")]
     Unsupported {
         driver: DriverKind,
@@ -64,6 +70,10 @@ impl fmt::Debug for DriverError {
             Self::MySql(_) => formatter.write_str("MySql(<redacted>)"),
             Self::Redis(_) => formatter.write_str("Redis(<redacted>)"),
             Self::RedisParse(_) => formatter.write_str("RedisParse(<redacted>)"),
+            Self::PreparedStatementUnsupported { session_healthy } => formatter
+                .debug_struct("PreparedStatementUnsupported")
+                .field("session_healthy", session_healthy)
+                .finish(),
             Self::Unsupported { driver, .. } => formatter
                 .debug_struct("Unsupported")
                 .field("driver", driver)
@@ -71,6 +81,56 @@ impl fmt::Debug for DriverError {
                 .finish(),
         }
     }
+}
+
+#[async_trait]
+pub trait ConnectionPing: Send + Sync {
+    async fn ping(&self, timeout: Duration) -> Result<(), DriverError>;
+}
+
+#[async_trait]
+pub trait MySqlPreparedExecution: Send + Sync {
+    async fn execute_prepared(
+        &self,
+        request: &PreparedMySqlRequest,
+    ) -> Result<QueryResult, DriverError>;
+}
+
+#[async_trait]
+pub trait RedisExecution: Send + Sync {
+    async fn execute_command(
+        &self,
+        request: &RedisExecuteRequest,
+    ) -> Result<QueryResult, DriverError>;
+}
+
+#[async_trait]
+pub trait CatalogBrowser: Send + Sync {
+    async fn load_page(&self, request: &CatalogRequest) -> Result<CatalogPage, DriverError>;
+}
+
+#[async_trait]
+pub trait KeyspaceBrowser: Send + Sync {
+    async fn scan_keys(&self, request: &RedisScanRequest) -> Result<RedisKeyPage, DriverError>;
+
+    async fn inspect_key(
+        &self,
+        request: &RedisKeyInspectRequest,
+    ) -> Result<RedisValuePreview, DriverError>;
+}
+
+#[derive(Clone)]
+pub enum ConnectedResources {
+    MySql {
+        ping: Arc<dyn ConnectionPing>,
+        execution: Arc<dyn MySqlPreparedExecution>,
+        catalog: Arc<dyn CatalogBrowser>,
+    },
+    Redis {
+        ping: Arc<dyn ConnectionPing>,
+        execution: Arc<dyn RedisExecution>,
+        keyspace: Arc<dyn KeyspaceBrowser>,
+    },
 }
 
 #[derive(Clone)]
@@ -87,10 +147,19 @@ impl Session {
         }
     }
 
-    pub async fn execute(&self, request: &ExecuteRequest) -> Result<QueryResult, DriverError> {
+    pub fn connected_resources(&self) -> ConnectedResources {
+        let session = Arc::new(self.clone());
         match self {
-            Self::MySql(session) => session.execute(request).await,
-            Self::Redis(session) => session.execute(request).await,
+            Self::MySql(_) => ConnectedResources::MySql {
+                ping: session.clone(),
+                execution: session.clone(),
+                catalog: session,
+            },
+            Self::Redis(_) => ConnectedResources::Redis {
+                ping: session.clone(),
+                execution: session.clone(),
+                keyspace: session,
+            },
         }
     }
 
@@ -98,6 +167,84 @@ impl Session {
         match self {
             Self::MySql(session) => session.close().await,
             Self::Redis(session) => session.close().await,
+        }
+    }
+}
+
+#[async_trait]
+impl ConnectionPing for Session {
+    async fn ping(&self, timeout: Duration) -> Result<(), DriverError> {
+        Session::ping(self, timeout).await
+    }
+}
+
+#[async_trait]
+impl MySqlPreparedExecution for Session {
+    async fn execute_prepared(
+        &self,
+        request: &PreparedMySqlRequest,
+    ) -> Result<QueryResult, DriverError> {
+        match self {
+            Self::MySql(session) => session.execute_prepared(request).await,
+            Self::Redis(_) => Err(DriverError::Unsupported {
+                driver: DriverKind::Redis,
+                operation: "mysql prepared execution".to_owned(),
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl RedisExecution for Session {
+    async fn execute_command(
+        &self,
+        request: &RedisExecuteRequest,
+    ) -> Result<QueryResult, DriverError> {
+        match self {
+            Self::Redis(session) => session.execute_command(request).await,
+            Self::MySql(_) => Err(DriverError::Unsupported {
+                driver: DriverKind::MySql,
+                operation: "redis command execution".to_owned(),
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl CatalogBrowser for Session {
+    async fn load_page(&self, request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
+        match self {
+            Self::MySql(session) => session.load_page(request).await,
+            Self::Redis(_) => Err(DriverError::Unsupported {
+                driver: DriverKind::Redis,
+                operation: "mysql catalog browsing".to_owned(),
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl KeyspaceBrowser for Session {
+    async fn scan_keys(&self, request: &RedisScanRequest) -> Result<RedisKeyPage, DriverError> {
+        match self {
+            Self::Redis(session) => session.scan_keys(request).await,
+            Self::MySql(_) => Err(DriverError::Unsupported {
+                driver: DriverKind::MySql,
+                operation: "redis keyspace browsing".to_owned(),
+            }),
+        }
+    }
+
+    async fn inspect_key(
+        &self,
+        request: &RedisKeyInspectRequest,
+    ) -> Result<RedisValuePreview, DriverError> {
+        match self {
+            Self::Redis(session) => session.inspect_key(request).await,
+            Self::MySql(_) => Err(DriverError::Unsupported {
+                driver: DriverKind::MySql,
+                operation: "redis key inspection".to_owned(),
+            }),
         }
     }
 }

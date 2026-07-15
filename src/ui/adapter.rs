@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, error::TryRecvError, error::TrySendError};
 use tokio::sync::watch;
 
-use crate::model::{OperationId, OperationKind, ProfileGeneration, ProfileId, QueryLanguage};
+use crate::model::{
+    CatalogRequest, OperationId, OperationKind, ProfileGeneration, ProfileId, QueryLanguage,
+    RedisKeyInspectRequest, RedisScanRequest,
+};
 use crate::service::{
     CreateProfileRequest, DeleteProfileRequest, TestDraftRequest, UpdateProfileRequest,
 };
@@ -51,6 +54,9 @@ pub enum UiCommand {
         row_limit: u32,
         timeout_ms: u64,
     },
+    BrowseCatalog(CatalogRequest),
+    ScanRedisKeys(RedisScanRequest),
+    InspectRedisKey(RedisKeyInspectRequest),
     CancelOperation {
         operation_id: OperationId,
     },
@@ -80,6 +86,9 @@ impl UiCommand {
             | Self::DisconnectProfile { operation_id, .. }
             | Self::ReconnectProfile { operation_id, .. }
             | Self::ShutdownRuntime { operation_id } => *operation_id,
+            Self::BrowseCatalog(request) => request.operation_id(),
+            Self::ScanRedisKeys(request) => request.operation_id(),
+            Self::InspectRedisKey(request) => request.operation_id(),
             Self::CreateProfile(request) => request.operation_id,
             Self::UpdateProfile(request) => request.operation_id,
             Self::DeleteProfile(request) => request.operation_id,
@@ -93,9 +102,12 @@ impl UiCommand {
             | Self::CreateProfile(_)
             | Self::UpdateProfile(_)
             | Self::DeleteProfile(_) => CommandLane::Mutation,
-            Self::TestConnection { .. } | Self::TestDraftConnection(_) | Self::Execute { .. } => {
-                CommandLane::Work
-            }
+            Self::TestConnection { .. }
+            | Self::TestDraftConnection(_)
+            | Self::Execute { .. }
+            | Self::BrowseCatalog(_)
+            | Self::ScanRedisKeys(_)
+            | Self::InspectRedisKey(_) => CommandLane::Work,
             Self::CancelOperation { .. }
             | Self::DisconnectProfile { .. }
             | Self::ReconnectProfile { .. } => CommandLane::Control,
@@ -156,6 +168,18 @@ impl fmt::Debug for UiCommand {
                 .field("text", &"<redacted>")
                 .field("row_limit", row_limit)
                 .field("timeout_ms", timeout_ms)
+                .finish(),
+            Self::BrowseCatalog(request) => formatter
+                .debug_tuple("UiCommand::BrowseCatalog")
+                .field(request)
+                .finish(),
+            Self::ScanRedisKeys(request) => formatter
+                .debug_tuple("UiCommand::ScanRedisKeys")
+                .field(request)
+                .finish(),
+            Self::InspectRedisKey(request) => formatter
+                .debug_tuple("UiCommand::InspectRedisKey")
+                .field(request)
                 .finish(),
             Self::CancelOperation { operation_id } => formatter
                 .debug_struct("UiCommand::CancelOperation")
@@ -377,6 +401,12 @@ impl ServicePort {
             | UiEvent::ProfileDeleted { operation_id, .. }
             | UiEvent::ConfigUncertain { operation_id }
             | UiEvent::RuntimeShutdown { operation_id } => *operation_id,
+            UiEvent::CatalogPageLoaded { page } => page.identity.operation_id,
+            UiEvent::CatalogPageFailed { request, .. } => request.operation_id(),
+            UiEvent::RedisKeysLoaded { page } => page.identity.operation_id,
+            UiEvent::RedisKeysFailed { request, .. } => request.operation_id(),
+            UiEvent::RedisKeyInspected { preview } => preview.identity.operation_id,
+            UiEvent::RedisKeyInspectFailed { request, .. } => request.operation_id(),
         };
         keys.remove(&ControlKey::Cancel(operation_id));
         match event {

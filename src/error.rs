@@ -53,7 +53,8 @@ impl AppError {
             }
             Self::Driver(
                 crate::drivers::DriverError::Unavailable { .. }
-                | crate::drivers::DriverError::Unsupported { .. },
+                | crate::drivers::DriverError::Unsupported { .. }
+                | crate::drivers::DriverError::PreparedStatementUnsupported { .. },
             )
             | Self::DesktopDisabled => PublicSummary::UnsupportedFeature.message(),
             Self::Driver(_) => PublicSummary::NetworkUnavailable.message(),

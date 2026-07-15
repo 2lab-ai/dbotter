@@ -574,6 +574,19 @@ enum ProfileWork {
         timeout: Duration,
         kind: OperationKind,
     },
+    Execute {
+        request: crate::model::ExecuteRequest,
+        kind: OperationKind,
+    },
+    BrowseCatalog {
+        request: crate::model::CatalogRequest,
+    },
+    ScanRedisKeys {
+        request: crate::model::RedisScanRequest,
+    },
+    InspectRedisKey {
+        request: crate::model::RedisKeyInspectRequest,
+    },
 }
 
 enum ProfileControlWork {
@@ -653,6 +666,30 @@ impl ProfileWork {
                 kind,
                 ..
             } => (*operation_id, profile_id, *profile_generation, *kind),
+            Self::Execute { request, kind } => (
+                request.operation_id,
+                &request.profile_id,
+                request.profile_generation,
+                *kind,
+            ),
+            Self::BrowseCatalog { request } => (
+                request.operation_id(),
+                request.profile_id(),
+                request.profile_generation(),
+                OperationKind::BrowseMySql,
+            ),
+            Self::ScanRedisKeys { request } => (
+                request.operation_id(),
+                request.profile_id(),
+                request.profile_generation(),
+                OperationKind::BrowseRedis,
+            ),
+            Self::InspectRedisKey { request } => (
+                request.operation_id(),
+                request.profile_id(),
+                request.profile_generation(),
+                OperationKind::InspectRedis,
+            ),
         }
     }
 }
@@ -905,16 +942,25 @@ fn handle_work(
             operation_id,
             profile_id,
             profile_generation,
-            ..
-        } => {
-            let _ = port.try_emit(UiEvent::ExecuteUnavailable {
+            language,
+            text,
+            row_limit,
+            timeout_ms,
+        } => ProfileWork::Execute {
+            request: crate::model::ExecuteRequest {
                 operation_id,
                 profile_id,
                 profile_generation,
-                summary: PublicSummary::UnsupportedFeature,
-            });
-            return;
-        }
+                language,
+                text,
+                row_limit,
+                timeout: duration_from_millis(timeout_ms),
+            },
+            kind: OperationKind::ExecuteMutation,
+        },
+        UiCommand::BrowseCatalog(request) => ProfileWork::BrowseCatalog { request },
+        UiCommand::ScanRedisKeys(request) => ProfileWork::ScanRedisKeys { request },
+        UiCommand::InspectRedisKey(request) => ProfileWork::InspectRedisKey { request },
         other => {
             let _ = port.try_emit(failure_for_unavailable(
                 other,
@@ -1592,6 +1638,16 @@ async fn run_profile_work(
             )
             .await
         }
+        ProfileWork::Execute { request, kind } => {
+            run_execute(service, request, kind, cancel, messages).await
+        }
+        ProfileWork::BrowseCatalog { request } => {
+            run_catalog_browse(service, request, cancel).await
+        }
+        ProfileWork::ScanRedisKeys { request } => run_redis_scan(service, request, cancel).await,
+        ProfileWork::InspectRedisKey { request } => {
+            run_redis_inspect(service, request, cancel).await
+        }
     }
 }
 
@@ -1704,30 +1760,56 @@ async fn run_connect(
     }
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 async fn run_execute(
     service: &ApplicationService,
     request: crate::model::ExecuteRequest,
-    profile_generation: ProfileGeneration,
     kind: OperationKind,
     cancel: &CancellationToken,
     messages: &mpsc::UnboundedSender<ControllerMessage>,
 ) -> UiEvent {
     let operation_id = request.operation_id;
     let profile_id = request.profile_id.clone();
-    if request.row_limit == 0 || request.row_limit > 10_000 {
-        return failed_from_service(
-            operation_id,
-            profile_id,
-            profile_generation,
-            None,
-            kind,
-            &ServiceError::InvalidRowLimit,
-        );
-    }
+    let profile_generation = request.profile_generation;
     let timeout = request.timeout;
     let deadline = tokio::time::Instant::now() + timeout;
+    let prepare = service.prepare_execute_request(&request);
+    tokio::pin!(prepare);
+    let typed_request = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return failed_profile_event(
+                operation_id,
+                profile_id,
+                profile_generation,
+                None,
+                kind,
+                PublicSummary::OperationCancelled,
+            );
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            return failed_profile_event(
+                operation_id,
+                profile_id,
+                profile_generation,
+                None,
+                kind,
+                PublicSummary::OperationTimedOut,
+            );
+        }
+        result = &mut prepare => match result {
+            Ok(request) => request,
+            Err(error) => {
+                return failed_from_service(
+                    operation_id,
+                    profile_id,
+                    profile_generation,
+                    None,
+                    kind,
+                    &error,
+                );
+            }
+        }
+    };
     let acquire = service.acquire_session_at(
         operation_id,
         profile_id.clone(),
@@ -1777,31 +1859,20 @@ async fn run_execute(
         session_generation,
     });
     tokio::task::yield_now().await;
-    if lease.profile().driver.language() != request.language {
-        return failed_from_service(
-            operation_id,
-            profile_id,
-            profile_generation,
-            Some(session_generation),
-            kind,
-            &ServiceError::LanguageMismatch {
-                driver: lease.profile().driver,
-                actual: request.language,
-            },
-        );
-    }
-    let execute = lease.execute(&request);
-    tokio::pin!(execute);
     enum ExecuteAttempt {
         Driver(Result<crate::model::QueryResult, crate::drivers::DriverError>),
         Cancelled,
         TimedOut,
     }
-    let attempt = tokio::select! {
-        biased;
-        () = cancel.cancelled() => ExecuteAttempt::Cancelled,
-        () = tokio::time::sleep_until(deadline) => ExecuteAttempt::TimedOut,
-        result = &mut execute => ExecuteAttempt::Driver(result),
+    let attempt = {
+        let execute = lease.execute_typed(&typed_request);
+        tokio::pin!(execute);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => ExecuteAttempt::Cancelled,
+            () = tokio::time::sleep_until(deadline) => ExecuteAttempt::TimedOut,
+            result = &mut execute => ExecuteAttempt::Driver(result),
+        }
     };
     let observation = service.observe_session(&lease, operation_id).await;
     match (attempt, observation) {
@@ -1810,7 +1881,7 @@ async fn run_execute(
             profile_id,
             profile_generation,
             session_generation,
-            result,
+            result: service.retain_execute_result(&typed_request, result),
         },
         (ExecuteAttempt::Driver(Err(error)), Ok(())) => {
             let disposition = SessionDisposition::for_driver_error(&error);
@@ -1818,13 +1889,14 @@ async fn run_execute(
             if disposition == SessionDisposition::Evict {
                 service.evict_session_lease(&lease).await;
             }
-            failed_profile_event(
+            failed_profile_event_with_disposition(
                 operation_id,
                 profile_id,
                 profile_generation,
-                Some(session_generation),
+                session_generation,
                 kind,
                 summary,
+                disposition,
             )
         }
         (ExecuteAttempt::Cancelled, _) => {
@@ -1860,6 +1932,66 @@ async fn run_execute(
                 &error,
             )
         }
+    }
+}
+
+async fn run_catalog_browse(
+    service: &ApplicationService,
+    request: crate::model::CatalogRequest,
+    cancel: &CancellationToken,
+) -> UiEvent {
+    let deadline = tokio::time::Instant::now() + request.timeout();
+    let operation = service.load_catalog_page(request.clone());
+    tokio::pin!(operation);
+    let result = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(PublicSummary::OperationCancelled),
+        () = tokio::time::sleep_until(deadline) => Err(PublicSummary::OperationTimedOut),
+        result = &mut operation => result.map_err(|error| error.public_summary()),
+    };
+    match result {
+        Ok(page) => UiEvent::CatalogPageLoaded { page },
+        Err(summary) => UiEvent::CatalogPageFailed { request, summary },
+    }
+}
+
+async fn run_redis_scan(
+    service: &ApplicationService,
+    request: crate::model::RedisScanRequest,
+    cancel: &CancellationToken,
+) -> UiEvent {
+    let deadline = tokio::time::Instant::now() + request.timeout;
+    let operation = service.scan_redis_keys(request.clone());
+    tokio::pin!(operation);
+    let result = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(PublicSummary::OperationCancelled),
+        () = tokio::time::sleep_until(deadline) => Err(PublicSummary::OperationTimedOut),
+        result = &mut operation => result.map_err(|error| error.public_summary()),
+    };
+    match result {
+        Ok(page) => UiEvent::RedisKeysLoaded { page },
+        Err(summary) => UiEvent::RedisKeysFailed { request, summary },
+    }
+}
+
+async fn run_redis_inspect(
+    service: &ApplicationService,
+    request: crate::model::RedisKeyInspectRequest,
+    cancel: &CancellationToken,
+) -> UiEvent {
+    let deadline = tokio::time::Instant::now() + request.timeout;
+    let operation = service.inspect_redis_key(request.clone());
+    tokio::pin!(operation);
+    let result = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(PublicSummary::OperationCancelled),
+        () = tokio::time::sleep_until(deadline) => Err(PublicSummary::OperationTimedOut),
+        result = &mut operation => result.map_err(|error| error.public_summary()),
+    };
+    match result {
+        Ok(preview) => UiEvent::RedisKeyInspected { preview },
+        Err(summary) => UiEvent::RedisKeyInspectFailed { request, summary },
     }
 }
 
@@ -2724,12 +2856,40 @@ fn failed_profile_event(
     }
 }
 
+fn failed_profile_event_with_disposition(
+    operation_id: OperationId,
+    profile_id: ProfileId,
+    profile_generation: ProfileGeneration,
+    session_generation: SessionGeneration,
+    kind: OperationKind,
+    summary: PublicSummary,
+    session_disposition: SessionDisposition,
+) -> UiEvent {
+    let connection_outcome = match session_disposition {
+        SessionDisposition::Keep => ConnectionFailureOutcome::Preserve,
+        SessionDisposition::Evict => ConnectionFailureOutcome::Disconnected,
+    };
+    UiEvent::OperationFailed {
+        operation_id,
+        profile_id,
+        profile_generation,
+        session_generation: Some(session_generation),
+        kind,
+        summary,
+        session_disposition: Some(session_disposition),
+        connection_outcome,
+    }
+}
+
 fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEvent {
     match command {
         UiCommand::RefreshProfiles { operation_id } => UiEvent::ProfilesFailed {
             operation_id,
             summary,
         },
+        UiCommand::BrowseCatalog(request) => UiEvent::CatalogPageFailed { request, summary },
+        UiCommand::ScanRedisKeys(request) => UiEvent::RedisKeysFailed { request, summary },
+        UiCommand::InspectRedisKey(request) => UiEvent::RedisKeyInspectFailed { request, summary },
         UiCommand::CreateProfile(request) => UiEvent::ProfileSaveFailed {
             operation_id: request.operation_id,
             profile_id: request

@@ -136,6 +136,107 @@ fn runtime_mutation_failure_carrier_stays_internal_and_non_debug() {
     );
 }
 
+#[test]
+fn p3_user_text_and_resource_boundaries_are_structural() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let model = fs::read_to_string(root.join("src/model.rs")).expect("model source");
+    let drivers = fs::read_to_string(root.join("src/drivers/mod.rs")).expect("driver source");
+    let mysql = fs::read_to_string(root.join("src/drivers/mysql.rs")).expect("mysql source");
+
+    for forbidden in ["sqlx::raw_sql", "execute_raw", "COM_QUERY", "raw fallback"] {
+        assert!(
+            !mysql.contains(forbidden),
+            "prepared-only MySQL source contains forbidden token {forbidden}"
+        );
+    }
+    for required in [
+        "PreparedMySqlRequest",
+        "RedisExecuteRequest",
+        "CatalogRequest",
+        "RedisScanRequest",
+        "RedisKeyInspectRequest",
+        "ResultSnapshot",
+    ] {
+        assert!(
+            model.contains(required),
+            "missing typed P3 request/result {required}"
+        );
+    }
+    for required in [
+        "trait ConnectionPing",
+        "trait MySqlPreparedExecution",
+        "trait RedisExecution",
+        "trait CatalogBrowser",
+        "trait KeyspaceBrowser",
+        "enum ConnectedResources",
+    ] {
+        assert!(
+            drivers.contains(required),
+            "missing typed P3 driver seam {required}"
+        );
+    }
+    assert!(
+        !drivers.contains("load_resource"),
+        "generic stringly resource loading is forbidden"
+    );
+}
+
+#[test]
+fn p3_production_ast_has_one_static_text_protocol_call_and_one_prepared_fetch() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join("build.rs")];
+    collect_rs(&root.join("src"), &mut files);
+    let mut production = String::new();
+    let mut mysql = String::new();
+    for path in files {
+        let tokens = production_tokens(&path);
+        if path.ends_with("src/drivers/mysql.rs") {
+            mysql = tokens.clone();
+        }
+        production.push_str(&tokens);
+    }
+
+    assert_eq!(
+        production.matches("sqlx::query(").count(),
+        1,
+        "the only text-protocol query is the static PING"
+    );
+    assert_eq!(
+        production.matches(".execute(").count(),
+        1,
+        "no dynamic text may gain an Executor::execute method call"
+    );
+    assert!(
+        mysql.contains("sqlx::query(\"SELECT1\").execute(&self.pool)"),
+        "the sole text-protocol call must remain the static health check"
+    );
+    for forbidden in [
+        "sqlx::raw_sql(",
+        "sqlx::query_as(",
+        "sqlx::query_scalar(",
+        "sqlx::query_with(",
+        "Executor::execute(",
+        "Executor>::execute(",
+        "::execute(",
+        ".fetch(",
+        ".fetch_all(",
+        ".fetch_one(",
+        ".fetch_optional(",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "production AST contains a text-protocol escape hatch: {forbidden}"
+        );
+    }
+    assert_eq!(production.matches(".fetch_many(").count(), 1);
+    assert!(
+        mysql.contains(
+            "letquery=statement.query();letmutstream=(&mut*connection).fetch_many(query);"
+        ),
+        "the only fetch must originate from the server-prepared statement"
+    );
+}
+
 fn production_tokens(path: &Path) -> String {
     let source = fs::read_to_string(path).expect("source reads");
     let parsed = syn::parse_file(&source).expect("production Rust parses");

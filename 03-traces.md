@@ -1,8 +1,8 @@
 # dbotter — authoritative vertical trace index
 
-Status: **P1 and P2 foundations independently reviewed GREEN. T0 remains RED
-overall; T1, T2, T3, T8, and T9 are Implementing; T4–T7 and T10 are Not
-started.** Update this document before changing cross-layer behavior.
+Status: **P1, P2, and P3 foundations independently reviewed GREEN. T0 remains
+RED overall; T1, T2, T3, T4, T8, and T9 are Implementing; T5–T7 and T10 are
+Not started.** Update this document before changing cross-layer behavior.
 
 The frozen normative trace is `docs/usable-mvp/trace.md` at SHA-256
 `91bfbe89874e88e2c97c7252073cbf7348778192f2a6a349a68b903e1baceaa4`.
@@ -32,9 +32,9 @@ Allowed implementation states are `Not started`, `RED`, `Implementing`,
 | T1 | Create/Edit, credential intent, unsaved draft Test | P1/P6 | Implementing (P1 core GREEN; P6 remains) | matrix/draft isolation/AX |
 | T2 | confirmed atomic profile delete | P1/P2/P6 | Implementing (P1/P2 core GREEN; P6 remains) | failpoint/order/tombstone/AX |
 | T3 | controller, reload, connect/disconnect/reconnect/shutdown | P2/P6 | Implementing (P2 core GREEN; P6 native/AX remains; not fully GREEN/Verified) | state/cache/race/shutdown/AX |
-| T4 | exact target, prepared-only execute, cancel | P3/P6 | Not started | scanner/source/live/RawInput |
-| T5 | lazy paginated MySQL catalog | P4/P6 | Not started | hermetic + mandatory live + CLI |
-| T6 | Redis SCAN/inspect and verified TLS | P5/P6 | Not started | hermetic + auth/TLS live + CLI |
+| T4 | exact target, prepared-only execute, cancel | P3/P6 | Implementing (P3 hermetic core GREEN; P6 RawInput/AX and mandatory live proof remain) | scanner/source/live/RawInput |
+| T5 | lazy paginated MySQL catalog | P4/P6 | Not started (P3 shared typed seam only) | hermetic + mandatory live + CLI |
+| T6 | Redis SCAN/inspect and verified TLS | P5/P6 | Not started (P3 shared typed seam only) | hermetic + auth/TLS live + CLI |
 | T7 | result/copy/streaming atomic export | P7 | Not started | byte goldens/filesystem failpoints |
 | T8 | static errors, total recovery, accessibility | P1/P6 | Implementing (P1 core GREEN; P6 remains) | Cartesian table/RawInput/AccessKit |
 | T9 | restart and credential availability | P1/P2/P6 | Implementing (P1/P2 core GREEN; P6 remains) | restart contract + installed AX |
@@ -150,14 +150,17 @@ P2 GREEN evidence proves:
 - network-only two-second abort, durable mutation/cooperative-export joins, no
   detached task, and actual `ui::run` shutdown.
 
-P3 remains Not started: Execute is fail-closed before session acquisition and
-no typed execution/resource capability is claimed. Remaining T3 evidence is P6
-native intent, RawInput/AccessKit, and installed AX coverage; no visual-style
+P3 now supplies the independently reviewed typed execute/controller lifecycle,
+including exact cancellation drop-before-close and one session disposition
+through cache, event, and UI outcome. Remaining T3 evidence is P6 native
+intent, RawInput/AccessKit, and installed AX coverage; no visual-style
 implementation is claimed by this checkpoint.
 
 ## T4 — exact target, prepared-only execution, and cancel
 
-Status: **Not started**. Contract source: frozen trace T4; slices P3/P6.
+Status: **Implementing** — the P3 hermetic core is independently reviewed
+GREEN; P6 RawInput/AX and mandatory live proof remain. Contract source: frozen
+trace T4; slices P3/P6.
 
 Selection wins as the declared target; otherwise MySQL uses the exact scanner
 and Redis uses one physical line. The MySQL scanner handles `#`, conditional
@@ -176,18 +179,29 @@ Execute limit controls are `editor.row_limit` and `editor.timeout`;
 `FocusExecuteLimits` is Execute-only. Cancel/timeout follows T3 and prior
 results remain visibly historical.
 
-RED owner/evidence:
+P3 GREEN evidence:
 
 - pure scanner normative table and profile A→B `editor.target` correlation;
-- source/trait rejection of raw fallback;
+- production-wide structural source/trait rejection of raw fallback;
+- prepared-only MySQL and constructor-bound/rechecked Redis execution seams;
+- pre-network bounds, bounded decode/retained snapshots, exact provenance, and
+  typed session-disposition/cancel lifecycle contracts;
+- stable headless execute/browse/inspect parser and JSON schemas while catalog
+  and keyspace capability bits remain planned.
+
+Remaining P6/live owner/evidence:
+
 - marker-table live negative for explicit-selection and current-target entry
   paths, asserting both markers absent;
 - prepared-unsupported no-fallback and proven-session outcome;
-- Redis closed command classifier before session acquisition.
+- real editor selection/caret RawInput, keyboard, AccessKit, and installed AX.
 
 ## T5 — lazy paginated MySQL catalog
 
-Status: **Not started**. Contract source: frozen trace T5; slices P4/P6.
+Status: **Not started** — P3 supplies only the independently reviewed typed
+catalog request/page/service/CLI seam and keeps `CATALOG` planned. P4/P6 still
+own implementation, live proof, and UI. Contract source: frozen trace T5;
+slices P4/P6.
 
 Typed `CatalogRequest::{Schemas, Relations, Columns}` flows through
 `CatalogBrowser`. Each static/bound prepared information-schema query requests
@@ -203,7 +217,10 @@ headless `browse mysql` JSON, then GUI/AX expansion.
 
 ## T6 — Redis SCAN/inspect and verified Required TLS
 
-Status: **Not started**. Contract source: frozen trace T6; slices P5/P6.
+Status: **Not started** — P3 supplies only the independently reviewed typed
+scan/inspect/raw-key/service/CLI seam and closed execute policy while keeping
+`KEYSPACE_BROWSE` planned. P5/P6 still own verified TLS, live proof, and UI.
+Contract source: frozen trace T6; slices P5/P6.
 
 `RedisScanRequest` preserves LiteralPrefix versus Glob; raw bytes are identity
 and display is separate. SCAN cursor `0` alone means complete. Inspect supports
@@ -316,9 +333,9 @@ scan, and final conformance audit.
 
 ## Verification command routing
 
-Commands are fixed interfaces. The P1 and P2 foundations passed their recorded
-checkpoint subsets below; commands owned by later slices remain planned and
-must not be interpreted as passes.
+Commands are fixed interfaces. The P1, P2, and P3 foundations passed their
+recorded checkpoint subsets below; commands owned by later slices remain
+planned and must not be interpreted as passes.
 
 P0 document baseline:
 
@@ -371,6 +388,33 @@ two independent reviewers each reported `NO P2 BLOCKER`.
 65ec73f1138587364005a1304fdd55006f85813283390fb3fd0f32f746183f3e  target/release/dbotter
 ```
 
+P3 checkpoint (passed):
+
+```sh
+cargo fmt --all -- --check
+git diff --check
+./scripts/check-release-contract.sh
+sh scripts/test-receipt-contract.sh
+cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+cargo test --locked --offline --all-targets --all-features
+cargo test --locked --offline --all-features --doc
+cargo build --locked --offline --release --all-features
+```
+
+This produced 227 passing regular tests and 18 passing doctests: lib 51/51,
+controller 46/46, service 37/37, source 6/6, execution 16/16, resource 10/10,
+and prepared-only MySQL 3/3. Formatting, diff, release-contract, receipt,
+strict Clippy, all-target/all-feature tests, doctests, and release build passed.
+The final source+test review snapshot is
+`599917d1507df767b5b873a6d52d914d9646b9135fa51671282b4f0b884d5ecb`;
+two independent reviewers each reported `NO P3 BLOCKER`.
+
+```text
+59a348c8a5e7f4bc63a15631cdac7be14444aebc57c84fb34ebbcb795692fec7  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
+1b7a9ca40dea4994126f101dfcab1fc33fa6019b773627699c77e24167ac5b95  tests snapshot (tests)
+9e43c9732be5a642873063f91a75364f9ad7f310735b17accaa3c24be0f95556  target/release/dbotter
+```
+
 Full source/hermetic interface for later slice claims:
 
 ```sh
@@ -400,10 +444,11 @@ trace row before that row may become Verified.
 
 ## Conformance record
 
-P0 changed documentation only. The independently reviewed P1 and P2
+P0 changed documentation only. The independently reviewed P1, P2, and P3
 foundations are GREEN, but no complete native journey is claimed GREEN: T0
-remains RED; T1/T8 remain Implementing for P6; and T2/T3/T9 remain Implementing
-for P6 native/AX evidence. P3–P9 remain Not started, and Execute stays
-fail-closed. Any production deviation is recorded here before code with an
-ADDED/MODIFIED/REMOVED/RENAMED classification, affected trace ids, migration
-impact, and contract evidence.
+remains RED; T1/T8 remain Implementing for P6; T2/T3/T9 remain Implementing for
+P6 native/AX evidence; and T4 remains Implementing for P6 RawInput/AX plus
+mandatory live proof. T5–T7 and T10, and slices P4–P9, remain Not started.
+Any production deviation is recorded here before code with an ADDED/MODIFIED/
+REMOVED/RENAMED classification, affected trace ids, migration impact, and
+contract evidence.

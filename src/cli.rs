@@ -2,10 +2,16 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use base64::Engine as _;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::error::AppError;
-use crate::model::{CheckReceipt, ExecOutput, ExecReceipt, ExecuteRequest, OperationId, ProfileId};
+use crate::model::{
+    CatalogPageToken, CatalogRequest, CheckReceipt, DEFAULT_CATALOG_PAGE_SIZE,
+    DEFAULT_CATALOG_TIMEOUT, DEFAULT_EXECUTE_ROWS, DEFAULT_REDIS_SCAN_COUNT, ExecOutput,
+    ExecReceipt, ExecuteRequest, OperationId, ProfileId, RedisKeyFilter, RedisKeyId,
+    RedisKeyInspectRequest, RedisScanRequest, RequestIdentity,
+};
 use crate::service::ApplicationService;
 
 #[derive(Parser)]
@@ -51,7 +57,7 @@ enum Command {
         profile: String,
         #[arg(long)]
         text: String,
-        #[arg(long, default_value_t = 1_000)]
+        #[arg(long, default_value_t = DEFAULT_EXECUTE_ROWS)]
         row_limit: u32,
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
@@ -60,6 +66,121 @@ enum Command {
     },
     /// Print driver availability/capabilities.
     Drivers,
+    /// Browse one typed backend resource.
+    Browse {
+        #[command(subcommand)]
+        backend: BrowseCommand,
+    },
+    /// Inspect one typed backend resource.
+    Inspect {
+        #[command(subcommand)]
+        backend: InspectCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum BrowseCommand {
+    /// Browse the MySQL catalog lazily.
+    #[command(name = "mysql")]
+    MySql {
+        #[command(subcommand)]
+        resource: MySqlBrowseCommand,
+    },
+    /// Browse the Redis keyspace with SCAN semantics.
+    Redis {
+        #[command(subcommand)]
+        resource: RedisBrowseCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MySqlBrowseCommand {
+    Schemas {
+        #[arg(long)]
+        profile: String,
+        #[arg(long, default_value_t = DEFAULT_CATALOG_PAGE_SIZE)]
+        page_size: u16,
+        #[arg(long)]
+        page_token: Option<String>,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long, value_enum, default_value = "json")]
+        format: OutputFormat,
+    },
+    Relations {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        schema: String,
+        #[arg(long, default_value_t = DEFAULT_CATALOG_PAGE_SIZE)]
+        page_size: u16,
+        #[arg(long)]
+        page_token: Option<String>,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long, value_enum, default_value = "json")]
+        format: OutputFormat,
+    },
+    Columns {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        schema: String,
+        #[arg(long)]
+        relation: String,
+        #[arg(long, default_value_t = DEFAULT_CATALOG_PAGE_SIZE)]
+        page_size: u16,
+        #[arg(long)]
+        page_token: Option<String>,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long, value_enum, default_value = "json")]
+        format: OutputFormat,
+    },
+}
+
+#[derive(Subcommand)]
+enum RedisBrowseCommand {
+    Keys {
+        #[arg(long)]
+        profile: String,
+        #[arg(long, value_enum, default_value = "literal-prefix")]
+        filter_mode: RedisFilterMode,
+        #[arg(long, default_value = "")]
+        filter: String,
+        #[arg(long, default_value_t = 0)]
+        cursor: u64,
+        #[arg(long, default_value_t = DEFAULT_REDIS_SCAN_COUNT)]
+        count: u32,
+        #[arg(long, value_enum, default_value = "json")]
+        format: OutputFormat,
+    },
+}
+
+#[derive(Subcommand)]
+enum InspectCommand {
+    Redis {
+        #[command(subcommand)]
+        resource: RedisInspectCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RedisInspectCommand {
+    Key {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        key_base64: String,
+        #[arg(long, value_enum, default_value = "json")]
+        format: OutputFormat,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RedisFilterMode {
+    LiteralPrefix,
+    Glob,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -136,10 +257,154 @@ async fn run_with_config(command: Command, config_path: PathBuf) -> Result<(), A
             )
             .await
         }
+        Command::Browse { backend } => {
+            let service = ApplicationService::load_path(config_path)?;
+            browse(&service, backend).await
+        }
+        Command::Inspect { backend } => {
+            let service = ApplicationService::load_path(config_path)?;
+            inspect(&service, backend).await
+        }
         Command::Version { .. } | Command::ConfigContract { .. } | Command::Drivers => {
             Err(AppError::InvalidInput)
         }
     }
+}
+
+async fn browse(service: &ApplicationService, command: BrowseCommand) -> Result<(), AppError> {
+    match command {
+        BrowseCommand::MySql { resource } => {
+            let (request, format) = match resource {
+                MySqlBrowseCommand::Schemas {
+                    profile,
+                    page_size,
+                    page_token,
+                    prefix,
+                    format,
+                } => {
+                    let identity = request_identity(service, &profile).await?;
+                    let request = CatalogRequest::Schemas {
+                        identity,
+                        prefix,
+                        page_token: page_token.map(CatalogPageToken),
+                        page_size,
+                        timeout: DEFAULT_CATALOG_TIMEOUT,
+                    };
+                    (request, format)
+                }
+                MySqlBrowseCommand::Relations {
+                    profile,
+                    schema,
+                    page_size,
+                    page_token,
+                    prefix,
+                    format,
+                } => {
+                    let identity = request_identity(service, &profile).await?;
+                    let request = CatalogRequest::Relations {
+                        identity,
+                        schema,
+                        prefix,
+                        page_token: page_token.map(CatalogPageToken),
+                        page_size,
+                        timeout: DEFAULT_CATALOG_TIMEOUT,
+                    };
+                    (request, format)
+                }
+                MySqlBrowseCommand::Columns {
+                    profile,
+                    schema,
+                    relation,
+                    page_size,
+                    page_token,
+                    prefix,
+                    format,
+                } => {
+                    let identity = request_identity(service, &profile).await?;
+                    let request = CatalogRequest::Columns {
+                        identity,
+                        schema,
+                        relation,
+                        prefix,
+                        page_token: page_token.map(CatalogPageToken),
+                        page_size,
+                        timeout: DEFAULT_CATALOG_TIMEOUT,
+                    };
+                    (request, format)
+                }
+            };
+            let page = service.load_catalog_page(request).await?;
+            match format {
+                OutputFormat::Json => print_json(&page),
+            }
+        }
+        BrowseCommand::Redis {
+            resource:
+                RedisBrowseCommand::Keys {
+                    profile,
+                    filter_mode,
+                    filter,
+                    cursor,
+                    count,
+                    format,
+                },
+        } => {
+            let identity = request_identity(service, &profile).await?;
+            let filter = match filter_mode {
+                RedisFilterMode::LiteralPrefix => RedisKeyFilter::LiteralPrefix(filter),
+                RedisFilterMode::Glob => RedisKeyFilter::Glob(filter),
+            };
+            let page = service
+                .scan_redis_keys(RedisScanRequest {
+                    identity,
+                    filter,
+                    cursor,
+                    count_hint: count,
+                    timeout: DEFAULT_CATALOG_TIMEOUT,
+                })
+                .await?;
+            match format {
+                OutputFormat::Json => print_json(&page),
+            }
+        }
+    }
+}
+
+async fn inspect(service: &ApplicationService, command: InspectCommand) -> Result<(), AppError> {
+    match command {
+        InspectCommand::Redis {
+            resource:
+                RedisInspectCommand::Key {
+                    profile,
+                    key_base64,
+                    format,
+                },
+        } => {
+            let identity = request_identity(service, &profile).await?;
+            let key = base64::engine::general_purpose::STANDARD
+                .decode(key_base64.as_bytes())
+                .map_err(|_| AppError::InvalidInput)?;
+            let preview = service
+                .inspect_redis_key(RedisKeyInspectRequest {
+                    identity,
+                    key: RedisKeyId(key),
+                    timeout: DEFAULT_CATALOG_TIMEOUT,
+                })
+                .await?;
+            match format {
+                OutputFormat::Json => print_json(&preview),
+            }
+        }
+    }
+}
+
+async fn request_identity(
+    service: &ApplicationService,
+    profile: &str,
+) -> Result<RequestIdentity, AppError> {
+    let profile_id = ProfileId(profile.to_owned());
+    let generation = service.profile_generation(&profile_id).await?;
+    Ok(RequestIdentity::new(profile_id, generation, OperationId(1)))
 }
 
 async fn check(
@@ -178,17 +443,15 @@ async fn execute(
     let language = service.language_for(&profile_id).await?;
     let profile_generation = service.profile_generation(&profile_id).await?;
     let outcome = service
-        .execute_at(
-            ExecuteRequest {
-                operation_id: OperationId(1),
-                profile_id,
-                language,
-                text,
-                row_limit,
-                timeout,
-            },
+        .execute_at(ExecuteRequest {
+            operation_id: OperationId(1),
+            profile_id,
             profile_generation,
-        )
+            language,
+            text,
+            row_limit,
+            timeout,
+        })
         .await?;
     let receipt = ExecReceipt::from_result(
         "ok",
@@ -237,6 +500,98 @@ mod tests {
             .expect("path"),
             std::path::Path::new("/explicit/config.toml")
         );
+    }
+
+    #[test]
+    fn p3_headless_resource_forms_parse_exactly() {
+        for arguments in [
+            vec![
+                "dbotter",
+                "--config",
+                "/tmp/config.toml",
+                "browse",
+                "mysql",
+                "schemas",
+                "--profile",
+                "mysql-local",
+                "--page-size",
+                "50",
+                "--format",
+                "json",
+            ],
+            vec![
+                "dbotter",
+                "--config",
+                "/tmp/config.toml",
+                "browse",
+                "mysql",
+                "relations",
+                "--profile",
+                "mysql-local",
+                "--schema",
+                "dbotter",
+                "--page-size",
+                "50",
+                "--page-token",
+                "opaque",
+                "--format",
+                "json",
+            ],
+            vec![
+                "dbotter",
+                "--config",
+                "/tmp/config.toml",
+                "browse",
+                "mysql",
+                "columns",
+                "--profile",
+                "mysql-local",
+                "--schema",
+                "dbotter",
+                "--relation",
+                "receipt",
+                "--page-size",
+                "50",
+                "--format",
+                "json",
+            ],
+            vec![
+                "dbotter",
+                "--config",
+                "/tmp/config.toml",
+                "browse",
+                "redis",
+                "keys",
+                "--profile",
+                "redis-local",
+                "--filter-mode",
+                "literal-prefix",
+                "--filter",
+                "receipt:",
+                "--cursor",
+                "0",
+                "--count",
+                "100",
+                "--format",
+                "json",
+            ],
+            vec![
+                "dbotter",
+                "--config",
+                "/tmp/config.toml",
+                "inspect",
+                "redis",
+                "key",
+                "--profile",
+                "redis-local",
+                "--key-base64",
+                "cmVjZWlwdDptYXJrZXI=",
+                "--format",
+                "json",
+            ],
+        ] {
+            Cli::try_parse_from(arguments).expect("frozen headless form parses");
+        }
     }
 
     #[test]

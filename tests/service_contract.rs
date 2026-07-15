@@ -10,11 +10,13 @@ use dbotter::config::{
     CommitState, Config, ConfigError, ConfigMutation, ConfigSourceVersion, ConfigWriter,
     MigrationConsent, MutationFailpoint, MutationFaultInjector, load_path,
 };
-use dbotter::drivers::DriverError;
+use dbotter::drivers::{
+    CatalogBrowser, ConnectedResources, ConnectionPing, DriverError, MySqlPreparedExecution,
+};
 use dbotter::model::{
-    ConnectionDraft, CredentialMode, DraftId, DriverKind, ExecuteRequest, OperationId,
-    OperationKind, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
-    QueryLanguage, QueryResult, TlsMode,
+    CatalogPage, CatalogRequest, ConnectionDraft, CredentialMode, DraftId, DriverKind,
+    ExecuteRequest, OperationId, OperationKind, PreparedMySqlRequest, ProfileFieldId,
+    ProfileGeneration, ProfileId, PublicCode, PublicSummary, QueryLanguage, QueryResult, TlsMode,
 };
 use dbotter::public_error::{RecoveryAction, SafeContext, recovery_for};
 use dbotter::secrets::{
@@ -22,8 +24,8 @@ use dbotter::secrets::{
 };
 use dbotter::service::{
     ApplicationService, CheckOutcome, CreateProfileRequest, DeleteProfileRequest, ExecuteOutcome,
-    ProfileValidationError, SecretResolver, ServiceError, SessionConnector, SessionHandle,
-    UpdateProfileRequest, validate_config_mutation,
+    ProfileValidationError, SecretResolver, ServiceError, SessionConnector, SessionDisposition,
+    SessionHandle, UpdateProfileRequest, validate_config_mutation,
 };
 
 #[async_trait]
@@ -36,6 +38,33 @@ trait CurrentGenerationTestExt {
     ) -> Result<CheckOutcome, ServiceError>;
 
     async fn execute(&self, request: ExecuteRequest) -> Result<ExecuteOutcome, ServiceError>;
+}
+
+#[test]
+fn prepared_unsupported_retains_only_a_typed_proven_healthy_session() {
+    assert_eq!(
+        SessionDisposition::for_driver_error(&DriverError::PreparedStatementUnsupported {
+            session_healthy: true,
+        }),
+        SessionDisposition::Keep
+    );
+    assert_eq!(
+        SessionDisposition::for_driver_error(&DriverError::PreparedStatementUnsupported {
+            session_healthy: false,
+        }),
+        SessionDisposition::Evict
+    );
+    let service_error = ServiceError::from(DriverError::PreparedStatementUnsupported {
+        session_healthy: true,
+    });
+    assert_eq!(
+        service_error.public_summary(),
+        PublicSummary::UnsupportedFeature
+    );
+    assert_eq!(
+        service_error.public_code(),
+        PublicCode::PreparedStatementUnsupported
+    );
 }
 
 #[async_trait]
@@ -53,15 +82,50 @@ impl CurrentGenerationTestExt for ApplicationService {
 
     async fn execute(&self, request: ExecuteRequest) -> Result<ExecuteOutcome, ServiceError> {
         let generation = self.profile_generation(&request.profile_id).await?;
-        self.execute_at(request, generation).await
+        let mut request = request;
+        request.profile_generation = generation;
+        self.execute_at(request).await
     }
 }
 
 #[derive(Default)]
 struct FakeSession {
     pings: AtomicUsize,
-    executes: AtomicUsize,
+    executes: Arc<AtomicUsize>,
     closes: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct FakeMySqlResources {
+    executes: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ConnectionPing for FakeMySqlResources {
+    async fn ping(&self, _timeout: Duration) -> Result<(), DriverError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MySqlPreparedExecution for FakeMySqlResources {
+    async fn execute_prepared(
+        &self,
+        _request: &PreparedMySqlRequest,
+    ) -> Result<QueryResult, DriverError> {
+        self.executes.fetch_add(1, Ordering::SeqCst);
+        Ok(empty_result())
+    }
+}
+
+#[async_trait]
+impl CatalogBrowser for FakeMySqlResources {
+    async fn load_page(&self, _request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
+        Err(DriverError::Unsupported {
+            driver: DriverKind::MySql,
+            operation: "test catalog".to_owned(),
+        })
+    }
 }
 
 #[async_trait]
@@ -71,9 +135,15 @@ impl SessionHandle for FakeSession {
         Ok(())
     }
 
-    async fn execute(&self, _request: &ExecuteRequest) -> Result<QueryResult, DriverError> {
-        self.executes.fetch_add(1, Ordering::SeqCst);
-        Ok(empty_result())
+    fn connected_resources(&self) -> Option<ConnectedResources> {
+        let resources = Arc::new(FakeMySqlResources {
+            executes: self.executes.clone(),
+        });
+        Some(ConnectedResources::MySql {
+            ping: resources.clone(),
+            execution: resources.clone(),
+            catalog: resources,
+        })
     }
 
     async fn close(&self) -> Result<(), DriverError> {
@@ -198,10 +268,6 @@ impl SessionHandle for ControlledSession {
         } else {
             Ok(())
         }
-    }
-
-    async fn execute(&self, _request: &ExecuteRequest) -> Result<QueryResult, DriverError> {
-        Ok(empty_result())
     }
 
     async fn close(&self) -> Result<(), DriverError> {
@@ -350,6 +416,7 @@ async fn saved_check_then_execute_reuses_a_session_and_preserves_correlation() {
         .execute(ExecuteRequest {
             operation_id: OperationId(42),
             profile_id: created.profile_id.clone(),
+            profile_generation: created.profile_generation,
             language: QueryLanguage::Sql,
             text: "SELECT 1".to_owned(),
             row_limit: 100,
@@ -4039,6 +4106,6 @@ fn empty_result() -> QueryResult {
         last_insert_id: None,
         elapsed_ms: 0,
         truncated: false,
-        notices: Vec::new(),
+        backend_notices_present: false,
     }
 }

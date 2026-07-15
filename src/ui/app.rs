@@ -394,11 +394,11 @@ fn connection_label(state: &ConnectionState) -> String {
     }
 }
 
-fn render_result(ui: &mut egui::Ui, result: &crate::model::QueryResult) {
+fn render_result(ui: &mut egui::Ui, result: &crate::model::ResultSnapshot) {
     ui.horizontal_wrapped(|ui| {
         ui.label(format!("{} rows", result.rows.len()));
         ui.label(format!("{} affected", result.affected_rows));
-        ui.label(format!("{} ms", result.elapsed_ms));
+        ui.label(format!("{} ms", result.provenance.duration_ms));
         if let Some(last_insert_id) = result.last_insert_id {
             ui.label(format!("last insert id {last_insert_id}"));
         }
@@ -407,7 +407,7 @@ fn render_result(ui: &mut egui::Ui, result: &crate::model::QueryResult) {
         }
     });
     for notice in &result.notices {
-        ui.small(notice);
+        ui.small(notice.message());
     }
     if result.columns.is_empty() {
         return;

@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -17,11 +17,18 @@ use crate::config::{
     LoadedConfig, MigrationConsent, MutationOutcome, PostCommitObservation,
     PostCommitObservationError,
 };
-use crate::drivers::{DriverError, Session};
+use crate::drivers::{ConnectedResources, DriverError, Session};
+use crate::execution::{
+    ExecutionLanguage, ExecutionTarget, ExecutionTargetError, ValidatedExecutionTarget,
+    extract_and_validate_target,
+};
 use crate::model::{
-    ConnectionDraft, ConnectionProfile, CredentialMode, DraftId, DriverAvailability,
-    DriverCapabilities, DriverKind, ExecuteRequest, OperationId, ProfileFieldId, ProfileGeneration,
-    ProfileId, PublicCode, PublicSummary, QueryLanguage, QueryResult, SessionGeneration, TlsMode,
+    CatalogPage, CatalogRequest, ConnectionDraft, ConnectionProfile, CredentialMode, DraftId,
+    DriverAvailability, DriverCapabilities, DriverKind, ExecuteRequest, OperationId,
+    PreparedMySqlRequest, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
+    QueryLanguage, QueryResult, RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage,
+    RedisScanRequest, RedisValuePreview, RequestIdentity, RequestValidationError, ResultId,
+    ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
 };
 use crate::secrets::{
     ReplacementSecretBuffer, SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate,
@@ -60,6 +67,13 @@ pub enum ServiceError {
         driver: DriverKind,
         actual: QueryLanguage,
     },
+    #[error("the request does not match the selected driver")]
+    DriverMismatch {
+        expected: DriverKind,
+        actual: DriverKind,
+    },
+    #[error("the request is invalid")]
+    InvalidRequest { code: PublicCode },
     #[error("row limit must be between 1 and 10000")]
     InvalidRowLimit,
     #[error(transparent)]
@@ -104,6 +118,15 @@ impl fmt::Debug for ServiceError {
                 .debug_struct("LanguageMismatch")
                 .field("driver", driver)
                 .field("actual", actual)
+                .finish(),
+            Self::DriverMismatch { expected, actual } => formatter
+                .debug_struct("DriverMismatch")
+                .field("expected", expected)
+                .field("actual", actual)
+                .finish(),
+            Self::InvalidRequest { code } => formatter
+                .debug_struct("InvalidRequest")
+                .field("code", code)
                 .finish(),
             Self::InvalidRowLimit => formatter.write_str("InvalidRowLimit"),
             Self::InvalidProfile(error) => formatter
@@ -151,6 +174,7 @@ impl ServiceError {
     pub fn public_error_parts(&self) -> (PublicSummary, PublicCode) {
         let code = match self {
             Self::InvalidProfile(ProfileValidationError::Field { code, .. })
+            | Self::InvalidRequest { code }
             | Self::DraftCredentialRequired { code, .. } => *code,
             Self::ProfileIdConflict { .. } => PublicCode::ProfileIdConflict,
             Self::ProfileStale { .. } => PublicCode::ProfileStale,
@@ -166,6 +190,9 @@ impl ServiceError {
             Self::Secret(SecretError::StoreUnavailable) => PublicCode::None,
             Self::Config(ConfigError::ExternalChange | ConfigError::InvalidProfile)
             | Self::ConfigUncertain => PublicCode::ConfigExternalChange,
+            Self::Driver(DriverError::PreparedStatementUnsupported { .. }) => {
+                PublicCode::PreparedStatementUnsupported
+            }
             _ => PublicCode::None,
         };
         let summary = match self {
@@ -186,6 +213,8 @@ impl ServiceError {
             Self::InvalidProfile(_)
             | Self::InvalidRowLimit
             | Self::LanguageMismatch { .. }
+            | Self::DriverMismatch { .. }
+            | Self::InvalidRequest { .. }
             | Self::ProfileIdConflict { .. }
             | Self::UnknownProfile(_) => PublicSummary::InvalidInput,
             Self::Secret(SecretError::MissingEnv(_) | SecretError::EmptyEnv(_)) => {
@@ -198,9 +227,11 @@ impl ServiceError {
             Self::Secret(SecretError::InvalidSessionIntent) => PublicSummary::InvalidInput,
             Self::Secret(SecretError::StoreUnavailable) => PublicSummary::InternalFailure,
             Self::Driver(DriverError::Timeout { .. }) => PublicSummary::OperationTimedOut,
-            Self::Driver(DriverError::Unavailable { .. } | DriverError::Unsupported { .. }) => {
-                PublicSummary::UnsupportedFeature
-            }
+            Self::Driver(
+                DriverError::Unavailable { .. }
+                | DriverError::Unsupported { .. }
+                | DriverError::PreparedStatementUnsupported { .. },
+            ) => PublicSummary::UnsupportedFeature,
             Self::Driver(_) => PublicSummary::NetworkUnavailable,
             Self::Config(_) => PublicSummary::ConfigWriteNotCommitted,
             Self::PostCommitObservation(_) => PublicSummary::CommittedDurabilityUnknown,
@@ -237,7 +268,7 @@ pub struct ExecuteOutcome {
     pub session_generation: SessionGeneration,
     pub driver: DriverKind,
     pub endpoint: String,
-    pub result: QueryResult,
+    pub result: ResultSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -435,7 +466,9 @@ impl fmt::Debug for ProfileMutationOutcome {
 #[async_trait]
 pub trait SessionHandle: Send + Sync {
     async fn ping(&self, timeout: Duration) -> Result<(), DriverError>;
-    async fn execute(&self, request: &ExecuteRequest) -> Result<QueryResult, DriverError>;
+    fn connected_resources(&self) -> Option<ConnectedResources> {
+        None
+    }
     async fn close(&self) -> Result<(), DriverError> {
         Ok(())
     }
@@ -447,8 +480,8 @@ impl SessionHandle for Session {
         Session::ping(self, timeout).await
     }
 
-    async fn execute(&self, request: &ExecuteRequest) -> Result<QueryResult, DriverError> {
-        Session::execute(self, request).await
+    fn connected_resources(&self) -> Option<ConnectedResources> {
+        Some(Session::connected_resources(self))
     }
 
     async fn close(&self) -> Result<(), DriverError> {
@@ -510,6 +543,7 @@ pub struct ApplicationService {
     session_secrets: Arc<SessionSecretStore>,
     next_generation: Arc<AtomicU64>,
     next_session_generation: Arc<AtomicU64>,
+    next_result_id: Arc<AtomicU64>,
     writer: ConfigWriter,
     mutation_lane: Arc<Semaphore>,
     config_uncertain: Arc<AtomicBool>,
@@ -695,6 +729,13 @@ impl SessionDisposition {
             DriverError::Redis(error) if matches!(error.kind(), redis::ErrorKind::Server(_)) => {
                 Self::Keep
             }
+            DriverError::PreparedStatementUnsupported { session_healthy } => {
+                if *session_healthy {
+                    Self::Keep
+                } else {
+                    Self::Evict
+                }
+            }
             DriverError::InvalidConfig { .. }
             | DriverError::Unavailable { .. }
             | DriverError::Timeout { .. }
@@ -745,11 +786,6 @@ impl DraftSessionLease {
 }
 
 impl SessionLease {
-    #[cfg(test)]
-    pub(crate) fn profile(&self) -> &ConnectionProfile {
-        &self.profile
-    }
-
     pub(crate) fn identity(&self) -> &CachedSessionIdentity {
         &self.identity
     }
@@ -758,11 +794,31 @@ impl SessionLease {
         self.handle.ping(timeout).await
     }
 
-    pub(crate) async fn execute(
+    fn connected_resources(&self) -> Result<ConnectedResources, DriverError> {
+        self.handle
+            .connected_resources()
+            .ok_or_else(|| DriverError::Unsupported {
+                driver: self.profile.driver,
+                operation: "typed connected resources".to_owned(),
+            })
+    }
+
+    pub(crate) async fn execute_typed(
         &self,
-        request: &ExecuteRequest,
+        request: &TypedExecuteRequest,
     ) -> Result<QueryResult, DriverError> {
-        self.handle.execute(request).await
+        match (request, self.connected_resources()?) {
+            (TypedExecuteRequest::MySql(request), ConnectedResources::MySql { execution, .. }) => {
+                execution.execute_prepared(request).await
+            }
+            (TypedExecuteRequest::Redis(request), ConnectedResources::Redis { execution, .. }) => {
+                execution.execute_command(request).await
+            }
+            _ => Err(DriverError::Unsupported {
+                driver: self.profile.driver,
+                operation: "mismatched typed execution resource".to_owned(),
+            }),
+        }
     }
 }
 
@@ -834,6 +890,7 @@ impl ApplicationService {
             session_secrets,
             next_generation: Arc::new(AtomicU64::new(next)),
             next_session_generation: Arc::new(AtomicU64::new(1)),
+            next_result_id: Arc::new(AtomicU64::new(1)),
             writer,
             mutation_lane: Arc::new(Semaphore::new(1)),
             config_uncertain: Arc::new(AtomicBool::new(false)),
@@ -1720,30 +1777,96 @@ impl ApplicationService {
         })
     }
 
+    pub(crate) async fn prepare_execute_request(
+        &self,
+        request: &ExecuteRequest,
+    ) -> Result<TypedExecuteRequest, ServiceError> {
+        self.ensure_config_certain()?;
+        let target = validate_execute_target(request)?;
+        let (profile, generation) = self.profile_with_generation(&request.profile_id).await?;
+        if generation != request.profile_generation {
+            return Err(ServiceError::ProfileStale {
+                profile_id: request.profile_id.clone(),
+                operation_id: request.operation_id,
+            });
+        }
+        if profile.driver.language() != request.language {
+            return Err(ServiceError::LanguageMismatch {
+                driver: profile.driver,
+                actual: request.language,
+            });
+        }
+        let identity = RequestIdentity::new(
+            request.profile_id.clone(),
+            request.profile_generation,
+            request.operation_id,
+        );
+        match (profile.driver, target) {
+            (DriverKind::MySql, ExecutionTarget::MySqlText(statement)) => {
+                let typed = PreparedMySqlRequest {
+                    identity,
+                    statement,
+                    row_limit: request.row_limit,
+                    timeout: request.timeout,
+                };
+                typed.validate().map_err(service_request_error)?;
+                Ok(TypedExecuteRequest::MySql(typed))
+            }
+            (DriverKind::Redis, ExecutionTarget::RedisArgv(argv)) => {
+                let typed = RedisExecuteRequest::new(
+                    identity,
+                    argv.into_iter().map(String::into_bytes).collect(),
+                    request.row_limit,
+                    request.timeout,
+                )
+                .map_err(service_request_error)?;
+                Ok(TypedExecuteRequest::Redis(typed))
+            }
+            (actual, _) => Err(ServiceError::Driver(DriverError::Unsupported {
+                driver: actual,
+                operation: "typed execution".to_owned(),
+            })),
+        }
+    }
+
+    pub(crate) fn retain_execute_result(
+        &self,
+        request: &TypedExecuteRequest,
+        result: QueryResult,
+    ) -> ResultSnapshot {
+        let duration_ms = result.elapsed_ms;
+        let completed_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+            .unwrap_or(i64::MAX);
+        let identity = request.identity();
+        let provenance = ResultProvenance {
+            result_id: ResultId(self.next_result_id.fetch_add(1, Ordering::SeqCst)),
+            profile_id: identity.profile_id.clone(),
+            profile_generation: identity.profile_generation,
+            operation_id: identity.operation_id,
+            driver: request.driver(),
+            completed_at_unix_ms,
+            duration_ms,
+        };
+        ResultSnapshot::retain(result, provenance, request.retention_policy())
+    }
+
     pub async fn execute_at(
         &self,
         request: ExecuteRequest,
-        expected_generation: ProfileGeneration,
     ) -> Result<ExecuteOutcome, ServiceError> {
-        self.ensure_config_certain()?;
-        if request.row_limit == 0 || request.row_limit > 10_000 {
-            return Err(ServiceError::InvalidRowLimit);
-        }
+        let typed_request = self.prepare_execute_request(&request).await?;
         let lease = self
             .acquire_session_at(
                 request.operation_id,
                 request.profile_id.clone(),
-                expected_generation,
+                request.profile_generation,
                 request.timeout,
             )
             .await?;
-        if lease.profile.driver.language() != request.language {
-            return Err(ServiceError::LanguageMismatch {
-                driver: lease.profile.driver,
-                actual: request.language,
-            });
-        }
-        let result = lease.execute(&request).await;
+        let result = lease.execute_typed(&typed_request).await;
         let observation = self.observe_session(&lease, request.operation_id).await;
         let disposition = result.as_ref().err().map_or(
             SessionDisposition::Keep,
@@ -1753,7 +1876,7 @@ impl ApplicationService {
             self.evict_session_lease(&lease).await;
         }
         observation?;
-        let result = result?;
+        let result = self.retain_execute_result(&typed_request, result?);
         Ok(ExecuteOutcome {
             operation_id: request.operation_id,
             profile_id: request.profile_id,
@@ -1763,6 +1886,155 @@ impl ApplicationService {
             endpoint: lease.profile.redacted_endpoint(),
             result,
         })
+    }
+
+    pub async fn load_catalog_page(
+        &self,
+        request: CatalogRequest,
+    ) -> Result<CatalogPage, ServiceError> {
+        request.validate().map_err(service_request_error)?;
+        self.ensure_typed_resource_request(
+            request.identity(),
+            DriverKind::MySql,
+            DriverCapabilities::CATALOG,
+            "mysql catalog browsing",
+        )
+        .await?;
+        let lease = self
+            .acquire_session_at(
+                request.operation_id(),
+                request.profile_id().clone(),
+                request.profile_generation(),
+                request.timeout(),
+            )
+            .await?;
+        let result = match lease.connected_resources() {
+            Ok(ConnectedResources::MySql { catalog, .. }) => catalog.load_page(&request).await,
+            Ok(_) => Err(DriverError::Unsupported {
+                driver: lease.profile.driver,
+                operation: "mismatched catalog resource".to_owned(),
+            }),
+            Err(error) => Err(error),
+        };
+        self.finish_resource_operation(&lease, request.operation_id(), result)
+            .await
+    }
+
+    pub async fn scan_redis_keys(
+        &self,
+        request: RedisScanRequest,
+    ) -> Result<RedisKeyPage, ServiceError> {
+        request.validate().map_err(service_request_error)?;
+        self.ensure_typed_resource_request(
+            request.identity(),
+            DriverKind::Redis,
+            DriverCapabilities::KEYSPACE_BROWSE,
+            "redis keyspace browsing",
+        )
+        .await?;
+        let lease = self
+            .acquire_session_at(
+                request.operation_id(),
+                request.profile_id().clone(),
+                request.profile_generation(),
+                request.timeout,
+            )
+            .await?;
+        let result = match lease.connected_resources() {
+            Ok(ConnectedResources::Redis { keyspace, .. }) => keyspace.scan_keys(&request).await,
+            Ok(_) => Err(DriverError::Unsupported {
+                driver: lease.profile.driver,
+                operation: "mismatched keyspace resource".to_owned(),
+            }),
+            Err(error) => Err(error),
+        };
+        self.finish_resource_operation(&lease, request.operation_id(), result)
+            .await
+    }
+
+    pub async fn inspect_redis_key(
+        &self,
+        request: RedisKeyInspectRequest,
+    ) -> Result<RedisValuePreview, ServiceError> {
+        request.validate().map_err(service_request_error)?;
+        self.ensure_typed_resource_request(
+            request.identity(),
+            DriverKind::Redis,
+            DriverCapabilities::KEYSPACE_BROWSE,
+            "redis key inspection",
+        )
+        .await?;
+        let lease = self
+            .acquire_session_at(
+                request.operation_id(),
+                request.profile_id().clone(),
+                request.profile_generation(),
+                request.timeout,
+            )
+            .await?;
+        let result = match lease.connected_resources() {
+            Ok(ConnectedResources::Redis { keyspace, .. }) => keyspace.inspect_key(&request).await,
+            Ok(_) => Err(DriverError::Unsupported {
+                driver: lease.profile.driver,
+                operation: "mismatched key inspection resource".to_owned(),
+            }),
+            Err(error) => Err(error),
+        };
+        self.finish_resource_operation(&lease, request.operation_id(), result)
+            .await
+    }
+
+    async fn ensure_typed_resource_request(
+        &self,
+        identity: &RequestIdentity,
+        expected_driver: DriverKind,
+        capability: DriverCapabilities,
+        operation: &'static str,
+    ) -> Result<(), ServiceError> {
+        self.ensure_config_certain()?;
+        let (profile, generation) = self.profile_with_generation(&identity.profile_id).await?;
+        if generation != identity.profile_generation {
+            return Err(ServiceError::ProfileStale {
+                profile_id: identity.profile_id.clone(),
+                operation_id: identity.operation_id,
+            });
+        }
+        if profile.driver != expected_driver {
+            return Err(ServiceError::DriverMismatch {
+                expected: expected_driver,
+                actual: profile.driver,
+            });
+        }
+        let ready = crate::drivers::descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.kind == profile.driver)
+            .is_some_and(|descriptor| descriptor.capabilities.contains(capability));
+        if !ready {
+            return Err(DriverError::Unsupported {
+                driver: profile.driver,
+                operation: operation.to_owned(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn finish_resource_operation<T>(
+        &self,
+        lease: &SessionLease,
+        operation_id: OperationId,
+        result: Result<T, DriverError>,
+    ) -> Result<T, ServiceError> {
+        let observation = self.observe_session(lease, operation_id).await;
+        let disposition = result.as_ref().err().map_or(
+            SessionDisposition::Keep,
+            SessionDisposition::for_driver_error,
+        );
+        if disposition == SessionDisposition::Evict || observation.is_err() {
+            self.evict_session_lease(lease).await;
+        }
+        observation?;
+        result.map_err(ServiceError::from)
     }
 
     pub(crate) async fn acquire_session_at(
@@ -2473,6 +2745,102 @@ impl ApplicationService {
                 .ok_or_else(|| SecretError::SessionCredentialRequired.into()),
         }
     }
+}
+
+pub(crate) enum TypedExecuteRequest {
+    MySql(PreparedMySqlRequest),
+    Redis(RedisExecuteRequest),
+}
+
+impl TypedExecuteRequest {
+    fn identity(&self) -> &RequestIdentity {
+        match self {
+            Self::MySql(request) => request.identity(),
+            Self::Redis(request) => request.identity(),
+        }
+    }
+
+    const fn driver(&self) -> DriverKind {
+        match self {
+            Self::MySql(_) => DriverKind::MySql,
+            Self::Redis(_) => DriverKind::Redis,
+        }
+    }
+
+    const fn retention_policy(&self) -> ResultRetentionPolicy {
+        match self {
+            Self::MySql(request) => ResultRetentionPolicy::mysql(request.row_limit as usize),
+            Self::Redis(request) => ResultRetentionPolicy::redis(request.row_limit() as usize),
+        }
+    }
+}
+
+fn validate_execute_target(request: &ExecuteRequest) -> Result<ExecutionTarget, ServiceError> {
+    let language = match request.language {
+        QueryLanguage::Sql => ExecutionLanguage::MySql,
+        QueryLanguage::RedisCommand => ExecutionLanguage::Redis,
+        QueryLanguage::MongoDocument => {
+            return Err(ServiceError::Driver(DriverError::Unsupported {
+                driver: DriverKind::MongoDb,
+                operation: "document execution".to_owned(),
+            }));
+        }
+    };
+    let timeout_seconds =
+        u32::try_from(request.timeout.as_secs()).map_err(|_| ServiceError::InvalidRequest {
+            code: PublicCode::TimeoutInput,
+        })?;
+    let character_count = request.text.chars().count();
+    extract_and_validate_target(
+        &request.text,
+        character_count,
+        Some(0..character_count),
+        language,
+        request.row_limit,
+        timeout_seconds,
+    )
+    .map(ValidatedExecutionTarget::into_target)
+    .map_err(execution_target_error)
+}
+
+fn execution_target_error(error: ExecutionTargetError) -> ServiceError {
+    let code = match error {
+        ExecutionTargetError::InvalidRowLimit => PublicCode::RowLimit,
+        ExecutionTargetError::InvalidTimeout => PublicCode::TimeoutInput,
+        ExecutionTargetError::AmbiguousSqlMode => PublicCode::AmbiguousSqlMode,
+        ExecutionTargetError::UnterminatedSqlToken => PublicCode::UnterminatedSqlToken,
+        ExecutionTargetError::InvalidCaretPosition
+        | ExecutionTargetError::InvalidSelectionRange
+        | ExecutionTargetError::NoCurrentStatement
+        | ExecutionTargetError::MultipleStatements
+        | ExecutionTargetError::RedisShellParseFailed
+        | ExecutionTargetError::RedisCommandDenied
+        | ExecutionTargetError::RedisTargetTooLarge
+        | ExecutionTargetError::RedisTooManyTokens
+        | ExecutionTargetError::RedisTokenTooLarge => PublicCode::StatementTarget,
+    };
+    ServiceError::InvalidRequest { code }
+}
+
+fn service_request_error(error: RequestValidationError) -> ServiceError {
+    let code = match error {
+        RequestValidationError::InvalidRowLimit => PublicCode::RowLimit,
+        RequestValidationError::InvalidExecuteTimeout => PublicCode::TimeoutInput,
+        RequestValidationError::InvalidCatalogPageSize
+        | RequestValidationError::InvalidCatalogTimeout
+        | RequestValidationError::EmptyCatalogParent
+        | RequestValidationError::EmptyCatalogPageToken => PublicCode::Catalog,
+        RequestValidationError::RedisFilterTooLarge
+        | RequestValidationError::InvalidRedisScanCount
+        | RequestValidationError::RedisKeyTooLarge => PublicCode::RedisScan,
+        RequestValidationError::EmptyStatement
+        | RequestValidationError::EmptyRedisCommand
+        | RequestValidationError::RedisCommandTooLarge
+        | RequestValidationError::TooManyRedisTokens
+        | RequestValidationError::RedisTokenTooLarge
+        | RequestValidationError::RedisCommandDenied => PublicCode::StatementTarget,
+    };
+    ServiceError::InvalidRequest { code }
 }
 
 enum MutationIdentity<'a> {

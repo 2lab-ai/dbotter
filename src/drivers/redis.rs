@@ -6,7 +6,8 @@ use secrecy::{ExposeSecret as _, SecretString};
 use crate::drivers::DriverError;
 use crate::model::{
     Cell, Column, ConnectionProfile, DriverAvailability, DriverCapabilities, DriverDescriptor,
-    DriverKind, ExecuteRequest, QueryLanguage, QueryResult, TlsMode,
+    DriverKind, MAX_REDIS_CELLS, MAX_REDIS_DEPTH, QueryLanguage, QueryResult, RedisExecuteRequest,
+    RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, TlsMode,
 };
 
 pub const DESCRIPTOR: DriverDescriptor = DriverDescriptor {
@@ -18,7 +19,7 @@ pub const DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     capabilities: DriverCapabilities::CONNECT
         .union(DriverCapabilities::PING)
         .union(DriverCapabilities::COMMAND),
-    planned_capabilities: DriverCapabilities::empty(),
+    planned_capabilities: DriverCapabilities::KEYSPACE_BROWSE,
     reason: None,
 };
 
@@ -90,29 +91,35 @@ impl RedisSession {
 
     pub async fn close(&self) {}
 
-    pub async fn execute(&self, request: &ExecuteRequest) -> Result<QueryResult, DriverError> {
-        let parts = parse_command(&request.text)?;
-        let command_name = &parts[0];
-        if is_blocking_command(command_name) {
-            return Err(DriverError::Unsupported {
+    pub async fn execute_command(
+        &self,
+        request: &RedisExecuteRequest,
+    ) -> Result<QueryResult, DriverError> {
+        request
+            .validate()
+            .map_err(|error| DriverError::InvalidConfig {
                 driver: DriverKind::Redis,
-                operation: command_name.to_ascii_uppercase(),
-            });
-        }
+                message: error.to_string(),
+            })?;
+        let Some((command_name, arguments)) = request.argv().split_first() else {
+            return Err(DriverError::RedisParse("command argv is empty".to_owned()));
+        };
+        let command_name = std::str::from_utf8(command_name)
+            .map_err(|_| DriverError::RedisParse("command name is not UTF-8".to_owned()))?;
         let mut command = ::redis::cmd(command_name);
-        for argument in &parts[1..] {
-            command.arg(argument);
+        for argument in arguments {
+            command.arg(argument.as_slice());
         }
         let started = Instant::now();
         let mut connection = self.connection.clone();
         let value: ::redis::Value =
-            tokio::time::timeout(request.timeout, command.query_async(&mut connection))
+            tokio::time::timeout(request.timeout(), command.query_async(&mut connection))
                 .await
                 .map_err(|_| DriverError::Timeout {
                     driver: DriverKind::Redis,
-                    seconds: request.timeout.as_secs(),
+                    seconds: request.timeout().as_secs(),
                 })??;
-        let rows = value_rows(value);
+        let (rows, truncated) = value_rows(value, request.row_limit() as usize);
         Ok(QueryResult {
             columns: vec![Column {
                 name: "value".to_owned(),
@@ -122,70 +129,145 @@ impl RedisSession {
             affected_rows: 0,
             last_insert_id: None,
             elapsed_ms: started.elapsed().as_millis(),
-            truncated: false,
-            notices: Vec::new(),
+            truncated,
+            backend_notices_present: false,
+        })
+    }
+
+    pub async fn scan_keys(
+        &self,
+        _request: &RedisScanRequest,
+    ) -> Result<RedisKeyPage, DriverError> {
+        Err(DriverError::Unsupported {
+            driver: DriverKind::Redis,
+            operation: "keyspace browsing is planned".to_owned(),
+        })
+    }
+
+    pub async fn inspect_key(
+        &self,
+        _request: &RedisKeyInspectRequest,
+    ) -> Result<RedisValuePreview, DriverError> {
+        Err(DriverError::Unsupported {
+            driver: DriverKind::Redis,
+            operation: "key inspection is planned".to_owned(),
         })
     }
 }
 
-fn parse_command(text: &str) -> Result<Vec<String>, DriverError> {
-    let parts =
-        shell_words::split(text).map_err(|error| DriverError::RedisParse(error.to_string()))?;
-    if parts.is_empty() {
-        return Err(DriverError::RedisParse("command is empty".to_owned()));
+struct DecodeBudget {
+    remaining_nodes: usize,
+    truncated: bool,
+}
+
+impl DecodeBudget {
+    fn consume(&mut self) -> bool {
+        let Some(remaining) = self.remaining_nodes.checked_sub(1) else {
+            return false;
+        };
+        self.remaining_nodes = remaining;
+        true
     }
-    Ok(parts)
 }
 
-fn is_blocking_command(command: &str) -> bool {
-    matches!(
-        command.to_ascii_uppercase().as_str(),
-        "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" | "MONITOR"
-    )
-}
-
-fn value_rows(value: ::redis::Value) -> Vec<Vec<Cell>> {
+fn value_rows(value: ::redis::Value, row_limit: usize) -> (Vec<Vec<Cell>>, bool) {
+    let mut budget = DecodeBudget {
+        remaining_nodes: MAX_REDIS_CELLS,
+        truncated: false,
+    };
     match value {
-        ::redis::Value::Array(values) => values
-            .into_iter()
-            .map(|value| vec![value_cell(value)])
-            .collect(),
-        value => vec![vec![value_cell(value)]],
+        ::redis::Value::Array(values) => {
+            let truncated = values.len() > row_limit;
+            let rows = values
+                .into_iter()
+                .take(row_limit)
+                .map(|value| vec![value_cell(value, &mut budget, 0)])
+                .collect();
+            (rows, truncated || budget.truncated)
+        }
+        _ if row_limit == 0 => (Vec::new(), true),
+        value => {
+            let cell = value_cell(value, &mut budget, 0);
+            (vec![vec![cell]], budget.truncated)
+        }
     }
 }
 
-fn value_cell(value: ::redis::Value) -> Cell {
+fn value_cell(value: ::redis::Value, budget: &mut DecodeBudget, depth: usize) -> Cell {
+    if depth >= MAX_REDIS_DEPTH || !budget.consume() {
+        budget.truncated = true;
+        return Cell::Text("[dbotter-truncated]".to_owned());
+    }
     match value {
         ::redis::Value::Nil => Cell::Null,
         ::redis::Value::Int(value) => Cell::Int(value),
-        ::redis::Value::BulkString(value) => match String::from_utf8(value) {
-            Ok(value) => Cell::Text(value),
-            Err(error) => Cell::Bytes {
-                preview: format!("{:02x?}", error.as_bytes().iter().take(32).collect::<Vec<_>>()),
-                len: error.as_bytes().len(),
-            },
-        },
+        ::redis::Value::BulkString(value) => String::from_utf8(value)
+            .map(Cell::Text)
+            .unwrap_or_else(|error| bytes_cell(error.into_bytes())),
         ::redis::Value::SimpleString(value) => Cell::Text(value),
         ::redis::Value::Okay => Cell::Text("OK".to_owned()),
         ::redis::Value::Double(value) => Cell::Float(value),
         ::redis::Value::Boolean(value) => Cell::Bool(value),
         ::redis::Value::Array(values) | ::redis::Value::Set(values) => Cell::Json(
-            serde_json::Value::Array(values.into_iter().map(value_json).collect()),
+            serde_json::Value::Array(values_json(values, budget, depth + 1)),
         ),
-        ::redis::Value::Map(entries) => Cell::Json(serde_json::Value::Array(
-            entries
-                .into_iter()
-                .map(|(key, value)| {
-                    serde_json::json!({ "key": value_json(key), "value": value_json(value) })
-                })
-                .collect(),
-        )),
-        other => Cell::Text(format!("{other:?}")),
+        ::redis::Value::Map(entries) => Cell::Json(serde_json::Value::Array(entries_json(
+            entries,
+            budget,
+            depth + 1,
+        ))),
+        ::redis::Value::Attribute { data, attributes } => {
+            let data = value_json(*data, budget, depth + 1);
+            let attributes = entries_json(attributes, budget, depth + 1);
+            Cell::Json(serde_json::json!({ "data": data, "attributes": attributes }))
+        }
+        ::redis::Value::VerbatimString { text, .. } => Cell::Text(text),
+        ::redis::Value::BigNumber(value) => Cell::Decimal(value.to_string()),
+        ::redis::Value::Push { data, .. } => Cell::Json(serde_json::json!({
+            "type": "push",
+            "data": values_json(data, budget, depth + 1)
+        })),
+        ::redis::Value::ServerError(_) => Cell::Text("[redis-server-error]".to_owned()),
+        _ => Cell::Text("[unsupported-resp-value]".to_owned()),
     }
 }
 
-fn value_json(value: ::redis::Value) -> serde_json::Value {
-    match value_cell(value) {
+fn values_json(
+    values: Vec<::redis::Value>,
+    budget: &mut DecodeBudget,
+    depth: usize,
+) -> Vec<serde_json::Value> {
+    let mut decoded = Vec::with_capacity(values.len().min(budget.remaining_nodes));
+    for value in values {
+        if budget.remaining_nodes == 0 || depth >= MAX_REDIS_DEPTH {
+            budget.truncated = true;
+            break;
+        }
+        decoded.push(value_json(value, budget, depth));
+    }
+    decoded
+}
+
+fn entries_json(
+    entries: Vec<(::redis::Value, ::redis::Value)>,
+    budget: &mut DecodeBudget,
+    depth: usize,
+) -> Vec<serde_json::Value> {
+    let mut decoded = Vec::with_capacity(entries.len().min(budget.remaining_nodes / 2));
+    for (key, value) in entries {
+        if budget.remaining_nodes == 0 || depth >= MAX_REDIS_DEPTH {
+            budget.truncated = true;
+            break;
+        }
+        let key = value_json(key, budget, depth);
+        let value = value_json(value, budget, depth);
+        decoded.push(serde_json::json!({ "key": key, "value": value }));
+    }
+    decoded
+}
+
+fn value_json(value: ::redis::Value, budget: &mut DecodeBudget, depth: usize) -> serde_json::Value {
+    match value_cell(value, budget, depth) {
         Cell::Null => serde_json::Value::Null,
         Cell::Bool(value) => value.into(),
         Cell::Int(value) => value.into(),
@@ -197,32 +279,35 @@ fn value_json(value: ::redis::Value) -> serde_json::Value {
     }
 }
 
+fn bytes_cell(bytes: Vec<u8>) -> Cell {
+    let mut preview = String::with_capacity(bytes.len().min(32) * 2 + 1);
+    for byte in bytes.iter().take(32) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut preview, "{byte:02x}");
+    }
+    if bytes.len() > 32 {
+        preview.push('…');
+    }
+    Cell::Bytes {
+        preview,
+        len: bytes.len(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn quoted_redis_arguments_are_preserved() {
-        assert_eq!(
-            parse_command("SET greeting 'hello world'").expect("parse"),
-            ["SET", "greeting", "hello world"]
-        );
-    }
-
-    #[test]
-    fn blocking_commands_are_rejected_case_insensitively() {
-        for command in ["subscribe", "PSUBSCRIBE", "ssubscribe", "Monitor"] {
-            assert!(is_blocking_command(command), "{command} must be denied");
-        }
-        assert!(!is_blocking_command("get"));
-    }
-
-    #[test]
     fn flat_array_becomes_one_row_per_value() {
-        let rows = value_rows(::redis::Value::Array(vec![
-            ::redis::Value::Int(1),
-            ::redis::Value::BulkString(b"two".to_vec()),
-        ]));
+        let (rows, truncated) = value_rows(
+            ::redis::Value::Array(vec![
+                ::redis::Value::Int(1),
+                ::redis::Value::BulkString(b"two".to_vec()),
+            ]),
+            2,
+        );
+        assert!(!truncated);
         assert_eq!(
             rows,
             vec![vec![Cell::Int(1)], vec![Cell::Text("two".into())]]
@@ -231,17 +316,60 @@ mod tests {
 
     #[test]
     fn nil_and_nested_resp_values_keep_their_shapes() {
-        assert_eq!(value_rows(::redis::Value::Nil), vec![vec![Cell::Null]]);
+        assert_eq!(
+            value_rows(::redis::Value::Nil, 1),
+            (vec![vec![Cell::Null]], false)
+        );
 
-        let rows = value_rows(::redis::Value::Array(vec![::redis::Value::Map(vec![(
-            ::redis::Value::SimpleString("key".to_owned()),
-            ::redis::Value::Array(vec![::redis::Value::Int(1), ::redis::Value::Nil]),
-        )])]));
+        let (rows, truncated) = value_rows(
+            ::redis::Value::Array(vec![::redis::Value::Map(vec![(
+                ::redis::Value::SimpleString("key".to_owned()),
+                ::redis::Value::Array(vec![::redis::Value::Int(1), ::redis::Value::Nil]),
+            )])]),
+            1,
+        );
+        assert!(!truncated);
         assert_eq!(
             rows,
             vec![vec![Cell::Json(serde_json::json!([
                 {"key": "key", "value": [1, null]}
             ]))]]
         );
+    }
+
+    #[test]
+    fn response_rows_respect_the_request_limit() {
+        let (rows, truncated) = value_rows(
+            ::redis::Value::Array(vec![::redis::Value::Int(1), ::redis::Value::Int(2)]),
+            1,
+        );
+        assert_eq!(rows, vec![vec![Cell::Int(1)]]);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn top_level_composite_propagates_depth_and_node_truncation() {
+        let mut nested = ::redis::Value::Int(1);
+        for _ in 0..=MAX_REDIS_DEPTH {
+            nested = ::redis::Value::Array(vec![nested]);
+        }
+        let (_, depth_truncated) = value_rows(
+            ::redis::Value::Map(vec![(
+                ::redis::Value::SimpleString("key".to_owned()),
+                nested,
+            )]),
+            100,
+        );
+        assert!(depth_truncated);
+
+        let (_, nodes_truncated) = value_rows(
+            ::redis::Value::Set(
+                (0..=MAX_REDIS_CELLS)
+                    .map(|value| ::redis::Value::Int(value as i64))
+                    .collect(),
+            ),
+            100,
+        );
+        assert!(nodes_truncated);
     }
 }
