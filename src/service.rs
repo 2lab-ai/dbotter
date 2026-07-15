@@ -21,7 +21,7 @@ use crate::drivers::{DriverError, Session};
 use crate::model::{
     ConnectionDraft, ConnectionProfile, CredentialMode, DraftId, DriverAvailability,
     DriverCapabilities, DriverKind, ExecuteRequest, OperationId, ProfileFieldId, ProfileGeneration,
-    ProfileId, PublicCode, PublicSummary, QueryLanguage, QueryResult, TlsMode,
+    ProfileId, PublicCode, PublicSummary, QueryLanguage, QueryResult, SessionGeneration, TlsMode,
 };
 use crate::secrets::{
     ReplacementSecretBuffer, SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate,
@@ -222,6 +222,8 @@ impl ServiceError {
 pub struct CheckOutcome {
     pub operation_id: OperationId,
     pub profile_id: ProfileId,
+    pub profile_generation: ProfileGeneration,
+    pub session_generation: SessionGeneration,
     pub driver: DriverKind,
     pub endpoint: String,
     pub elapsed_ms: u128,
@@ -231,6 +233,8 @@ pub struct CheckOutcome {
 pub struct ExecuteOutcome {
     pub operation_id: OperationId,
     pub profile_id: ProfileId,
+    pub profile_generation: ProfileGeneration,
+    pub session_generation: SessionGeneration,
     pub driver: DriverKind,
     pub endpoint: String,
     pub result: QueryResult,
@@ -346,6 +350,18 @@ enum DraftCredentialSource {
 }
 
 impl TestDraftRequest {
+    pub(crate) fn draft_id(&self) -> DraftId {
+        self.draft_id
+    }
+
+    pub(crate) fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     fn without_credential(
         draft_id: DraftId,
         operation_id: OperationId,
@@ -488,30 +504,266 @@ impl SecretResolver for EnvironmentSecrets {
 #[derive(Clone)]
 pub struct ApplicationService {
     config_path: Arc<PathBuf>,
-    observed: Arc<RwLock<ObservedState>>,
+    state: Arc<RwLock<ServiceState>>,
     connector: Arc<dyn SessionConnector>,
     environment: Arc<dyn SecretResolver>,
     session_secrets: Arc<SessionSecretStore>,
-    sessions: Arc<RwLock<HashMap<ProfileId, CachedSession>>>,
     next_generation: Arc<AtomicU64>,
+    next_session_generation: Arc<AtomicU64>,
     writer: ConfigWriter,
     mutation_lane: Arc<Semaphore>,
     config_uncertain: Arc<AtomicBool>,
+}
+
+struct ServiceState {
+    observed: ObservedState,
+    sessions: HashMap<ProfileId, CachedSession>,
 }
 
 struct ObservedState {
     config: Config,
     source_version: ConfigSourceVersion,
     generations: HashMap<ProfileId, ProfileGeneration>,
-    session_epoch: u64,
+    tombstones: HashMap<ProfileId, ProfileGeneration>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConnectionFingerprint {
+    driver: DriverKind,
+    host: String,
+    port: u16,
+    database: Option<String>,
+    username: Option<String>,
+    tls: TlsMode,
+    credential_mode: CredentialMode,
+    secret_env: Option<String>,
+    redis_ca_file: Option<PathBuf>,
+}
+
+impl fmt::Debug for ConnectionFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConnectionFingerprint(<redacted>)")
+    }
+}
+
+impl From<&ConnectionProfile> for ConnectionFingerprint {
+    fn from(profile: &ConnectionProfile) -> Self {
+        Self {
+            driver: profile.driver,
+            host: profile.host.clone(),
+            port: profile.port,
+            database: profile.database.clone(),
+            username: profile.username.clone(),
+            tls: profile.tls,
+            credential_mode: profile.credential_mode,
+            secret_env: profile.secret_env.clone(),
+            redis_ca_file: profile.redis_tls.ca_file.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedSessionIdentity {
+    pub profile_generation: ProfileGeneration,
+    pub session_generation: SessionGeneration,
+    pub connection_fingerprint: ConnectionFingerprint,
+}
+
+pub(crate) struct RuntimeUpdateOutcome {
+    pub(crate) mutation: ProfileMutationOutcome,
+    pub(crate) deferred_session: Option<DeferredSessionFence>,
+    pub(crate) cleanup: DeferredRuntimeCleanup,
+}
+
+pub(crate) struct DeferredSessionFence {
+    profile_id: ProfileId,
+    previous: CachedSessionIdentity,
+    next_profile_generation: ProfileGeneration,
+    next_fingerprint: ConnectionFingerprint,
+    retag_eligible: bool,
+}
+
+pub(crate) struct DeferredRuntimeCleanup {
+    targets: Vec<DeferredCleanupTarget>,
+    secret_updates: Vec<(ProfileId, SessionSecretUpdate)>,
+    clear_all_secrets: bool,
+    retain_secret_profiles: Option<HashSet<ProfileId>>,
+}
+
+pub(crate) struct DeferredCleanupTarget {
+    profile_id: ProfileId,
+    previous_generation: ProfileGeneration,
+    session: Option<CachedSessionIdentity>,
+    clear_secret: bool,
+}
+
+impl DeferredRuntimeCleanup {
+    fn empty() -> Self {
+        Self {
+            targets: Vec::new(),
+            secret_updates: Vec::new(),
+            clear_all_secrets: false,
+            retain_secret_profiles: None,
+        }
+    }
+
+    pub(crate) fn targets(&self) -> impl Iterator<Item = (&ProfileId, ProfileGeneration)> {
+        self.targets
+            .iter()
+            .map(|target| (&target.profile_id, target.previous_generation))
+    }
+}
+
+pub(crate) struct RuntimeDeleteOutcome {
+    pub(crate) mutation: ProfileMutationOutcome,
+    pub(crate) cleanup: DeferredRuntimeCleanup,
+}
+
+pub(crate) struct RuntimeCreateOutcome {
+    pub(crate) mutation: ProfileMutationOutcome,
+    pub(crate) cleanup: DeferredRuntimeCleanup,
+}
+
+pub(crate) struct RuntimeMutationFailure {
+    pub(crate) error: ServiceError,
+    pub(crate) cleanup: DeferredRuntimeCleanup,
+}
+
+impl From<ServiceError> for RuntimeMutationFailure {
+    fn from(error: ServiceError) -> Self {
+        Self {
+            error,
+            cleanup: DeferredRuntimeCleanup::empty(),
+        }
+    }
+}
+
+impl From<ProfileValidationError> for RuntimeMutationFailure {
+    fn from(error: ProfileValidationError) -> Self {
+        ServiceError::from(error).into()
+    }
+}
+
+impl From<SecretError> for RuntimeMutationFailure {
+    fn from(error: SecretError) -> Self {
+        ServiceError::from(error).into()
+    }
+}
+
+pub(crate) struct RuntimeReloadOutcome {
+    pub(crate) diff: Option<ReloadConfigurationOutcome>,
+    pub(crate) cleanup: DeferredRuntimeCleanup,
+    pub(crate) config_uncertain: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReloadConfigurationOutcome {
+    pub unchanged: Vec<ProfileId>,
+    pub added: Vec<ProfileId>,
+    pub changed: Vec<(ProfileId, ProfileGeneration)>,
+    pub removed: Vec<(ProfileId, ProfileGeneration)>,
 }
 
 #[derive(Clone)]
 struct CachedSession {
-    profile: ConnectionProfile,
-    generation: ProfileGeneration,
-    session_epoch: u64,
+    profile_generation: ProfileGeneration,
+    session_generation: SessionGeneration,
+    connection_fingerprint: ConnectionFingerprint,
     handle: Arc<dyn SessionHandle>,
+}
+
+impl CachedSession {
+    fn identity(&self) -> CachedSessionIdentity {
+        CachedSessionIdentity {
+            profile_generation: self.profile_generation,
+            session_generation: self.session_generation,
+            connection_fingerprint: self.connection_fingerprint.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionDisposition {
+    Keep,
+    Evict,
+}
+
+impl SessionDisposition {
+    pub fn for_driver_error(error: &DriverError) -> Self {
+        match error {
+            DriverError::MySql(sqlx::Error::Database(_)) => Self::Keep,
+            DriverError::Redis(error) if matches!(error.kind(), redis::ErrorKind::Server(_)) => {
+                Self::Keep
+            }
+            DriverError::InvalidConfig { .. }
+            | DriverError::Unavailable { .. }
+            | DriverError::Timeout { .. }
+            | DriverError::MySql(_)
+            | DriverError::Redis(_)
+            | DriverError::RedisParse(_)
+            | DriverError::Unsupported { .. } => Self::Evict,
+        }
+    }
+}
+
+pub(crate) struct SessionLease {
+    profile_id: ProfileId,
+    profile: ConnectionProfile,
+    identity: CachedSessionIdentity,
+    handle: Arc<dyn SessionHandle>,
+}
+
+pub(crate) struct DraftSessionLease {
+    draft_id: DraftId,
+    operation_id: OperationId,
+    profile: ConnectionProfile,
+    timeout: Duration,
+    started: Instant,
+    handle: Arc<dyn SessionHandle>,
+}
+
+impl DraftSessionLease {
+    pub(crate) fn draft_id(&self) -> DraftId {
+        self.draft_id
+    }
+
+    pub(crate) fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    pub(crate) fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    pub(crate) async fn ping(&self) -> Result<(), DriverError> {
+        self.handle.ping(self.timeout).await
+    }
+
+    pub(crate) async fn close(&self) -> Result<(), DriverError> {
+        self.handle.close().await
+    }
+}
+
+impl SessionLease {
+    #[cfg(test)]
+    pub(crate) fn profile(&self) -> &ConnectionProfile {
+        &self.profile
+    }
+
+    pub(crate) fn identity(&self) -> &CachedSessionIdentity {
+        &self.identity
+    }
+
+    pub(crate) async fn ping(&self, timeout: Duration) -> Result<(), DriverError> {
+        self.handle.ping(timeout).await
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        request: &ExecuteRequest,
+    ) -> Result<QueryResult, DriverError> {
+        self.handle.execute(request).await
+    }
 }
 
 struct ObservedMutationOutcome {
@@ -568,17 +820,20 @@ impl ApplicationService {
         }
         Self {
             config_path: Arc::new(path),
-            observed: Arc::new(RwLock::new(ObservedState {
-                config: loaded.config,
-                source_version: loaded.source_version,
-                generations,
-                session_epoch: 1,
+            state: Arc::new(RwLock::new(ServiceState {
+                observed: ObservedState {
+                    config: loaded.config,
+                    source_version: loaded.source_version,
+                    generations,
+                    tombstones: HashMap::new(),
+                },
+                sessions: HashMap::new(),
             })),
             connector,
             environment,
             session_secrets,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(next)),
+            next_session_generation: Arc::new(AtomicU64::new(1)),
             writer,
             mutation_lane: Arc::new(Semaphore::new(1)),
             config_uncertain: Arc::new(AtomicBool::new(false)),
@@ -590,17 +845,18 @@ impl ApplicationService {
     }
 
     pub async fn source_version(&self) -> ConfigSourceVersion {
-        self.observed.read().await.source_version
+        self.state.read().await.observed.source_version
     }
 
     pub async fn profiles_snapshot(&self) -> Vec<ConnectionProfile> {
-        self.observed.read().await.config.profiles.clone()
+        self.state.read().await.observed.config.profiles.clone()
     }
 
     pub async fn profiles_with_generations_snapshot(
         &self,
     ) -> Vec<(ConnectionProfile, ProfileGeneration)> {
-        let observed = self.observed.read().await;
+        let state = self.state.read().await;
+        let observed = &state.observed;
         observed
             .config
             .profiles
@@ -619,17 +875,40 @@ impl ApplicationService {
         &self,
         profile_id: &ProfileId,
     ) -> Result<ProfileGeneration, ServiceError> {
-        self.observed
+        self.state
             .read()
             .await
+            .observed
             .generations
             .get(profile_id)
             .copied()
             .ok_or_else(|| ServiceError::UnknownProfile(profile_id.clone()))
     }
 
+    pub async fn tombstone_generation(&self, profile_id: &ProfileId) -> Option<ProfileGeneration> {
+        self.state
+            .read()
+            .await
+            .observed
+            .tombstones
+            .get(profile_id)
+            .copied()
+    }
+
     pub async fn cached_session_count(&self) -> usize {
-        self.sessions.read().await.len()
+        self.state.read().await.sessions.len()
+    }
+
+    pub async fn cached_session_identity(
+        &self,
+        profile_id: &ProfileId,
+    ) -> Option<CachedSessionIdentity> {
+        self.state
+            .read()
+            .await
+            .sessions
+            .get(profile_id)
+            .map(CachedSession::identity)
     }
 
     /// Reports only whether the exact saved profile currently owns an
@@ -641,11 +920,38 @@ impl ApplicationService {
             .map_err(ServiceError::Secret)
     }
 
+    pub(crate) async fn needs_session_credential(
+        &self,
+        profile_id: &ProfileId,
+    ) -> Result<bool, ServiceError> {
+        let profile = self.profile(profile_id).await?;
+        Ok(profile.credential_mode == CredentialMode::Session
+            && !self.has_current_session_secret(profile_id)?)
+    }
+
     pub fn is_config_uncertain(&self) -> bool {
         self.config_uncertain.load(Ordering::Acquire)
     }
 
     pub async fn reload_configuration(&self) -> Result<(), ServiceError> {
+        self.reload_configuration_with_outcome().await.map(|_| ())
+    }
+
+    pub async fn reload_configuration_with_outcome(
+        &self,
+    ) -> Result<ReloadConfigurationOutcome, ServiceError> {
+        let outcome = self.reload_configuration_for_runtime().await?;
+        self.apply_deferred_cleanup(outcome.cleanup).await?;
+        if outcome.config_uncertain {
+            Err(ServiceError::ConfigUncertain)
+        } else {
+            outcome.diff.ok_or(ServiceError::ConfigUncertain)
+        }
+    }
+
+    pub(crate) async fn reload_configuration_for_runtime(
+        &self,
+    ) -> Result<RuntimeReloadOutcome, ServiceError> {
         let _permit = self
             .mutation_lane
             .clone()
@@ -653,13 +959,122 @@ impl ApplicationService {
             .await
             .map_err(|_| ServiceError::MutationLaneClosed)?;
         let path = self.config_path.as_ref().clone();
-        let loaded = tokio::task::spawn_blocking(move || crate::config::load_path(&path))
-            .await
-            .map_err(|_| ServiceError::ConfigTaskFailed)??;
-        validate_config_identity(&loaded.config)?;
-        self.replace_loaded_config(loaded).await;
+        let loaded =
+            match tokio::task::spawn_blocking(move || crate::config::load_path(&path)).await {
+                Ok(Ok(loaded)) if validate_config_identity(&loaded.config).is_ok() => loaded,
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                    let cleanup = self.enter_config_uncertain_deferred().await;
+                    return Ok(RuntimeReloadOutcome {
+                        diff: None,
+                        cleanup,
+                        config_uncertain: true,
+                    });
+                }
+            };
+        let outcome = {
+            let state = self.state.read().await;
+            let observed = &state.observed;
+            let previous = observed
+                .config
+                .profiles
+                .iter()
+                .map(|profile| (ProfileId(profile.id.clone()), profile))
+                .collect::<HashMap<_, _>>();
+            let next = loaded
+                .config
+                .profiles
+                .iter()
+                .map(|profile| (ProfileId(profile.id.clone()), profile))
+                .collect::<HashMap<_, _>>();
+            let mut outcome = ReloadConfigurationOutcome::default();
+            for (profile_id, profile) in &next {
+                match previous.get(profile_id) {
+                    Some(previous_profile) if *previous_profile == *profile => {
+                        outcome.unchanged.push(profile_id.clone());
+                    }
+                    Some(_) => {
+                        if let Some(generation) = observed.generations.get(profile_id).copied() {
+                            outcome.changed.push((profile_id.clone(), generation));
+                        }
+                    }
+                    None => outcome.added.push(profile_id.clone()),
+                }
+            }
+            for profile_id in previous.keys() {
+                if !next.contains_key(profile_id)
+                    && let Some(generation) = observed.generations.get(profile_id).copied()
+                {
+                    outcome.removed.push((profile_id.clone(), generation));
+                }
+            }
+            outcome
+                .unchanged
+                .sort_by(|left, right| left.0.cmp(&right.0));
+            outcome.added.sort_by(|left, right| left.0.cmp(&right.0));
+            outcome
+                .changed
+                .sort_by(|left, right| left.0.0.cmp(&right.0.0));
+            outcome
+                .removed
+                .sort_by(|left, right| left.0.0.cmp(&right.0.0));
+            outcome
+        };
+        let cleanup = self.replace_loaded_config(loaded).await;
         self.config_uncertain.store(false, Ordering::Release);
-        Ok(())
+        Ok(RuntimeReloadOutcome {
+            diff: Some(outcome),
+            cleanup,
+            config_uncertain: false,
+        })
+    }
+
+    pub async fn disconnect_profile_exact(
+        &self,
+        operation_id: OperationId,
+        profile_id: &ProfileId,
+        expected_generation: ProfileGeneration,
+        expected_session_generation: Option<SessionGeneration>,
+    ) -> Result<Option<CachedSessionIdentity>, ServiceError> {
+        self.ensure_generation(profile_id, expected_generation, operation_id)
+            .await?;
+        let current = self.cached_session_identity(profile_id).await;
+        match (current, expected_session_generation) {
+            (None, None) => Ok(None),
+            (Some(identity), Some(expected)) if identity.session_generation == expected => {
+                if self
+                    .evict_cached_session_exact(profile_id, expected_generation, expected)
+                    .await
+                {
+                    Ok(Some(identity))
+                } else {
+                    Err(ServiceError::ProfileStale {
+                        profile_id: profile_id.clone(),
+                        operation_id,
+                    })
+                }
+            }
+            (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => {
+                Err(ServiceError::ProfileStale {
+                    profile_id: profile_id.clone(),
+                    operation_id,
+                })
+            }
+        }
+    }
+
+    pub async fn shutdown_runtime(&self) {
+        let handles = self
+            .state
+            .write()
+            .await
+            .sessions
+            .drain()
+            .map(|(_, cached)| cached.handle)
+            .collect::<Vec<_>>();
+        let _ = self.session_secrets.clear_all();
+        for handle in handles {
+            let _ = handle.close().await;
+        }
     }
 
     pub fn prepare_secretless_draft_test(
@@ -803,6 +1218,27 @@ impl ApplicationService {
         &self,
         request: CreateProfileRequest,
     ) -> Result<ProfileMutationOutcome, ServiceError> {
+        match self.create_profile_inner(request, false).await {
+            Ok(outcome) => Ok(outcome.mutation),
+            Err(failure) => {
+                self.apply_deferred_cleanup(failure.cleanup).await?;
+                Err(failure.error)
+            }
+        }
+    }
+
+    pub(crate) async fn create_profile_for_runtime(
+        &self,
+        request: CreateProfileRequest,
+    ) -> Result<RuntimeCreateOutcome, RuntimeMutationFailure> {
+        self.create_profile_inner(request, true).await
+    }
+
+    async fn create_profile_inner(
+        &self,
+        request: CreateProfileRequest,
+        defer_cleanup: bool,
+    ) -> Result<RuntimeCreateOutcome, RuntimeMutationFailure> {
         self.ensure_config_certain()?;
         validate_connection_draft(&request.draft)?;
         validate_create_secret_update(request.draft.credential_mode, &request.secret_update)
@@ -846,15 +1282,21 @@ impl ApplicationService {
             }
         };
         let outcome = match self.write_config(mutation, migration_consent).await {
-            Err(ServiceError::Config(ConfigError::ProfileAlreadyExists(_)))
-                if requested_id.is_some() =>
+            Err(failure)
+                if requested_id.is_some()
+                    && matches!(
+                        &failure.error,
+                        ServiceError::Config(ConfigError::ProfileAlreadyExists(_))
+                    ) =>
             {
                 return Err(ServiceError::ProfileIdConflict {
                     draft_id,
                     operation_id,
-                });
+                }
+                .into());
             }
-            result => result?,
+            Err(failure) => return Err(failure),
+            Ok(outcome) => outcome,
         };
         let affected_profile_id = outcome
             .affected_profile_id
@@ -864,29 +1306,52 @@ impl ApplicationService {
         if let Some(requested_id) = requested_id.as_ref()
             && requested_id != &affected_profile_id
         {
-            self.enter_config_uncertain().await;
-            return Err(ServiceError::ConfigUncertain);
+            return Err(self
+                .runtime_mutation_failure(ServiceError::ConfigUncertain)
+                .await);
         }
         expected_profile.id.clone_from(&affected_profile_id.0);
         if observed_profile(&outcome.loaded.config, &affected_profile_id) != Some(&expected_profile)
         {
-            self.enter_config_uncertain().await;
-            return Err(ServiceError::ConfigUncertain);
+            return Err(self
+                .runtime_mutation_failure(ServiceError::ConfigUncertain)
+                .await);
         }
         let profile_id = affected_profile_id;
-        let generation = self
+        let reconciled = match self
             .reconcile_after_mutation(
                 outcome.loaded.config.clone(),
                 MutationIdentity::Create(&profile_id),
             )
-            .await?;
-        self.session_secrets.apply(&profile_id, secret_update)?;
-        Ok(ProfileMutationOutcome {
-            operation_id,
-            profile_id,
-            profile_generation: generation,
-            commit_state: outcome.state,
-            migration_backup: outcome.migration_backup,
+            .await
+        {
+            Ok(reconciled) => reconciled,
+            Err(ServiceError::ConfigUncertain) => {
+                return Err(self
+                    .runtime_mutation_failure(ServiceError::ConfigUncertain)
+                    .await);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut cleanup = reconciled.cleanup;
+        cleanup
+            .secret_updates
+            .push((profile_id.clone(), secret_update));
+        let cleanup = if defer_cleanup {
+            cleanup
+        } else {
+            self.apply_deferred_cleanup(cleanup).await?;
+            DeferredRuntimeCleanup::empty()
+        };
+        Ok(RuntimeCreateOutcome {
+            mutation: ProfileMutationOutcome {
+                operation_id,
+                profile_id,
+                profile_generation: reconciled.profile_generation,
+                commit_state: outcome.state,
+                migration_backup: outcome.migration_backup,
+            },
+            cleanup,
         })
     }
 
@@ -894,6 +1359,31 @@ impl ApplicationService {
         &self,
         request: UpdateProfileRequest,
     ) -> Result<ProfileMutationOutcome, ServiceError> {
+        match self
+            .update_profile_inner(request, UpdateSessionPolicy::Legacy)
+            .await
+        {
+            Ok(outcome) => Ok(outcome.mutation),
+            Err(failure) => {
+                self.apply_deferred_cleanup(failure.cleanup).await?;
+                Err(failure.error)
+            }
+        }
+    }
+
+    pub(crate) async fn update_profile_for_runtime(
+        &self,
+        request: UpdateProfileRequest,
+    ) -> Result<RuntimeUpdateOutcome, RuntimeMutationFailure> {
+        self.update_profile_inner(request, UpdateSessionPolicy::Defer)
+            .await
+    }
+
+    async fn update_profile_inner(
+        &self,
+        request: UpdateProfileRequest,
+        session_policy: UpdateSessionPolicy,
+    ) -> Result<RuntimeUpdateOutcome, RuntimeMutationFailure> {
         self.ensure_config_certain()?;
         validate_connection_draft(&request.draft)?;
         let _permit = self
@@ -918,50 +1408,95 @@ impl ApplicationService {
         )
         .map_err(|_| invalid_session_intent_error())?;
         let updated = ConnectionProfile::from_draft(request.profile_id.0.clone(), request.draft);
+        let keep_secret = matches!(&request.secret_update, SessionSecretUpdate::Keep);
+        let secret_preserves_connection = match updated.credential_mode {
+            CredentialMode::Session => keep_secret,
+            CredentialMode::None | CredentialMode::Environment => true,
+        };
+        let connection_fingerprint_unchanged =
+            ConnectionFingerprint::from(&expected_profile) == ConnectionFingerprint::from(&updated);
+        let retain_idle_session = secret_preserves_connection
+            && connection_fingerprint_unchanged
+            && expected_profile == updated;
+        let retag_eligible = secret_preserves_connection && connection_fingerprint_unchanged;
         let mutation = ConfigMutation::UpdateChecked {
             profile_id: request.profile_id.0.clone(),
             expected_profile,
             profile: updated.clone(),
         };
         let outcome = match self.write_config(mutation, request.migration_consent).await {
-            Err(ServiceError::Config(
-                ConfigError::ProfileMissing(_) | ConfigError::ExternalChange,
-            )) => {
+            Err(failure)
+                if matches!(
+                    &failure.error,
+                    ServiceError::Config(
+                        ConfigError::ProfileMissing(_) | ConfigError::ExternalChange
+                    )
+                ) =>
+            {
                 return Err(ServiceError::ProfileStale {
                     profile_id: request.profile_id,
                     operation_id: request.operation_id,
-                });
+                }
+                .into());
             }
-            result => result?,
+            Err(failure) => return Err(failure),
+            Ok(outcome) => outcome,
         };
         if outcome.affected_profile_id.as_deref() != Some(request.profile_id.as_str())
             || observed_profile(&outcome.loaded.config, &request.profile_id) != Some(&updated)
         {
-            self.enter_config_uncertain().await;
-            return Err(ServiceError::ConfigUncertain);
+            return Err(self
+                .runtime_mutation_failure(ServiceError::ConfigUncertain)
+                .await);
         }
-        let keep_secret = matches!(&request.secret_update, SessionSecretUpdate::Keep);
-        let generation = self
+        let reconciled = match self
             .reconcile_after_mutation(
                 outcome.loaded.config.clone(),
                 MutationIdentity::Update {
                     profile_id: &request.profile_id,
-                    keep_secret,
+                    session_policy: match session_policy {
+                        UpdateSessionPolicy::Legacy => {
+                            LocalSessionPolicy::Resolve(retain_idle_session)
+                        }
+                        UpdateSessionPolicy::Defer => LocalSessionPolicy::Defer { retag_eligible },
+                    },
                 },
             )
-            .await?;
-        let evict_session = !matches!(&request.secret_update, SessionSecretUpdate::Keep);
-        if evict_session {
-            self.evict_session(&request.profile_id).await;
-        }
-        self.session_secrets
-            .apply(&request.profile_id, request.secret_update)?;
-        Ok(ProfileMutationOutcome {
-            operation_id: request.operation_id,
-            profile_id: request.profile_id,
-            profile_generation: generation,
-            commit_state: outcome.state,
-            migration_backup: outcome.migration_backup,
+            .await
+        {
+            Ok(reconciled) => reconciled,
+            Err(ServiceError::ConfigUncertain) => {
+                return Err(self
+                    .runtime_mutation_failure(ServiceError::ConfigUncertain)
+                    .await);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut cleanup = reconciled.cleanup;
+        cleanup
+            .secret_updates
+            .push((request.profile_id.clone(), request.secret_update));
+        let deferred_session = reconciled.deferred_session;
+        let (deferred_session, cleanup) = match session_policy {
+            UpdateSessionPolicy::Legacy => {
+                if let Some(fence) = deferred_session {
+                    self.resolve_deferred_session(fence, true).await;
+                }
+                self.apply_deferred_cleanup(cleanup).await?;
+                (None, DeferredRuntimeCleanup::empty())
+            }
+            UpdateSessionPolicy::Defer => (deferred_session, cleanup),
+        };
+        Ok(RuntimeUpdateOutcome {
+            mutation: ProfileMutationOutcome {
+                operation_id: request.operation_id,
+                profile_id: request.profile_id,
+                profile_generation: reconciled.profile_generation,
+                commit_state: outcome.state,
+                migration_backup: outcome.migration_backup,
+            },
+            deferred_session,
+            cleanup,
         })
     }
 
@@ -969,6 +1504,27 @@ impl ApplicationService {
         &self,
         request: DeleteProfileRequest,
     ) -> Result<ProfileMutationOutcome, ServiceError> {
+        match self.delete_profile_inner(request, false).await {
+            Ok(outcome) => Ok(outcome.mutation),
+            Err(failure) => {
+                self.apply_deferred_cleanup(failure.cleanup).await?;
+                Err(failure.error)
+            }
+        }
+    }
+
+    pub(crate) async fn delete_profile_for_runtime(
+        &self,
+        request: DeleteProfileRequest,
+    ) -> Result<RuntimeDeleteOutcome, RuntimeMutationFailure> {
+        self.delete_profile_inner(request, true).await
+    }
+
+    async fn delete_profile_inner(
+        &self,
+        request: DeleteProfileRequest,
+        defer_cleanup: bool,
+    ) -> Result<RuntimeDeleteOutcome, RuntimeMutationFailure> {
         self.ensure_config_certain()?;
         let _permit = self
             .mutation_lane
@@ -989,37 +1545,60 @@ impl ApplicationService {
             expected_profile,
         };
         let outcome = match self.write_config(mutation, request.migration_consent).await {
-            Err(ServiceError::Config(
-                ConfigError::ProfileMissing(_) | ConfigError::ExternalChange,
-            )) => {
+            Err(failure)
+                if matches!(
+                    &failure.error,
+                    ServiceError::Config(
+                        ConfigError::ProfileMissing(_) | ConfigError::ExternalChange
+                    )
+                ) =>
+            {
                 return Err(ServiceError::ProfileStale {
                     profile_id: request.profile_id,
                     operation_id: request.operation_id,
-                });
+                }
+                .into());
             }
-            result => result?,
+            Err(failure) => return Err(failure),
+            Ok(outcome) => outcome,
         };
         if outcome.affected_profile_id.as_deref() != Some(request.profile_id.as_str())
             || observed_profile(&outcome.loaded.config, &request.profile_id).is_some()
         {
-            self.enter_config_uncertain().await;
-            return Err(ServiceError::ConfigUncertain);
+            return Err(self
+                .runtime_mutation_failure(ServiceError::ConfigUncertain)
+                .await);
         }
-        let generation = self
+        let reconciled = match self
             .reconcile_after_mutation(
                 outcome.loaded.config.clone(),
                 MutationIdentity::Delete(&request.profile_id),
             )
-            .await?;
-        self.evict_session(&request.profile_id).await;
-        self.session_secrets
-            .apply(&request.profile_id, SessionSecretUpdate::Clear)?;
-        Ok(ProfileMutationOutcome {
-            operation_id: request.operation_id,
-            profile_id: request.profile_id,
-            profile_generation: generation,
-            commit_state: outcome.state,
-            migration_backup: outcome.migration_backup,
+            .await
+        {
+            Ok(reconciled) => reconciled,
+            Err(ServiceError::ConfigUncertain) => {
+                return Err(self
+                    .runtime_mutation_failure(ServiceError::ConfigUncertain)
+                    .await);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let cleanup = if defer_cleanup {
+            reconciled.cleanup
+        } else {
+            self.apply_deferred_cleanup(reconciled.cleanup).await?;
+            DeferredRuntimeCleanup::empty()
+        };
+        Ok(RuntimeDeleteOutcome {
+            mutation: ProfileMutationOutcome {
+                operation_id: request.operation_id,
+                profile_id: request.profile_id,
+                profile_generation: reconciled.profile_generation,
+                commit_state: outcome.state,
+                migration_backup: outcome.migration_backup,
+            },
+            cleanup,
         })
     }
 
@@ -1027,6 +1606,25 @@ impl ApplicationService {
         &self,
         request: TestDraftRequest,
     ) -> Result<DraftTestOutcome, ServiceError> {
+        let temporary = self.acquire_draft_session(request).await?;
+        let ping = temporary.ping().await;
+        let close = temporary.close().await;
+        self.ensure_config_certain()?;
+        ping?;
+        close?;
+        Ok(DraftTestOutcome {
+            draft_id: temporary.draft_id,
+            operation_id: temporary.operation_id,
+            driver: temporary.profile.driver,
+            endpoint: temporary.profile.redacted_endpoint(),
+            elapsed_ms: temporary.started.elapsed().as_millis(),
+        })
+    }
+
+    pub(crate) async fn acquire_draft_session(
+        &self,
+        request: TestDraftRequest,
+    ) -> Result<DraftSessionLease, ServiceError> {
         self.ensure_config_certain()?;
         validate_connection_draft(&request.draft)?;
         let TestDraftRequest {
@@ -1078,117 +1676,142 @@ impl ApplicationService {
             .connector
             .connect(&profile, secret.as_deref(), timeout)
             .await?;
-        let ping = temporary.ping(timeout).await;
-        let close = temporary.close().await;
-        self.ensure_config_certain()?;
-        ping?;
-        close?;
-        Ok(DraftTestOutcome {
+        Ok(DraftSessionLease {
             draft_id,
             operation_id,
-            driver: profile.driver,
-            endpoint: profile.redacted_endpoint(),
-            elapsed_ms: started.elapsed().as_millis(),
+            profile,
+            timeout,
+            started,
+            handle: temporary,
         })
     }
 
-    pub async fn check(
+    pub async fn check_at(
         &self,
         operation_id: OperationId,
         profile_id: ProfileId,
+        expected_generation: ProfileGeneration,
         timeout: Duration,
     ) -> Result<CheckOutcome, ServiceError> {
-        self.ensure_config_certain()?;
-        let (profile, generation, session_epoch) =
-            self.profile_with_generation(&profile_id).await?;
-        validate_profile_for_network(&profile)?;
         let started = Instant::now();
-        let session = self
-            .session_for(&profile, generation, session_epoch, operation_id, timeout)
-            .await?;
-        let ping = session.ping(timeout).await;
-        let observation = self
-            .ensure_session_observation(&profile_id, generation, session_epoch, operation_id)
-            .await;
-        if ping.is_err() || observation.is_err() {
-            self.close_exact_cached_session(
-                &profile_id,
-                &profile,
-                generation,
-                session_epoch,
-                &session,
+        let lease = self
+            .acquire_session_at(
+                operation_id,
+                profile_id.clone(),
+                expected_generation,
+                timeout,
             )
-            .await;
+            .await?;
+        let ping = lease.ping(timeout).await;
+        let observation = self.observe_session(&lease, operation_id).await;
+        if ping.is_err() || observation.is_err() {
+            self.evict_session_lease(&lease).await;
         }
         observation?;
         ping?;
         Ok(CheckOutcome {
             operation_id,
             profile_id,
-            driver: profile.driver,
-            endpoint: profile.redacted_endpoint(),
+            profile_generation: lease.identity.profile_generation,
+            session_generation: lease.identity.session_generation,
+            driver: lease.profile.driver,
+            endpoint: lease.profile.redacted_endpoint(),
             elapsed_ms: started.elapsed().as_millis(),
         })
     }
 
-    pub async fn execute(&self, request: ExecuteRequest) -> Result<ExecuteOutcome, ServiceError> {
+    pub async fn execute_at(
+        &self,
+        request: ExecuteRequest,
+        expected_generation: ProfileGeneration,
+    ) -> Result<ExecuteOutcome, ServiceError> {
         self.ensure_config_certain()?;
         if request.row_limit == 0 || request.row_limit > 10_000 {
             return Err(ServiceError::InvalidRowLimit);
         }
-        let (profile, generation, session_epoch) =
-            self.profile_with_generation(&request.profile_id).await?;
-        validate_profile_for_network(&profile)?;
-        if profile.driver.language() != request.language {
-            return Err(ServiceError::LanguageMismatch {
-                driver: profile.driver,
-                actual: request.language,
-            });
-        }
-        let session = self
-            .session_for(
-                &profile,
-                generation,
-                session_epoch,
+        let lease = self
+            .acquire_session_at(
                 request.operation_id,
+                request.profile_id.clone(),
+                expected_generation,
                 request.timeout,
             )
             .await?;
-        let result = session.execute(&request).await;
-        let observation = self
-            .ensure_session_observation(
-                &request.profile_id,
-                generation,
-                session_epoch,
-                request.operation_id,
-            )
-            .await;
-        if result.is_err() || observation.is_err() {
-            self.close_exact_cached_session(
-                &request.profile_id,
-                &profile,
-                generation,
-                session_epoch,
-                &session,
-            )
-            .await;
+        if lease.profile.driver.language() != request.language {
+            return Err(ServiceError::LanguageMismatch {
+                driver: lease.profile.driver,
+                actual: request.language,
+            });
+        }
+        let result = lease.execute(&request).await;
+        let observation = self.observe_session(&lease, request.operation_id).await;
+        let disposition = result.as_ref().err().map_or(
+            SessionDisposition::Keep,
+            SessionDisposition::for_driver_error,
+        );
+        if disposition == SessionDisposition::Evict || observation.is_err() {
+            self.evict_session_lease(&lease).await;
         }
         observation?;
         let result = result?;
         Ok(ExecuteOutcome {
             operation_id: request.operation_id,
             profile_id: request.profile_id,
-            driver: profile.driver,
-            endpoint: profile.redacted_endpoint(),
+            profile_generation: lease.identity.profile_generation,
+            session_generation: lease.identity.session_generation,
+            driver: lease.profile.driver,
+            endpoint: lease.profile.redacted_endpoint(),
             result,
         })
+    }
+
+    pub(crate) async fn acquire_session_at(
+        &self,
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        expected_generation: ProfileGeneration,
+        timeout: Duration,
+    ) -> Result<SessionLease, ServiceError> {
+        self.ensure_config_certain()?;
+        let (profile, generation) = self.profile_with_generation(&profile_id).await?;
+        if generation != expected_generation {
+            return Err(ServiceError::ProfileStale {
+                profile_id,
+                operation_id,
+            });
+        }
+        validate_profile_for_network(&profile)?;
+        self.session_for(&profile, generation, operation_id, timeout)
+            .await
+    }
+
+    pub(crate) async fn observe_session(
+        &self,
+        lease: &SessionLease,
+        operation_id: OperationId,
+    ) -> Result<(), ServiceError> {
+        self.ensure_session_observation(
+            &lease.profile_id,
+            lease.identity.profile_generation,
+            operation_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn evict_session_lease(&self, lease: &SessionLease) -> bool {
+        self.evict_cached_session_exact(
+            &lease.profile_id,
+            lease.identity.profile_generation,
+            lease.identity.session_generation,
+        )
+        .await
     }
 
     async fn write_config(
         &self,
         mutation: ConfigMutation,
         consent: MigrationConsent,
-    ) -> Result<ObservedMutationOutcome, ServiceError> {
+    ) -> Result<ObservedMutationOutcome, RuntimeMutationFailure> {
         let writer = self.writer.clone();
         let path = self.config_path.as_ref().clone();
         let outcome =
@@ -1210,8 +1833,11 @@ impl ApplicationService {
                 affected_profile_id,
             }),
             PostCommitObservation::Failed(error) => {
-                self.enter_config_uncertain().await;
-                Err(ServiceError::PostCommitObservation(error))
+                let cleanup = self.enter_config_uncertain_deferred().await;
+                Err(RuntimeMutationFailure {
+                    error: ServiceError::PostCommitObservation(error),
+                    cleanup,
+                })
             }
         }
     }
@@ -1224,65 +1850,179 @@ impl ApplicationService {
         }
     }
 
-    async fn enter_config_uncertain(&self) {
-        let handles = {
-            let mut observed = self.observed.write().await;
-            self.config_uncertain.store(true, Ordering::Release);
-            let mut sessions = self.sessions.write().await;
-            observed.session_epoch = observed.session_epoch.saturating_add(1);
-            sessions
-                .drain()
-                .map(|(_, cached)| cached.handle)
-                .collect::<Vec<_>>()
+    async fn runtime_mutation_failure(&self, error: ServiceError) -> RuntimeMutationFailure {
+        RuntimeMutationFailure {
+            error,
+            cleanup: self.enter_config_uncertain_deferred().await,
+        }
+    }
+
+    async fn enter_config_uncertain_deferred(&self) -> DeferredRuntimeCleanup {
+        self.config_uncertain.store(true, Ordering::Release);
+        let targets = {
+            let mut state = self.state.write().await;
+            let targets = state
+                .observed
+                .generations
+                .iter()
+                .map(|(profile_id, generation)| DeferredCleanupTarget {
+                    profile_id: profile_id.clone(),
+                    previous_generation: *generation,
+                    session: state.sessions.get(profile_id).map(CachedSession::identity),
+                    clear_secret: true,
+                })
+                .collect::<Vec<_>>();
+            for generation in state.observed.generations.values_mut() {
+                *generation = self.allocate_profile_generation();
+            }
+            targets
         };
-        let _ = self.session_secrets.clear_all();
-        for handle in handles {
-            let _ = handle.close().await;
+        DeferredRuntimeCleanup {
+            targets,
+            secret_updates: Vec::new(),
+            clear_all_secrets: true,
+            retain_secret_profiles: None,
         }
     }
 
-    async fn evict_session(&self, profile_id: &ProfileId) {
-        let handle = self
-            .sessions
-            .write()
-            .await
-            .remove(profile_id)
-            .map(|cached| cached.handle);
-        if let Some(handle) = handle {
-            let _ = handle.close().await;
-        }
-    }
-
-    async fn close_exact_cached_session(
+    pub async fn evict_cached_session_exact(
         &self,
         profile_id: &ProfileId,
-        profile: &ConnectionProfile,
-        generation: ProfileGeneration,
-        session_epoch: u64,
-        handle: &Arc<dyn SessionHandle>,
-    ) {
-        let removed = {
-            let mut sessions = self.sessions.write().await;
-            let remove_exact = sessions.get(profile_id).is_some_and(|cached| {
-                cached.profile == *profile
-                    && cached.generation == generation
-                    && cached.session_epoch == session_epoch
-                    && Arc::ptr_eq(&cached.handle, handle)
+        profile_generation: ProfileGeneration,
+        session_generation: SessionGeneration,
+    ) -> bool {
+        let removed = self
+            .take_cached_session_exact(profile_id, profile_generation, session_generation)
+            .await;
+        if let Some(removed) = removed {
+            let _ = removed.close().await;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) async fn take_cached_session_exact(
+        &self,
+        profile_id: &ProfileId,
+        profile_generation: ProfileGeneration,
+        session_generation: SessionGeneration,
+    ) -> Option<Arc<dyn SessionHandle>> {
+        {
+            let mut state = self.state.write().await;
+            let remove_exact = state.sessions.get(profile_id).is_some_and(|cached| {
+                cached.profile_generation == profile_generation
+                    && cached.session_generation == session_generation
             });
             if remove_exact {
-                sessions.remove(profile_id).map(|cached| cached.handle)
+                state
+                    .sessions
+                    .remove(profile_id)
+                    .map(|cached| cached.handle)
             } else {
                 None
             }
-        };
-        if let Some(removed) = removed {
-            let _ = removed.close().await;
         }
     }
 
-    async fn replace_loaded_config(&self, loaded: LoadedConfig) {
-        let (previous_profiles, previous_generations) = {
-            let observed = self.observed.read().await;
+    pub async fn evict_cached_session_profile_generation(
+        &self,
+        profile_id: &ProfileId,
+        profile_generation: ProfileGeneration,
+    ) -> bool {
+        let identity = self.cached_session_identity(profile_id).await;
+        match identity {
+            Some(identity) if identity.profile_generation == profile_generation => {
+                self.evict_cached_session_exact(
+                    profile_id,
+                    profile_generation,
+                    identity.session_generation,
+                )
+                .await
+            }
+            Some(_) | None => false,
+        }
+    }
+
+    pub(crate) async fn retag_cached_session_exact(
+        &self,
+        profile_id: &ProfileId,
+        expected: &CachedSessionIdentity,
+        new_profile_generation: ProfileGeneration,
+        new_fingerprint: &ConnectionFingerprint,
+    ) -> bool {
+        let mut state = self.state.write().await;
+        let Some(cached) = state.sessions.get_mut(profile_id) else {
+            return false;
+        };
+        if cached.identity() != *expected || cached.connection_fingerprint != *new_fingerprint {
+            return false;
+        }
+        cached.profile_generation = new_profile_generation;
+        true
+    }
+
+    pub(crate) async fn resolve_deferred_session(
+        &self,
+        fence: DeferredSessionFence,
+        allow_retag: bool,
+    ) -> bool {
+        if allow_retag && fence.retag_eligible {
+            self.retag_cached_session_exact(
+                &fence.profile_id,
+                &fence.previous,
+                fence.next_profile_generation,
+                &fence.next_fingerprint,
+            )
+            .await
+        } else {
+            self.evict_cached_session_exact(
+                &fence.profile_id,
+                fence.previous.profile_generation,
+                fence.previous.session_generation,
+            )
+            .await;
+            false
+        }
+    }
+
+    pub(crate) async fn apply_deferred_cleanup(
+        &self,
+        cleanup: DeferredRuntimeCleanup,
+    ) -> Result<(), ServiceError> {
+        for target in &cleanup.targets {
+            if let Some(identity) = &target.session {
+                self.evict_cached_session_exact(
+                    &target.profile_id,
+                    identity.profile_generation,
+                    identity.session_generation,
+                )
+                .await;
+            }
+        }
+        for target in &cleanup.targets {
+            if target.clear_secret {
+                self.session_secrets
+                    .apply(&target.profile_id, SessionSecretUpdate::Clear)?;
+            }
+        }
+        if cleanup.clear_all_secrets {
+            self.session_secrets.clear_all()?;
+            return Ok(());
+        }
+        if let Some(profile_ids) = &cleanup.retain_secret_profiles {
+            self.session_secrets.retain_profiles(profile_ids)?;
+        }
+        for (profile_id, update) in cleanup.secret_updates {
+            self.session_secrets.apply(&profile_id, update)?;
+        }
+        Ok(())
+    }
+
+    async fn replace_loaded_config(&self, loaded: LoadedConfig) -> DeferredRuntimeCleanup {
+        let (previous_profiles, previous_generations, mut tombstones, previous_sessions) = {
+            let state = self.state.read().await;
+            let observed = &state.observed;
             (
                 observed
                     .config
@@ -1292,6 +2032,12 @@ impl ApplicationService {
                     .map(|profile| (ProfileId(profile.id.clone()), profile))
                     .collect::<HashMap<_, _>>(),
                 observed.generations.clone(),
+                observed.tombstones.clone(),
+                state
+                    .sessions
+                    .iter()
+                    .map(|(profile_id, cached)| (profile_id.clone(), cached.identity()))
+                    .collect::<HashMap<_, _>>(),
             )
         };
         let next_profiles: HashMap<ProfileId, ConnectionProfile> = loaded
@@ -1313,40 +2059,46 @@ impl ApplicationService {
                 previous_generations
                     .get(&profile_id)
                     .copied()
-                    .unwrap_or_else(|| {
-                        ProfileGeneration(self.next_generation.fetch_add(1, Ordering::Relaxed))
-                    })
+                    .unwrap_or_else(|| self.allocate_profile_generation())
             } else {
-                ProfileGeneration(self.next_generation.fetch_add(1, Ordering::Relaxed))
+                self.allocate_profile_generation()
             };
             generations.insert(profile_id, generation);
         }
-        let handles = {
-            let mut observed = self.observed.write().await;
-            let mut sessions = self.sessions.write().await;
-            let session_epoch = observed.session_epoch;
-            let handles = sessions
-                .extract_if(|profile_id, cached| {
-                    let retain = unchanged.contains(profile_id)
-                        && next_profiles.get(profile_id) == Some(&cached.profile);
-                    if retain && let Some(generation) = generations.get(profile_id) {
-                        cached.generation = *generation;
-                    }
-                    !retain
-                })
-                .map(|(_, cached)| cached.handle)
-                .collect::<Vec<_>>();
-            let _ = self.session_secrets.retain_profiles(&unchanged);
-            *observed = ObservedState {
+        for profile_id in previous_profiles.keys() {
+            if !next_profiles.contains_key(profile_id) {
+                tombstones.insert(profile_id.clone(), self.allocate_profile_generation());
+            }
+        }
+        {
+            let mut state = self.state.write().await;
+            state.observed = ObservedState {
                 config: loaded.config,
                 source_version: loaded.source_version,
                 generations,
-                session_epoch,
+                tombstones,
             };
-            handles
-        };
-        for handle in handles {
-            let _ = handle.close().await;
+        }
+        let targets = previous_profiles
+            .iter()
+            .filter(|(profile_id, previous)| next_profiles.get(*profile_id) != Some(*previous))
+            .filter_map(|(profile_id, _)| {
+                previous_generations
+                    .get(profile_id)
+                    .copied()
+                    .map(|previous_generation| DeferredCleanupTarget {
+                        profile_id: profile_id.clone(),
+                        previous_generation,
+                        session: previous_sessions.get(profile_id).cloned(),
+                        clear_secret: true,
+                    })
+            })
+            .collect();
+        DeferredRuntimeCleanup {
+            targets,
+            secret_updates: Vec::new(),
+            clear_all_secrets: false,
+            retain_secret_profiles: Some(next_profiles.keys().cloned().collect()),
         }
     }
 
@@ -1354,9 +2106,10 @@ impl ApplicationService {
         &self,
         config: Config,
         identity: MutationIdentity<'_>,
-    ) -> Result<ProfileGeneration, ServiceError> {
-        let (previous_profiles, previous_generations) = {
-            let observed = self.observed.read().await;
+    ) -> Result<ReconcileMutationOutcome, ServiceError> {
+        let (previous_profiles, previous_generations, mut tombstones, previous_sessions) = {
+            let state = self.state.read().await;
+            let observed = &state.observed;
             (
                 observed
                     .config
@@ -1366,6 +2119,12 @@ impl ApplicationService {
                     .map(|profile| (ProfileId(profile.id.clone()), profile))
                     .collect::<HashMap<_, _>>(),
                 observed.generations.clone(),
+                observed.tombstones.clone(),
+                state
+                    .sessions
+                    .iter()
+                    .map(|(profile_id, cached)| (profile_id.clone(), cached.identity()))
+                    .collect::<HashMap<_, _>>(),
             )
         };
         let next_profiles: HashMap<ProfileId, ConnectionProfile> = config
@@ -1375,34 +2134,6 @@ impl ApplicationService {
             .map(|profile| (ProfileId(profile.id.clone()), profile))
             .collect();
         let local_profile_id = identity.profile_id();
-        let local_keep_secret = identity.keeps_secret();
-        let retained_cache_ids: HashSet<ProfileId> = next_profiles
-            .iter()
-            .filter(|(profile_id, profile)| {
-                previous_profiles.get(*profile_id) == Some(*profile)
-                    && (*profile_id != local_profile_id
-                        || matches!(
-                            identity,
-                            MutationIdentity::Update {
-                                keep_secret: true,
-                                ..
-                            }
-                        ))
-            })
-            .map(|(profile_id, _)| profile_id.clone())
-            .collect();
-        let retained_secret_ids: HashSet<ProfileId> = next_profiles
-            .iter()
-            .filter(|(profile_id, profile)| {
-                if *profile_id == local_profile_id {
-                    local_keep_secret
-                } else {
-                    previous_profiles.get(*profile_id) == Some(*profile)
-                }
-            })
-            .map(|(profile_id, _)| profile_id.clone())
-            .collect();
-
         let mut generations = HashMap::with_capacity(config.profiles.len());
         let mut affected_generation = None;
         for profile in &config.profiles {
@@ -1410,16 +2141,14 @@ impl ApplicationService {
             let is_local_target = &profile_id == local_profile_id;
             let force_local_generation = is_local_target && !identity.is_delete();
             let generation = if force_local_generation {
-                ProfileGeneration(self.next_generation.fetch_add(1, Ordering::Relaxed))
+                self.allocate_profile_generation()
             } else if previous_profiles.get(&profile_id) == Some(profile) {
                 previous_generations
                     .get(&profile_id)
                     .copied()
-                    .unwrap_or_else(|| {
-                        ProfileGeneration(self.next_generation.fetch_add(1, Ordering::Relaxed))
-                    })
+                    .unwrap_or_else(|| self.allocate_profile_generation())
             } else {
-                ProfileGeneration(self.next_generation.fetch_add(1, Ordering::Relaxed))
+                self.allocate_profile_generation()
             };
             if is_local_target {
                 affected_generation = Some(generation);
@@ -1427,44 +2156,64 @@ impl ApplicationService {
             generations.insert(profile_id, generation);
         }
         if identity.is_delete() {
-            affected_generation = Some(ProfileGeneration(
-                self.next_generation.fetch_add(1, Ordering::Relaxed),
-            ));
+            let deletion_generation = self.allocate_profile_generation();
+            tombstones.insert(local_profile_id.clone(), deletion_generation);
+            affected_generation = Some(deletion_generation);
         }
-        let handles = {
-            let mut observed = self.observed.write().await;
-            let mut sessions = self.sessions.write().await;
-            let session_epoch = observed.session_epoch;
-            let handles = sessions
-                .extract_if(|profile_id, cached| {
-                    let retain = retained_cache_ids.contains(profile_id)
-                        && next_profiles.get(profile_id) == Some(&cached.profile);
-                    if retain && let Some(generation) = generations.get(profile_id) {
-                        cached.generation = *generation;
-                    }
-                    !retain
-                })
-                .map(|(_, cached)| cached.handle)
-                .collect::<Vec<_>>();
-            let _ = self.session_secrets.retain_profiles(&retained_secret_ids);
-            *observed = ObservedState {
+        let mut deferred_session = None;
+        let mut cleanup = DeferredRuntimeCleanup::empty();
+        cleanup.retain_secret_profiles = Some(next_profiles.keys().cloned().collect());
+        for (profile_id, previous_profile) in &previous_profiles {
+            let is_local_target = profile_id == local_profile_id;
+            let profile_changed = next_profiles.get(profile_id) != Some(previous_profile);
+            let local_generation_changed =
+                is_local_target && !matches!(identity, MutationIdentity::Create(_));
+            if !profile_changed && !local_generation_changed {
+                continue;
+            }
+            let previous_generation = previous_generations
+                .get(profile_id)
+                .copied()
+                .ok_or(ServiceError::ConfigUncertain)?;
+            let mut session = previous_sessions.get(profile_id).cloned();
+            if is_local_target
+                && let Some(retag_eligible) = identity.deferred_retag_eligibility()
+                && let (Some(previous), Some(next_profile_generation), Some(next_profile)) = (
+                    session.take(),
+                    generations.get(profile_id),
+                    next_profiles.get(profile_id),
+                )
+            {
+                deferred_session = Some(DeferredSessionFence {
+                    profile_id: profile_id.clone(),
+                    previous,
+                    next_profile_generation: *next_profile_generation,
+                    next_fingerprint: ConnectionFingerprint::from(next_profile),
+                    retag_eligible,
+                });
+            }
+            cleanup.targets.push(DeferredCleanupTarget {
+                profile_id: profile_id.clone(),
+                previous_generation,
+                session,
+                clear_secret: !is_local_target || identity.is_delete(),
+            });
+        }
+        let profile_generation = affected_generation.ok_or(ServiceError::ConfigUncertain)?;
+        {
+            let mut state = self.state.write().await;
+            state.observed = ObservedState {
                 config,
                 source_version: ConfigSourceVersion::V2,
                 generations,
-                session_epoch,
+                tombstones,
             };
-            handles
-        };
-        for handle in handles {
-            let _ = handle.close().await;
         }
-        match affected_generation {
-            Some(generation) => Ok(generation),
-            None => {
-                self.enter_config_uncertain().await;
-                Err(ServiceError::ConfigUncertain)
-            }
-        }
+        Ok(ReconcileMutationOutcome {
+            profile_generation,
+            deferred_session,
+            cleanup,
+        })
     }
 
     async fn ensure_generation(
@@ -1474,9 +2223,10 @@ impl ApplicationService {
         operation_id: OperationId,
     ) -> Result<(), ServiceError> {
         if self
-            .observed
+            .state
             .read()
             .await
+            .observed
             .generations
             .get(profile_id)
             .copied()
@@ -1491,10 +2241,21 @@ impl ApplicationService {
         }
     }
 
+    pub(crate) async fn ensure_profile_generation(
+        &self,
+        profile_id: &ProfileId,
+        expected: ProfileGeneration,
+        operation_id: OperationId,
+    ) -> Result<(), ServiceError> {
+        self.ensure_generation(profile_id, expected, operation_id)
+            .await
+    }
+
     async fn profile(&self, profile_id: &ProfileId) -> Result<ConnectionProfile, ServiceError> {
-        self.observed
+        self.state
             .read()
             .await
+            .observed
             .config
             .profiles
             .iter()
@@ -1506,8 +2267,9 @@ impl ApplicationService {
     async fn profile_with_generation(
         &self,
         profile_id: &ProfileId,
-    ) -> Result<(ConnectionProfile, ProfileGeneration, u64), ServiceError> {
-        let observed = self.observed.read().await;
+    ) -> Result<(ConnectionProfile, ProfileGeneration), ServiceError> {
+        let state = self.state.read().await;
+        let observed = &state.observed;
         let profile = observed
             .config
             .profiles
@@ -1520,22 +2282,20 @@ impl ApplicationService {
             .get(profile_id)
             .copied()
             .ok_or_else(|| ServiceError::UnknownProfile(profile_id.clone()))?;
-        Ok((profile, generation, observed.session_epoch))
+        Ok((profile, generation))
     }
 
     async fn ensure_session_observation(
         &self,
         profile_id: &ProfileId,
         generation: ProfileGeneration,
-        session_epoch: u64,
         operation_id: OperationId,
     ) -> Result<(), ServiceError> {
-        let observed = self.observed.read().await;
+        let state = self.state.read().await;
+        let observed = &state.observed;
         if self.is_config_uncertain() {
             Err(ServiceError::ConfigUncertain)
-        } else if observed.generations.get(profile_id).copied() == Some(generation)
-            && observed.session_epoch == session_epoch
-        {
+        } else if observed.generations.get(profile_id).copied() == Some(generation) {
             Ok(())
         } else {
             Err(ServiceError::ProfileStale {
@@ -1549,17 +2309,17 @@ impl ApplicationService {
         &self,
         profile: &ConnectionProfile,
         generation: ProfileGeneration,
-        session_epoch: u64,
         operation_id: OperationId,
         timeout: Duration,
-    ) -> Result<Arc<dyn SessionHandle>, ServiceError> {
+    ) -> Result<SessionLease, ServiceError> {
         self.ensure_config_certain()?;
         let profile_id = ProfileId(profile.id.clone());
+        let fingerprint = ConnectionFingerprint::from(profile);
         {
-            let observed = self.observed.read().await;
-            let sessions = self.sessions.read().await;
-            let is_current = observed.generations.get(&profile_id).copied() == Some(generation)
-                && observed.session_epoch == session_epoch
+            let state = self.state.read().await;
+            let observed = &state.observed;
+            let is_current = state.observed.generations.get(&profile_id).copied()
+                == Some(generation)
                 && observed
                     .config
                     .profiles
@@ -1574,17 +2334,22 @@ impl ApplicationService {
                     operation_id,
                 });
             }
-            if let Some(cached) = sessions.get(&profile_id)
-                && cached.profile == *profile
-                && cached.generation == generation
-                && cached.session_epoch == session_epoch
+            if let Some(cached) = state.sessions.get(&profile_id)
+                && cached.connection_fingerprint == fingerprint
+                && cached.profile_generation == generation
             {
-                return Ok(cached.handle.clone());
+                return Ok(SessionLease {
+                    profile_id,
+                    profile: profile.clone(),
+                    identity: cached.identity(),
+                    handle: cached.handle.clone(),
+                });
             }
         }
         ensure_ready(profile)?;
         ensure_connector_tls_support(self.connector.as_ref(), profile)?;
         let secret = self.resolve_profile_secret(profile)?;
+        let attempted_session_generation = self.allocate_session_generation();
         let connected = match self
             .connector
             .connect(profile, secret.as_deref(), timeout)
@@ -1592,28 +2357,23 @@ impl ApplicationService {
         {
             Ok(connected) => connected,
             Err(error) => {
-                self.ensure_session_observation(
-                    &profile_id,
-                    generation,
-                    session_epoch,
-                    operation_id,
-                )
-                .await?;
+                self.ensure_session_observation(&profile_id, generation, operation_id)
+                    .await?;
                 return Err(error.into());
             }
         };
         enum CacheInstall {
-            Installed(Option<Arc<dyn SessionHandle>>),
-            Existing(Arc<dyn SessionHandle>),
+            Installed(Option<Arc<dyn SessionHandle>>, CachedSessionIdentity),
+            Existing(Arc<dyn SessionHandle>, CachedSessionIdentity),
             Stale,
             Uncertain,
         }
         let install = {
-            let observed = self.observed.read().await;
-            let mut sessions = self.sessions.write().await;
-            let is_current = observed.generations.get(&profile_id).copied() == Some(generation)
-                && observed.session_epoch == session_epoch
-                && observed
+            let mut state = self.state.write().await;
+            let is_current = state.observed.generations.get(&profile_id).copied()
+                == Some(generation)
+                && state
+                    .observed
                     .config
                     .profiles
                     .iter()
@@ -1622,37 +2382,52 @@ impl ApplicationService {
                 CacheInstall::Uncertain
             } else if !is_current {
                 CacheInstall::Stale
-            } else if let Some(cached) = sessions.get(&profile_id)
-                && cached.profile == *profile
-                && cached.generation == generation
-                && cached.session_epoch == session_epoch
+            } else if let Some(cached) = state.sessions.get(&profile_id)
+                && cached.connection_fingerprint == fingerprint
+                && cached.profile_generation == generation
             {
-                CacheInstall::Existing(cached.handle.clone())
+                CacheInstall::Existing(cached.handle.clone(), cached.identity())
             } else {
-                let displaced = sessions
+                let identity = CachedSessionIdentity {
+                    profile_generation: generation,
+                    session_generation: attempted_session_generation,
+                    connection_fingerprint: fingerprint.clone(),
+                };
+                let displaced = state
+                    .sessions
                     .insert(
                         profile_id.clone(),
                         CachedSession {
-                            profile: profile.clone(),
-                            generation,
-                            session_epoch,
+                            profile_generation: generation,
+                            session_generation: attempted_session_generation,
+                            connection_fingerprint: fingerprint.clone(),
                             handle: connected.clone(),
                         },
                     )
                     .map(|cached| cached.handle);
-                CacheInstall::Installed(displaced)
+                CacheInstall::Installed(displaced, identity)
             }
         };
         match install {
-            CacheInstall::Installed(displaced) => {
+            CacheInstall::Installed(displaced, identity) => {
                 if let Some(displaced) = displaced {
                     let _ = displaced.close().await;
                 }
-                Ok(connected)
+                Ok(SessionLease {
+                    profile_id,
+                    profile: profile.clone(),
+                    identity,
+                    handle: connected,
+                })
             }
-            CacheInstall::Existing(existing) => {
+            CacheInstall::Existing(existing, identity) => {
                 let _ = connected.close().await;
-                Ok(existing)
+                Ok(SessionLease {
+                    profile_id,
+                    profile: profile.clone(),
+                    identity,
+                    handle: existing,
+                })
             }
             CacheInstall::Stale => {
                 let _ = connected.close().await;
@@ -1666,6 +2441,14 @@ impl ApplicationService {
                 Err(ServiceError::ConfigUncertain)
             }
         }
+    }
+
+    fn allocate_profile_generation(&self) -> ProfileGeneration {
+        ProfileGeneration(self.next_generation.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn allocate_session_generation(&self) -> SessionGeneration {
+        SessionGeneration(self.next_session_generation.fetch_add(1, Ordering::SeqCst))
     }
 
     fn resolve_profile_secret(
@@ -1696,7 +2479,7 @@ enum MutationIdentity<'a> {
     Create(&'a ProfileId),
     Update {
         profile_id: &'a ProfileId,
-        keep_secret: bool,
+        session_policy: LocalSessionPolicy,
     },
     Delete(&'a ProfileId),
 }
@@ -1710,19 +2493,41 @@ impl MutationIdentity<'_> {
         }
     }
 
-    fn keeps_secret(&self) -> bool {
-        matches!(
-            self,
+    fn deferred_retag_eligibility(&self) -> Option<bool> {
+        match self {
             Self::Update {
-                keep_secret: true,
+                session_policy: LocalSessionPolicy::Resolve(retag_eligible),
                 ..
             }
-        )
+            | Self::Update {
+                session_policy: LocalSessionPolicy::Defer { retag_eligible },
+                ..
+            } => Some(*retag_eligible),
+            Self::Create(_) | Self::Delete(_) => None,
+        }
     }
 
     fn is_delete(&self) -> bool {
         matches!(self, Self::Delete(_))
     }
+}
+
+#[derive(Clone, Copy)]
+enum UpdateSessionPolicy {
+    Legacy,
+    Defer,
+}
+
+#[derive(Clone, Copy)]
+enum LocalSessionPolicy {
+    Resolve(bool),
+    Defer { retag_eligible: bool },
+}
+
+struct ReconcileMutationOutcome {
+    profile_generation: ProfileGeneration,
+    deferred_session: Option<DeferredSessionFence>,
+    cleanup: DeferredRuntimeCleanup,
 }
 
 pub fn validate_connection_draft(draft: &ConnectionDraft) -> Result<(), ProfileValidationError> {

@@ -1,8 +1,8 @@
 # dbotter — usable MVP architecture
 
-Status: **approved target architecture with the P1 foundation independently
-reviewed GREEN. T0 remains RED overall; T1, T2, T8, and T9 are Implementing;
-T3–T7 and T10 are Not started.**
+Status: **approved target architecture with the P1 and P2 foundations
+independently reviewed GREEN. T0 remains RED overall; T1, T2, T3, T8, and T9
+are Implementing; T4–T7 and T10 are Not started.**
 
 Normative detail lives in `docs/usable-mvp/{spec,trace,plan}.md`. This document
 is the repository architecture entrypoint and must remain consistent with those
@@ -19,14 +19,22 @@ The UI owns pure/display state only. Live sessions, task registry, config
 writer, secrets, and filesystem export workers stay behind typed service and
 runtime boundaries. No lock crosses `.await`.
 
-### P1 checkpoint boundary
+### P1/P2 checkpoint boundary
 
 P1 implements the config/profile mutation and reconciliation foundation,
 credential storage/resolution types, atomic observed-state and session-cache
 race foundations, and closed public-error/recovery mappings. That bounded slice
-is independently reviewed GREEN. It does not implement the P2 controller or
-the P6 first-run RawInput/AccessKit and full native intent/recovery journey;
-therefore no complete T0/T1/T2/T8/T9 journey is claimed GREEN.
+is independently reviewed GREEN.
+
+P2 implements and independently proves the monotonic profile/session generation
+allocator, fingerprinted cache with exact compare-remove, bounded controller,
+reload/Config uncertain fences, tombstone lifecycle, classified cleanup, and
+runtime shutdown. Reserve-before-spawn, coalesced control, one-profile/four-
+global permits, exact event correlation, network-only two-second abort, and
+durable mutation/export joins are part of that GREEN boundary. P2 does not
+complete P6 native/RawInput/AccessKit or visual work, so T2/T3/T9 remain
+Implementing rather than fully GREEN or Verified. P3 is still Not started and
+Execute remains fail-closed.
 
 ## Target topology
 
@@ -183,6 +191,17 @@ still current.
   cancellation per row/chunk and Shutdown waits for actual worker/temp cleanup.
 - Registry/permit/temp cleanup precedes terminal event delivery, including
   panic/`JoinError` and full/closed event-lane cases.
+
+The P2 source+test review is bound to snapshot
+`e987bbf1d8a7f919cf53b95e882e0fa7b072d4226d7bb5e99e5e06d4dda65378`;
+two independent reviewers each reported `NO P2 BLOCKER`. Its reproducible
+production, test, and release-binary SHA-256 values are
+`279757012280ab7bdcb90b547242114c80efcff3b64c26b7dcff4e3abb78fa9d`,
+`467982ee06068fe8fee669cc20e43ca05b1a0f72129c69137743c70d3eecce1b`,
+and `65ec73f1138587364005a1304fdd55006f85813283390fb3fd0f32f746183f3e`.
+The checkpoint passed 188 regular tests and 12 doctests, strict locked/offline
+Clippy, formatting, diff, release-contract, receipt, all-target/all-feature
+tests, and the release build.
 
 ## UI architecture and accessibility
 

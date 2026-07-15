@@ -24,13 +24,16 @@ pub struct DbotterApp {
 
 impl DbotterApp {
     pub fn new(port: UiPort) -> Self {
-        let app = Self {
+        let mut app = Self {
             port,
             model: UiModel::default(),
             profile_editor: None,
             next_draft_id: 1,
         };
-        let _ = app.port.try_submit(UiCommand::RefreshProfiles);
+        let operation_id = app.model.next_operation();
+        let _ = app
+            .port
+            .try_submit(UiCommand::RefreshProfiles { operation_id });
         app
     }
 
@@ -50,13 +53,18 @@ impl DbotterApp {
                 });
             match profile_result {
                 ProfileEventResult::Saved(profile_id, warning) => {
+                    self.model.fold(event);
                     self.model.selected_profile = Some(profile_id);
                     self.model.status = warning.map_or_else(
                         || "Profile saved; refreshing profiles…".to_owned(),
                         |summary| summary.message().to_owned(),
                     );
                     self.profile_editor = None;
-                    if let Err(error) = self.port.try_submit(UiCommand::RefreshProfiles) {
+                    let operation_id = self.model.next_operation();
+                    if let Err(error) = self
+                        .port
+                        .try_submit(UiCommand::RefreshProfiles { operation_id })
+                    {
                         self.report_submit_error(error);
                     }
                     continue;
@@ -71,9 +79,27 @@ impl DbotterApp {
             }
             self.model.fold(event);
         }
+        if let Some(editor) = self.profile_editor.as_mut() {
+            editor.set_config_uncertain(self.model.is_config_uncertain());
+        }
+    }
+
+    fn submit_refresh(&mut self) {
+        let operation_id = self.model.next_operation();
+        match self
+            .port
+            .try_submit(UiCommand::RefreshProfiles { operation_id })
+        {
+            Ok(()) => self.model.status = "Reloading profiles…".to_owned(),
+            Err(error) => self.report_submit_error(error),
+        }
     }
 
     fn submit_test(&mut self, profile_id: ProfileId) {
+        if self.model.is_config_uncertain() {
+            self.model.status = "Reload profiles before using connections.".to_owned();
+            return;
+        }
         let Some(profile) = self
             .model
             .profiles
@@ -91,10 +117,13 @@ impl DbotterApp {
             self.model.status = "Connection test is already pending".to_owned();
             return;
         }
+        let profile_generation = profile.generation;
         let operation_id = self.model.next_operation();
         match self.port.try_submit(UiCommand::TestConnection {
             operation_id,
             profile_id: profile_id.clone(),
+            profile_generation,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
         }) {
             Ok(()) => {
                 self.model
@@ -107,6 +136,10 @@ impl DbotterApp {
     }
 
     fn submit_execute(&mut self) {
+        if self.model.is_config_uncertain() {
+            self.model.status = "Reload profiles before executing.".to_owned();
+            return;
+        }
         if self.model.pending_execute.is_some() {
             self.model.status = "Execute is already pending".to_owned();
             return;
@@ -126,16 +159,18 @@ impl DbotterApp {
         }
         let operation_id = self.model.next_operation();
         let profile_id = profile.id;
+        let profile_generation = profile.generation;
         match self.port.try_submit(UiCommand::Execute {
             operation_id,
             profile_id: profile_id.clone(),
+            profile_generation,
             language: profile.driver.language(),
             text,
             row_limit: DEFAULT_ROW_LIMIT,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         }) {
             Ok(()) => {
-                self.model.pending_execute = Some((operation_id, profile_id));
+                self.model.pending_execute = Some((operation_id, profile_id, profile_generation));
                 self.model.status = "Executing…".to_owned();
             }
             Err(error) => self.report_submit_error(error),
@@ -156,18 +191,31 @@ impl DbotterApp {
             .show(root_ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.heading("Connections");
-                    if ui.small_button("+ MySQL").clicked() {
+                    let actions_enabled = !self.model.is_config_uncertain();
+                    if ui
+                        .add_enabled(actions_enabled, egui::Button::new("+ MySQL").small())
+                        .clicked()
+                    {
                         let draft_id = self.allocate_draft_id();
                         self.profile_editor = Some(ProfileEditor::new(draft_id, DriverKind::MySql));
                     }
-                    if ui.small_button("+ Redis").clicked() {
+                    if ui
+                        .add_enabled(actions_enabled, egui::Button::new("+ Redis").small())
+                        .clicked()
+                    {
                         let draft_id = self.allocate_draft_id();
                         self.profile_editor = Some(ProfileEditor::new(draft_id, DriverKind::Redis));
                     }
-                    if ui.small_button("+ MongoDB").clicked() {
+                    if ui
+                        .add_enabled(actions_enabled, egui::Button::new("+ MongoDB").small())
+                        .clicked()
+                    {
                         let draft_id = self.allocate_draft_id();
                         self.profile_editor =
                             Some(ProfileEditor::new(draft_id, DriverKind::MongoDb));
+                    }
+                    if ui.small_button("Reload").clicked() {
+                        self.submit_refresh();
                     }
                 });
                 ui.separator();
@@ -193,18 +241,22 @@ impl DbotterApp {
             ui.small(format!("database: {database}"));
         }
         let state = self.model.connection_state(&profile.id).clone();
+        let actions_enabled = !self.model.is_config_uncertain();
         ui.horizontal(|ui| {
             ui.label(connection_label(&state));
             if ui
                 .add_enabled(
-                    profile.is_ready() && !state.is_pending(),
+                    actions_enabled && profile.is_ready() && !state.is_pending(),
                     egui::Button::new("Test"),
                 )
                 .clicked()
             {
                 self.submit_test(profile.id.clone());
             }
-            if ui.button("Edit").clicked() {
+            if ui
+                .add_enabled(actions_enabled, egui::Button::new("Edit"))
+                .clicked()
+            {
                 let draft_id = self.allocate_draft_id();
                 self.profile_editor = Some(ProfileEditor::edit(
                     draft_id,
@@ -251,6 +303,9 @@ impl DbotterApp {
                             SaveAttempt::Disconnected => {
                                 self.model.status = "Service is unavailable".to_owned();
                             }
+                            SaveAttempt::ConfigUncertain => {
+                                self.model.status = "Reload profiles before saving.".to_owned();
+                            }
                             SaveAttempt::AlreadyPending(_) => {
                                 self.model.status = "Profile save is already pending".to_owned();
                             }
@@ -273,7 +328,8 @@ impl DbotterApp {
                     ));
                 }
             });
-            ui.add(
+            ui.add_enabled(
+                !self.model.is_config_uncertain(),
                 egui::TextEdit::multiline(&mut self.model.editor_text)
                     .code_editor()
                     .desired_rows(10)
@@ -284,7 +340,8 @@ impl DbotterApp {
                 .model
                 .selected_profile_snapshot()
                 .is_some_and(ProfileSnapshot::is_ready)
-                && self.model.pending_execute.is_none();
+                && self.model.pending_execute.is_none()
+                && !self.model.is_config_uncertain();
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(execute_enabled, egui::Button::new("Execute"))
@@ -292,7 +349,7 @@ impl DbotterApp {
                 {
                     self.submit_execute();
                 }
-                if let Some((operation_id, _)) = &self.model.pending_execute {
+                if let Some((operation_id, _, _)) = &self.model.pending_execute {
                     ui.spinner();
                     ui.label(format!("operation {}", operation_id.0));
                 }
@@ -326,10 +383,14 @@ fn connection_label(state: &ConnectionState) -> String {
     match state {
         ConnectionState::Disconnected => "● Disconnected".to_owned(),
         ConnectionState::Pending(_) => "◌ Connecting…".to_owned(),
-        ConnectionState::Connected { elapsed_ms } => format!("● Connected · {elapsed_ms} ms"),
+        ConnectionState::Connected { elapsed_ms, .. } => {
+            format!("● Connected · {elapsed_ms} ms")
+        }
+        ConnectionState::NeedsCredential => "● Credential required".to_owned(),
         ConnectionState::Failed { summary } => {
             format!("● Failed · {}", summary.message())
         }
+        ConnectionState::Closing => "◌ Closing…".to_owned(),
     }
 }
 
@@ -446,7 +507,7 @@ mod tests {
         let mut app = DbotterApp::new(ui);
         assert!(matches!(
             service.try_next_command(),
-            Some(UiCommand::RefreshProfiles)
+            Some(UiCommand::RefreshProfiles { .. })
         ));
         app.model.profiles = vec![profile(DriverKind::MySql, DriverAvailability::Ready)];
         app.model.selected_profile = Some(ProfileId("profile".to_owned()));
@@ -474,6 +535,27 @@ mod tests {
         app.submit_execute();
 
         assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn config_uncertain_submits_neither_profile_network_work_nor_execute() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        app.model.profiles = vec![profile(DriverKind::MySql, DriverAvailability::Ready)];
+        app.model.selected_profile = Some(ProfileId("profile".to_owned()));
+        app.model.editor_text = "SELECT 1".to_owned();
+        app.model.fold(crate::ui::UiEvent::ConfigUncertain {
+            operation_id: crate::model::OperationId(10),
+        });
+
+        app.submit_test(ProfileId("profile".to_owned()));
+        app.submit_execute();
+
+        assert!(
+            service.try_next_command().is_none(),
+            "configuration uncertainty must block test and execute at the UI boundary"
+        );
     }
 
     #[test]

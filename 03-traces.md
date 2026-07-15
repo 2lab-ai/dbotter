@@ -1,8 +1,8 @@
 # dbotter — authoritative vertical trace index
 
-Status: **P1 foundation independently reviewed GREEN. T0 remains RED overall;
-T1, T2, T8, and T9 are Implementing; T3–T7 and T10 are Not started.** Update
-this document before changing cross-layer behavior.
+Status: **P1 and P2 foundations independently reviewed GREEN. T0 remains RED
+overall; T1, T2, T3, T8, and T9 are Implementing; T4–T7 and T10 are Not
+started.** Update this document before changing cross-layer behavior.
 
 The frozen normative trace is `docs/usable-mvp/trace.md` at SHA-256
 `91bfbe89874e88e2c97c7252073cbf7348778192f2a6a349a68b903e1baceaa4`.
@@ -30,14 +30,14 @@ Allowed implementation states are `Not started`, `RED`, `Implementing`,
 |---|---|---|---|---|
 | T0 | v1 read-only load, v2 migration/reload, first run | P1/P6 | RED (P1 config GREEN; P6 remains) | config/frozen-reader/RawInput |
 | T1 | Create/Edit, credential intent, unsaved draft Test | P1/P6 | Implementing (P1 core GREEN; P6 remains) | matrix/draft isolation/AX |
-| T2 | confirmed atomic profile delete | P1/P2/P6 | Implementing (P1 core GREEN; P2/P6 remain) | failpoint/order/tombstone/AX |
-| T3 | controller, reload, connect/disconnect/reconnect/shutdown | P2/P6 | Not started | state/cache/race/shutdown |
+| T2 | confirmed atomic profile delete | P1/P2/P6 | Implementing (P1/P2 core GREEN; P6 remains) | failpoint/order/tombstone/AX |
+| T3 | controller, reload, connect/disconnect/reconnect/shutdown | P2/P6 | Implementing (P2 core GREEN; P6 native/AX remains; not fully GREEN/Verified) | state/cache/race/shutdown/AX |
 | T4 | exact target, prepared-only execute, cancel | P3/P6 | Not started | scanner/source/live/RawInput |
 | T5 | lazy paginated MySQL catalog | P4/P6 | Not started | hermetic + mandatory live + CLI |
 | T6 | Redis SCAN/inspect and verified TLS | P5/P6 | Not started | hermetic + auth/TLS live + CLI |
 | T7 | result/copy/streaming atomic export | P7 | Not started | byte goldens/filesystem failpoints |
 | T8 | static errors, total recovery, accessibility | P1/P6 | Implementing (P1 core GREEN; P6 remains) | Cartesian table/RawInput/AccessKit |
-| T9 | restart and credential availability | P1/P2/P6 | Implementing (P1 core GREEN; P2/P6 remain) | restart contract + installed AX |
+| T9 | restart and credential availability | P1/P2/P6 | Implementing (P1/P2 core GREEN; P6 remains) | restart contract + installed AX |
 | T10 | CI/manifest/preview/tap/Brew/installed journey | P8/P9 | Not started | source/artifact/process/receipt chain |
 
 ## Approved vocabulary and correlation
@@ -107,8 +107,9 @@ P6 evidence is the complete native intent journey and AX ids.
 
 ## T2 — confirmed atomic profile delete
 
-Status: **Implementing** — P1 atomic config-delete/reconciliation evidence is
-GREEN; P2/P6 remain. Contract source: frozen trace T2; slices P1/P2/P6.
+Status: **Implementing** — P1 atomic config-delete/reconciliation and P2
+tombstone/controller lifecycle evidence are GREEN; P6 remains. Contract source:
+frozen trace T2; slices P1/P2/P6.
 
 Opening/cancelling confirmation is side-effect free. With active work the
 dialog names static OperationKind and says dbotter stops waiting while the
@@ -118,12 +119,16 @@ server state Unknown. Pre-rename failure changes nothing; post-rename
 durability uncertainty reloads and reconciles.
 
 P1 GREEN evidence covers config failpoint barriers, unrelated-profile
-preservation, and durability-unknown reconciliation. Remaining evidence is P2
-tombstone/controller ordering and restart behavior plus P6 dialog/AX coverage.
+preservation, and durability-unknown reconciliation. P2 GREEN evidence covers
+tombstone publication, exact generation fences, active-work cancellation/join,
+exact-session cleanup, correlated deletion, and known-versus-Unknown server
+state. Remaining evidence is P6 dialog/AX coverage.
 
 ## T3 — controller, reload, connection lifecycle, and shutdown
 
-Status: **Not started**. Contract source: frozen trace T3 and §3; slices P2/P6.
+Status: **Implementing** — P2 core is independently reviewed GREEN; P6 native/
+AX work remains, so T3 is not fully GREEN or Verified. Contract source: frozen
+trace T3 and §3; slices P2/P6.
 
 The bounded mutation/work/control/event lanes, per-profile/global permits,
 tagged task registry, cache generations, reload diff, Config uncertain barrier,
@@ -133,9 +138,22 @@ session generation. Cancel/timeout reports Unknown and compare-removes only the
 used generation. Shutdown drains secret-bearing queues and joins async,
 mutation, and cooperative export work without detaching tasks.
 
-RED owner/evidence: deterministic barrier/model races, full lane behavior,
-panic/JoinError, permit/registry cleanup, no-lock-across-await, reload cases,
-cache table, and secret final-Arc drop.
+P2 GREEN evidence proves:
+
+- monotonic profile/session generations, fingerprinted cache identity, and
+  exact generation/session compare-remove;
+- bounded 32/16/16/128 work/mutation/control/event lanes, one profile and four
+  global network permits, reserve-before-spawn, and coalesced control;
+- tombstone/reload diff behavior and the Config uncertain barrier;
+- exact cancel/timeout/panic/full/closed cleanup with correlated terminal
+  events, including predecessor-event fences;
+- network-only two-second abort, durable mutation/cooperative-export joins, no
+  detached task, and actual `ui::run` shutdown.
+
+P3 remains Not started: Execute is fail-closed before session acquisition and
+no typed execution/resource capability is claimed. Remaining T3 evidence is P6
+native intent, RawInput/AccessKit, and installed AX coverage; no visual-style
+implementation is claimed by this checkpoint.
 
 ## T4 — exact target, prepared-only execution, and cancel
 
@@ -245,8 +263,9 @@ RawInput/AccessKit/contrast/disclosure suites, and installed recovery journey.
 
 ## T9 — restart and credential availability
 
-Status: **Implementing** — P1 config/credential restart foundation is GREEN;
-P2/P6 remain. Contract source: frozen trace T9; slices P1/P2/P6.
+Status: **Implementing** — P1 config/credential and P2 fresh-runtime lifecycle
+foundations are GREEN; P6 remains. Contract source: frozen trace T9; slices
+P1/P2/P6.
 
 Restart reloads version 2 and creates fresh runtime generations/cache/store/
 workspace. Profiles and Redis TLS fields persist; session secrets/results/
@@ -255,9 +274,9 @@ Keep disabled, Replace default, Forget available. Environment shows
 Available/Missing/Empty without value exposure.
 
 P1 GREEN evidence covers persisted v2/TLS fields, migration backup/frozen-reader
-behavior, and session/environment credential availability foundations.
-Remaining evidence is the P2 fresh-runtime/reconnect lifecycle and P6 exact
-credential-intent/AX states.
+behavior, and session/environment credential availability foundations. P2
+GREEN evidence covers fresh runtime generations/cache and exact reconnect/
+shutdown lifecycle. Remaining evidence is P6 exact credential-intent/AX states.
 
 ## T10 — gated preview publication, Brew install, and installed proof
 
@@ -297,9 +316,9 @@ scan, and final conformance audit.
 
 ## Verification command routing
 
-Commands are fixed interfaces. The P1 foundation passed the checkpoint subset
-below; commands owned by later slices remain planned and must not be interpreted
-as passes.
+Commands are fixed interfaces. The P1 and P2 foundations passed their recorded
+checkpoint subsets below; commands owned by later slices remain planned and
+must not be interpreted as passes.
 
 P0 document baseline:
 
@@ -308,7 +327,7 @@ shasum -a 256 docs/usable-mvp/spec.md docs/usable-mvp/trace.md docs/usable-mvp/p
 git diff --check
 ```
 
-P1 checkpoint (passed):
+Historical P1 checkpoint (passed):
 
 ```sh
 cargo fmt --all -- --check
@@ -325,6 +344,32 @@ This produced 136 passing regular tests and 12 passing doctests (also 12/12 in
 the separate doctest run), with production/test snapshot SHA-256 values
 `6ccd3ded9a82384ce92b823914e1b5e9f518886460fc0df1c6455ed6d9a327a9`
 and `dfacf608d773ca16dd4d25bdf0dc5bfb8f17926baf60d63bcadb1470ffb8114e`.
+
+P2 checkpoint (passed):
+
+```sh
+cargo fmt --all -- --check
+git diff --check
+./scripts/check-release-contract.sh
+sh scripts/test-receipt-contract.sh
+cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+cargo test --locked --offline --all-targets --all-features
+cargo test --doc --locked --offline --all-features
+cargo build --release --locked --offline --all-features
+```
+
+This produced 188 passing regular tests and 12 passing doctests: lib 48/48,
+controller 42/42, service 36/36, and source 4/4. Formatting, diff,
+release-contract, receipt, strict Clippy, all-target/all-feature tests,
+doctests, and release build passed. The final source+test review snapshot is
+`e987bbf1d8a7f919cf53b95e882e0fa7b072d4226d7bb5e99e5e06d4dda65378`;
+two independent reviewers each reported `NO P2 BLOCKER`.
+
+```text
+279757012280ab7bdcb90b547242114c80efcff3b64c26b7dcff4e3abb78fa9d  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
+467982ee06068fe8fee669cc20e43ca05b1a0f72129c69137743c70d3eecce1b  tests snapshot (tests)
+65ec73f1138587364005a1304fdd55006f85813283390fb3fd0f32f746183f3e  target/release/dbotter
+```
 
 Full source/hermetic interface for later slice claims:
 
@@ -355,9 +400,10 @@ trace row before that row may become Verified.
 
 ## Conformance record
 
-P0 changed documentation only. The independently reviewed P1 foundation is
-GREEN, but no complete runtime journey is claimed GREEN: T0 remains RED and
-T1/T2/T8/T9 remain Implementing until their listed P2/P6 evidence lands. Any
-production deviation is recorded here before code with an
+P0 changed documentation only. The independently reviewed P1 and P2
+foundations are GREEN, but no complete native journey is claimed GREEN: T0
+remains RED; T1/T8 remain Implementing for P6; and T2/T3/T9 remain Implementing
+for P6 native/AX evidence. P3–P9 remain Not started, and Execute stays
+fail-closed. Any production deviation is recorded here before code with an
 ADDED/MODIFIED/REMOVED/RENAMED classification, affected trace ids, migration
 impact, and contract evidence.

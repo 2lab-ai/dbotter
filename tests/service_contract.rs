@@ -21,10 +21,41 @@ use dbotter::secrets::{
     ReplacementSecretBuffer, SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate,
 };
 use dbotter::service::{
-    ApplicationService, CreateProfileRequest, DeleteProfileRequest, ProfileValidationError,
-    SecretResolver, ServiceError, SessionConnector, SessionHandle, UpdateProfileRequest,
-    validate_config_mutation,
+    ApplicationService, CheckOutcome, CreateProfileRequest, DeleteProfileRequest, ExecuteOutcome,
+    ProfileValidationError, SecretResolver, ServiceError, SessionConnector, SessionHandle,
+    UpdateProfileRequest, validate_config_mutation,
 };
+
+#[async_trait]
+trait CurrentGenerationTestExt {
+    async fn check(
+        &self,
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        timeout: Duration,
+    ) -> Result<CheckOutcome, ServiceError>;
+
+    async fn execute(&self, request: ExecuteRequest) -> Result<ExecuteOutcome, ServiceError>;
+}
+
+#[async_trait]
+impl CurrentGenerationTestExt for ApplicationService {
+    async fn check(
+        &self,
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        timeout: Duration,
+    ) -> Result<CheckOutcome, ServiceError> {
+        let generation = self.profile_generation(&profile_id).await?;
+        self.check_at(operation_id, profile_id, generation, timeout)
+            .await
+    }
+
+    async fn execute(&self, request: ExecuteRequest) -> Result<ExecuteOutcome, ServiceError> {
+        let generation = self.profile_generation(&request.profile_id).await?;
+        self.execute_at(request, generation).await
+    }
+}
 
 #[derive(Default)]
 struct FakeSession {

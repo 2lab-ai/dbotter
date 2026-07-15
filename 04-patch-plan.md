@@ -1,8 +1,8 @@
 # dbotter — usable MVP implementation and conformance plan
 
-Status: **P0 documentation baseline complete. P1 foundation is independently
-reviewed GREEN. T0 remains RED overall; T1/T2/T8/T9 are Implementing; P2–P9
-and T3–T7/T10 are Not started.**
+Status: **P0 documentation baseline complete. P1 and P2 foundations are
+independently reviewed GREEN. T0 remains RED overall; T1/T2/T3/T8/T9 are
+Implementing; P3–P9 and T4–T7/T10 are Not started.**
 
 This file routes implementation work. The full ordered plan is frozen at
 `docs/usable-mvp/plan.md`; this repository-facing ledger must not weaken it.
@@ -49,7 +49,7 @@ substitute for a slice's RED/GREEN/live/installed evidence.
 |---|---|---|---|
 | P0 | approve/reconcile repository and release contracts | all routing | Complete (docs) |
 | P1 | config/profile/credential/public-error foundation | T0, T1, T2, T8, T9 | GREEN (independently reviewed foundation) |
-| P2 | generations/cache/controller/reload/shutdown | T2, T3, T9 | Not started |
+| P2 | generations/cache/controller/reload/shutdown | T2, T3, T9 | GREEN (independently reviewed foundation) |
 | P3 | typed prepared execution/resource/result/CLI seams | T4, shared T5/T6 | Not started |
 | P4 | lazy paginated MySQL catalog | T5 | Not started |
 | P5 | Redis SCAN/inspect and verified Required TLS | T6 | Not started |
@@ -113,10 +113,12 @@ The independently reviewed P1 checkpoint implemented and proved:
 - closed public errors and exhaustive
   `OperationKind × PublicSummary -> NonEmpty<RecoveryAction>`.
 
-P1 provides only the service-level observed-state/cache race foundations needed
-by its owned contracts; the full concurrent controller remains P2. T0 therefore
-stays RED pending P6 first-run RawInput/AccessKit, while T1/T2/T8/T9 stay
-Implementing pending their explicit P2/P6 owners.
+At the historical P1 checkpoint, P1 provided only the service-level observed-
+state/cache race foundations needed by its owned contracts; the full concurrent
+controller remained assigned to P2. P2 has since reached the independently
+reviewed GREEN checkpoint recorded below. T0 remains RED for P6 first-run
+RawInput/AccessKit; T1/T8 remain Implementing for P6; and T2/T3/T9 remain
+Implementing for P6 native/AX evidence.
 
 Checkpoint gates passed:
 
@@ -143,11 +145,50 @@ dfacf608d773ca16dd4d25bdf0dc5bfb8f17926baf60d63bcadb1470ffb8114e  tests snapshot
 
 ## P2 — controller and lifecycle
 
-Implement only after P1 integration. Required RED contracts include monotonic
-profile/session generations, tombstones, exact state/cache table, tagged
-`RegisteredTask` scopes, bounded lanes/permits, control priority, compare-remove
-races, reload/Config uncertain, panic/event-lane cleanup, and async versus
-blocking shutdown. No lock may cross await and no task may detach.
+The independently reviewed P2 checkpoint implemented and proved:
+
+- monotonic profile/session generations and fingerprinted cache identity with
+  exact profile/session-generation compare-remove;
+- tagged `RegisteredTask` scopes; bounded 32/16/16/128 work/mutation/control/
+  event lanes; one-profile/four-global network limits; reserve-before-spawn;
+  control priority and coalescing;
+- tombstones, exact reload diff, Config uncertain fencing, and fresh-runtime
+  lifecycle;
+- cancel/timeout/panic/full/closed cleanup with exact terminal correlation and
+  no stale predecessor event overwriting newer pending/connected state;
+- network-only two-second abort, durable mutation/cooperative-export join, no
+  detached task, and actual `ui::run` shutdown.
+
+P2 is GREEN only for that runtime foundation. T2, T3, and T9 remain
+Implementing because P6 native/RawInput/AccessKit and installed AX evidence
+remain. No P6 visual-style implementation is claimed. P3–P9 remain Not started;
+Execute remains fail-closed before session acquisition.
+
+Checkpoint gates passed:
+
+```sh
+cargo fmt --all -- --check
+git diff --check
+./scripts/check-release-contract.sh
+sh scripts/test-receipt-contract.sh
+cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+cargo test --locked --offline --all-targets --all-features
+cargo test --doc --locked --offline --all-features
+cargo build --release --locked --offline --all-features
+```
+
+Evidence: 188 regular tests plus 12 doctests passed; focused totals were lib
+48/48, controller 42/42, service 36/36, and source 4/4. Formatting, diff,
+release-contract, receipt, strict Clippy, all-target/all-feature tests,
+doctests, and release build passed. The final source+test review snapshot was
+`e987bbf1d8a7f919cf53b95e882e0fa7b072d4226d7bb5e99e5e06d4dda65378`;
+two independent reviewers each returned `NO P2 BLOCKER`.
+
+```text
+279757012280ab7bdcb90b547242114c80efcff3b64c26b7dcff4e3abb78fa9d  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
+467982ee06068fe8fee669cc20e43ca05b1a0f72129c69137743c70d3eecce1b  tests snapshot (tests)
+65ec73f1138587364005a1304fdd55006f85813283390fb3fd0f32f746183f3e  target/release/dbotter
+```
 
 ## P3 — typed execution/resource seam
 
@@ -193,10 +234,10 @@ higher preview after exact config-contract preflight; tags/assets are immutable.
 
 ## Fixed verification interfaces
 
-The following commands are the full interfaces for later slice claims. P1's
-passed checkpoint subset is recorded above. A missing command or failure is
-evidence that its owning slice is not Verified, not permission to weaken the
-contract.
+The following commands are the full interfaces for later slice claims. P1 and
+P2 passed checkpoint subsets are recorded above. A missing command or failure
+is evidence that its owning slice is not Verified, not permission to weaken
+the contract.
 
 ### Source and hermetic
 

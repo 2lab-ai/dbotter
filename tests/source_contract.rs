@@ -36,6 +36,106 @@ fn every_production_ast_region_has_no_panicking_placeholder_or_legacy_upsert() {
     }
 }
 
+#[test]
+fn p2_controller_identity_and_secret_boundaries_are_structural() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let service = fs::read_to_string(root.join("src/service.rs")).expect("service source");
+    let runtime = fs::read_to_string(root.join("src/ui/runtime.rs")).expect("runtime source");
+    let ui = fs::read_to_string(root.join("src/ui/mod.rs")).expect("ui source");
+    let compact_ui = ui
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+
+    assert!(service.contains("struct CachedSession"));
+    assert!(
+        service.contains("state: Arc<RwLock<ServiceState>>"),
+        "observed generations and cached-session metadata need one atomic lock domain"
+    );
+    assert!(!service.contains("observed: Arc<RwLock<ObservedState>>"));
+    assert!(!service.contains("sessions: Arc<RwLock<HashMap<ProfileId, CachedSession>>>"));
+    for field in [
+        "profile_generation: ProfileGeneration",
+        "session_generation: SessionGeneration",
+        "connection_fingerprint: ConnectionFingerprint",
+    ] {
+        assert!(
+            service.contains(field),
+            "missing cache identity field {field}"
+        );
+    }
+    assert!(
+        !service.contains("#[derive(Clone)]\npub struct SessionLease"),
+        "raw session lease must not be cloneable"
+    );
+    assert!(
+        !service.contains("pub async fn check(\n"),
+        "public saved-profile work must require an explicit generation"
+    );
+    assert!(
+        !service.contains("pub async fn execute(&self"),
+        "public saved-profile execution must require an explicit generation"
+    );
+    assert!(runtime.contains("pub struct RegisteredTask"));
+    for field in ["operation_id", "scope", "cancel", "join"] {
+        assert!(
+            runtime.contains(field),
+            "missing registered-task field {field}"
+        );
+    }
+    assert!(runtime.contains("tokio::select!"));
+    assert!(runtime.contains("biased;"));
+    assert!(
+        ui.contains("pub async fn run"),
+        "native wrapper must remain alive to join controller shutdown"
+    );
+    assert!(
+        ui.contains("request_shutdown") && compact_ui.contains("runtime.wait().await"),
+        "eframe return must signal and await runtime before Tokio teardown"
+    );
+    assert!(
+        !ui.contains("_runtime"),
+        "dropping a JoinHandle must not be the native shutdown strategy"
+    );
+}
+
+#[test]
+fn config_uncertain_native_controls_keep_only_reload_and_shutdown_available() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let app = fs::read_to_string(root.join("src/ui/app.rs")).expect("app source");
+    let profile_form =
+        fs::read_to_string(root.join("src/ui/profile_form.rs")).expect("profile form source");
+
+    assert!(
+        app.contains("is_config_uncertain") && app.contains("Reload"),
+        "native app must derive action availability from config certainty and expose reload"
+    );
+    assert!(
+        profile_form.contains("ConfigUncertain")
+            && profile_form.contains("actions_enabled")
+            && profile_form.contains("config_uncertain"),
+        "profile save controls must close when config state becomes uncertain"
+    );
+}
+
+#[test]
+fn runtime_mutation_failure_carrier_stays_internal_and_non_debug() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let service = fs::read_to_string(root.join("src/service.rs")).expect("service source");
+
+    assert!(service.contains("pub(crate) struct RuntimeMutationFailure"));
+    assert!(
+        !service.contains("#[derive(Debug)]\npub(crate) struct RuntimeMutationFailure")
+            && !service.contains("impl Debug for RuntimeMutationFailure")
+            && !service.contains("impl fmt::Debug for RuntimeMutationFailure"),
+        "the failure carrier may contain deferred secret updates and must not be debug-formattable"
+    );
+    assert!(
+        !service.contains("pub struct RuntimeMutationFailure"),
+        "the deferred cleanup carrier must not cross the crate API boundary"
+    );
+}
+
 fn production_tokens(path: &Path) -> String {
     let source = fs::read_to_string(path).expect("source reads");
     let parsed = syn::parse_file(&source).expect("production Rust parses");

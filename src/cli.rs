@@ -100,7 +100,7 @@ pub async fn run(cli: Cli) -> Result<(), AppError> {
 
 async fn run_with_config(command: Command, config_path: PathBuf) -> Result<(), AppError> {
     match command {
-        Command::Gui => run_gui(config_path),
+        Command::Gui => run_gui(config_path).await,
         Command::Check {
             profile,
             format,
@@ -148,8 +148,10 @@ async fn check(
     format: OutputFormat,
     timeout: Duration,
 ) -> Result<(), AppError> {
+    let profile_id = ProfileId(profile_id.to_owned());
+    let profile_generation = service.profile_generation(&profile_id).await?;
     let outcome = service
-        .check(OperationId(1), ProfileId(profile_id.to_owned()), timeout)
+        .check_at(OperationId(1), profile_id, profile_generation, timeout)
         .await?;
     let receipt = CheckReceipt {
         status: "ok",
@@ -174,15 +176,19 @@ async fn execute(
 ) -> Result<(), AppError> {
     let profile_id = ProfileId(profile_id.to_owned());
     let language = service.language_for(&profile_id).await?;
+    let profile_generation = service.profile_generation(&profile_id).await?;
     let outcome = service
-        .execute(ExecuteRequest {
-            operation_id: OperationId(1),
-            profile_id,
-            language,
-            text,
-            row_limit,
-            timeout,
-        })
+        .execute_at(
+            ExecuteRequest {
+                operation_id: OperationId(1),
+                profile_id,
+                language,
+                text,
+                row_limit,
+                timeout,
+            },
+            profile_generation,
+        )
         .await?;
     let receipt = ExecReceipt::from_result(
         "ok",
@@ -206,12 +212,12 @@ fn print_json(value: &impl serde::Serialize) -> Result<(), AppError> {
 }
 
 #[cfg(feature = "desktop")]
-fn run_gui(config_path: PathBuf) -> Result<(), AppError> {
-    crate::ui::run(config_path)
+async fn run_gui(config_path: PathBuf) -> Result<(), AppError> {
+    crate::ui::run(config_path).await
 }
 
 #[cfg(not(feature = "desktop"))]
-fn run_gui(_config_path: PathBuf) -> Result<(), AppError> {
+async fn run_gui(_config_path: PathBuf) -> Result<(), AppError> {
     Err(AppError::DesktopDisabled)
 }
 

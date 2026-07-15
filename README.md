@@ -5,20 +5,26 @@ Redis preview. MongoDB remains honestly Planned.
 
 ## Current status
 
-The approved contract and P1 foundation are complete at this checkpoint:
+The approved contract and P1/P2 foundations are complete at this checkpoint:
 
 - P0 repository documentation baseline: complete;
 - P1 config/profile/credential/public-error foundation: independently reviewed
   GREEN;
+- P2 generations/cache/controller/reload/shutdown: independently reviewed
+  GREEN;
 - T0 overall: RED because P6 first-run RawInput/AccessKit proof is missing; the
   P1 config portion is GREEN;
-- T1, T2, T8, and T9: Implementing with P1 core evidence complete and their
-  remaining P2/P6 ownership explicit in `03-traces.md`;
-- T3–T7, T10, and P2–P9: Not started.
+- T1 and T8: Implementing with P1 core GREEN and P6 remaining;
+- T2: Implementing with P1/P2 core GREEN and P6 remaining;
+- T3: Implementing with P2 core GREEN and P6 native/AX work remaining; it is
+  not fully GREEN or Verified;
+- T9: Implementing with P1/P2 core GREEN and P6 remaining;
+- T4–T7 and T10, and slices P3–P9: Not started.
 
-The P1 checkpoint is evidence for that foundation only. Historical demo code
-and release machinery remain **not** proof of the remaining usable MVP or of an
-installed/verified preview.
+The P2 checkpoint is evidence for its bounded runtime foundation only. Execute
+remains fail-closed until P3, and P6 native accessibility and visual work remain
+future work. Historical demo code and release machinery remain **not** proof of
+the remaining usable MVP or of an installed/verified preview.
 
 ## Contract map
 
@@ -56,31 +62,34 @@ MongoDB stays disabled/Planned. Query history, editable grids, transactions,
 SSH/proxy, import, ER diagrams, AI, keychain persistence, and stable publication
 are not part of this task.
 
-## P1 checkpoint verification
+## P2 checkpoint verification
 
-The independently reviewed P1 foundation passed the following local gates:
+The cumulative P1/P2 checkpoint passed the following local gates:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features --offline -- -D warnings
-cargo test --all-features --offline
-cargo test --doc --all-features --offline
-cargo build --release --all-features --offline
-cargo test --test source_contract --all-features --offline
-sh scripts/test-receipt-contract.sh
 git diff --check
+./scripts/check-release-contract.sh
+sh scripts/test-receipt-contract.sh
+cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+cargo test --locked --offline --all-targets --all-features
+cargo test --doc --locked --offline --all-features
+cargo build --release --locked --offline --all-features
 ```
 
-The full test run passed 136 regular tests and 12 doctests; the separate
-doctest run passed 12/12. The source contract passed 1/1, and the receipt
-contract, strict Clippy, formatting, and release build gates passed.
+The final run passed 188 regular tests and 12 doctests. Focused counts were
+lib 48/48, controller 42/42, service 36/36, and source 4/4. Formatting, diff,
+release-contract, receipt, strict Clippy, all-target/all-feature tests,
+doctests, and the release build passed. Two independent final reviewers each
+reported `NO P2 BLOCKER` against source+test review snapshot
+`e987bbf1d8a7f919cf53b95e882e0fa7b072d4226d7bb5e99e5e06d4dda65378`.
 
 Checkpoint SHA-256 values:
 
 ```text
-6ccd3ded9a82384ce92b823914e1b5e9f518886460fc0df1c6455ed6d9a327a9  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
-dfacf608d773ca16dd4d25bdf0dc5bfb8f17926baf60d63bcadb1470ffb8114e  tests snapshot (tests)
-80c8a75e35103a498fa845591c4418b038ac19c68b3d34aef50cf075dc765bb1  target/release/dbotter
+279757012280ab7bdcb90b547242114c80efcff3b64c26b7dcff4e3abb78fa9d  production snapshot (Cargo.toml, Cargo.lock, build.rs, src)
+467982ee06068fe8fee669cc20e43ca05b1a0f72129c69137743c70d3eecce1b  tests snapshot (tests)
+65ec73f1138587364005a1304fdd55006f85813283390fb3fd0f32f746183f3e  target/release/dbotter
 ```
 
 The snapshots are reproducible with the tracked-plus-untracked file list in

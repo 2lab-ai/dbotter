@@ -3,8 +3,17 @@ mod app;
 mod model;
 mod profile_form;
 mod runtime;
+#[cfg(test)]
+mod runtime_contract_tests;
 
-pub use adapter::UiCommand;
+pub use adapter::{
+    CONTROL_CAPACITY, EVENT_CAPACITY, MUTATION_CAPACITY, ServicePort, SubmitError, UiCommand,
+    UiPort, WORK_CAPACITY, bounded_ports, controller_ports,
+};
+pub use model::{
+    ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot, UiEvent, UiModel,
+};
+pub use runtime::{RegisteredTask, RuntimeHandle, TaskScope, spawn_with_service};
 
 use crate::error::AppError;
 
@@ -15,10 +24,11 @@ fn app_icon() -> Result<eframe::egui::IconData, AppError> {
         .map_err(|error| AppError::Desktop(format!("invalid embedded app icon: {error}")))
 }
 
-pub fn run(config_path: std::path::PathBuf) -> Result<(), AppError> {
+pub async fn run(config_path: std::path::PathBuf) -> Result<(), AppError> {
     let icon = app_icon()?;
-    let (ui, service) = adapter::bounded_ports(64);
-    runtime::spawn(service, config_path);
+    let (ui, service) = adapter::controller_ports();
+    let shutdown = ui.shutdown_requester();
+    let runtime = runtime::spawn(service, config_path);
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
@@ -26,12 +36,19 @@ pub fn run(config_path: std::path::PathBuf) -> Result<(), AppError> {
             .with_icon(icon),
         ..eframe::NativeOptions::default()
     };
-    eframe::run_native(
+    let native_result = eframe::run_native(
         "dbotter",
         options,
         Box::new(move |_| Ok(Box::new(app::DbotterApp::new(ui)))),
     )
-    .map_err(|error| AppError::Desktop(error.to_string()))
+    .map_err(|error| AppError::Desktop(error.to_string()));
+    let _ = shutdown.request_shutdown();
+    let runtime_result = runtime
+        .wait()
+        .await
+        .map_err(|error| AppError::Desktop(format!("controller runtime failed: {error}")));
+    native_result?;
+    runtime_result
 }
 
 #[cfg(test)]
@@ -47,6 +64,19 @@ mod tests {
         assert_eq!(
             dimensions,
             Ok((1254, 1254, 1254_usize * 1254_usize * 4_usize))
+        );
+    }
+
+    #[test]
+    fn native_shutdown_requester_survives_ui_port_move() {
+        let (ui, service) = adapter::controller_ports();
+        let shutdown = ui.shutdown_requester();
+        drop(ui);
+
+        assert_eq!(shutdown.request_shutdown(), Ok(()));
+        assert_eq!(
+            *service.shutdown_rx.borrow(),
+            Some(crate::model::OperationId(u64::MAX))
         );
     }
 }

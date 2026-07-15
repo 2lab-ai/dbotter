@@ -1,8 +1,9 @@
 # dbotter — usable MVP product contract
 
-Status: **P1 foundation independently reviewed GREEN. T0 remains RED overall;
-T1, T2, T8, and T9 are Implementing; T3–T7 and T10 are Not started.** This file
-describes the approved target and the bounded P1 implementation checkpoint.
+Status: **P1 and P2 foundations independently reviewed GREEN. T0 remains RED
+overall; T1, T2, T3, T8, and T9 are Implementing; T4–T7 and T10 are Not
+started.** This file describes the approved target and the bounded P1/P2
+implementation checkpoint.
 
 ## Authority and change control
 
@@ -44,14 +45,14 @@ copied.
 |---|---|---|
 | T0 | exact-path v1 read-only load, v2 migration/reload, first run | RED overall; P1 config GREEN, P6 RawInput/AX missing |
 | T1 | Create/Edit, credential intent, side-effect-free draft test | Implementing; P1 core GREEN, P6 remains |
-| T2 | confirmed atomic delete | Implementing; P1 core GREEN, P2/P6 remain |
-| T3 | controller, reload, connect/disconnect/reconnect/shutdown | Not started |
+| T2 | confirmed atomic delete | Implementing; P1/P2 core GREEN, P6 remains |
+| T3 | controller, reload, connect/disconnect/reconnect/shutdown | Implementing; P2 core GREEN, P6 native/AX remains; not fully GREEN/Verified |
 | T4 | exact target, prepared-only MySQL/Redis execute, cancel | Not started |
 | T5 | lazy paginated MySQL catalog | Not started |
 | T6 | Redis SCAN/inspect and verified Required TLS | Not started |
 | T7 | profile result, exact copy, streaming atomic export | Not started |
 | T8 | static errors, total recovery, native accessibility | Implementing; P1 core GREEN, P6 remains |
-| T9 | restart and credential availability | Implementing; P1 core GREEN, P2/P6 remain |
+| T9 | restart and credential availability | Implementing; P1/P2 core GREEN, P6 remains |
 | T10 | gated CI/release/tap/Brew/installed golden journey | Not started |
 
 Existing demo code or historical release artifacts are not evidence that a row
@@ -196,16 +197,30 @@ SSH/proxy tunnels, imports, ER diagrams, AI, multi-tab IDE behavior, keychain
 persistence, guaranteed server cancellation, and multi-process writer safety
 are out of scope. Stable publication is not part of this task.
 
-## P1 checkpoint verification
+## P2 checkpoint verification
 
-The P1 foundation is independently reviewed GREEN after 136 regular tests and
-12 doctests, strict Clippy, formatting, release build, source-contract, receipt-
-contract, and diff checks passed. The recorded production and test snapshot
-SHA-256 values are respectively:
+P2 is independently reviewed GREEN for generations/cache/controller/reload/
+shutdown. It proves exact monotonic generations, connection fingerprints and
+cache compare-remove; bounded 32/16/16/128 work/mutation/control/event lanes;
+one profile and four global network permits; reserve-before-spawn and coalesced
+control; tombstone/reload uncertainty fences; exact cancel/timeout/panic/full/
+closed cleanup; a network-only two-second abort with durable mutation/export
+join and actual `ui::run` shutdown; and operation-exact event folding. Execute
+remains fail-closed until P3. T0/T1/T2/T3/T8/T9 retain their P6 owners; no P6
+native/AX or visual-style completion is claimed.
+
+The final checkpoint passed formatting, diff, release-contract, receipt,
+strict locked/offline Clippy, all-target/all-feature tests, doctests, and the
+release build: 188 regular tests plus 12 doctests, including lib 48/48,
+controller 42/42, service 36/36, and source 4/4. Two independent reviewers each
+reported `NO P2 BLOCKER` against source+test review snapshot
+`e987bbf1d8a7f919cf53b95e882e0fa7b072d4226d7bb5e99e5e06d4dda65378`.
+The recorded production, test, and release-binary SHA-256 values are:
 
 ```text
-6ccd3ded9a82384ce92b823914e1b5e9f518886460fc0df1c6455ed6d9a327a9
-dfacf608d773ca16dd4d25bdf0dc5bfb8f17926baf60d63bcadb1470ffb8114e
+279757012280ab7bdcb90b547242114c80efcff3b64c26b7dcff4e3abb78fa9d  production snapshot
+467982ee06068fe8fee669cc20e43ca05b1a0f72129c69137743c70d3eecce1b  tests snapshot
+65ec73f1138587364005a1304fdd55006f85813283390fb3fd0f32f746183f3e  target/release/dbotter
 ```
 
 Frozen approval integrity remains checked with:

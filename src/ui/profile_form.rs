@@ -262,6 +262,7 @@ pub(super) enum SaveAttempt {
     Invalid,
     Busy,
     Disconnected,
+    ConfigUncertain,
     AlreadyPending(OperationId),
 }
 
@@ -280,6 +281,7 @@ pub(super) struct ProfileEditor {
     pub errors: ValidationErrors,
     status: String,
     pending_save: Option<(OperationId, ProfileId)>,
+    config_uncertain: bool,
 }
 
 impl ProfileEditor {
@@ -292,6 +294,7 @@ impl ProfileEditor {
             errors: ValidationErrors::default(),
             status: "New profile".to_owned(),
             pending_save: None,
+            config_uncertain: false,
         }
     }
 
@@ -313,6 +316,7 @@ impl ProfileEditor {
             errors: ValidationErrors::default(),
             status: "Editing profile".to_owned(),
             pending_save: None,
+            config_uncertain: false,
         }
     }
 
@@ -323,7 +327,16 @@ impl ProfileEditor {
     }
 
     pub fn actions_enabled(&self) -> bool {
-        self.draft.driver != DriverKind::MongoDb && self.pending_save.is_none()
+        !self.config_uncertain
+            && self.draft.driver != DriverKind::MongoDb
+            && self.pending_save.is_none()
+    }
+
+    pub fn set_config_uncertain(&mut self, config_uncertain: bool) {
+        self.config_uncertain = config_uncertain;
+        if config_uncertain {
+            self.status = "Reload profiles before saving.".to_owned();
+        }
     }
 
     pub fn status(&self) -> &str {
@@ -331,6 +344,10 @@ impl ProfileEditor {
     }
 
     pub fn try_save(&mut self, port: &UiPort, operation_id: OperationId) -> SaveAttempt {
+        if self.config_uncertain {
+            self.status = "Reload profiles before saving.".to_owned();
+            return SaveAttempt::ConfigUncertain;
+        }
         if let Some((pending, _)) = self.pending_save {
             self.status = "Save is already pending".to_owned();
             return SaveAttempt::AlreadyPending(pending);
@@ -403,11 +420,19 @@ impl ProfileEditor {
     }
 
     pub fn handle_event(&mut self, event: &UiEvent) -> ProfileEventResult {
+        if matches!(event, UiEvent::ConfigUncertain { .. }) {
+            self.set_config_uncertain(true);
+            return ProfileEventResult::Ignored;
+        }
+        if self.config_uncertain {
+            return ProfileEventResult::Ignored;
+        }
         match event {
             UiEvent::ProfileSaved {
                 operation_id,
                 profile_id,
                 warning,
+                ..
             } if self.pending_save.as_ref() == Some(&(*operation_id, profile_id.clone())) => {
                 self.pending_save = None;
                 self.status = warning.map_or_else(
@@ -430,6 +455,9 @@ impl ProfileEditor {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) -> FormAction {
+        if self.config_uncertain {
+            ui.disable();
+        }
         ui.heading(match self.mode {
             EditorMode::Add => "Add connection profile",
             EditorMode::Edit { .. } => "Edit connection profile",
@@ -902,7 +930,12 @@ mod tests {
     #[test]
     fn double_save_and_busy_channel_submit_at_most_once() {
         let (ui, mut service) = bounded_ports(1);
-        assert_eq!(ui.try_submit(UiCommand::RefreshProfiles), Ok(()));
+        assert_eq!(
+            ui.try_submit(UiCommand::RefreshProfiles {
+                operation_id: OperationId(99),
+            }),
+            Ok(())
+        );
         let mut editor = valid_editor(DriverKind::Redis);
         assert_eq!(editor.try_save(&ui, OperationId(1)), SaveAttempt::Busy);
         assert!(editor.pending_operation().is_none());
@@ -939,6 +972,25 @@ mod tests {
     }
 
     #[test]
+    fn config_uncertain_disables_profile_save_before_command_construction() {
+        let (ui, mut service) = bounded_ports(1);
+        let mut editor = valid_editor(DriverKind::MySql);
+        assert_eq!(
+            editor.handle_event(&UiEvent::ConfigUncertain {
+                operation_id: OperationId(40),
+            }),
+            ProfileEventResult::Ignored
+        );
+
+        assert!(!editor.actions_enabled());
+        let _ = editor.try_save(&ui, OperationId(41));
+        assert!(
+            service.try_next_command().is_none(),
+            "uncertain profile save must not enter the mutation lane"
+        );
+    }
+
+    #[test]
     fn save_event_is_correlated_for_refresh_selection() {
         let (ui, mut service) = bounded_ports(1);
         let mut editor = valid_editor(DriverKind::MySql);
@@ -951,6 +1003,9 @@ mod tests {
             editor.handle_event(&UiEvent::ProfileSaved {
                 operation_id: OperationId(9),
                 profile_id: ProfileId("local-profile".to_owned()),
+                previous_generation: None,
+                profile_generation: ProfileGeneration(1),
+                session_retained: false,
                 warning: None,
             }),
             ProfileEventResult::Saved(ProfileId("local-profile".to_owned()), None)
