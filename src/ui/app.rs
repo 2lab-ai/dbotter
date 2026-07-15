@@ -5353,4 +5353,95 @@ mod tests {
         assert!(service.try_next_command().is_none());
         assert_eq!(app.model.next_operation(), OperationId(2));
     }
+
+    #[test]
+    fn saved_environment_profile_reports_missing_without_exposing_a_value_and_gates_connect() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let mut profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        profile.persisted.credential_mode = CredentialMode::Environment;
+        profile.persisted.secret_env = Some("DBOTTER_G_DEFINITELY_MISSING".to_owned());
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let output = context.run_ui(RawInput::default(), |ui| app.profile_card(ui, &profile));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("saved environment profile AccessKit");
+        let (_, availability) = accesskit_author_node(update, "profile.environment.availability");
+        assert_eq!(availability.label(), Some("Environment credential"));
+        assert_eq!(availability.value(), Some("Missing"));
+        assert!(
+            accesskit_author_node(update, "connection.connect")
+                .1
+                .is_disabled(),
+            "a saved Environment profile may connect only when its name is Available"
+        );
+    }
+
+    #[test]
+    fn non_v1_profile_and_delete_surfaces_omit_migration_consent() {
+        let mut editor = ProfileEditor::new(DraftId(990), DriverKind::MySql);
+        let editor_context = Context::default();
+        editor_context.enable_accesskit();
+        let editor_output = editor_context.run_ui(RawInput::default(), |ui| {
+            let _ = editor.show(ui);
+        });
+        let editor_update = editor_output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("profile editor AccessKit");
+        assert!(
+            editor_update
+                .nodes
+                .iter()
+                .all(|(_, node)| node.author_id() != Some("profile.migration.confirm")),
+            "migration consent must be absent unless the loaded config is version 1"
+        );
+
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.open_delete_confirmation(&profile);
+        let delete_context = Context::default();
+        delete_context.enable_accesskit();
+        let delete_output =
+            delete_context.run_ui(RawInput::default(), |ui| app.show_delete_confirmation(ui));
+        let delete_update = delete_output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("delete confirmation AccessKit");
+        assert!(
+            delete_update
+                .nodes
+                .iter()
+                .all(|(_, node)| node.author_id() != Some("profile.delete.migration_confirm")),
+            "delete migration consent must be absent unless the loaded config is version 1"
+        );
+    }
+
+    #[test]
+    fn migration_surfaces_declare_exact_backup_value_nodes() {
+        let form_source = include_str!("profile_form.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("profile form production source");
+        let app_source = include_str!("app.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("app production source");
+
+        assert!(form_source.contains("\"profile.migration.backup\""));
+        assert!(app_source.contains("\"profile.delete.migration_backup\""));
+        assert!(form_source.contains("migration_required"));
+    }
 }

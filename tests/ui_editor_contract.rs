@@ -290,3 +290,94 @@ fn raw_input_shortcut_submits_once_and_pending_work_exposes_exact_cancel() {
     assert!(pending_ids.contains("editor.execute"));
     assert!(pending_ids.contains("editor.cancel"));
 }
+
+#[test]
+fn multi_frame_selection_survives_exact_profile_switches() {
+    let profile_a = profile(
+        "mysql-a",
+        7,
+        DriverKind::MySql,
+        Some("app"),
+        TlsMode::Required,
+    );
+    let profile_b = profile(
+        "mysql-b",
+        11,
+        DriverKind::MySql,
+        Some("audit"),
+        TlsMode::Required,
+    );
+    let key_a = WorkspaceKey::new(profile_a.id.clone(), profile_a.generation);
+    let key_b = WorkspaceKey::new(profile_b.id.clone(), profile_b.generation);
+    let mut model = UiModel::default();
+    {
+        let workspace = model.workspace_mut(key_a.clone());
+        workspace.editor_text = "SELECT 1;".to_owned();
+        workspace.caret_character_index = workspace.editor_text.chars().count();
+    }
+    {
+        let workspace = model.workspace_mut(key_b.clone());
+        workspace.editor_text = "SELECT 2;".to_owned();
+        workspace.caret_character_index = 0;
+    }
+
+    let context = Context::default();
+    let mut surface = EditorSurface::default();
+    surface.request_focus("editor.input");
+    let _ = context.run_ui(RawInput::default(), |ui| {
+        let _ = surface.show(ui, &profile_a, model.workspace_mut(key_a.clone()), true);
+    });
+
+    let select_previous_character = Event::Key {
+        key: Key::ArrowLeft,
+        physical_key: Some(Key::ArrowLeft),
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    };
+    let _ = context.run_ui(
+        RawInput {
+            events: vec![select_previous_character],
+            ..RawInput::default()
+        },
+        |ui| {
+            let _ = surface.show(ui, &profile_a, model.workspace_mut(key_a.clone()), true);
+        },
+    );
+    assert_eq!(
+        model
+            .workspace(&key_a)
+            .expect("workspace A")
+            .caret_character_index,
+        8
+    );
+    assert_eq!(
+        model
+            .workspace(&key_a)
+            .expect("workspace A")
+            .selection_character_range,
+        Some(8..9)
+    );
+
+    let _ = context.run_ui(RawInput::default(), |ui| {
+        let _ = surface.show(ui, &profile_b, model.workspace_mut(key_b.clone()), true);
+    });
+    assert_eq!(
+        model
+            .workspace(&key_b)
+            .expect("workspace B")
+            .caret_character_index,
+        0,
+        "workspace B must not inherit workspace A's selection"
+    );
+
+    let _ = context.run_ui(RawInput::default(), |ui| {
+        let _ = surface.show(ui, &profile_a, model.workspace_mut(key_a.clone()), true);
+    });
+    let workspace_a = model.workspace(&key_a).expect("workspace A after return");
+    assert_eq!(workspace_a.caret_character_index, 8);
+    assert_eq!(workspace_a.selection_character_range, Some(8..9));
+}
