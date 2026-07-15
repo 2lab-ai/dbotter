@@ -24,6 +24,7 @@ use crate::service::{
 };
 
 use super::adapter::{ControlKey, ServicePort, UiCommand};
+use super::editor::classify_execute_operation;
 use super::model::{ConnectionFailureOutcome, PostCloseState, ProfileSnapshot, UiEvent};
 
 const GLOBAL_NETWORK_LIMIT: usize = 4;
@@ -949,18 +950,21 @@ fn handle_work(
             text,
             row_limit,
             timeout_ms,
-        } => ProfileWork::Execute {
-            request: crate::model::ExecuteRequest {
-                operation_id,
-                profile_id,
-                profile_generation,
-                language,
-                text,
-                row_limit,
-                timeout: duration_from_millis(timeout_ms),
-            },
-            kind: OperationKind::ExecuteMutation,
-        },
+        } => {
+            let kind = classify_execute_operation(language, &text);
+            ProfileWork::Execute {
+                request: crate::model::ExecuteRequest {
+                    operation_id,
+                    profile_id,
+                    profile_generation,
+                    language,
+                    text,
+                    row_limit,
+                    timeout: duration_from_millis(timeout_ms),
+                },
+                kind,
+            }
+        }
         UiCommand::BrowseCatalog(request) => ProfileWork::BrowseCatalog { request },
         UiCommand::ScanRedisKeys(request) => ProfileWork::ScanRedisKeys { request },
         UiCommand::InspectRedisKey(request) => ProfileWork::InspectRedisKey { request },

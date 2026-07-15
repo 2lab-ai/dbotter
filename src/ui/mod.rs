@@ -1,6 +1,7 @@
 mod accessibility;
 mod adapter;
 mod app;
+mod editor;
 mod layout;
 mod model;
 mod mysql_explorer;
@@ -17,6 +18,12 @@ pub use adapter::{
     UiPort, WORK_CAPACITY, bounded_ports, controller_ports,
 };
 pub use app::DEFAULT_EXECUTE_ROW_LIMIT;
+pub use editor::{
+    EDITOR_CANCEL_ID, EDITOR_EXECUTE_ID, EDITOR_INPUT_ID, EDITOR_ROW_LIMIT_ID, EDITOR_TARGET_ID,
+    EDITOR_TIMEOUT_ID, EditorCursor, EditorExecuteIntent, EditorIntent, EditorSurface,
+    EditorValidationError, build_execute_intent, classify_execute_operation, editor_target_label,
+    pending_cancel_intent,
+};
 pub use layout::NativeLayout;
 pub use model::{
     ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot, ProfileWorkspace,
