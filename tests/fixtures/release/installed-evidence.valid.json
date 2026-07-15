@@ -75,26 +75,637 @@
     }
   },
   "live": {
-    "schema": "dbotter.live-contract-receipt.v1",
-    "source_sha": "0123456789abcdef0123456789abcdef01234567",
-    "started_at": "2026-07-15T13:02:00Z",
-    "project": "dbotter-e2e",
-    "tests": {
-      "mysql_catalog": "p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli",
-      "mysql_prepared_auth": "mysql_contract",
-      "redis_keyspace_tls_auth": "redis_live_receipt"
+    "schema": "dbotter.live-contract-receipt.v2",
+    "source": {
+      "kind": "ci_expected_sha",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "run_id": 123456789,
+      "run_attempt": 2
     },
-    "assertions": {
-      "mysql_catalog": true,
-      "mysql_prepared_only": true,
-      "mysql_auth": true,
-      "redis_keyspace": true,
-      "redis_auth_plaintext": true,
-      "redis_auth_tls": true,
-      "redis_tls_ca_recovery": true,
-      "redis_tls_host_recovery": true,
-      "redis_plaintext_fallback": false,
-      "overall": true
+    "project": "dbotter-e2e",
+    "started_at": "2026-07-15T13:02:00Z",
+    "finished_at": "2026-07-15T13:04:00Z",
+    "suites": {
+      "mysql_catalog": {
+        "test": "p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli",
+        "started_at": "2026-07-15T13:02:00Z",
+        "finished_at": "2026-07-15T13:04:00Z",
+        "cases": [
+          {
+            "id": "mysql.catalog.cli.page1",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.cli.page2",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.column.ordinal_order",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.column.page1",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.column.page2",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.count_cap",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.empty",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.filter.clear_after_metadata_cap",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.filter.narrow_after_count_cap",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.metadata_cap_4mib",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.permission.check_denied",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.permission.execute_denied",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.relation.binary_order",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.relation.page1",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.relation.page2",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.relation.table",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.relation.view",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.schema.scope",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.schema.visibility",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.token.cross_config_rejected",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.token.stale_connection_rejected",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.token.stale_generation_rejected",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.catalog.token.tampered_rejected",
+            "executed": 1,
+            "passed": 1
+          }
+        ],
+        "measurements": {
+          "cli_pages": 2,
+          "column_pages": 2,
+          "column_rows": 100,
+          "denied_operations": 2,
+          "metadata_retained_bytes": 4190000,
+          "metadata_truncations": 1,
+          "relation_pages": 2,
+          "relation_rows": 34,
+          "retained_relations": 2000
+        }
+      },
+      "mysql_safety": {
+        "test": "live_mysql_safety_receipt",
+        "started_at": "2026-07-15T13:02:00Z",
+        "finished_at": "2026-07-15T13:04:00Z",
+        "cases": [
+          {
+            "id": "mysql.auth.environment.available.correct",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.available.wrong",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.available.wrong.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.available.wrong.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.available.wrong.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.empty",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.empty.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.empty.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.empty.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.missing",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.missing.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.missing.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.environment.missing.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.session.correct",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.session.wrong",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.session.wrong.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.session.wrong.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.auth.session.wrong.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.execute.mutation",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.execute.read",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.marker.current_target.extracted_prepared",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.marker.explicit_selection.absent",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.marker.explicit_selection.prepare_only_rejected",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.marker.explicit_selection.ui_rejected",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.marker.second_probe.absent",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.marker.second_probe.prepare_only_rejected",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.prepared_unsupported.error",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.prepared_unsupported.no_raw_fallback",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.prepared_unsupported.session_retained",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.prepared_unsupported.static_recovery",
+            "executed": 1,
+            "passed": 1
+          }
+        ],
+        "measurements": {
+          "auth_failures": 4,
+          "marker_prepared_attempts": 2,
+          "marker_rows_after": 0,
+          "prepared_unsupported_attempts": 1,
+          "raw_fallback_attempts": 0,
+          "statements_executed": 2
+        }
+      },
+      "redis": {
+        "test": "redis_live_receipt",
+        "started_at": "2026-07-15T13:02:00Z",
+        "finished_at": "2026-07-15T13:04:00Z",
+        "cases": [
+          {
+            "id": "redis.auth.plaintext.environment.available.correct",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.available.wrong",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.available.wrong.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.available.wrong.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.available.wrong.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.empty",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.empty.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.empty.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.empty.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.missing",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.missing.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.missing.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.environment.missing.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.session.correct",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.session.wrong",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.session.wrong.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.session.wrong.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.plaintext.session.wrong.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.available.correct",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.available.wrong",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.available.wrong.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.available.wrong.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.available.wrong.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.empty",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.empty.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.empty.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.empty.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.missing",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.missing.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.missing.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.environment.missing.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.session.correct",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.session.wrong",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.session.wrong.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.session.wrong.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.auth.tls.session.wrong.recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.classifier.no_command",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.cli.browse",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.cli.inspect",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.inspect.truncation_64kib",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.inspect.ttl.expiring",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.inspect.ttl.missing",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.inspect.ttl.persistent",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.inspect.type.hash",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.inspect.type.list",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.inspect.type.set",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.inspect.type.stream",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.inspect.type.string",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.inspect.type.zset",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.mutation.readback",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.scan.multiple_pages",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.scan.oversize_skipped",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.scan.raw_binary_identity",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.tls.ca_preserved",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.tls.host_recovery",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.tls.wrong_ca.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.tls.wrong_ca.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.tls.wrong_ca.focus_ca",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.tls.wrong_host.action",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.tls.wrong_host.code",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "redis.tls.wrong_host.focus_host",
+            "executed": 1,
+            "passed": 1
+          }
+        ],
+        "measurements": {
+          "auth_failures": 8,
+          "cli_operations": 2,
+          "inspect_types": 6,
+          "mutation_readbacks": 2,
+          "plaintext_fallback_attempts": 0,
+          "required_tls_attempts": 3,
+          "scan_pages": 4,
+          "tls_recovery_attempts": 1
+        }
+      }
     }
   },
   "cli": {

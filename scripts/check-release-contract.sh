@@ -111,6 +111,7 @@ require_literal scripts/verify-installed-gui.sh 'result.export.json'
 require_literal scripts/verify-installed-gui.sh 'DBOTTER_AX_DRIVER'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.p7-installed-evidence.v1'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.formula-install-evidence.v1'
+require_literal scripts/assemble-installed-receipt.py 'dbotter.live-contract-receipt.v2'
 
 if [ -n "$manifest" ]; then
   validator=(./scripts/validate-preview-manifest.py "$manifest")
