@@ -238,6 +238,20 @@ if "${validate[@]/$proof/$wrong_candidate_config_type}" >/dev/null 2>&1; then
   fail "proof accepted a type-confused candidate config contract"
 fi
 
+wrong_candidate_config_float="$tmp_dir/wrong-candidate-config-float.json"
+jq '.preflight.candidate.config_contract.read_versions = [1.0, 2.0]' \
+  "$proof" >"$wrong_candidate_config_float"
+if "${validate[@]/$proof/$wrong_candidate_config_float}" >/dev/null 2>&1; then
+  fail "proof accepted floating-point candidate read versions"
+fi
+
+wrong_candidate_write_float="$tmp_dir/wrong-candidate-write-float.json"
+jq '.preflight.candidate.config_contract.write_version = 2.0' \
+  "$proof" >"$wrong_candidate_write_float"
+if "${validate[@]/$proof/$wrong_candidate_write_float}" >/dev/null 2>&1; then
+  fail "proof accepted a floating-point candidate write version"
+fi
+
 wrong_commit="$tmp_dir/wrong-commit.json"
 jq '.tap.formula_commit = "2222222222222222222222222222222222222222"' "$proof" >"$wrong_commit"
 if "${validate[@]/$proof/$wrong_commit}" >/dev/null 2>&1; then

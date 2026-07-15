@@ -84,6 +84,23 @@ def positive_integer(value: Any, location: str) -> int:
     return value
 
 
+def exact_config_contract(value: Any, location: str) -> dict[str, Any]:
+    config = exact_object(value, CONFIG_KEYS, location)
+    read_versions = config["read_versions"]
+    if (
+        not isinstance(read_versions, list)
+        or len(read_versions) != 2
+        or any(type(version) is not int for version in read_versions)
+        or read_versions != [1, 2]
+        or type(config["write_version"]) is not int
+        or config["write_version"] != 2
+        or type(config["migration_backup_suffix"]) is not str
+        or config["migration_backup_suffix"] != ".v1.bak"
+    ):
+        raise ContractError(f"{location} is not the exact typed three-field contract")
+    return config
+
+
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -231,6 +248,9 @@ def validate(args: argparse.Namespace) -> None:
         raise ContractError("downloaded manifest failed the four-target contract") from error
     if manifest["version"] != expected_version:
         raise ContractError("downloaded manifest version disagrees with dispatch")
+    manifest_config_contract = exact_config_contract(
+        manifest["config_contract"], "manifest.config_contract"
+    )
     artifacts = manifest["artifacts"]
     if not isinstance(artifacts, list):
         raise ContractError("manifest artifacts is not an array")
@@ -274,22 +294,10 @@ def validate(args: argparse.Namespace) -> None:
     identity = exact_object(
         candidate["identity"], IDENTITY_KEYS, "proof.preflight.candidate.identity"
     )
-    config_contract = exact_object(
+    config_contract = exact_config_contract(
         candidate["config_contract"],
-        CONFIG_KEYS,
         "proof.preflight.candidate.config_contract",
     )
-    read_versions = config_contract["read_versions"]
-    if (
-        not isinstance(read_versions, list)
-        or len(read_versions) != 2
-        or any(type(version) is not int for version in read_versions)
-        or read_versions != [1, 2]
-        or type(config_contract["write_version"]) is not int
-        or config_contract["write_version"] != 2
-        or config_contract["migration_backup_suffix"] != ".v1.bak"
-    ):
-        raise ContractError("proof preflight candidate config contract is not exact")
     expected_candidate_target = "x86_64-unknown-linux-gnu"
     if candidate["target"] != expected_candidate_target:
         raise ContractError("proof preflight executed the wrong candidate target")
@@ -302,7 +310,7 @@ def validate(args: argparse.Namespace) -> None:
         "arch": "x86_64",
     }:
         raise ContractError("proof preflight candidate identity disagrees with manifest")
-    if config_contract != manifest["config_contract"]:
+    if config_contract != manifest_config_contract:
         raise ContractError("proof preflight candidate config contract disagrees with manifest")
 
     if args.formula.is_symlink() or not args.formula.is_file():
