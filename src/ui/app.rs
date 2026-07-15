@@ -2115,6 +2115,57 @@ mod tests {
     }
 
     #[test]
+    fn uncommitted_delete_failure_restores_the_exact_prior_active_operation() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        app.model.profiles = vec![profile.clone()];
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        let prior = ActiveOperation {
+            operation_id: OperationId(77),
+            kind: OperationKind::ExecuteMutation,
+        };
+        app.active_operations.insert(profile.id.clone(), prior);
+
+        app.open_delete_confirmation(&profile);
+        app.confirm_delete_confirmation();
+        let delete_operation = match service.try_next_command() {
+            Some(UiCommand::DeleteProfile(request)) => request.operation_id,
+            _ => panic!("confirmed delete command"),
+        };
+        let error = PublicOperationError::new_or_internal(
+            OperationKind::DeleteProfile,
+            PublicSummary::ConfigWriteNotCommitted,
+            PublicCode::None,
+            &SafeContext::profile(profile.id.clone(), delete_operation),
+        );
+        assert!(service.try_emit(crate::ui::UiEvent::OperationFailed {
+            operation_id: delete_operation,
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            session_generation: None,
+            kind: OperationKind::DeleteProfile,
+            summary: error.summary,
+            error,
+            session_disposition: None,
+            connection_outcome: crate::ui::ConnectionFailureOutcome::Preserve,
+        }));
+        app.poll_events();
+
+        assert_eq!(app.active_operations.get(&profile.id), Some(&prior));
+        app.open_delete_confirmation(&profile);
+        assert_eq!(
+            app.delete_confirmation
+                .as_ref()
+                .and_then(|confirmation| confirmation.active_kind),
+            Some(OperationKind::ExecuteMutation)
+        );
+    }
+
+    #[test]
     fn failed_save_connect_refresh_clears_follow_up_before_unrelated_reload() {
         let (ui_port, mut service) = bounded_ports(4);
         let mut app = DbotterApp::new(ui_port);
