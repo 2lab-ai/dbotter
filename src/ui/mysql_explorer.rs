@@ -684,4 +684,36 @@ mod tests {
         assert_eq!(state.retry_request(), Some(&failed));
         assert!(state.is_stale_for(&failed));
     }
+
+    #[test]
+    fn ordinary_explorer_text_meets_wcag_aa_contrast_on_white() {
+        fn relative_luminance(channel: u8) -> f64 {
+            let channel = f64::from(channel) / 255.0;
+            if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        }
+
+        fn contrast(foreground: egui::Color32, background: egui::Color32) -> f64 {
+            let foreground = 0.2126 * relative_luminance(foreground.r())
+                + 0.7152 * relative_luminance(foreground.g())
+                + 0.0722 * relative_luminance(foreground.b());
+            let background = 0.2126 * relative_luminance(background.r())
+                + 0.7152 * relative_luminance(background.g())
+                + 0.0722 * relative_luminance(background.b());
+            let (lighter, darker) = if foreground >= background {
+                (foreground, background)
+            } else {
+                (background, foreground)
+            };
+            (lighter + 0.05) / (darker + 0.05)
+        }
+
+        assert!(
+            contrast(OPENAI_INK_44, OPENAI_CANVAS) >= 4.5,
+            "ordinary informational text must be at least 4.5:1 on the white canvas"
+        );
+    }
 }

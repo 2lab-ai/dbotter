@@ -74,22 +74,41 @@ fn p4_catalog_queries_are_three_static_prepared_binary_keyset_plans() {
 #[test]
 fn p4_opaque_tokens_are_context_bound_and_integrity_checked() {
     let catalog = source("src/drivers/mysql_catalog.rs");
+    let service = source("src/service.rs");
+    let manifest = source("Cargo.toml");
 
     for required in [
         "TOKEN_VERSION",
         "encode_page_token",
         "decode_page_token",
-        "Sha256",
+        "Hmac<Sha256>",
+        "verify_slice",
         "profile_fingerprint",
         "profile_generation",
         "parent_fingerprint",
         "prefix_fingerprint",
+        "page_size",
     ] {
         assert!(
             catalog.contains(required),
             "opaque token integrity is missing {required}"
         );
     }
+    for required in ["hmac =", "getrandom =", "zeroize ="] {
+        assert!(
+            manifest.contains(required),
+            "catalog token key dependency is missing {required}"
+        );
+    }
+    assert!(
+        service.contains("catalog_token_key: Arc<CatalogTokenKey>")
+            && service.contains("CatalogTokenKey::generate"),
+        "each ApplicationService must own one generated catalog token key"
+    );
+    assert!(
+        catalog.contains("CatalogTokenKey(<redacted>)") && !catalog.contains("fn token_digest("),
+        "token keys must be redacted and tokens must not use a forgeable plain digest"
+    );
 }
 
 #[test]

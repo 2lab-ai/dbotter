@@ -934,6 +934,79 @@ async fn p3_execute_cancel_drops_driver_future_before_exact_session_close() {
 }
 
 #[tokio::test]
+async fn p4_catalog_cancel_and_outer_timeout_drop_driver_future_before_exact_session_close() {
+    for (index, cancel_explicitly) in [true, false].into_iter().enumerate() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("config.toml");
+        let session = Arc::new(CatalogLifecycleSession::default());
+        let service = test_service_with_connector(
+            &path,
+            Arc::new(CatalogLifecycleConnector {
+                session: session.clone(),
+            }),
+        );
+        let operation_id = OperationId(212 + index as u64);
+        let profile = service
+            .create_profile(create_request(
+                &format!("mysql-p4-lifecycle-{index}"),
+                OperationId(209 + index as u64),
+            ))
+            .await
+            .expect("mysql profile");
+        let (mut ui, service_port) = controller_ports();
+        let runtime = spawn_with_service(service_port, service.clone());
+        let request = CatalogRequest::Schemas {
+            identity: RequestIdentity::new(
+                profile.profile_id.clone(),
+                profile.profile_generation,
+                operation_id,
+            ),
+            prefix: None,
+            page_token: None,
+            page_size: 50,
+            timeout: if cancel_explicitly {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_secs(1)
+            },
+        };
+
+        ui.try_submit(UiCommand::BrowseCatalog(request.clone()))
+            .expect("catalog submits");
+        session.resources.wait_until_started().await;
+        if cancel_explicitly {
+            ui.try_submit(UiCommand::CancelOperation { operation_id })
+                .expect("cancel submits");
+        }
+        let expected_summary = if cancel_explicitly {
+            dbotter::model::PublicSummary::OperationCancelled
+        } else {
+            dbotter::model::PublicSummary::OperationTimedOut
+        };
+        wait_for_event(&mut ui, |event| {
+            matches!(
+                event,
+                UiEvent::CatalogPageFailed {
+                    request,
+                    summary,
+                    ..
+                } if request.operation_id() == operation_id && *summary == expected_summary
+            )
+        })
+        .await;
+
+        assert!(session.resources.catalog_dropped.load(Ordering::SeqCst));
+        assert!(
+            !session.close_before_catalog_drop.load(Ordering::SeqCst),
+            "the catalog future must release its connection before exact pool/session close"
+        );
+        assert_eq!(session.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(service.cached_session_count().await, 0);
+        shutdown(&ui, runtime, OperationId(218 + index as u64)).await;
+    }
+}
+
+#[tokio::test]
 async fn p3_driver_session_disposition_is_identical_in_cache_event_and_ui_outcome() {
     for (index, session_healthy) in [true, false].into_iter().enumerate() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -3229,6 +3302,102 @@ struct ExecuteTestConnector {
 
 #[async_trait]
 impl SessionConnector for ExecuteTestConnector {
+    async fn connect(
+        &self,
+        _profile: &dbotter::model::ConnectionProfile,
+        _secret: Option<&SessionSecret>,
+        _timeout: Duration,
+    ) -> Result<Arc<dyn SessionHandle>, DriverError> {
+        Ok(self.session.clone())
+    }
+}
+
+struct CatalogDropGuard(Arc<AtomicBool>);
+
+impl Drop for CatalogDropGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[derive(Default)]
+struct CatalogLifecycleResources {
+    started: AtomicBool,
+    started_notify: tokio::sync::Notify,
+    catalog_dropped: Arc<AtomicBool>,
+}
+
+impl CatalogLifecycleResources {
+    async fn wait_until_started(&self) {
+        while !self.started.load(Ordering::SeqCst) {
+            self.started_notify.notified().await;
+        }
+    }
+}
+
+#[async_trait]
+impl ConnectionPing for CatalogLifecycleResources {
+    async fn ping(&self, _timeout: Duration) -> Result<(), DriverError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MySqlPreparedExecution for CatalogLifecycleResources {
+    async fn execute_prepared(
+        &self,
+        _request: &PreparedMySqlRequest,
+    ) -> Result<QueryResult, DriverError> {
+        Ok(empty_driver_result())
+    }
+}
+
+#[async_trait]
+impl CatalogBrowser for CatalogLifecycleResources {
+    async fn load_page(&self, _request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
+        let _guard = CatalogDropGuard(self.catalog_dropped.clone());
+        self.started.store(true, Ordering::SeqCst);
+        self.started_notify.notify_waiters();
+        std::future::pending::<Result<CatalogPage, DriverError>>().await
+    }
+}
+
+#[derive(Default)]
+struct CatalogLifecycleSession {
+    resources: Arc<CatalogLifecycleResources>,
+    closes: AtomicUsize,
+    close_before_catalog_drop: AtomicBool,
+}
+
+#[async_trait]
+impl SessionHandle for CatalogLifecycleSession {
+    async fn ping(&self, _timeout: Duration) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    fn connected_resources(&self) -> Option<ConnectedResources> {
+        Some(ConnectedResources::MySql {
+            ping: self.resources.clone(),
+            execution: self.resources.clone(),
+            catalog: self.resources.clone(),
+        })
+    }
+
+    async fn close(&self) -> Result<(), DriverError> {
+        if !self.resources.catalog_dropped.load(Ordering::SeqCst) {
+            self.close_before_catalog_drop.store(true, Ordering::SeqCst);
+        }
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct CatalogLifecycleConnector {
+    session: Arc<CatalogLifecycleSession>,
+}
+
+#[async_trait]
+impl SessionConnector for CatalogLifecycleConnector {
     async fn connect(
         &self,
         _profile: &dbotter::model::ConnectionProfile,

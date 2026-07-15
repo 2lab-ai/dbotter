@@ -842,6 +842,50 @@ mod tests {
     }
 
     #[test]
+    fn attacker_cannot_rewrite_payload_and_resign_with_public_sha256() {
+        let request = schema_request(4, None);
+        let outcome = CatalogRetentionOutcome {
+            nodes: vec![schema("app_b")],
+            retained_counts: CatalogRetainedCounts {
+                schemas: 1,
+                ..CatalogRetainedCounts::default()
+            },
+            retained_utf8_bytes: 5,
+            truncated: false,
+        };
+        let valid =
+            encode_page_token(&request, &outcome.nodes[0], &outcome).expect("encode valid token");
+        let mut parts = valid.0.split('.');
+        let prefix = parts.next().expect("token prefix");
+        let payload = parts.next().expect("token payload");
+        let _integrity = parts.next().expect("token integrity");
+        assert!(parts.next().is_none());
+
+        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("decode public payload");
+        let mut rewritten: serde_json::Value =
+            serde_json::from_slice(&payload_bytes).expect("parse public payload");
+        rewritten["last_name"] = serde_json::Value::String("app_forged".to_owned());
+        rewritten["schemas"] = serde_json::Value::from(199_u64);
+        let rewritten_bytes = serde_json::to_vec(&rewritten).expect("serialize rewritten payload");
+
+        let mut attacker_digest = Sha256::new();
+        attacker_digest.update(TOKEN_DIGEST_DOMAIN);
+        attacker_digest.update(&rewritten_bytes);
+        let forged = CatalogPageToken(format!(
+            "{prefix}.{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rewritten_bytes),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(attacker_digest.finalize())
+        ));
+
+        assert!(
+            decode_page_token(&request, &forged).is_err(),
+            "a public checksum cannot authenticate attacker-controlled continuation state"
+        );
+    }
+
+    #[test]
     fn no_extra_row_does_not_fabricate_truncation_at_an_exact_cap() {
         let request = CatalogRequest::Schemas {
             identity: identity(4),
