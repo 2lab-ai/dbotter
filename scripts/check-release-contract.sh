@@ -9,6 +9,30 @@ fail() {
   exit 1
 }
 
+manifest=""
+greater_than=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manifest)
+      [ "$#" -ge 2 ] || fail "--manifest requires a path"
+      [ -z "$manifest" ] || fail "--manifest may be provided only once"
+      manifest="$2"
+      shift 2
+      ;;
+    --greater-than)
+      [ "$#" -ge 2 ] || fail "--greater-than requires a version"
+      [ -z "$greater_than" ] || fail "--greater-than may be provided only once"
+      greater_than="$2"
+      shift 2
+      ;;
+    *)
+      fail "unknown argument: $1"
+      ;;
+  esac
+done
+[ -z "$greater_than" ] || [ -n "$manifest" ] \
+  || fail "--greater-than requires --manifest"
+
 require_literal() {
   local file="$1"
   local literal="$2"
@@ -25,6 +49,10 @@ for workflow in .github/workflows/ci.yml .github/workflows/preview.yml .github/w
   test -s "$workflow" || fail "$workflow is missing or empty"
 done
 test -x scripts/package-version.sh || fail "scripts/package-version.sh is missing or not executable"
+test -x scripts/validate-preview-manifest.py \
+  || fail "scripts/validate-preview-manifest.py is missing or not executable"
+test -s packaging/release/preview-manifest.schema.json \
+  || fail "preview manifest schema is missing or empty"
 
 package_version="$(./scripts/package-version.sh)"
 manifest_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -1)"
@@ -71,5 +99,13 @@ for workflow in .github/workflows/preview.yml .github/workflows/release.yml; do
   require_literal "$workflow" 'sha256sum dbotter-* > SHA256SUMS'
   require_literal "$workflow" 'release/SHA256SUMS'
 done
+
+if [ -n "$manifest" ]; then
+  validator=(./scripts/validate-preview-manifest.py "$manifest")
+  if [ -n "$greater_than" ]; then
+    validator+=(--greater-than "$greater_than")
+  fi
+  "${validator[@]}"
+fi
 
 echo "release contract: ok"
