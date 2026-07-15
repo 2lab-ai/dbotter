@@ -3,19 +3,89 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc::{self, error::TryRecvError, error::TrySendError};
 use tokio::sync::watch;
 
 use crate::model::{
-    CatalogRequest, OperationId, OperationKind, ProfileGeneration, ProfileId, QueryLanguage,
-    RedisKeyInspectRequest, RedisScanRequest,
+    CatalogRequest, ConnectionDraft, DraftId, OperationId, OperationKind, ProfileGeneration,
+    ProfileId, QueryLanguage, RedisKeyInspectRequest, RedisScanRequest,
 };
+use crate::secrets::SessionSecret;
 use crate::service::{
     CreateProfileRequest, DeleteProfileRequest, TestDraftRequest, UpdateProfileRequest,
 };
 
 use super::model::UiEvent;
+
+pub enum DraftTestIntent {
+    Secretless {
+        draft_id: DraftId,
+        operation_id: OperationId,
+        draft: ConnectionDraft,
+        timeout: Duration,
+    },
+    SessionReplace {
+        draft_id: DraftId,
+        operation_id: OperationId,
+        draft: ConnectionDraft,
+        secret: Arc<SessionSecret>,
+        timeout: Duration,
+    },
+    SessionKeep {
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        draft_id: DraftId,
+        operation_id: OperationId,
+        draft: ConnectionDraft,
+        timeout: Duration,
+    },
+    Environment {
+        draft_id: DraftId,
+        operation_id: OperationId,
+        draft: ConnectionDraft,
+        timeout: Duration,
+    },
+}
+
+impl DraftTestIntent {
+    pub(crate) const fn draft_id(&self) -> DraftId {
+        match self {
+            Self::Secretless { draft_id, .. }
+            | Self::SessionReplace { draft_id, .. }
+            | Self::SessionKeep { draft_id, .. }
+            | Self::Environment { draft_id, .. } => *draft_id,
+        }
+    }
+
+    pub(crate) const fn operation_id(&self) -> OperationId {
+        match self {
+            Self::Secretless { operation_id, .. }
+            | Self::SessionReplace { operation_id, .. }
+            | Self::SessionKeep { operation_id, .. }
+            | Self::Environment { operation_id, .. } => *operation_id,
+        }
+    }
+}
+
+impl fmt::Debug for DraftTestIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Secretless { .. } => "Secretless",
+            Self::SessionReplace { .. } => "SessionReplace",
+            Self::SessionKeep { .. } => "SessionKeep",
+            Self::Environment { .. } => "Environment",
+        };
+        formatter
+            .debug_struct("DraftTestIntent")
+            .field("kind", &name)
+            .field("draft_id", &self.draft_id())
+            .field("operation_id", &self.operation_id())
+            .field("payload", &"<redacted>")
+            .finish()
+    }
+}
 
 pub const WORK_CAPACITY: usize = 32;
 pub const MUTATION_CAPACITY: usize = 16;
@@ -45,6 +115,7 @@ pub enum UiCommand {
         timeout_ms: u64,
     },
     TestDraftConnection(TestDraftRequest),
+    PrepareDraftConnectionTest(DraftTestIntent),
     Execute {
         operation_id: OperationId,
         profile_id: ProfileId,
@@ -93,6 +164,7 @@ impl UiCommand {
             Self::UpdateProfile(request) => request.operation_id,
             Self::DeleteProfile(request) => request.operation_id,
             Self::TestDraftConnection(request) => request.operation_id(),
+            Self::PrepareDraftConnectionTest(intent) => intent.operation_id(),
         }
     }
 
@@ -104,6 +176,7 @@ impl UiCommand {
             | Self::DeleteProfile(_) => CommandLane::Mutation,
             Self::TestConnection { .. }
             | Self::TestDraftConnection(_)
+            | Self::PrepareDraftConnectionTest(_)
             | Self::Execute { .. }
             | Self::BrowseCatalog(_)
             | Self::ScanRedisKeys(_)
@@ -150,6 +223,10 @@ impl fmt::Debug for UiCommand {
             Self::TestDraftConnection(request) => formatter
                 .debug_tuple("UiCommand::TestDraftConnection")
                 .field(request)
+                .finish(),
+            Self::PrepareDraftConnectionTest(intent) => formatter
+                .debug_tuple("UiCommand::PrepareDraftConnectionTest")
+                .field(intent)
                 .finish(),
             Self::Execute {
                 operation_id,
@@ -270,6 +347,20 @@ pub struct UiPort {
     control_keys: Arc<Mutex<HashSet<ControlKey>>>,
 }
 
+pub(crate) struct MutationSubmitPermit<'a> {
+    permit: mpsc::Permit<'a, UiCommand>,
+}
+
+impl MutationSubmitPermit<'_> {
+    pub(crate) fn submit(self, command: UiCommand) -> Result<(), SubmitError> {
+        if command.lane() != CommandLane::Mutation {
+            return Err(SubmitError::Disconnected);
+        }
+        self.permit.send(command);
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ShutdownRequester {
     shutdown_tx: watch::Sender<Option<OperationId>>,
@@ -334,6 +425,13 @@ impl UiPort {
         }
         permit.send(command);
         Ok(())
+    }
+
+    pub(crate) fn try_reserve_mutation(&self) -> Result<MutationSubmitPermit<'_>, SubmitError> {
+        self.mutation_tx
+            .try_reserve()
+            .map(|permit| MutationSubmitPermit { permit })
+            .map_err(map_try_send_error)
     }
 
     pub fn drain_events(&mut self, limit: usize) -> Vec<UiEvent> {

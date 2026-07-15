@@ -145,6 +145,16 @@ pub enum MigrationConsent {
     Cancelled,
 }
 
+impl MigrationConsent {
+    pub const fn from_confirmation(confirmed: bool) -> Self {
+        if confirmed {
+            Self::Confirmed
+        } else {
+            Self::Cancelled
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigMutation {
     Create(ConnectionProfile),

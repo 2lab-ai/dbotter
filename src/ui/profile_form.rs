@@ -1,22 +1,41 @@
 //! Pure profile draft validation plus egui rendering and save correlation.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use eframe::egui;
 
 use crate::config::MigrationConsent;
 use crate::model::{
     ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileFieldId,
-    ProfileGeneration, ProfileId, RedisTlsConfig, TlsMode,
+    ProfileGeneration, ProfileId, RedisTlsConfig, SessionCredentialIntent, TlsMode,
 };
-use crate::secrets::SessionSecretUpdate;
-use crate::service::{CreateProfileRequest, UpdateProfileRequest};
+use crate::secrets::{
+    CredentialEditContext, EnvironmentAvailability, ReplacementSecretBuffer, probe_environment,
+    session_intent_policy, session_update_for_save,
+};
+use crate::service::{CreateProfileRequest, UpdateProfileRequest, slugify_profile_id};
 
-use super::adapter::{SubmitError, UiCommand, UiPort};
+use super::accessibility::named_author_id;
+use super::adapter::{DraftTestIntent, SubmitError, UiCommand, UiPort};
 use super::model::UiEvent;
+use super::theme::OpenAiTheme;
 
 const REDIS_CA_FILE_FIELD_ID: &str = "profile.redis_tls.ca_file";
 const REDIS_CA_FILE_PICK_ID: &str = "profile.redis_tls.ca_file.pick";
+const PROFILE_NAME_ID: &str = "profile.name";
+const PROFILE_ID_ID: &str = "profile.id";
+const PROFILE_AUTO_ID_ID: &str = "profile.id.auto";
+const PROFILE_SESSION_INTENT_ID: &str = "profile.session.intent";
+const PROFILE_SESSION_REPLACEMENT_ID: &str = "profile.session.replacement";
+const PROFILE_ENVIRONMENT_ID: &str = "profile.environment.name";
+const PROFILE_ENVIRONMENT_CHECK_ID: &str = "profile.environment.check";
+const PROFILE_MIGRATION_ID: &str = "profile.migration.confirm";
+const PROFILE_TEST_ID: &str = "profile.test_draft";
+const PROFILE_SAVE_ID: &str = "profile.save";
+const PROFILE_SAVE_CONNECT_ID: &str = "profile.save_connect";
+const PROFILE_CANCEL_ID: &str = "profile.cancel";
+const DRAFT_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum EditorMode {
@@ -255,7 +274,9 @@ impl ValidationErrors {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FormAction {
     None,
-    Save,
+    Save { connect: bool },
+    TestDraft,
+    ProbeEnvironment,
     Cancel,
     PickRedisCaFile,
 }
@@ -271,9 +292,21 @@ pub(super) enum SaveAttempt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DraftTestAttempt {
+    Submitted(OperationId),
+    Invalid,
+    Busy,
+    Disconnected,
+    ConfigUncertain,
+    AlreadyPending(OperationId),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ProfileEventResult {
     Ignored,
     Saved(ProfileId, Option<crate::model::PublicSummary>),
+    SavedAndConnect(ProfileId, Option<crate::model::PublicSummary>),
     Failed,
 }
 
@@ -282,11 +315,13 @@ enum PendingSave {
     Create {
         operation_id: OperationId,
         draft_id: DraftId,
+        connect_after_save: bool,
     },
     Update {
         operation_id: OperationId,
         profile_id: ProfileId,
         profile_generation: ProfileGeneration,
+        connect_after_save: bool,
     },
 }
 
@@ -296,16 +331,33 @@ impl PendingSave {
             Self::Create { operation_id, .. } | Self::Update { operation_id, .. } => *operation_id,
         }
     }
+
+    fn connect_after_save(&self) -> bool {
+        match self {
+            Self::Create {
+                connect_after_save, ..
+            }
+            | Self::Update {
+                connect_after_save, ..
+            } => *connect_after_save,
+        }
+    }
 }
 
 pub(super) struct ProfileEditor {
     pub mode: EditorMode,
     draft_id: DraftId,
     session_keep_available: bool,
+    use_auto_id: bool,
+    session_intent: Option<SessionCredentialIntent>,
+    replacement_secret: ReplacementSecretBuffer,
+    environment_availability: Option<EnvironmentAvailability>,
+    migration_confirmed: bool,
     pub draft: ProfileDraft,
     pub errors: ValidationErrors,
     status: String,
     pending_save: Option<PendingSave>,
+    pending_draft_test: Option<OperationId>,
     config_uncertain: bool,
     focus_field: Option<ProfileFieldId>,
 }
@@ -316,10 +368,16 @@ impl ProfileEditor {
             mode: EditorMode::Add,
             draft_id,
             session_keep_available: false,
+            use_auto_id: true,
+            session_intent: None,
+            replacement_secret: ReplacementSecretBuffer::default(),
+            environment_availability: None,
+            migration_confirmed: false,
             draft: ProfileDraft::new(driver),
             errors: ValidationErrors::default(),
             status: "New profile".to_owned(),
             pending_save: None,
+            pending_draft_test: None,
             config_uncertain: false,
             focus_field: None,
         }
@@ -331,6 +389,9 @@ impl ProfileEditor {
         expected_generation: ProfileGeneration,
         has_current_session_secret: bool,
     ) -> Self {
+        let context = CredentialEditContext::Edit {
+            has_current: has_current_session_secret,
+        };
         Self {
             mode: EditorMode::Edit {
                 original_id: ProfileId(profile.id.clone()),
@@ -339,10 +400,17 @@ impl ProfileEditor {
             draft_id,
             session_keep_available: profile.credential_mode == CredentialMode::Session
                 && has_current_session_secret,
+            use_auto_id: false,
+            session_intent: session_intent_policy(profile.credential_mode, context)
+                .map(|policy| policy.default),
+            replacement_secret: ReplacementSecretBuffer::default(),
+            environment_availability: None,
+            migration_confirmed: false,
             draft: ProfileDraft::from_profile(profile),
             errors: ValidationErrors::default(),
             status: "Editing profile".to_owned(),
             pending_save: None,
+            pending_draft_test: None,
             config_uncertain: false,
             focus_field: None,
         }
@@ -350,6 +418,79 @@ impl ProfileEditor {
 
     pub fn request_focus(&mut self, field: ProfileFieldId) {
         self.focus_field = Some(field);
+    }
+
+    fn credential_context(&self) -> CredentialEditContext {
+        match self.mode {
+            EditorMode::Add => CredentialEditContext::Create,
+            EditorMode::Edit { .. } => CredentialEditContext::Edit {
+                has_current: self.session_keep_available,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_auto_id(&mut self, use_auto_id: bool) {
+        if matches!(self.mode, EditorMode::Add) {
+            self.use_auto_id = use_auto_id;
+        }
+    }
+
+    pub fn auto_id_preview(&self) -> Option<String> {
+        (matches!(self.mode, EditorMode::Add) && self.use_auto_id)
+            .then(|| slugify_profile_id(&self.draft.name))
+    }
+
+    #[cfg(test)]
+    pub fn set_migration_confirmed(&mut self, confirmed: bool) {
+        self.migration_confirmed = confirmed;
+    }
+
+    pub fn select_credential_mode(&mut self, mode: CredentialMode) {
+        self.draft.select_credential_mode(mode);
+        self.environment_availability = None;
+        self.session_intent =
+            session_intent_policy(mode, self.credential_context()).map(|policy| policy.default);
+        if mode != CredentialMode::Session {
+            self.replacement_secret.forget();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn session_intent(&self) -> Option<SessionCredentialIntent> {
+        self.session_intent
+    }
+
+    pub fn select_session_intent(&mut self, intent: SessionCredentialIntent) {
+        let allowed = session_intent_policy(self.draft.credential_mode, self.credential_context())
+            .is_some_and(|policy| policy.allowed.contains(&intent));
+        if !allowed {
+            return;
+        }
+        self.session_intent = Some(intent);
+        if intent != SessionCredentialIntent::Replace {
+            self.replacement_secret.forget();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_replacement_secret(&mut self, value: String) {
+        let replacement = ReplacementSecretBuffer::new(value);
+        self.select_session_intent(SessionCredentialIntent::Replace);
+        if self.session_intent == Some(SessionCredentialIntent::Replace) {
+            self.replacement_secret = replacement;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn replacement_is_set(&self) -> bool {
+        !self.replacement_secret.is_empty()
+    }
+
+    pub fn probe_environment_availability(&mut self) -> EnvironmentAvailability {
+        let availability = probe_environment(self.draft.secret_env.trim());
+        self.environment_availability = Some(availability);
+        availability
     }
 
     #[cfg(test)]
@@ -383,12 +524,14 @@ impl ProfileEditor {
         !self.config_uncertain
             && self.draft.driver != DriverKind::MongoDb
             && self.pending_save.is_none()
+            && self.pending_draft_test.is_none()
     }
 
     pub fn set_config_uncertain(&mut self, config_uncertain: bool) {
         self.config_uncertain = config_uncertain;
         if config_uncertain {
             self.status = "Reload profiles before saving.".to_owned();
+            self.pending_draft_test = None;
         }
     }
 
@@ -396,7 +539,17 @@ impl ProfileEditor {
         &self.status
     }
 
+    #[cfg(test)]
     pub fn try_save(&mut self, port: &UiPort, operation_id: OperationId) -> SaveAttempt {
+        self.try_save_with_connect(port, operation_id, false)
+    }
+
+    pub fn try_save_with_connect(
+        &mut self,
+        port: &UiPort,
+        operation_id: OperationId,
+        connect_after_save: bool,
+    ) -> SaveAttempt {
         if self.config_uncertain {
             self.status = "Reload profiles before saving.".to_owned();
             return SaveAttempt::ConfigUncertain;
@@ -405,7 +558,20 @@ impl ProfileEditor {
             self.status = "Save is already pending".to_owned();
             return SaveAttempt::AlreadyPending(pending);
         }
-        let profile = match self.draft.validate() {
+        if let Some(pending) = self.pending_draft_test {
+            self.status = "Draft test is already pending".to_owned();
+            return SaveAttempt::AlreadyPending(pending);
+        }
+        if self.draft.driver == DriverKind::MongoDb {
+            self.status = "MongoDB profiles are planned and unavailable.".to_owned();
+            return SaveAttempt::Invalid;
+        }
+        let mut validated_draft = self.draft.clone();
+        let use_auto_id = matches!(self.mode, EditorMode::Add) && self.use_auto_id;
+        if use_auto_id {
+            validated_draft.id = slugify_profile_id(&validated_draft.name);
+        }
+        let profile = match validated_draft.validate() {
             Ok(profile) => profile,
             Err(errors) => {
                 self.errors = *errors;
@@ -420,19 +586,19 @@ impl ProfileEditor {
             self.status = "Fix the highlighted fields".to_owned();
             return SaveAttempt::Invalid;
         }
-        if profile.credential_mode == CredentialMode::Session && !self.session_keep_available {
-            self.status = "A replacement session credential is required".to_owned();
-            return SaveAttempt::Invalid;
-        }
         let profile_id = ProfileId(profile.id.clone());
         let draft = profile.as_draft();
         let mode = self.mode.clone();
         let draft_id = self.draft_id;
         let destination_mode = profile.credential_mode;
+        let credential_context = self.credential_context();
+        let session_intent = self.session_intent;
+        let migration_consent = MigrationConsent::from_confirmation(self.migration_confirmed);
         let pending_save = match &mode {
             EditorMode::Add => PendingSave::Create {
                 operation_id,
                 draft_id,
+                connect_after_save,
             },
             EditorMode::Edit {
                 original_id,
@@ -441,16 +607,51 @@ impl ProfileEditor {
                 operation_id,
                 profile_id: original_id.clone(),
                 profile_generation: *expected_generation,
+                connect_after_save,
             },
         };
-        match port.try_submit_with(move || match mode {
+        let permit = match port.try_reserve_mutation() {
+            Ok(permit) => permit,
+            Err(SubmitError::Busy) => {
+                self.status = "Service is busy; profile was not submitted".to_owned();
+                return SaveAttempt::Busy;
+            }
+            Err(SubmitError::Disconnected) => {
+                self.status = "Service is unavailable".to_owned();
+                return SaveAttempt::Disconnected;
+            }
+        };
+        let replacement = if session_intent == Some(SessionCredentialIntent::Replace) {
+            match self.replacement_secret.take_for_save() {
+                Ok(secret) => Some(secret),
+                Err(_) => {
+                    self.status = "Enter a replacement session credential.".to_owned();
+                    return SaveAttempt::Invalid;
+                }
+            }
+        } else {
+            None
+        };
+        let secret_update = match session_update_for_save(
+            destination_mode,
+            credential_context,
+            session_intent,
+            replacement,
+        ) {
+            Ok(update) => update,
+            Err(_) => {
+                self.status = "Choose a valid session credential action.".to_owned();
+                return SaveAttempt::Invalid;
+            }
+        };
+        let command = match mode {
             EditorMode::Add => UiCommand::CreateProfile(CreateProfileRequest {
                 draft_id,
                 operation_id,
-                explicit_id: Some(profile_id),
+                explicit_id: (!use_auto_id).then_some(profile_id),
                 draft,
-                secret_update: SessionSecretUpdate::Clear,
-                migration_consent: MigrationConsent::Cancelled,
+                secret_update,
+                migration_consent,
             }),
             EditorMode::Edit {
                 original_id,
@@ -460,14 +661,11 @@ impl ProfileEditor {
                 expected_generation,
                 operation_id,
                 draft,
-                secret_update: if destination_mode == CredentialMode::Session {
-                    SessionSecretUpdate::Keep
-                } else {
-                    SessionSecretUpdate::Clear
-                },
-                migration_consent: MigrationConsent::Cancelled,
+                secret_update,
+                migration_consent,
             }),
-        }) {
+        };
+        match permit.submit(command) {
             Ok(()) => {
                 self.errors = ValidationErrors::default();
                 self.pending_save = Some(pending_save);
@@ -482,6 +680,105 @@ impl ProfileEditor {
                 self.status = "Service is unavailable".to_owned();
                 SaveAttempt::Disconnected
             }
+        }
+    }
+
+    pub fn try_test_draft(&mut self, port: &UiPort, operation_id: OperationId) -> DraftTestAttempt {
+        if self.config_uncertain {
+            self.status = "Reload profiles before testing.".to_owned();
+            return DraftTestAttempt::ConfigUncertain;
+        }
+        if self.draft.driver == DriverKind::MongoDb {
+            self.status = "MongoDB draft testing is planned and unavailable.".to_owned();
+            return DraftTestAttempt::Unavailable;
+        }
+        if let Some(pending) = self.pending_draft_test {
+            return DraftTestAttempt::AlreadyPending(pending);
+        }
+        if let Some(pending) = self.pending_operation() {
+            return DraftTestAttempt::AlreadyPending(pending);
+        }
+        let mut validated_draft = self.draft.clone();
+        if matches!(self.mode, EditorMode::Add) && self.use_auto_id {
+            validated_draft.id = slugify_profile_id(&validated_draft.name);
+        }
+        let profile = match validated_draft.validate() {
+            Ok(profile) => profile,
+            Err(errors) => {
+                self.errors = *errors;
+                self.status = "Fix the highlighted fields".to_owned();
+                return DraftTestAttempt::Invalid;
+            }
+        };
+        let draft = profile.as_draft();
+        let intent = match profile.credential_mode {
+            CredentialMode::None => DraftTestIntent::Secretless {
+                draft_id: self.draft_id,
+                operation_id,
+                draft,
+                timeout: DRAFT_TEST_TIMEOUT,
+            },
+            CredentialMode::Environment => DraftTestIntent::Environment {
+                draft_id: self.draft_id,
+                operation_id,
+                draft,
+                timeout: DRAFT_TEST_TIMEOUT,
+            },
+            CredentialMode::Session => match self.session_intent {
+                Some(SessionCredentialIntent::KeepCurrent) => {
+                    let EditorMode::Edit {
+                        original_id,
+                        expected_generation,
+                    } = &self.mode
+                    else {
+                        self.status = "Keep is unavailable for a new profile.".to_owned();
+                        return DraftTestAttempt::Invalid;
+                    };
+                    DraftTestIntent::SessionKeep {
+                        profile_id: original_id.clone(),
+                        profile_generation: *expected_generation,
+                        draft_id: self.draft_id,
+                        operation_id,
+                        draft,
+                        timeout: DRAFT_TEST_TIMEOUT,
+                    }
+                }
+                Some(SessionCredentialIntent::Replace) => {
+                    let secret = match self.replacement_secret.copy_for_test() {
+                        Ok(secret) => secret,
+                        Err(_) => {
+                            self.status = "Enter a replacement session credential.".to_owned();
+                            return DraftTestAttempt::Invalid;
+                        }
+                    };
+                    DraftTestIntent::SessionReplace {
+                        draft_id: self.draft_id,
+                        operation_id,
+                        draft,
+                        secret,
+                        timeout: DRAFT_TEST_TIMEOUT,
+                    }
+                }
+                Some(SessionCredentialIntent::Forget) => DraftTestIntent::Secretless {
+                    draft_id: self.draft_id,
+                    operation_id,
+                    draft,
+                    timeout: DRAFT_TEST_TIMEOUT,
+                },
+                None => {
+                    self.status = "Choose a session credential action.".to_owned();
+                    return DraftTestAttempt::Invalid;
+                }
+            },
+        };
+        match port.try_submit(UiCommand::PrepareDraftConnectionTest(intent)) {
+            Ok(()) => {
+                self.pending_draft_test = Some(operation_id);
+                self.status = "Testing draft connection…".to_owned();
+                DraftTestAttempt::Submitted(operation_id)
+            }
+            Err(SubmitError::Busy) => DraftTestAttempt::Busy,
+            Err(SubmitError::Disconnected) => DraftTestAttempt::Disconnected,
         }
     }
 
@@ -511,12 +808,20 @@ impl ProfileEditor {
                 }) if pending == operation_id && pending_profile == profile_id
             ) =>
             {
+                let connect_after_save = self
+                    .pending_save
+                    .as_ref()
+                    .is_some_and(PendingSave::connect_after_save);
                 self.pending_save = None;
                 self.status = warning.map_or_else(
                     || "Profile saved".to_owned(),
                     |summary| summary.message().to_owned(),
                 );
-                ProfileEventResult::Saved(profile_id.clone(), *warning)
+                if connect_after_save {
+                    ProfileEventResult::SavedAndConnect(profile_id.clone(), *warning)
+                } else {
+                    ProfileEventResult::Saved(profile_id.clone(), *warning)
+                }
             }
             UiEvent::ProfileCreateFailed {
                 operation_id,
@@ -528,12 +833,32 @@ impl ProfileEditor {
                 Some(PendingSave::Create {
                     operation_id: pending,
                     draft_id: pending_draft,
+                    ..
                 }) if pending == operation_id && pending_draft == draft_id
             ) =>
             {
                 self.pending_save = None;
                 self.status = error.summary.message().to_owned();
                 ProfileEventResult::Failed
+            }
+            UiEvent::DraftConnectionReady {
+                operation_id,
+                draft_id,
+                elapsed_ms,
+            } if *draft_id == self.draft_id && self.pending_draft_test == Some(*operation_id) => {
+                self.pending_draft_test = None;
+                self.status = format!("Draft connection ready in {elapsed_ms} ms");
+                ProfileEventResult::Ignored
+            }
+            UiEvent::DraftOperationFailed {
+                operation_id,
+                draft_id,
+                error,
+                ..
+            } if *draft_id == self.draft_id && self.pending_draft_test == Some(*operation_id) => {
+                self.pending_draft_test = None;
+                self.status = error.summary.message().to_owned();
+                ProfileEventResult::Ignored
             }
             UiEvent::ProfileUpdateFailed {
                 operation_id,
@@ -547,6 +872,7 @@ impl ProfileEditor {
                     operation_id: pending,
                     profile_id: pending_profile,
                     profile_generation: pending_generation,
+                    ..
                 }) if pending == operation_id
                     && pending_profile == profile_id
                     && pending_generation == profile_generation
@@ -562,6 +888,8 @@ impl ProfileEditor {
 
     pub fn show(&mut self, ui: &mut egui::Ui) -> FormAction {
         let mut pick_redis_ca_file = false;
+        let mut probe_environment = false;
+        OpenAiTheme::apply(ui.ctx());
         if self.config_uncertain {
             ui.disable();
         }
@@ -576,22 +904,45 @@ impl ProfileEditor {
             .selected_text(driver_name(self.draft.driver))
             .show_ui(ui, |ui| {
                 for driver in [DriverKind::MySql, DriverKind::Redis, DriverKind::MongoDb] {
-                    ui.selectable_value(&mut selected_driver, driver, driver_name(driver));
+                    if driver == DriverKind::MongoDb && self.draft.driver != DriverKind::MongoDb {
+                        ui.add_enabled_ui(false, |ui| {
+                            ui.selectable_value(&mut selected_driver, driver, "MongoDB (planned)");
+                        });
+                    } else {
+                        ui.selectable_value(&mut selected_driver, driver, driver_name(driver));
+                    }
                 }
             });
         if self.draft.driver != selected_driver {
             self.draft.select_driver(selected_driver);
         }
-        let id_editable = matches!(self.mode, EditorMode::Add);
+        ui.label("Display name");
+        let name_response =
+            ui.add(egui::TextEdit::singleline(&mut self.draft.name).id_salt(PROFILE_NAME_ID));
+        named_author_id(name_response, PROFILE_NAME_ID, "Profile display name");
+        render_error(ui, self.errors.name.as_deref());
+
+        if matches!(self.mode, EditorMode::Add) {
+            let auto_response = ui.checkbox(&mut self.use_auto_id, "Generate profile id from name");
+            named_author_id(
+                auto_response,
+                PROFILE_AUTO_ID_ID,
+                "Generate profile id automatically",
+            );
+            if let Some(preview) = self.auto_id_preview() {
+                ui.small(format!(
+                    "Will create as {preview}; conflicts receive -2, -3, …"
+                ));
+            }
+        }
+        let id_editable = matches!(self.mode, EditorMode::Add) && !self.use_auto_id;
         ui.label("Profile id");
-        ui.add_enabled(id_editable, egui::TextEdit::singleline(&mut self.draft.id));
-        render_error(ui, self.errors.id.as_deref());
-        text_field(
-            ui,
-            "Display name",
-            &mut self.draft.name,
-            self.errors.name.as_deref(),
+        let id_response = ui.add_enabled(
+            id_editable,
+            egui::TextEdit::singleline(&mut self.draft.id).id_salt(PROFILE_ID_ID),
         );
+        named_author_id(id_response, PROFILE_ID_ID, "Profile id");
+        render_error(ui, self.errors.id.as_deref());
         text_field_with_focus(
             ui,
             "Host",
@@ -686,60 +1037,151 @@ impl ProfileEditor {
                 }
             });
         if selected_credential_mode != self.draft.credential_mode {
-            self.draft.select_credential_mode(selected_credential_mode);
+            self.select_credential_mode(selected_credential_mode);
         }
         match self.draft.credential_mode {
             CredentialMode::Environment => {
-                text_field(
-                    ui,
-                    "Secret environment variable",
-                    &mut self.draft.secret_env,
-                    self.errors.secret_env.as_deref(),
+                ui.label("Secret environment variable");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.draft.secret_env)
+                        .id_salt(PROFILE_ENVIRONMENT_ID),
                 );
+                named_author_id(
+                    response,
+                    PROFILE_ENVIRONMENT_ID,
+                    "Secret environment variable name",
+                );
+                render_error(ui, self.errors.secret_env.as_deref());
+                let check = ui.add_sized(
+                    [144.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                    egui::Button::new("Check availability"),
+                );
+                probe_environment = named_author_id(
+                    check,
+                    PROFILE_ENVIRONMENT_CHECK_ID,
+                    "Check environment credential availability",
+                )
+                .clicked();
+                if let Some(availability) = self.environment_availability {
+                    ui.label(format!(
+                        "Environment credential: {}",
+                        environment_availability_label(availability)
+                    ));
+                }
                 ui.small("Only the environment-variable name is persisted.");
             }
-            CredentialMode::Session if self.session_keep_available => {
-                ui.small("The current in-memory session credential will be kept.");
-            }
             CredentialMode::Session => {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "No current session credential is available. Replacement entry is not yet available in this preview, so Save remains disabled for this mode.",
-                );
+                if let Some(policy) =
+                    session_intent_policy(CredentialMode::Session, self.credential_context())
+                {
+                    let mut selected_intent = self.session_intent.unwrap_or(policy.default);
+                    let response = egui::ComboBox::from_id_salt(PROFILE_SESSION_INTENT_ID)
+                        .selected_text(session_intent_name(selected_intent))
+                        .show_ui(ui, |ui| {
+                            for intent in policy.allowed {
+                                ui.selectable_value(
+                                    &mut selected_intent,
+                                    intent,
+                                    session_intent_name(intent),
+                                );
+                            }
+                        })
+                        .response;
+                    named_author_id(
+                        response,
+                        PROFILE_SESSION_INTENT_ID,
+                        "Session credential action",
+                    );
+                    if self.session_intent != Some(selected_intent) {
+                        self.select_session_intent(selected_intent);
+                    }
+                    if selected_intent == SessionCredentialIntent::Replace {
+                        ui.label("Replacement session credential");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(self.replacement_secret.as_mut_string())
+                                .id_salt(PROFILE_SESSION_REPLACEMENT_ID)
+                                .password(true),
+                        );
+                        named_author_id(
+                            response,
+                            PROFILE_SESSION_REPLACEMENT_ID,
+                            "Replacement session credential",
+                        );
+                        ui.small("Held only in a zeroizing in-memory buffer.");
+                    } else if selected_intent == SessionCredentialIntent::KeepCurrent {
+                        ui.small("Keep uses only the current exact profile credential.");
+                    } else {
+                        ui.small("Forget clears any in-memory credential when saved.");
+                    }
+                } else {
+                    self.session_intent = None;
+                    ui.small("Session credential actions are unavailable.");
+                }
             }
             CredentialMode::None => {
                 ui.small("No credential reference will be stored.");
             }
         }
-        if self.draft.driver == DriverKind::MongoDb && !self.actions_enabled() {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "MongoDB is planned. Save is available; Test and Execute are disabled.",
-            );
+        if self.draft.driver == DriverKind::MongoDb {
+            ui.strong("MongoDB is planned. Profile creation and network actions are disabled.");
         }
+        let migration = ui.checkbox(
+            &mut self.migration_confirmed,
+            "Allow a version-1 configuration migration with backup if required",
+        );
+        named_author_id(
+            migration,
+            PROFILE_MIGRATION_ID,
+            "Confirm configuration migration backup",
+        );
         ui.separator();
         let footer_action = ui
             .horizontal(|ui| {
-                let session_save_available = self.draft.credential_mode != CredentialMode::Session
-                    || self.session_keep_available;
-                let save = ui
-                    .add_enabled(
-                        self.pending_operation().is_none() && session_save_available,
-                        egui::Button::new("Save"),
+                let actions_enabled = self.actions_enabled();
+                let test = ui.add_enabled(
+                    actions_enabled,
+                    egui::Button::new("Test draft")
+                        .min_size(egui::vec2(112.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                );
+                let test =
+                    named_author_id(test, PROFILE_TEST_ID, "Test draft connection").clicked();
+                let save = ui.add_enabled(
+                    actions_enabled,
+                    egui::Button::new("Save")
+                        .min_size(egui::vec2(96.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                );
+                let save = named_author_id(save, PROFILE_SAVE_ID, "Save profile").clicked();
+                let save_connect = ui.add_enabled(
+                    actions_enabled,
+                    egui::Button::new(
+                        egui::RichText::new("Save & Connect").color(egui::Color32::WHITE),
                     )
-                    .clicked();
-                let cancel = ui
-                    .add_enabled(
-                        self.pending_operation().is_none(),
-                        egui::Button::new("Cancel"),
-                    )
-                    .clicked();
-                if self.pending_save.is_some() {
+                    .fill(egui::Color32::BLACK)
+                    .min_size(egui::vec2(144.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                );
+                let save_connect = named_author_id(
+                    save_connect,
+                    PROFILE_SAVE_CONNECT_ID,
+                    "Save profile and connect",
+                )
+                .clicked();
+                let cancel = ui.add_enabled(
+                    self.pending_operation().is_none() && self.pending_draft_test.is_none(),
+                    egui::Button::new("Cancel")
+                        .min_size(egui::vec2(96.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                );
+                let cancel =
+                    named_author_id(cancel, PROFILE_CANCEL_ID, "Cancel profile edit").clicked();
+                if self.pending_save.is_some() || self.pending_draft_test.is_some() {
                     ui.spinner();
                 }
                 ui.label(&self.status);
-                if save {
-                    FormAction::Save
+                if test {
+                    FormAction::TestDraft
+                } else if save_connect {
+                    FormAction::Save { connect: true }
+                } else if save {
+                    FormAction::Save { connect: false }
                 } else if cancel {
                     FormAction::Cancel
                 } else {
@@ -749,6 +1191,8 @@ impl ProfileEditor {
             .inner;
         if pick_redis_ca_file {
             FormAction::PickRedisCaFile
+        } else if probe_environment {
+            FormAction::ProbeEnvironment
         } else {
             footer_action
         }
@@ -805,6 +1249,22 @@ fn credential_mode_name(mode: CredentialMode) -> &'static str {
         CredentialMode::None => "None",
         CredentialMode::Session => "Session",
         CredentialMode::Environment => "Environment",
+    }
+}
+
+fn session_intent_name(intent: SessionCredentialIntent) -> &'static str {
+    match intent {
+        SessionCredentialIntent::KeepCurrent => "Keep current",
+        SessionCredentialIntent::Replace => "Replace",
+        SessionCredentialIntent::Forget => "Forget",
+    }
+}
+
+fn environment_availability_label(availability: EnvironmentAvailability) -> &'static str {
+    match availability {
+        EnvironmentAvailability::Available => "Available",
+        EnvironmentAvailability::Missing => "Missing",
+        EnvironmentAvailability::Empty => "Empty",
     }
 }
 
@@ -895,7 +1355,10 @@ mod tests {
             panic!("expected create command");
         };
         assert_eq!(request.explicit_id, None);
-        assert_eq!(request.migration_consent, MigrationConsent::Confirmed);
+        assert_eq!(
+            request.migration_consent,
+            MigrationConsent::from_confirmation(true)
+        );
     }
 
     #[test]
@@ -1282,19 +1745,40 @@ mod tests {
     }
 
     #[test]
-    fn mongodb_save_is_allowed_but_actions_are_disabled() {
+    fn mongodb_save_and_network_actions_are_disabled() {
         let (ui, mut service) = bounded_ports(1);
         let mut editor = valid_editor(DriverKind::MongoDb);
         assert!(!editor.actions_enabled());
-        assert!(matches!(
-            editor.try_save(&ui, OperationId(4)),
-            SaveAttempt::Submitted(_)
-        ));
-        assert!(matches!(
-            service.try_next_command(),
-            Some(UiCommand::CreateProfile(request))
-                if request.draft.driver == DriverKind::MongoDb
-        ));
+        assert_eq!(editor.try_save(&ui, OperationId(4)), SaveAttempt::Invalid);
+        assert_eq!(
+            editor.try_test_draft(&ui, OperationId(5)),
+            DraftTestAttempt::Unavailable
+        );
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn busy_mutation_lane_does_not_consume_replacement_secret() {
+        let (ui, mut service) = bounded_ports(1);
+        assert_eq!(
+            ui.try_submit(UiCommand::RefreshProfiles {
+                operation_id: OperationId(220),
+            }),
+            Ok(())
+        );
+        let mut editor = ProfileEditor::new(DraftId(220), DriverKind::Redis);
+        editor.draft.name = "Session Redis".to_owned();
+        editor.select_credential_mode(CredentialMode::Session);
+        editor.set_replacement_secret("replace-secret".to_owned());
+
+        assert_eq!(editor.try_save(&ui, OperationId(221)), SaveAttempt::Busy);
+        assert!(editor.replacement_is_set());
+        assert!(service.try_next_command().is_some());
+        assert_eq!(
+            editor.try_save(&ui, OperationId(222)),
+            SaveAttempt::Submitted(OperationId(222))
+        );
+        assert!(!editor.replacement_is_set());
     }
 
     #[test]

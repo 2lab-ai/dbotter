@@ -92,6 +92,10 @@ impl ReplacementSecretBuffer {
         self.0.as_str()
     }
 
+    pub(crate) fn as_mut_string(&mut self) -> &mut String {
+        &mut self.0
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

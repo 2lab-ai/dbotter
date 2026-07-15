@@ -18,7 +18,9 @@ use super::adapter::{SubmitError, UiCommand, UiPort};
 use super::editor::{EditorIntent, EditorSurface};
 use super::model::{ConnectionState, ProfileSnapshot, UiEvent, UiModel};
 use super::mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
-use super::profile_form::{FormAction, ProfileEditor, ProfileEventResult, SaveAttempt};
+use super::profile_form::{
+    DraftTestAttempt, FormAction, ProfileEditor, ProfileEventResult, SaveAttempt,
+};
 use super::redis_explorer::{RedisExplorer, RedisExplorerIntent};
 
 const EVENT_DRAIN_LIMIT: usize = 128;
@@ -33,6 +35,7 @@ pub struct DbotterApp {
     editor_surface: EditorSurface,
     redis_explorer: RedisExplorer,
     next_draft_id: u64,
+    pending_connect_after_refresh: Option<ProfileId>,
 }
 
 impl DbotterApp {
@@ -45,6 +48,7 @@ impl DbotterApp {
             editor_surface: EditorSurface::default(),
             redis_explorer: RedisExplorer::default(),
             next_draft_id: 1,
+            pending_connect_after_refresh: None,
         };
         let operation_id = app.model.next_operation();
         let _ = app
@@ -87,6 +91,24 @@ impl DbotterApp {
                     }
                     continue;
                 }
+                ProfileEventResult::SavedAndConnect(profile_id, warning) => {
+                    self.model.fold(event);
+                    self.model.selected_profile = Some(profile_id.clone());
+                    self.pending_connect_after_refresh = Some(profile_id);
+                    self.model.status = warning.map_or_else(
+                        || "Profile saved; refreshing before connect…".to_owned(),
+                        |summary| summary.message().to_owned(),
+                    );
+                    self.profile_editor = None;
+                    let operation_id = self.model.next_operation();
+                    if let Err(error) = self
+                        .port
+                        .try_submit(UiCommand::RefreshProfiles { operation_id })
+                    {
+                        self.report_submit_error(error);
+                    }
+                    continue;
+                }
                 ProfileEventResult::Failed => {
                     if let Some(editor) = &self.profile_editor {
                         self.model.status = editor.status().to_owned();
@@ -95,7 +117,12 @@ impl DbotterApp {
                 }
                 ProfileEventResult::Ignored => {}
             }
+            let profiles_loaded = matches!(event, UiEvent::ProfilesLoaded { .. });
             self.model.fold(event);
+            if profiles_loaded && let Some(profile_id) = self.pending_connect_after_refresh.take() {
+                self.model.selected_profile = Some(profile_id.clone());
+                self.submit_test(profile_id);
+            }
         }
         self.mysql_explorers.retain(|(profile_id, generation), _| {
             self.model.active_generation(profile_id) == Some(*generation)
@@ -561,10 +588,10 @@ impl DbotterApp {
                 }
             });
             match action {
-                FormAction::Save => {
+                FormAction::Save { connect } => {
                     let operation_id = self.model.next_operation();
                     if let Some(editor) = self.profile_editor.as_mut() {
-                        match editor.try_save(&self.port, operation_id) {
+                        match editor.try_save_with_connect(&self.port, operation_id, connect) {
                             SaveAttempt::Submitted(_) => {
                                 self.model.status = "Saving profile…".to_owned();
                             }
@@ -584,6 +611,37 @@ impl DbotterApp {
                                 self.model.status = "Profile save is already pending".to_owned();
                             }
                         }
+                    }
+                }
+                FormAction::TestDraft => {
+                    let operation_id = self.model.next_operation();
+                    if let Some(editor) = self.profile_editor.as_mut() {
+                        match editor.try_test_draft(&self.port, operation_id) {
+                            DraftTestAttempt::Submitted(_) => {
+                                self.model.status = "Testing draft connection…".to_owned();
+                            }
+                            DraftTestAttempt::Invalid | DraftTestAttempt::Unavailable => {
+                                self.model.status = editor.status().to_owned();
+                            }
+                            DraftTestAttempt::Busy => {
+                                self.model.status = "Service is busy".to_owned();
+                            }
+                            DraftTestAttempt::Disconnected => {
+                                self.model.status = "Service is unavailable".to_owned();
+                            }
+                            DraftTestAttempt::ConfigUncertain => {
+                                self.model.status = "Reload profiles before testing.".to_owned();
+                            }
+                            DraftTestAttempt::AlreadyPending(_) => {
+                                self.model.status = "Profile work is already pending".to_owned();
+                            }
+                        }
+                    }
+                }
+                FormAction::ProbeEnvironment => {
+                    if let Some(editor) = self.profile_editor.as_mut() {
+                        let availability = editor.probe_environment_availability();
+                        self.model.status = format!("Environment credential: {availability:?}");
                     }
                 }
                 FormAction::Cancel => self.profile_editor = None,

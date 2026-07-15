@@ -14,8 +14,8 @@ mod runtime_contract_tests;
 mod theme;
 
 pub use adapter::{
-    CONTROL_CAPACITY, EVENT_CAPACITY, MUTATION_CAPACITY, ServicePort, SubmitError, UiCommand,
-    UiPort, WORK_CAPACITY, bounded_ports, controller_ports,
+    CONTROL_CAPACITY, DraftTestIntent, EVENT_CAPACITY, MUTATION_CAPACITY, ServicePort, SubmitError,
+    UiCommand, UiPort, WORK_CAPACITY, bounded_ports, controller_ports,
 };
 pub use app::DEFAULT_EXECUTE_ROW_LIMIT;
 pub use editor::{

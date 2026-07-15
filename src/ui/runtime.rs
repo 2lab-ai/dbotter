@@ -23,7 +23,7 @@ use crate::service::{
     RuntimeReloadOutcome, RuntimeUpdateOutcome, ServiceError, SessionDisposition, TestDraftRequest,
 };
 
-use super::adapter::{ControlKey, ServicePort, UiCommand};
+use super::adapter::{ControlKey, DraftTestIntent, ServicePort, UiCommand};
 use super::editor::classify_execute_operation;
 use super::model::{ConnectionFailureOutcome, PostCloseState, ProfileSnapshot, UiEvent};
 
@@ -593,6 +593,27 @@ enum ProfileWork {
     },
 }
 
+enum DraftWorkInput {
+    Prepared(TestDraftRequest),
+    Intent(DraftTestIntent),
+}
+
+impl DraftWorkInput {
+    fn operation_id(&self) -> OperationId {
+        match self {
+            Self::Prepared(request) => request.operation_id(),
+            Self::Intent(intent) => intent.operation_id(),
+        }
+    }
+
+    fn draft_id(&self) -> DraftId {
+        match self {
+            Self::Prepared(request) => request.draft_id(),
+            Self::Intent(intent) => intent.draft_id(),
+        }
+    }
+}
+
 enum ProfileControlWork {
     Disconnect {
         operation_id: OperationId,
@@ -920,7 +941,19 @@ fn handle_work(
     let work = match command {
         UiCommand::TestDraftConnection(request) => {
             start_draft_work(
-                request,
+                DraftWorkInput::Prepared(request),
+                port,
+                application,
+                message_tx,
+                global_permits,
+                draft_permits,
+                registry,
+            );
+            return;
+        }
+        UiCommand::PrepareDraftConnectionTest(intent) => {
+            start_draft_work(
+                DraftWorkInput::Intent(intent),
                 port,
                 application,
                 message_tx,
@@ -989,7 +1022,7 @@ fn handle_work(
 
 #[allow(clippy::too_many_arguments)]
 fn start_draft_work(
-    request: TestDraftRequest,
+    input: DraftWorkInput,
     port: &ServicePort,
     application: &ApplicationService,
     message_tx: &mpsc::UnboundedSender<ControllerMessage>,
@@ -997,8 +1030,8 @@ fn start_draft_work(
     draft_permits: &mut DraftPermitRegistry,
     registry: &mut TaskRegistry,
 ) {
-    let operation_id = request.operation_id();
-    let draft_id = request.draft_id();
+    let operation_id = input.operation_id();
+    let draft_id = input.draft_id();
     let reservation = match registry.reserve(operation_id) {
         Ok(reservation) => reservation,
         Err(()) => {
@@ -1047,7 +1080,26 @@ fn start_draft_work(
         if start_rx.await.is_err() {
             return;
         }
-        let event = run_draft_work(&service, request, &task_cancel).await;
+        let event = match input {
+            DraftWorkInput::Prepared(request) => {
+                run_draft_work(&service, request, &task_cancel).await
+            }
+            DraftWorkInput::Intent(intent) => {
+                match prepare_draft_test_intent(&service, intent).await {
+                    Ok(request) => run_draft_work(&service, request, &task_cancel).await,
+                    Err((failed_draft, failed_operation, error)) => {
+                        let (summary, code) = error.public_error_parts();
+                        draft_failed_event(
+                            failed_operation,
+                            failed_draft,
+                            OperationKind::TestDraftConnection,
+                            summary,
+                            code,
+                        )
+                    }
+                }
+            }
+        };
         drop(draft_permit);
         drop(global_permit);
         task_completion_sent.store(true, Ordering::Release);
@@ -1087,6 +1139,53 @@ fn start_draft_work(
             ));
         }
     }
+}
+
+async fn prepare_draft_test_intent(
+    service: &ApplicationService,
+    intent: DraftTestIntent,
+) -> Result<TestDraftRequest, (DraftId, OperationId, ServiceError)> {
+    let draft_id = intent.draft_id();
+    let operation_id = intent.operation_id();
+    let result = match intent {
+        DraftTestIntent::Secretless { draft, timeout, .. } => {
+            service.prepare_secretless_draft_test(draft_id, operation_id, draft, timeout)
+        }
+        DraftTestIntent::SessionReplace {
+            draft,
+            secret,
+            timeout,
+            ..
+        } => service.prepare_replacement_secret_draft_test(
+            draft_id,
+            operation_id,
+            draft,
+            secret,
+            timeout,
+        ),
+        DraftTestIntent::SessionKeep {
+            profile_id,
+            profile_generation,
+            draft,
+            timeout,
+            ..
+        } => {
+            service
+                .prepare_keep_current_draft_test(
+                    profile_id,
+                    profile_generation,
+                    draft_id,
+                    operation_id,
+                    draft,
+                    timeout,
+                )
+                .await
+        }
+        DraftTestIntent::Environment { draft, timeout, .. } => {
+            service.prepare_environment_draft_test(draft_id, operation_id, draft, timeout)
+        }
+    };
+    result.map_err(|error| (draft_id, operation_id, error))
 }
 
 async fn run_draft_work(
@@ -3712,6 +3811,13 @@ fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEven
         UiCommand::TestDraftConnection(request) => draft_failed_event(
             request.operation_id(),
             request.draft_id(),
+            OperationKind::TestDraftConnection,
+            summary,
+            PublicCode::None,
+        ),
+        UiCommand::PrepareDraftConnectionTest(intent) => draft_failed_event(
+            intent.operation_id(),
+            intent.draft_id(),
             OperationKind::TestDraftConnection,
             summary,
             PublicCode::None,

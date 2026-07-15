@@ -1310,6 +1310,28 @@ impl ApplicationService {
         ))
     }
 
+    pub(crate) fn prepare_replacement_secret_draft_test(
+        &self,
+        draft_id: DraftId,
+        operation_id: OperationId,
+        draft: ConnectionDraft,
+        secret: Arc<SessionSecret>,
+        timeout: Duration,
+    ) -> Result<TestDraftRequest, ServiceError> {
+        self.ensure_config_certain()?;
+        validate_connection_draft(&draft)?;
+        if draft.credential_mode != CredentialMode::Session {
+            return Err(ProfileValidationError::field(ProfileFieldId::CredentialMode).into());
+        }
+        Ok(TestDraftRequest::with_credential(
+            draft_id,
+            operation_id,
+            draft,
+            DraftCredentialSource::SessionReplace(secret),
+            timeout,
+        ))
+    }
+
     pub async fn prepare_keep_current_draft_test(
         &self,
         profile_id: ProfileId,
