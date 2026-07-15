@@ -136,7 +136,8 @@ fn load_or_create_token_key(path: &Path) -> std::io::Result<CatalogTokenKey> {
         .filter(|value| !value.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(directory)?;
-    let candidate = CatalogTokenKey::generate().map_err(std::io::Error::other)?;
+    let candidate = CatalogTokenKey::generate()
+        .map_err(|_| std::io::Error::other("catalog token integrity entropy is unavailable"))?;
     let (temp_path, mut temp_file) = create_token_key_temp(directory)?;
     let cleanup = TokenKeyTempCleanup::new(temp_path.clone());
     temp_file.write_all(candidate.0.as_ref())?;
