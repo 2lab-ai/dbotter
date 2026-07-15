@@ -59,7 +59,12 @@ fn prepared_unsupported_is_static_and_never_resubmits_user_text() {
 
 #[test]
 fn mysql_authentication_handshake_is_classified_before_pool_retry_and_shares_timeout() {
+    let cargo = source("Cargo.toml");
     let mysql = source("src/drivers/mysql.rs");
+    assert!(
+        cargo.contains("\"mysql-rsa\""),
+        "TLS-disabled caching_sha2_password must finish its RSA handshake so server auth errno is observable"
+    );
     let direct = mysql
         .find("MySqlConnection::connect_with(&options)")
         .expect("single direct authentication handshake");
