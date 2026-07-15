@@ -10,21 +10,27 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[path = "common/live_evidence.rs"]
+mod live_evidence;
+
 use base64::Engine as _;
 use dbotter::config::{Config, ConfigWriter};
+use dbotter::drivers::DriverError;
 use dbotter::drivers::redis::{
     RedisSession, reset_transport_attempt_counts, transport_attempt_counts,
 };
 use dbotter::drivers::redis_browser::RedisScanAccumulator;
-use dbotter::drivers::{DriverError, RedisTlsFailure};
+use dbotter::execution::{ExecutionLanguage, ExecutionTargetError, extract_and_validate_target};
 use dbotter::model::{
     Cell, ConnectionProfile, CredentialMode, DriverKind, MAX_REDIS_KEY_BYTES, OperationId,
-    ProfileGeneration, ProfileId, PublicCode, PublicSummary, RedisExecuteRequest, RedisKeyFilter,
-    RedisKeyId, RedisKeyInspectRequest, RedisScanRequest, RedisTlsConfig, RedisTtl, RedisValueType,
-    RequestIdentity, TlsMode,
+    OperationKind, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
+    RedisExecuteRequest, RedisKeyFilter, RedisKeyId, RedisKeyInspectRequest, RedisScanRequest,
+    RedisTlsConfig, RedisTtl, RedisValueType, RequestIdentity, TlsMode,
 };
+use dbotter::public_error::{RecoveryAction, SafeContext, recovery_for};
 use dbotter::secrets::{SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate};
 use dbotter::service::{ApplicationService, DriverConnector, SecretResolver, ServiceError};
+use live_evidence::LiveEvidence;
 use secrecy::SecretString;
 
 const CORRECT_PASSWORD: &str = "dbotter-redis-local-only";
@@ -233,7 +239,20 @@ async fn seed_representative_dataset(session: &RedisSession) -> Vec<u8> {
     binary_key
 }
 
-async fn assert_scan_and_inspection(session: &RedisSession, binary_key: &[u8]) {
+struct RedisMeasurements {
+    scan_pages: usize,
+    inspect_types: usize,
+    mutation_readbacks: usize,
+}
+
+async fn assert_scan_and_inspection(
+    session: &RedisSession,
+    binary_key: &[u8],
+    evidence: &mut LiveEvidence,
+) -> RedisMeasurements {
+    let multiple_pages = evidence.begin("redis.scan.multiple_pages");
+    let raw_binary_identity = evidence.begin("redis.scan.raw_binary_identity");
+    let oversize_skipped = evidence.begin("redis.scan.oversize_skipped");
     let filter = RedisKeyFilter::LiteralPrefix("p5:".to_owned());
     let mut accumulator = RedisScanAccumulator::new(filter.clone());
     let mut cursor = 0_u64;
@@ -258,6 +277,7 @@ async fn assert_scan_and_inspection(session: &RedisSession, binary_key: &[u8]) {
         assert!(pages < 1_000, "SCAN cursor failed to converge");
     }
     assert!(pages > 1, "fixture must prove more than one SCAN page");
+    evidence.pass(multiple_pages);
     assert!(
         accumulator
             .keys()
@@ -265,34 +285,57 @@ async fn assert_scan_and_inspection(session: &RedisSession, binary_key: &[u8]) {
             .any(|entry| entry.id.as_bytes() == binary_key),
         "binary key identity must survive SCAN"
     );
+    evidence.pass(raw_binary_identity);
     assert_eq!(accumulator.skipped_oversize(), 1);
     assert!(accumulator.truncated());
     assert!(accumulator.is_complete());
+    evidence.pass(oversize_skipped);
 
     let cases = [
-        ("p5:string", RedisValueType::String, RedisTtl::Persistent),
-        ("p5:hash", RedisValueType::Hash, RedisTtl::Persistent),
-        ("p5:list", RedisValueType::List, RedisTtl::Persistent),
-        ("p5:set", RedisValueType::Set, RedisTtl::Persistent),
-        ("p5:zset", RedisValueType::SortedSet, RedisTtl::Persistent),
-        ("p5:stream", RedisValueType::Stream, RedisTtl::Persistent),
+        (
+            "p5:string",
+            RedisValueType::String,
+            "redis.inspect.type.string",
+        ),
+        ("p5:hash", RedisValueType::Hash, "redis.inspect.type.hash"),
+        ("p5:list", RedisValueType::List, "redis.inspect.type.list"),
+        ("p5:set", RedisValueType::Set, "redis.inspect.type.set"),
+        (
+            "p5:zset",
+            RedisValueType::SortedSet,
+            "redis.inspect.type.zset",
+        ),
+        (
+            "p5:stream",
+            RedisValueType::Stream,
+            "redis.inspect.type.stream",
+        ),
     ];
-    for (index, (key, expected_type, expected_ttl)) in cases.into_iter().enumerate() {
+    let persistent_ttl = evidence.begin("redis.inspect.ttl.persistent");
+    let mut inspect_types = 0_usize;
+    for (index, (key, expected_type, case_id)) in cases.into_iter().enumerate() {
+        let type_checkpoint = evidence.begin(case_id);
         let preview = inspect(session, 300 + index as u64, key.as_bytes().to_vec())
             .await
             .unwrap_or_else(|error| panic!("inspect {key}: {error:?}"));
         assert_eq!(preview.value_type, expected_type, "key={key}");
-        assert_eq!(preview.ttl, expected_ttl, "key={key}");
+        assert_eq!(preview.ttl, RedisTtl::Persistent, "key={key}");
         assert!(!preview.items.is_empty(), "key={key}");
         assert!(preview.retained_items <= 100, "key={key}");
         assert!(preview.retained_bytes <= 1024 * 1024, "key={key}");
+        inspect_types += 1;
+        evidence.pass(type_checkpoint);
     }
+    evidence.pass(persistent_ttl);
 
+    let expiring_ttl = evidence.begin("redis.inspect.ttl.expiring");
     let ttl = inspect(session, 400, b"p5:ttl".to_vec())
         .await
         .expect("expiring key");
     assert!(matches!(ttl.ttl, RedisTtl::ExpiresIn(value) if value > 0));
+    evidence.pass(expiring_ttl);
 
+    let truncation = evidence.begin("redis.inspect.truncation_64kib");
     let large = inspect(session, 401, b"p5:large-string".to_vec())
         .await
         .expect("large string");
@@ -300,6 +343,7 @@ async fn assert_scan_and_inspection(session: &RedisSession, binary_key: &[u8]) {
     assert_eq!(large.size, Some(70_000));
     assert!(large.truncated);
     assert!(large.retained_bytes <= 64 * 1024);
+    evidence.pass(truncation);
 
     let binary = inspect(session, 402, binary_key.to_vec())
         .await
@@ -307,10 +351,12 @@ async fn assert_scan_and_inspection(session: &RedisSession, binary_key: &[u8]) {
     assert_eq!(binary.key.id.as_bytes(), binary_key);
     assert_eq!(binary.value_type, RedisValueType::String);
 
+    let missing_ttl = evidence.begin("redis.inspect.ttl.missing");
     assert!(matches!(
         inspect(session, 403, b"p5:missing".to_vec()).await,
         Err(DriverError::RedisKeyMissing)
     ));
+    evidence.pass(missing_ttl);
     let oversize = RedisKeyInspectRequest {
         identity: identity("redis-live-direct", 404),
         key: RedisKeyId(vec![b'x'; MAX_REDIS_KEY_BYTES + 1]),
@@ -318,16 +364,45 @@ async fn assert_scan_and_inspection(session: &RedisSession, binary_key: &[u8]) {
     };
     assert!(oversize.validate().is_err());
 
+    let mutation_readback = evidence.begin("redis.mutation.readback");
+    let mut mutation_readbacks = 0_usize;
     execute(session, 405, argv(&["SET", "p5:mutation", "before"])).await;
     let before = inspect(session, 406, b"p5:mutation".to_vec())
         .await
         .expect("mutation before");
     assert!(matches!(&before.items[0], Cell::Text(value) if value == "before"));
+    mutation_readbacks += 1;
     execute(session, 407, argv(&["SET", "p5:mutation", "after"])).await;
     let after = inspect(session, 408, b"p5:mutation".to_vec())
         .await
         .expect("mutation after");
     assert!(matches!(&after.items[0], Cell::Text(value) if value == "after"));
+    mutation_readbacks += 1;
+    evidence.pass(mutation_readback);
+    RedisMeasurements {
+        scan_pages: pages,
+        inspect_types,
+        mutation_readbacks,
+    }
+}
+
+fn assert_classifier_without_command(evidence: &mut LiveEvidence) {
+    reset_transport_attempt_counts();
+    let classifier = evidence.begin("redis.classifier.no_command");
+    let rejected = extract_and_validate_target(
+        "SUBSCRIBE measured-channel",
+        0,
+        None,
+        ExecutionLanguage::Redis,
+        100,
+        5,
+    )
+    .expect_err("blocking Redis family must be rejected before session acquisition");
+    assert_eq!(rejected, ExecutionTargetError::RedisCommandDenied);
+    let attempts = transport_attempt_counts();
+    assert_eq!(attempts.plaintext, 0);
+    assert_eq!(attempts.required_tls, 0);
+    evidence.pass(classifier);
 }
 
 enum ResolverState {
@@ -391,14 +466,154 @@ async fn service_check(
     result
 }
 
-async fn assert_auth_matrix(fixture: &LiveFixture) {
-    for tls in [TlsMode::Disabled, TlsMode::Required] {
-        let label = if tls == TlsMode::Required {
-            "tls"
-        } else {
-            "plain"
-        };
+struct UnavailableAuthCaseIds {
+    failure: &'static str,
+    code: &'static str,
+    action: &'static str,
+    recovery: &'static str,
+}
 
+struct AuthCaseIds {
+    session_correct: &'static str,
+    session_wrong: &'static str,
+    session_wrong_code: &'static str,
+    session_wrong_action: &'static str,
+    session_wrong_recovery: &'static str,
+    environment_correct: &'static str,
+    environment_wrong: &'static str,
+    environment_wrong_code: &'static str,
+    environment_wrong_action: &'static str,
+    environment_wrong_recovery: &'static str,
+    missing: UnavailableAuthCaseIds,
+    empty: UnavailableAuthCaseIds,
+}
+
+const PLAINTEXT_AUTH: AuthCaseIds = AuthCaseIds {
+    session_correct: "redis.auth.plaintext.session.correct",
+    session_wrong: "redis.auth.plaintext.session.wrong",
+    session_wrong_code: "redis.auth.plaintext.session.wrong.code",
+    session_wrong_action: "redis.auth.plaintext.session.wrong.action",
+    session_wrong_recovery: "redis.auth.plaintext.session.wrong.recovery",
+    environment_correct: "redis.auth.plaintext.environment.available.correct",
+    environment_wrong: "redis.auth.plaintext.environment.available.wrong",
+    environment_wrong_code: "redis.auth.plaintext.environment.available.wrong.code",
+    environment_wrong_action: "redis.auth.plaintext.environment.available.wrong.action",
+    environment_wrong_recovery: "redis.auth.plaintext.environment.available.wrong.recovery",
+    missing: UnavailableAuthCaseIds {
+        failure: "redis.auth.plaintext.environment.missing",
+        code: "redis.auth.plaintext.environment.missing.code",
+        action: "redis.auth.plaintext.environment.missing.action",
+        recovery: "redis.auth.plaintext.environment.missing.recovery",
+    },
+    empty: UnavailableAuthCaseIds {
+        failure: "redis.auth.plaintext.environment.empty",
+        code: "redis.auth.plaintext.environment.empty.code",
+        action: "redis.auth.plaintext.environment.empty.action",
+        recovery: "redis.auth.plaintext.environment.empty.recovery",
+    },
+};
+
+const TLS_AUTH: AuthCaseIds = AuthCaseIds {
+    session_correct: "redis.auth.tls.session.correct",
+    session_wrong: "redis.auth.tls.session.wrong",
+    session_wrong_code: "redis.auth.tls.session.wrong.code",
+    session_wrong_action: "redis.auth.tls.session.wrong.action",
+    session_wrong_recovery: "redis.auth.tls.session.wrong.recovery",
+    environment_correct: "redis.auth.tls.environment.available.correct",
+    environment_wrong: "redis.auth.tls.environment.available.wrong",
+    environment_wrong_code: "redis.auth.tls.environment.available.wrong.code",
+    environment_wrong_action: "redis.auth.tls.environment.available.wrong.action",
+    environment_wrong_recovery: "redis.auth.tls.environment.available.wrong.recovery",
+    missing: UnavailableAuthCaseIds {
+        failure: "redis.auth.tls.environment.missing",
+        code: "redis.auth.tls.environment.missing.code",
+        action: "redis.auth.tls.environment.missing.action",
+        recovery: "redis.auth.tls.environment.missing.recovery",
+    },
+    empty: UnavailableAuthCaseIds {
+        failure: "redis.auth.tls.environment.empty",
+        code: "redis.auth.tls.environment.empty.code",
+        action: "redis.auth.tls.environment.empty.action",
+        recovery: "redis.auth.tls.environment.empty.recovery",
+    },
+};
+
+fn assert_auth_code(error: &ServiceError, code: PublicCode) {
+    assert_eq!(
+        error.public_error_parts(),
+        (PublicSummary::AuthenticationFailed, code)
+    );
+}
+
+fn assert_auth_action(error: &ServiceError, profile_id: &str, expected: RecoveryAction) {
+    let actions = recovery_for(
+        OperationKind::ConnectProfile,
+        error.public_summary(),
+        error.public_code(),
+        &SafeContext::profile(ProfileId(profile_id.to_owned()), OperationId(700)),
+    )
+    .expect("typed Redis Authentication recovery");
+    assert_eq!(actions.as_slice(), &[expected]);
+}
+
+async fn unavailable_environment_case(
+    fixture: &LiveFixture,
+    evidence: &mut LiveEvidence,
+    tls: TlsMode,
+    label: &str,
+    state: ResolverState,
+    ids: &UnavailableAuthCaseIds,
+) -> usize {
+    let profile_id = format!("environment-{label}");
+    let failure = evidence.begin(ids.failure);
+    let error = service_check(
+        fixture.profile(&profile_id, tls, CredentialMode::Environment),
+        state,
+        None,
+    )
+    .await
+    .expect_err("unavailable Redis Environment credential must fail");
+    let auth_failures = 1;
+    evidence.pass(failure);
+
+    let code = evidence.begin(ids.code);
+    assert_auth_code(&error, PublicCode::CredentialEnvironmentName);
+    evidence.pass(code);
+
+    let action = evidence.begin(ids.action);
+    assert_auth_action(
+        &error,
+        &profile_id,
+        RecoveryAction::EditProfile(
+            ProfileId(profile_id.clone()),
+            ProfileFieldId::CredentialEnvironmentName,
+        ),
+    );
+    evidence.pass(action);
+
+    let recovery = evidence.begin(ids.recovery);
+    service_check(
+        fixture.profile(
+            &format!("{profile_id}-recovered"),
+            tls,
+            CredentialMode::Environment,
+        ),
+        ResolverState::Available(CORRECT_PASSWORD.to_owned()),
+        None,
+    )
+    .await
+    .expect("Redis unavailable Environment recovery");
+    evidence.pass(recovery);
+    auth_failures
+}
+
+async fn assert_auth_matrix(fixture: &LiveFixture, evidence: &mut LiveEvidence) -> usize {
+    let mut auth_failures = 0_usize;
+    for (tls, label, ids) in [
+        (TlsMode::Disabled, "plaintext", &PLAINTEXT_AUTH),
+        (TlsMode::Required, "tls", &TLS_AUTH),
+    ] {
+        let session_correct = evidence.begin(ids.session_correct);
         service_check(
             fixture.profile(
                 &format!("session-correct-{label}"),
@@ -410,29 +625,47 @@ async fn assert_auth_matrix(fixture: &LiveFixture) {
         )
         .await
         .unwrap_or_else(|error| panic!("Session correct/{label}: {error:?}"));
+        evidence.pass(session_correct);
+
+        let session_profile_id = format!("session-wrong-{label}");
+        let session_wrong = evidence.begin(ids.session_wrong);
         let wrong_session = service_check(
-            fixture.profile(
-                &format!("session-wrong-{label}"),
-                tls,
-                CredentialMode::Session,
-            ),
+            fixture.profile(&session_profile_id, tls, CredentialMode::Session),
             ResolverState::Missing,
             Some(WRONG_PASSWORD),
         )
         .await
-        .expect_err("wrong Session password must fail");
-        assert_eq!(
-            wrong_session.public_error_parts(),
-            (
-                PublicSummary::AuthenticationFailed,
-                PublicCode::SessionCredential
-            ),
-            "Session wrong/{label}"
+        .expect_err("wrong Redis Session password must fail");
+        auth_failures += 1;
+        evidence.pass(session_wrong);
+        let session_code = evidence.begin(ids.session_wrong_code);
+        assert_auth_code(&wrong_session, PublicCode::SessionCredential);
+        evidence.pass(session_code);
+        let session_action = evidence.begin(ids.session_wrong_action);
+        assert_auth_action(
+            &wrong_session,
+            &session_profile_id,
+            RecoveryAction::OpenCredentialPrompt(ProfileId(session_profile_id.clone())),
         );
-
+        evidence.pass(session_action);
+        let session_recovery = evidence.begin(ids.session_wrong_recovery);
         service_check(
             fixture.profile(
-                &format!("env-correct-{label}"),
+                &format!("session-recovered-{label}"),
+                tls,
+                CredentialMode::Session,
+            ),
+            ResolverState::Missing,
+            Some(CORRECT_PASSWORD),
+        )
+        .await
+        .expect("Redis Session recovery");
+        evidence.pass(session_recovery);
+
+        let environment_correct = evidence.begin(ids.environment_correct);
+        service_check(
+            fixture.profile(
+                &format!("environment-correct-{label}"),
                 tls,
                 CredentialMode::Environment,
             ),
@@ -441,81 +674,161 @@ async fn assert_auth_matrix(fixture: &LiveFixture) {
         )
         .await
         .unwrap_or_else(|error| panic!("Environment Available correct/{label}: {error:?}"));
+        evidence.pass(environment_correct);
+
+        let environment_profile_id = format!("environment-wrong-{label}");
+        let environment_wrong = evidence.begin(ids.environment_wrong);
         let wrong_environment = service_check(
-            fixture.profile(
-                &format!("env-wrong-{label}"),
-                tls,
-                CredentialMode::Environment,
-            ),
+            fixture.profile(&environment_profile_id, tls, CredentialMode::Environment),
             ResolverState::Available(WRONG_PASSWORD.to_owned()),
             None,
         )
         .await
-        .expect_err("wrong Environment password must fail");
-        assert_eq!(
-            wrong_environment.public_error_parts(),
-            (
-                PublicSummary::AuthenticationFailed,
-                PublicCode::CredentialEnvironmentName,
+        .expect_err("wrong Redis Environment password must fail");
+        auth_failures += 1;
+        evidence.pass(environment_wrong);
+        let environment_code = evidence.begin(ids.environment_wrong_code);
+        assert_auth_code(&wrong_environment, PublicCode::CredentialEnvironmentName);
+        evidence.pass(environment_code);
+        let environment_action = evidence.begin(ids.environment_wrong_action);
+        assert_auth_action(
+            &wrong_environment,
+            &environment_profile_id,
+            RecoveryAction::EditProfile(
+                ProfileId(environment_profile_id.clone()),
+                ProfileFieldId::CredentialEnvironmentName,
             ),
-            "Environment Available wrong/{label}"
         );
+        evidence.pass(environment_action);
+        let environment_recovery = evidence.begin(ids.environment_wrong_recovery);
+        service_check(
+            fixture.profile(
+                &format!("environment-recovered-{label}"),
+                tls,
+                CredentialMode::Environment,
+            ),
+            ResolverState::Available(CORRECT_PASSWORD.to_owned()),
+            None,
+        )
+        .await
+        .expect("Redis Environment wrong recovery");
+        evidence.pass(environment_recovery);
 
-        for (state, state_label) in [
-            (ResolverState::Missing, "Missing"),
-            (ResolverState::Empty, "Empty"),
-        ] {
-            let error = service_check(
-                fixture.profile(
-                    &format!("env-{}-{label}", state_label.to_ascii_lowercase()),
-                    tls,
-                    CredentialMode::Environment,
-                ),
-                state,
-                None,
-            )
-            .await
-            .expect_err("unavailable environment credential must fail");
-            assert_eq!(
-                error.public_error_parts(),
-                (
-                    PublicSummary::AuthenticationFailed,
-                    PublicCode::CredentialEnvironmentName,
-                ),
-                "Environment {state_label}/{label}"
-            );
-        }
+        auth_failures += unavailable_environment_case(
+            fixture,
+            evidence,
+            tls,
+            &format!("missing-{label}"),
+            ResolverState::Missing,
+            &ids.missing,
+        )
+        .await;
+        auth_failures += unavailable_environment_case(
+            fixture,
+            evidence,
+            tls,
+            &format!("empty-{label}"),
+            ResolverState::Empty,
+            &ids.empty,
+        )
+        .await;
     }
+    auth_failures
 }
 
-async fn assert_tls_verification_and_no_fallback(fixture: &LiveFixture) {
+async fn assert_tls_verification_and_no_fallback(
+    fixture: &LiveFixture,
+    evidence: &mut LiveEvidence,
+) -> (usize, usize, usize) {
     reset_transport_attempt_counts();
-    let secret = SecretString::from(CORRECT_PASSWORD.to_owned());
 
+    let wrong_ca_code = evidence.begin("redis.tls.wrong_ca.code");
     let mut wrong_ca = fixture.profile("tls-wrong-ca", TlsMode::Required, CredentialMode::Session);
     wrong_ca.redis_tls.ca_file = Some(fixture.wrong_ca_file.clone());
-    match RedisSession::connect(&wrong_ca, Some(&secret), TIMEOUT).await {
-        Err(DriverError::RedisTls {
-            failure: RedisTlsFailure::CaUntrusted,
-        }) => {}
-        Ok(_) => panic!("wrong CA unexpectedly connected"),
-        Err(error) => panic!("wrong CA classification: {error:?}"),
-    }
+    let wrong_ca_error = service_check(wrong_ca, ResolverState::Missing, Some(CORRECT_PASSWORD))
+        .await
+        .expect_err("wrong CA must fail");
+    assert_eq!(
+        wrong_ca_error.public_error_parts(),
+        (
+            PublicSummary::TlsVerificationFailed,
+            PublicCode::RedisTlsCaUntrustedIssuer,
+        )
+    );
+    evidence.pass(wrong_ca_code);
+    let wrong_ca_action = evidence.begin("redis.tls.wrong_ca.action");
+    let wrong_ca_recovery = recovery_for(
+        OperationKind::ConnectProfile,
+        wrong_ca_error.public_summary(),
+        wrong_ca_error.public_code(),
+        &SafeContext::profile(ProfileId("tls-wrong-ca".to_owned()), OperationId(700)),
+    )
+    .expect("wrong CA recovery");
+    assert_eq!(
+        wrong_ca_recovery.as_slice(),
+        &[RecoveryAction::EditProfile(
+            ProfileId("tls-wrong-ca".to_owned()),
+            ProfileFieldId::RedisCaFile,
+        )]
+    );
+    evidence.pass(wrong_ca_action);
+    let wrong_ca_focus = evidence.begin("redis.tls.wrong_ca.focus_ca");
+    assert_eq!(
+        ProfileFieldId::RedisCaFile.focus_id(),
+        "profile.redis_tls.ca_file"
+    );
+    evidence.pass(wrong_ca_focus);
 
+    let wrong_host_code = evidence.begin("redis.tls.wrong_host.code");
     let mut wrong_host =
         fixture.profile("tls-wrong-host", TlsMode::Required, CredentialMode::Session);
+    let original_ca = wrong_host.redis_tls.ca_file.clone();
     wrong_host.host = "127.0.0.1".to_owned();
-    assert!(matches!(
-        RedisSession::connect(&wrong_host, Some(&secret), TIMEOUT).await,
-        Err(DriverError::RedisTls {
-            failure: RedisTlsFailure::HostnameMismatch
-        })
-    ));
+    let wrong_host_error = service_check(
+        wrong_host.clone(),
+        ResolverState::Missing,
+        Some(CORRECT_PASSWORD),
+    )
+    .await
+    .expect_err("wrong host must fail");
+    assert_eq!(
+        wrong_host_error.public_error_parts(),
+        (
+            PublicSummary::TlsVerificationFailed,
+            PublicCode::TlsHostnameMismatch,
+        )
+    );
+    evidence.pass(wrong_host_code);
+    let wrong_host_action = evidence.begin("redis.tls.wrong_host.action");
+    let wrong_host_recovery = recovery_for(
+        OperationKind::ConnectProfile,
+        wrong_host_error.public_summary(),
+        wrong_host_error.public_code(),
+        &SafeContext::profile(ProfileId("tls-wrong-host".to_owned()), OperationId(700)),
+    )
+    .expect("wrong host recovery");
+    assert_eq!(
+        wrong_host_recovery.as_slice(),
+        &[RecoveryAction::EditProfile(
+            ProfileId("tls-wrong-host".to_owned()),
+            ProfileFieldId::Host,
+        )]
+    );
+    evidence.pass(wrong_host_action);
+    let wrong_host_focus = evidence.begin("redis.tls.wrong_host.focus_host");
+    assert_eq!(ProfileFieldId::Host.focus_id(), "profile.host");
+    evidence.pass(wrong_host_focus);
 
+    let ca_preserved = evidence.begin("redis.tls.ca_preserved");
+    let host_recovery = evidence.begin("redis.tls.host_recovery");
     wrong_host.host = fixture.tls_host.clone();
-    RedisSession::connect(&wrong_host, Some(&secret), TIMEOUT)
+    assert_eq!(wrong_host.redis_tls.ca_file, original_ca);
+    service_check(wrong_host, ResolverState::Missing, Some(CORRECT_PASSWORD))
         .await
         .expect("same CA succeeds when only the host is corrected");
+    let tls_recovery_attempts = 1_usize;
+    evidence.pass(ca_preserved);
+    evidence.pass(host_recovery);
 
     let attempts = transport_attempt_counts();
     assert_eq!(
@@ -526,9 +839,18 @@ async fn assert_tls_verification_and_no_fallback(fixture: &LiveFixture) {
         attempts.required_tls, 3,
         "all three attempts remain TLS-only"
     );
+    (
+        usize::try_from(attempts.plaintext).expect("plaintext attempt count"),
+        usize::try_from(attempts.required_tls).expect("TLS attempt count"),
+        tls_recovery_attempts,
+    )
 }
 
-fn assert_cli_round_trip(fixture: &LiveFixture, binary_key: &[u8]) {
+fn assert_cli_round_trip(
+    fixture: &LiveFixture,
+    binary_key: &[u8],
+    evidence: &mut LiveEvidence,
+) -> usize {
     let directory = tempfile::tempdir().expect("CLI config tempdir");
     let path = directory.path().join("config.toml");
     let profile = fixture.profile(
@@ -547,6 +869,8 @@ fn assert_cli_round_trip(fixture: &LiveFixture, binary_key: &[u8]) {
     .expect("write CLI profile");
 
     let expected_base64 = base64::engine::general_purpose::STANDARD.encode(binary_key);
+    let mut cli_operations = 0_usize;
+    let cli_browse = evidence.begin("redis.cli.browse");
     let mut cursor = 0_u64;
     let mut found = false;
     for _ in 0..1_000 {
@@ -586,7 +910,10 @@ fn assert_cli_round_trip(fixture: &LiveFixture, binary_key: &[u8]) {
         found,
         "headless browse must expose the binary key as base64"
     );
+    cli_operations += 1;
+    evidence.pass(cli_browse);
 
+    let cli_inspect = evidence.begin("redis.cli.inspect");
     let output = Command::new(env!("CARGO_BIN_EXE_dbotter"))
         .arg("--config")
         .arg(&path)
@@ -606,6 +933,9 @@ fn assert_cli_round_trip(fixture: &LiveFixture, binary_key: &[u8]) {
     assert_eq!(preview["key"]["key_base64"], expected_base64);
     assert_eq!(preview["value_type"], "string");
     assert_eq!(preview["ttl"]["state"], "persistent");
+    cli_operations += 1;
+    evidence.pass(cli_inspect);
+    cli_operations
 }
 
 fn assert_cli_success(output: &std::process::Output, operation: &str) {
@@ -619,7 +949,11 @@ fn assert_cli_success(output: &std::process::Output, operation: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires scripts/verify-live-redis.sh Docker fixture"]
 async fn redis_live_receipt() {
+    let mut evidence =
+        LiveEvidence::required("redis", "redis_live_receipt", "DBOTTER_LIVE_REDIS_EVIDENCE")
+            .expect("initialize Redis evidence");
     let fixture = LiveFixture::required();
+    assert_classifier_without_command(&mut evidence);
     let secret = SecretString::from(CORRECT_PASSWORD.to_owned());
     let profile = fixture.profile(
         "redis-live-direct",
@@ -630,19 +964,49 @@ async fn redis_live_receipt() {
         .await
         .expect("authenticated plaintext Redis fixture");
     let binary_key = seed_representative_dataset(&session).await;
-    assert_scan_and_inspection(&session, &binary_key).await;
+    let measurements = assert_scan_and_inspection(&session, &binary_key, &mut evidence).await;
 
-    assert_auth_matrix(&fixture).await;
-    assert_tls_verification_and_no_fallback(&fixture).await;
-    assert_cli_round_trip(&fixture, &binary_key);
+    let auth_failures = assert_auth_matrix(&fixture, &mut evidence).await;
+    let (plaintext_fallback_attempts, required_tls_attempts, tls_recovery_attempts) =
+        assert_tls_verification_and_no_fallback(&fixture, &mut evidence).await;
+    let cli_operations = assert_cli_round_trip(&fixture, &binary_key, &mut evidence);
 
     execute(&session, 999, argv(&["FLUSHDB"])).await;
+    evidence
+        .measure("auth_failures", auth_failures)
+        .expect("Redis auth failure count");
+    evidence
+        .measure("cli_operations", cli_operations)
+        .expect("Redis CLI operation count");
+    evidence
+        .measure("inspect_types", measurements.inspect_types)
+        .expect("Redis inspect type count");
+    evidence
+        .measure("mutation_readbacks", measurements.mutation_readbacks)
+        .expect("Redis mutation readback count");
+    evidence
+        .measure("plaintext_fallback_attempts", plaintext_fallback_attempts)
+        .expect("Redis plaintext fallback count");
+    evidence
+        .measure("required_tls_attempts", required_tls_attempts)
+        .expect("Redis required TLS count");
+    evidence
+        .measure("scan_pages", measurements.scan_pages)
+        .expect("Redis scan page count");
+    evidence
+        .measure("tls_recovery_attempts", tls_recovery_attempts)
+        .expect("Redis TLS recovery count");
+    evidence.finish().expect("publish Redis evidence");
 }
 
 #[test]
 fn live_receipt_source_requires_all_frozen_proof_dimensions() {
     let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!()))
         .expect("live receipt source");
+    let implementation = source
+        .split("#[test]\nfn live_receipt_source_requires_all_frozen_proof_dimensions()")
+        .next()
+        .expect("live receipt implementation section");
     for required in [
         "pages > 1",
         "binary key identity",
@@ -655,14 +1019,21 @@ fn live_receipt_source_requires_all_frozen_proof_dimensions() {
         "RedisTtl::ExpiresIn",
         "p5:large-string",
         "p5:mutation",
-        "Session correct",
-        "Environment Available",
-        "Environment {state_label}",
-        "RedisTlsFailure::CaUntrusted",
-        "RedisTlsFailure::HostnameMismatch",
+        "ids.session_correct",
+        "ids.environment_correct",
+        "UnavailableAuthCaseIds",
+        "PublicCode::RedisTlsCaUntrustedIssuer",
+        "PublicCode::TlsHostnameMismatch",
+        "ProfileFieldId::RedisCaFile.focus_id()",
+        "ProfileFieldId::Host.focus_id()",
+        "wrong_host.redis_tls.ca_file, original_ca",
         "attempts.plaintext, 0",
         "CARGO_BIN_EXE_dbotter",
+        "evidence.finish()",
     ] {
-        assert!(source.contains(required), "missing live proof: {required}");
+        assert!(
+            implementation.contains(required),
+            "missing live proof: {required}"
+        );
     }
 }

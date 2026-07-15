@@ -7,7 +7,9 @@ mod live_evidence;
 
 use dbotter::config::{Config, ConfigWriter};
 use dbotter::drivers::{self, DriverError, MySqlPreparedExecution, Session};
-use dbotter::execution::{ExecutionLanguage, ExecutionTargetError, extract_and_validate_target};
+use dbotter::execution::{
+    ExecutionLanguage, ExecutionTarget, ExecutionTargetError, extract_and_validate_target,
+};
 use dbotter::model::{
     Cell, ConnectionProfile, CredentialMode, DriverKind, OperationId, OperationKind,
     PreparedMySqlRequest, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
@@ -130,6 +132,7 @@ fn assert_auth_action(error: &ServiceError, profile_id: &str, expected: Recovery
 }
 
 async fn assert_auth_matrix(evidence: &mut LiveEvidence) -> usize {
+    let mut auth_failures = 0_usize;
     let session_correct = evidence.begin("mysql.auth.session.correct");
     service_check(
         profile("session-correct", CredentialMode::Session),
@@ -148,6 +151,7 @@ async fn assert_auth_matrix(evidence: &mut LiveEvidence) -> usize {
     )
     .await
     .expect_err("Session wrong must fail");
+    auth_failures += 1;
     evidence.pass(session_wrong);
     let session_code = evidence.begin("mysql.auth.session.wrong.code");
     assert_auth_code(&session_error, PublicCode::SessionCredential);
@@ -187,6 +191,7 @@ async fn assert_auth_matrix(evidence: &mut LiveEvidence) -> usize {
     )
     .await
     .expect_err("Environment Available wrong must fail");
+    auth_failures += 1;
     evidence.pass(environment_wrong);
     let environment_wrong_code = evidence.begin("mysql.auth.environment.available.wrong.code");
     assert_auth_code(
@@ -233,6 +238,7 @@ async fn assert_auth_matrix(evidence: &mut LiveEvidence) -> usize {
         )
         .await
         .expect_err("unavailable Environment credential must fail");
+        auth_failures += 1;
         evidence.pass(failed);
 
         let code_case = match label {
@@ -279,7 +285,7 @@ async fn assert_auth_matrix(evidence: &mut LiveEvidence) -> usize {
         evidence.pass(recovery);
     }
 
-    4
+    auth_failures
 }
 
 async fn mysql_session() -> Session {
@@ -330,6 +336,9 @@ async fn live_mysql_safety_receipt() {
     )
     .expect("initialize MySQL safety evidence");
     let auth_failures = assert_auth_matrix(&mut evidence).await;
+    let mut statements_executed = 0_usize;
+    let mut marker_prepared_attempts = 0_usize;
+    let mut prepared_unsupported_attempts = 0_usize;
 
     let session = mysql_session().await;
     execute(&session, 1, "DROP TABLE IF EXISTS dbotter_live_execute")
@@ -349,6 +358,7 @@ async fn live_mysql_safety_receipt() {
         .expect("prepared read");
     assert_eq!(read.rows, [vec![Cell::Int(42)]]);
     assert_eq!(read.affected_rows, 0);
+    statements_executed += 1;
     evidence.pass(execute_read);
 
     let execute_mutation = evidence.begin("mysql.execute.mutation");
@@ -370,6 +380,7 @@ async fn live_mysql_safety_receipt() {
     .await
     .expect("mutation readback");
     assert_eq!(text_cell(&mutation_readback), "measured");
+    statements_executed += 1;
     evidence.pass(execute_mutation);
 
     execute(&session, 6, "DROP TABLE IF EXISTS dbotter_live_marker")
@@ -401,6 +412,7 @@ async fn live_mysql_safety_receipt() {
         .await
         .expect_err("explicit selection adapter must stop at server prepare");
     assert!(matches!(explicit_error, DriverError::MySql(_)));
+    marker_prepared_attempts += 1;
     evidence.pass(explicit_prepare);
     let explicit_absent = evidence.begin("mysql.marker.explicit_selection.absent");
     let after_explicit = execute(
@@ -413,16 +425,42 @@ async fn live_mysql_safety_receipt() {
     assert!(after_explicit.rows.is_empty());
     evidence.pass(explicit_absent);
 
-    let current_prepare = evidence.begin("mysql.marker.current_target.prepare_only_rejected");
-    let current_error = execute(&session, 10, MARKER_TEXT)
+    let current_target = evidence.begin("mysql.marker.current_target.extracted_prepared");
+    let current_text = "SELECT 41 AS first; SELECT 42 AS current";
+    let current_caret = current_text
+        .find("SELECT 42")
+        .expect("current-target marker")
+        + "SELECT ".len();
+    let current = extract_and_validate_target(
+        current_text,
+        current_caret,
+        None,
+        ExecutionLanguage::MySql,
+        100,
+        10,
+    )
+    .expect("extract current MySQL statement");
+    let ExecutionTarget::MySqlText(current_statement) = current.into_target() else {
+        panic!("MySQL current target changed language")
+    };
+    assert_eq!(current_statement, "SELECT 42 AS current");
+    let current_result = execute(&session, 10, &current_statement)
         .await
-        .expect_err("current-target adapter must stop at server prepare");
+        .expect("execute extracted current target through prepare");
+    assert_eq!(current_result.rows, [vec![Cell::Int(42)]]);
+    evidence.pass(current_target);
+
+    let current_prepare = evidence.begin("mysql.marker.second_probe.prepare_only_rejected");
+    let current_error = execute(&session, 11, MARKER_TEXT)
+        .await
+        .expect_err("second exact marker probe must stop at server prepare");
     assert!(matches!(current_error, DriverError::MySql(_)));
+    marker_prepared_attempts += 1;
     evidence.pass(current_prepare);
-    let current_absent = evidence.begin("mysql.marker.current_target.absent");
+    let current_absent = evidence.begin("mysql.marker.second_probe.absent");
     let after_current = execute(
         &session,
-        11,
+        12,
         "SELECT marker FROM dbotter_live_marker ORDER BY marker",
     )
     .await
@@ -431,7 +469,7 @@ async fn live_mysql_safety_receipt() {
     evidence.pass(current_absent);
 
     let unsupported_error_checkpoint = evidence.begin("mysql.prepared_unsupported.error");
-    let unsupported = execute(&session, 12, "USE information_schema")
+    let unsupported = execute(&session, 13, "USE information_schema")
         .await
         .expect_err("USE must be unsupported by the prepared protocol");
     assert!(matches!(
@@ -440,6 +478,7 @@ async fn live_mysql_safety_receipt() {
             session_healthy: true
         }
     ));
+    prepared_unsupported_attempts += 1;
     evidence.pass(unsupported_error_checkpoint);
 
     let retained = evidence.begin("mysql.prepared_unsupported.session_retained");
@@ -447,14 +486,14 @@ async fn live_mysql_safety_receipt() {
         SessionDisposition::for_driver_error(&unsupported),
         SessionDisposition::Keep
     );
-    let retained_read = execute(&session, 13, "SELECT 1 AS healthy")
+    let retained_read = execute(&session, 14, "SELECT 1 AS healthy")
         .await
         .expect("same session remains healthy after prepared unsupported");
     assert_eq!(retained_read.rows, [vec![Cell::Int(1)]]);
     evidence.pass(retained);
 
     let no_fallback = evidence.begin("mysql.prepared_unsupported.no_raw_fallback");
-    let database = execute(&session, 14, "SELECT DATABASE()")
+    let database = execute(&session, 15, "SELECT DATABASE()")
         .await
         .expect("read current database after unsupported prepare");
     let raw_fallback_attempts = usize::from(text_cell(&database) != "dbotter");
@@ -478,14 +517,14 @@ async fn live_mysql_safety_receipt() {
         OperationKind::ExecuteRead,
         service_error.public_summary(),
         service_error.public_code(),
-        &SafeContext::profile(recovery_profile.clone(), OperationId(12)),
+        &SafeContext::profile(recovery_profile.clone(), OperationId(13)),
     )
     .expect("prepared unsupported recovery");
     assert_eq!(
         recovery.as_slice(),
         &[
             RecoveryAction::FocusEditor(recovery_profile),
-            RecoveryAction::DismissError(OperationId(12)),
+            RecoveryAction::DismissError(OperationId(13)),
         ]
     );
     evidence.pass(static_recovery);
@@ -494,19 +533,22 @@ async fn live_mysql_safety_receipt() {
         .measure("auth_failures", auth_failures)
         .expect("auth failure count");
     evidence
-        .measure("marker_prepared_attempts", 2)
+        .measure("marker_prepared_attempts", marker_prepared_attempts)
         .expect("marker prepare count");
     evidence
         .measure("marker_rows_after", after_current.rows.len())
         .expect("marker rows after");
     evidence
-        .measure("prepared_unsupported_attempts", 1)
+        .measure(
+            "prepared_unsupported_attempts",
+            prepared_unsupported_attempts,
+        )
         .expect("prepared unsupported count");
     evidence
         .measure("raw_fallback_attempts", raw_fallback_attempts)
         .expect("raw fallback count");
     evidence
-        .measure("statements_executed", 2)
+        .measure("statements_executed", statements_executed)
         .expect("required statement count");
     evidence.finish().expect("publish MySQL safety evidence");
 }

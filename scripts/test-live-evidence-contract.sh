@@ -106,11 +106,12 @@ mysql_safety_cases="$(cases_from_ids \
   mysql.auth.session.wrong.recovery \
   mysql.execute.mutation \
   mysql.execute.read \
-  mysql.marker.current_target.absent \
-  mysql.marker.current_target.prepare_only_rejected \
+  mysql.marker.current_target.extracted_prepared \
   mysql.marker.explicit_selection.absent \
   mysql.marker.explicit_selection.prepare_only_rejected \
   mysql.marker.explicit_selection.ui_rejected \
+  mysql.marker.second_probe.absent \
+  mysql.marker.second_probe.prepare_only_rejected \
   mysql.prepared_unsupported.error \
   mysql.prepared_unsupported.no_raw_fallback \
   mysql.prepared_unsupported.session_retained \
@@ -118,18 +119,40 @@ mysql_safety_cases="$(cases_from_ids \
 redis_cases="$(cases_from_ids \
   redis.auth.plaintext.environment.available.correct \
   redis.auth.plaintext.environment.available.wrong \
+  redis.auth.plaintext.environment.available.wrong.action \
+  redis.auth.plaintext.environment.available.wrong.code \
+  redis.auth.plaintext.environment.available.wrong.recovery \
   redis.auth.plaintext.environment.empty \
+  redis.auth.plaintext.environment.empty.action \
+  redis.auth.plaintext.environment.empty.code \
+  redis.auth.plaintext.environment.empty.recovery \
   redis.auth.plaintext.environment.missing \
-  redis.auth.plaintext.recovery \
+  redis.auth.plaintext.environment.missing.action \
+  redis.auth.plaintext.environment.missing.code \
+  redis.auth.plaintext.environment.missing.recovery \
   redis.auth.plaintext.session.correct \
   redis.auth.plaintext.session.wrong \
+  redis.auth.plaintext.session.wrong.action \
+  redis.auth.plaintext.session.wrong.code \
+  redis.auth.plaintext.session.wrong.recovery \
   redis.auth.tls.environment.available.correct \
   redis.auth.tls.environment.available.wrong \
+  redis.auth.tls.environment.available.wrong.action \
+  redis.auth.tls.environment.available.wrong.code \
+  redis.auth.tls.environment.available.wrong.recovery \
   redis.auth.tls.environment.empty \
+  redis.auth.tls.environment.empty.action \
+  redis.auth.tls.environment.empty.code \
+  redis.auth.tls.environment.empty.recovery \
   redis.auth.tls.environment.missing \
-  redis.auth.tls.recovery \
+  redis.auth.tls.environment.missing.action \
+  redis.auth.tls.environment.missing.code \
+  redis.auth.tls.environment.missing.recovery \
   redis.auth.tls.session.correct \
   redis.auth.tls.session.wrong \
+  redis.auth.tls.session.wrong.action \
+  redis.auth.tls.session.wrong.code \
+  redis.auth.tls.session.wrong.recovery \
   redis.classifier.no_command \
   redis.cli.browse \
   redis.cli.inspect \
