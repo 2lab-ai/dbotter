@@ -24,6 +24,7 @@ fn profile_workspaces_are_isolated_by_profile_and_generation() {
 
     model.workspace_mut(first.clone()).editor_text = "SELECT 'first'".to_owned();
     model.workspace_mut(replacement.clone()).editor_text = "SELECT 'replacement'".to_owned();
+    model.workspace_mut(first.clone()).catalog_retry_pending = true;
 
     assert_eq!(
         model
@@ -36,5 +37,12 @@ fn profile_workspaces_are_isolated_by_profile_and_generation() {
             .workspace(&replacement)
             .map(|workspace| workspace.editor_text.as_str()),
         Some("SELECT 'replacement'")
+    );
+    assert_eq!(
+        model
+            .workspace(&first)
+            .map(|workspace| workspace.catalog_retry_pending),
+        Some(true),
+        "resource and retry state belongs to the same exact workspace key"
     );
 }
