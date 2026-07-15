@@ -2,6 +2,7 @@ pub mod mongodb;
 pub mod mysql;
 pub mod mysql_catalog;
 pub mod redis;
+pub mod redis_browser;
 
 use std::fmt;
 use std::sync::Arc;
@@ -15,6 +16,12 @@ use crate::model::{
     MySqlPublicErrorCode, PreparedMySqlRequest, QueryResult, RedisExecuteRequest,
     RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, TlsMode,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisTlsFailure {
+    CaUntrusted,
+    HostnameMismatch,
+}
 
 #[derive(thiserror::Error)]
 pub enum DriverError {
@@ -41,6 +48,12 @@ pub enum DriverError {
         #[source]
         ::redis::RedisError,
     ),
+    #[error("redis TLS verification failed")]
+    RedisTls { failure: RedisTlsFailure },
+    #[error("the Redis key disappeared")]
+    RedisKeyMissing,
+    #[error("the Redis key type changed during inspection")]
+    RedisKeyTypeChanged,
     #[error("redis command could not be parsed")]
     RedisParse(String),
     #[error("mysql server prepared protocol does not support this statement")]
@@ -78,6 +91,12 @@ impl fmt::Debug for DriverError {
                 .field("code", code)
                 .finish(),
             Self::Redis(_) => formatter.write_str("Redis(<redacted>)"),
+            Self::RedisTls { failure } => formatter
+                .debug_struct("RedisTls")
+                .field("failure", failure)
+                .finish(),
+            Self::RedisKeyMissing => formatter.write_str("RedisKeyMissing"),
+            Self::RedisKeyTypeChanged => formatter.write_str("RedisKeyTypeChanged"),
             Self::RedisParse(_) => formatter.write_str("RedisParse(<redacted>)"),
             Self::PreparedStatementUnsupported { session_healthy } => formatter
                 .debug_struct("PreparedStatementUnsupported")
@@ -300,12 +319,6 @@ pub async fn connect(
     timeout: Duration,
 ) -> Result<Session, DriverError> {
     validate_profile(profile)?;
-    if profile.driver == DriverKind::Redis && profile.tls != TlsMode::Disabled {
-        return Err(DriverError::Unsupported {
-            driver: DriverKind::Redis,
-            operation: "non-plaintext transport is not implemented".to_owned(),
-        });
-    }
     match profile.driver {
         DriverKind::MySql => Ok(Session::MySql(
             mysql::MySqlSession::connect(profile, secret, timeout).await?,

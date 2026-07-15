@@ -1,9 +1,10 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use redis::IntoConnectionInfo as _;
 use secrecy::{ExposeSecret as _, SecretString};
 
-use crate::drivers::DriverError;
+use crate::drivers::{DriverError, RedisTlsFailure};
 use crate::model::{
     Cell, Column, ConnectionProfile, DriverAvailability, DriverCapabilities, DriverDescriptor,
     DriverKind, MAX_REDIS_CELLS, MAX_REDIS_DEPTH, QueryLanguage, QueryResult, RedisExecuteRequest,
@@ -18,10 +19,36 @@ pub const DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     languages: &[QueryLanguage::RedisCommand],
     capabilities: DriverCapabilities::CONNECT
         .union(DriverCapabilities::PING)
-        .union(DriverCapabilities::COMMAND),
-    planned_capabilities: DriverCapabilities::KEYSPACE_BROWSE,
+        .union(DriverCapabilities::COMMAND)
+        .union(DriverCapabilities::KEYSPACE_BROWSE),
+    planned_capabilities: DriverCapabilities::empty(),
     reason: None,
 };
+
+static PLAINTEXT_TRANSPORT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static REQUIRED_TLS_TRANSPORT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedisTransportAttemptCounts {
+    pub plaintext: u64,
+    pub required_tls: u64,
+}
+
+/// Test/receipt instrumentation for proving that Required has no plaintext edge.
+/// The counters contain no endpoint, credential, or user value.
+#[doc(hidden)]
+pub fn transport_attempt_counts() -> RedisTransportAttemptCounts {
+    RedisTransportAttemptCounts {
+        plaintext: PLAINTEXT_TRANSPORT_ATTEMPTS.load(Ordering::SeqCst),
+        required_tls: REQUIRED_TLS_TRANSPORT_ATTEMPTS.load(Ordering::SeqCst),
+    }
+}
+
+#[doc(hidden)]
+pub fn reset_transport_attempt_counts() {
+    PLAINTEXT_TRANSPORT_ATTEMPTS.store(0, Ordering::SeqCst);
+    REQUIRED_TLS_TRANSPORT_ATTEMPTS.store(0, Ordering::SeqCst);
+}
 
 #[derive(Clone)]
 pub struct RedisSession {
@@ -34,10 +61,10 @@ impl RedisSession {
         secret: Option<&SecretString>,
         timeout: Duration,
     ) -> Result<Self, DriverError> {
-        if profile.tls != TlsMode::Disabled {
+        if profile.tls == TlsMode::Preferred {
             return Err(DriverError::Unsupported {
                 driver: DriverKind::Redis,
-                operation: "non-plaintext transport is not implemented".to_owned(),
+                operation: "legacy Preferred TLS mode".to_owned(),
             });
         }
         let db = profile
@@ -58,16 +85,72 @@ impl RedisSession {
         }
         // Build the address without a credential-bearing URL. redis 1.3 keeps
         // ConnectionInfo fields private and exposes mutation builders instead.
-        let info = (profile.host.clone(), profile.port)
+        let mut info = (profile.host.clone(), profile.port)
             .into_connection_info()?
             .set_redis_settings(redis);
-        let client = ::redis::Client::open(info)?;
-        let connection = tokio::time::timeout(timeout, client.get_connection_manager())
-            .await
-            .map_err(|_| DriverError::Timeout {
-                driver: DriverKind::Redis,
-                seconds: timeout.as_secs(),
-            })??;
+        let client = match profile.tls {
+            TlsMode::Disabled => {
+                PLAINTEXT_TRANSPORT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+                ::redis::Client::open(info)?
+            }
+            TlsMode::Required => {
+                REQUIRED_TLS_TRANSPORT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+                info = info.set_addr(::redis::ConnectionAddr::TcpTls {
+                    host: profile.host.clone(),
+                    port: profile.port,
+                    insecure: false,
+                    tls_params: None,
+                });
+                if let Some(ca_file) = profile.redis_tls.ca_file.as_deref() {
+                    let root_cert =
+                        std::fs::read(ca_file).map_err(|_| DriverError::InvalidConfig {
+                            driver: DriverKind::Redis,
+                            message: "configured Redis CA file is not readable".to_owned(),
+                        })?;
+                    ::redis::Client::build_with_tls(
+                        info,
+                        ::redis::TlsCertificates {
+                            client_tls: None,
+                            root_cert: Some(root_cert),
+                        },
+                    )?
+                } else {
+                    ::redis::Client::open(info)?
+                }
+            }
+            TlsMode::Preferred => {
+                return Err(DriverError::Unsupported {
+                    driver: DriverKind::Redis,
+                    operation: "legacy Preferred TLS mode".to_owned(),
+                });
+            }
+        };
+        // The manager's default initial-connect retry loop can turn a stable
+        // authentication rejection into our outer timeout. Initial connect is
+        // single-attempt so the typed Redis error remains available; the
+        // manager still owns reconnect behavior after a successful session.
+        let manager_config = ::redis::aio::ConnectionManagerConfig::new()
+            .set_number_of_retries(0)
+            .set_connection_timeout(Some(timeout))
+            .set_response_timeout(Some(timeout));
+        let connection = match tokio::time::timeout(
+            timeout,
+            client.get_connection_manager_with_config(manager_config),
+        )
+        .await
+        {
+            Err(_) => {
+                return Err(DriverError::Timeout {
+                    driver: DriverKind::Redis,
+                    seconds: timeout.as_secs(),
+                });
+            }
+            Ok(Err(error)) if profile.tls == TlsMode::Required => {
+                return Err(classify_required_tls_error(error));
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Ok(Ok(connection)) => connection,
+        };
         Ok(Self { connection })
     }
 
@@ -134,25 +217,57 @@ impl RedisSession {
         })
     }
 
-    pub async fn scan_keys(
-        &self,
-        _request: &RedisScanRequest,
-    ) -> Result<RedisKeyPage, DriverError> {
-        Err(DriverError::Unsupported {
-            driver: DriverKind::Redis,
-            operation: "keyspace browsing is planned".to_owned(),
-        })
+    pub async fn scan_keys(&self, request: &RedisScanRequest) -> Result<RedisKeyPage, DriverError> {
+        let mut connection = self.connection.clone();
+        crate::drivers::redis_browser::scan_keys(&mut connection, request).await
     }
 
     pub async fn inspect_key(
         &self,
-        _request: &RedisKeyInspectRequest,
+        request: &RedisKeyInspectRequest,
     ) -> Result<RedisValuePreview, DriverError> {
-        Err(DriverError::Unsupported {
-            driver: DriverKind::Redis,
-            operation: "key inspection is planned".to_owned(),
-        })
+        let mut connection = self.connection.clone();
+        crate::drivers::redis_browser::inspect_key(&mut connection, request).await
     }
+}
+
+fn classify_required_tls_error(error: ::redis::RedisError) -> DriverError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(current) = source {
+        if let Some(failure) = redis_tls_failure(current) {
+            return DriverError::RedisTls { failure };
+        }
+        source = current.source();
+    }
+    DriverError::Redis(error)
+}
+
+fn redis_tls_failure(error: &(dyn std::error::Error + 'static)) -> Option<RedisTlsFailure> {
+    if let Some(rustls::Error::InvalidCertificate(certificate)) =
+        error.downcast_ref::<rustls::Error>()
+    {
+        return Some(match certificate {
+            rustls::CertificateError::NotValidForName
+            | rustls::CertificateError::NotValidForNameContext { .. } => {
+                RedisTlsFailure::HostnameMismatch
+            }
+            _ => RedisTlsFailure::CaUntrusted,
+        });
+    }
+    // tokio-rustls stores the typed rustls failure inside `io::Error`.
+    // redis-rs in turn stores that as `Arc<dyn Error>` and exposes the Arc
+    // itself as `source()`, so both wrappers must be opened explicitly.
+    if let Some(io_error) = error.downcast_ref::<std::io::Error>()
+        && let Some(inner) = io_error.get_ref()
+    {
+        return redis_tls_failure(inner);
+    }
+    if let Some(shared) =
+        error.downcast_ref::<std::sync::Arc<dyn std::error::Error + Send + Sync + 'static>>()
+    {
+        return redis_tls_failure(shared.as_ref());
+    }
+    None
 }
 
 struct DecodeBudget {

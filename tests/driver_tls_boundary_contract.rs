@@ -4,42 +4,34 @@ use dbotter::drivers::{DriverError, connect};
 use dbotter::model::{ConnectionProfile, CredentialMode, DriverKind, RedisTlsConfig, TlsMode};
 
 #[tokio::test]
-async fn public_driver_connect_rejects_every_non_plaintext_redis_mode_before_io() {
-    for tls in [TlsMode::Preferred, TlsMode::Required] {
-        let result = connect(&redis_profile(tls), None, Duration::from_millis(1)).await;
-        assert!(
-            matches!(
-                result,
-                Err(DriverError::Unsupported {
-                    driver: DriverKind::Redis,
-                    ..
-                })
-            ),
-            "TLS mode {tls:?} must fail closed at drivers::connect"
-        );
-    }
+async fn public_driver_connect_rejects_legacy_preferred_before_io() {
+    let result = connect(
+        &redis_profile(TlsMode::Preferred),
+        None,
+        Duration::from_millis(1),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(DriverError::Unsupported {
+            driver: DriverKind::Redis,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]
-async fn redis_session_constructor_independently_rejects_non_plaintext_modes() {
-    for tls in [TlsMode::Preferred, TlsMode::Required] {
-        let result = dbotter::drivers::redis::RedisSession::connect(
-            &redis_profile(tls),
-            None,
-            Duration::from_millis(1),
-        )
-        .await;
-        assert!(
-            matches!(
-                result,
-                Err(DriverError::Unsupported {
-                    driver: DriverKind::Redis,
-                    ..
-                })
-            ),
-            "TLS mode {tls:?} must fail closed at RedisSession::connect"
-        );
-    }
+async fn required_redis_transport_is_supported_and_never_reclassified_as_unsupported() {
+    let result = dbotter::drivers::redis::RedisSession::connect(
+        &redis_profile(TlsMode::Required),
+        None,
+        Duration::from_millis(1),
+    )
+    .await;
+    assert!(
+        !matches!(result, Err(DriverError::Unsupported { .. })),
+        "Required must enter the verified TLS transport path"
+    );
 }
 
 fn redis_profile(tls: TlsMode) -> ConnectionProfile {

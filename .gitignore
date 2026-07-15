@@ -2,4 +2,5 @@
 /.worktrees/
 /artifacts/*.json
 /artifacts/.receipt*.tmp
+/artifacts/redis-tls/
 .DS_Store

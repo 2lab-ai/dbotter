@@ -1,4 +1,4 @@
-version = 1
+version = 2
 
 [[profiles]]
 id = "mysql-local"
@@ -9,6 +9,7 @@ port = 33306
 database = "dbotter"
 username = "dbotter"
 tls = "disabled"
+credential_mode = "environment"
 secret_env = "DBOTTER_MYSQL_PASSWORD"
 
 [[profiles]]
@@ -19,6 +20,30 @@ host = "127.0.0.1"
 port = 36379
 database = "0"
 tls = "disabled"
+credential_mode = "none"
+
+[[profiles]]
+id = "redis-auth-local"
+name = "Local authenticated Redis"
+driver = "redis"
+host = "127.0.0.1"
+port = 36380
+database = "0"
+tls = "disabled"
+credential_mode = "environment"
+secret_env = "DBOTTER_REDIS_PASSWORD"
+
+[[profiles]]
+id = "redis-tls-auth-local"
+name = "Local authenticated Redis TLS"
+driver = "redis"
+host = "localhost"
+port = 36381
+database = "0"
+tls = "required"
+credential_mode = "environment"
+secret_env = "DBOTTER_REDIS_PASSWORD"
+redis_tls = { ca_file = "artifacts/redis-tls/ca.pem" }
 
 [[profiles]]
 id = "mongodb-local"
@@ -28,3 +53,4 @@ host = "127.0.0.1"
 port = 37017
 database = "dbotter"
 tls = "disabled"
+credential_mode = "none"

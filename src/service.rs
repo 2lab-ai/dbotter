@@ -63,6 +63,8 @@ pub enum ServiceError {
     Secret(#[from] SecretError),
     #[error(transparent)]
     Driver(#[from] DriverError),
+    #[error("connection authentication failed")]
+    ConnectionAuthenticationFailed { code: PublicCode },
     #[error("unknown profile")]
     UnknownProfile(ProfileId),
     #[error("query language does not match the selected driver")]
@@ -115,6 +117,10 @@ impl fmt::Debug for ServiceError {
             Self::Config(_) => formatter.write_str("Config(<redacted>)"),
             Self::Secret(_) => formatter.write_str("Secret(<redacted>)"),
             Self::Driver(_) => formatter.write_str("Driver(<redacted>)"),
+            Self::ConnectionAuthenticationFailed { code } => formatter
+                .debug_struct("ConnectionAuthenticationFailed")
+                .field("code", code)
+                .finish(),
             Self::UnknownProfile(profile_id) => formatter
                 .debug_tuple("UnknownProfile")
                 .field(profile_id)
@@ -200,6 +206,23 @@ impl ServiceError {
                 PublicCode::PreparedStatementUnsupported
             }
             Self::Driver(DriverError::InvalidCatalogRequest) => PublicCode::Catalog,
+            Self::Driver(DriverError::RedisTls { failure }) => match failure {
+                crate::drivers::RedisTlsFailure::CaUntrusted => {
+                    PublicCode::RedisTlsCaUntrustedIssuer
+                }
+                crate::drivers::RedisTlsFailure::HostnameMismatch => {
+                    PublicCode::TlsHostnameMismatch
+                }
+            },
+            Self::Driver(DriverError::Redis(error))
+                if matches!(
+                    error.kind(),
+                    redis::ErrorKind::Server(redis::ServerErrorKind::NoPerm)
+                ) =>
+            {
+                PublicCode::Username
+            }
+            Self::ConnectionAuthenticationFailed { code } => *code,
             Self::Driver(error) => error
                 .mysql_public_code()
                 .map_or(PublicCode::None, PublicCode::MySql),
@@ -244,6 +267,24 @@ impl ServiceError {
             Self::Secret(SecretError::InvalidSessionIntent) => PublicSummary::InvalidInput,
             Self::Secret(SecretError::StoreUnavailable) => PublicSummary::InternalFailure,
             Self::Driver(DriverError::Timeout { .. }) => PublicSummary::OperationTimedOut,
+            Self::Driver(DriverError::RedisTls { .. }) => PublicSummary::TlsVerificationFailed,
+            Self::Driver(DriverError::RedisKeyMissing | DriverError::RedisKeyTypeChanged) => {
+                PublicSummary::ResourceStale
+            }
+            Self::Driver(DriverError::Redis(error))
+                if error.kind() == redis::ErrorKind::AuthenticationFailed =>
+            {
+                PublicSummary::AuthenticationFailed
+            }
+            Self::Driver(DriverError::Redis(error))
+                if matches!(
+                    error.kind(),
+                    redis::ErrorKind::Server(redis::ServerErrorKind::NoPerm)
+                ) =>
+            {
+                PublicSummary::PermissionDenied
+            }
+            Self::ConnectionAuthenticationFailed { .. } => PublicSummary::AuthenticationFailed,
             Self::Driver(
                 DriverError::Unavailable { .. }
                 | DriverError::Unsupported { .. }
@@ -538,6 +579,10 @@ impl SessionConnector for DriverConnector {
             crate::drivers::connect(profile, secret.map(SessionSecret::inner), timeout).await?;
         Ok(Arc::new(session))
     }
+
+    fn supports_redis_tls(&self) -> bool {
+        true
+    }
 }
 
 pub trait SecretResolver: Send + Sync {
@@ -775,12 +820,14 @@ impl SessionDisposition {
                 }
             }
             DriverError::InvalidCatalogRequest => Self::Keep,
+            DriverError::RedisKeyMissing | DriverError::RedisKeyTypeChanged => Self::Keep,
             DriverError::InvalidConfig { .. }
             | DriverError::Unavailable { .. }
             | DriverError::Timeout { .. }
             | DriverError::MySql(_)
             | DriverError::Redis(_)
             | DriverError::RedisParse(_)
+            | DriverError::RedisTls { .. }
             | DriverError::Unsupported { .. } => Self::Evict,
         }
     }
@@ -1789,7 +1836,8 @@ impl ApplicationService {
         let temporary = self
             .connector
             .connect(&profile, secret.as_deref(), timeout)
-            .await?;
+            .await
+            .map_err(|error| connection_error(&profile, error))?;
         Ok(DraftSessionLease {
             draft_id,
             operation_id,
@@ -2720,7 +2768,7 @@ impl ApplicationService {
             Err(error) => {
                 self.ensure_session_observation(&profile_id, generation, operation_id)
                     .await?;
-                return Err(error.into());
+                return Err(connection_error(profile, error));
             }
         };
         enum CacheInstall {
@@ -3305,6 +3353,21 @@ fn ensure_connector_tls_support(
         });
     }
     Ok(())
+}
+
+fn connection_error(profile: &ConnectionProfile, error: DriverError) -> ServiceError {
+    if let DriverError::Redis(redis) = &error
+        && redis.kind() == redis::ErrorKind::AuthenticationFailed
+    {
+        let code = match profile.credential_mode {
+            CredentialMode::Session => PublicCode::SessionCredential,
+            CredentialMode::Environment => PublicCode::CredentialEnvironmentName,
+            CredentialMode::None => PublicCode::Username,
+        };
+        ServiceError::ConnectionAuthenticationFailed { code }
+    } else {
+        ServiceError::Driver(error)
+    }
 }
 
 fn ensure_ready(profile: &ConnectionProfile) -> Result<(), DriverError> {

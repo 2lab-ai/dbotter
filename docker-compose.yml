@@ -34,6 +34,70 @@ services:
     volumes:
       - redis-data:/data
 
+  redis-auth:
+    image: redis:7.4-alpine
+    restart: "no"
+    environment:
+      REDISCLI_AUTH: dbotter-redis-local-only
+    command:
+      - redis-server
+      - --requirepass
+      - dbotter-redis-local-only
+      - --save
+      - ""
+    ports:
+      - "127.0.0.1:36380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis-tls-auth:
+    image: redis:7.4-alpine
+    restart: "no"
+    environment:
+      REDISCLI_AUTH: dbotter-redis-local-only
+    command:
+      - redis-server
+      - --port
+      - "0"
+      - --tls-port
+      - "6379"
+      - --tls-cert-file
+      - /tls/server.pem
+      - --tls-key-file
+      - /tls/server-key.pem
+      - --tls-ca-cert-file
+      - /tls/ca.pem
+      - --tls-auth-clients
+      - "no"
+      - --requirepass
+      - dbotter-redis-local-only
+      - --save
+      - ""
+    ports:
+      - "127.0.0.1:36381:6379"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "redis-cli",
+          "--tls",
+          "--cacert",
+          "/tls/ca.pem",
+          "-h",
+          "localhost",
+          "--sni",
+          "localhost",
+          "ping",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - ./artifacts/redis-tls:/tls:ro
+
   mongodb:
     image: mongo:8.0
     restart: "no"

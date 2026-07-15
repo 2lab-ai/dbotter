@@ -1256,7 +1256,7 @@ async fn p3_driver_session_disposition_is_identical_in_cache_event_and_ui_outcom
 }
 
 #[tokio::test]
-async fn p4_catalog_reaches_its_typed_resource_while_mismatches_and_keyspace_stay_gated() {
+async fn catalog_and_keyspace_commands_reach_independently_ready_resources() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");
     let connector = Arc::new(CountingConnector::default());
@@ -1406,7 +1406,11 @@ async fn p4_catalog_reaches_its_typed_resource_while_mismatches_and_keyspace_sta
     })
     .await;
 
-    assert_eq!(connector.connects.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        connector.connects.load(Ordering::SeqCst),
+        3,
+        "ready MySQL catalog connects once while each ready Redis request reaches and evicts this deliberately mismatched test connector"
+    );
     shutdown(&ui, runtime, OperationId(209)).await;
 }
 
