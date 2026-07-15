@@ -855,6 +855,8 @@ fn display_cell(cell: &Cell) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::DbotterApp;
     use crate::model::{
         ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
@@ -864,6 +866,7 @@ mod tests {
     use crate::ui::adapter::{UiCommand, bounded_ports};
     use crate::ui::model::{ProfileSnapshot, WorkspaceKey};
     use crate::ui::redis_explorer::RedisExplorerIntent;
+    use eframe::egui::{Context, Event, Key, Modifiers, RawInput};
 
     fn profile(driver: DriverKind, availability: DriverAvailability) -> ProfileSnapshot {
         let persisted = ConnectionProfile {
@@ -894,6 +897,93 @@ mod tests {
             planned_reason: None,
             has_current_session_secret: false,
             persisted,
+        }
+    }
+
+    #[test]
+    fn actual_app_editor_shortcut_submits_exact_generation_and_accesskit_ids() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::RefreshProfiles { .. })
+        ));
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile];
+        app.model.selected_profile = Some(ProfileId("profile".to_owned()));
+        app.model.workspace_mut(key.clone()).editor_text = "SELECT 1".to_owned();
+
+        #[cfg(target_os = "macos")]
+        let modifiers = Modifiers {
+            mac_cmd: true,
+            command: true,
+            ..Modifiers::default()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let modifiers = Modifiers {
+            ctrl: true,
+            command: true,
+            ..Modifiers::default()
+        };
+        let input = RawInput {
+            events: vec![Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..RawInput::default()
+        };
+        let context = Context::default();
+        context.enable_accesskit();
+        let output = context.run_ui(input, |ui| app.editor_and_results(ui));
+
+        let Some(UiCommand::Execute {
+            operation_id,
+            profile_id,
+            profile_generation,
+            text,
+            row_limit,
+            timeout_ms,
+            ..
+        }) = service.try_next_command()
+        else {
+            panic!("actual app shortcut did not submit Execute");
+        };
+        assert_eq!(operation_id, OperationId(2));
+        assert_eq!(profile_id, ProfileId("profile".to_owned()));
+        assert_eq!(profile_generation, ProfileGeneration(1));
+        assert_eq!(text, "SELECT 1");
+        assert_eq!(row_limit, 500);
+        assert_eq!(timeout_ms, 30_000);
+        assert_eq!(
+            app.model
+                .workspace(&key)
+                .and_then(|workspace| workspace.pending_execute),
+            Some(operation_id)
+        );
+
+        let ids = output
+            .platform_output
+            .accesskit_update
+            .expect("actual app frame must emit AccessKit")
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.author_id().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            "editor.target",
+            "editor.input",
+            "editor.row_limit",
+            "editor.timeout",
+            "editor.execute",
+        ] {
+            assert!(
+                ids.contains(expected),
+                "missing actual app AX id {expected}"
+            );
         }
     }
 
