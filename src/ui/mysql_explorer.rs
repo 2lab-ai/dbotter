@@ -788,4 +788,73 @@ mod tests {
             "ordinary informational text must be at least 4.5:1 on the white canvas"
         );
     }
+
+    #[test]
+    fn mysql_explorer_boundary_is_exact_openai_gray_and_keeps_focus_geometry() {
+        assert_eq!(
+            OPENAI_HAIRLINE,
+            egui::Color32::from_gray(0x91),
+            "MySQL boundaries must use exact #919191"
+        );
+
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            apply_openai_component_style(ui);
+            let visuals = ui.visuals();
+            for widget in [
+                &visuals.widgets.noninteractive,
+                &visuals.widgets.inactive,
+                &visuals.widgets.hovered,
+                &visuals.widgets.active,
+                &visuals.widgets.open,
+            ] {
+                assert_eq!(widget.corner_radius, egui::CornerRadius::ZERO);
+            }
+            assert!(visuals.widgets.active.bg_stroke.width >= 2.0);
+            assert_eq!(visuals.widgets.active.bg_stroke.color, OPENAI_INK);
+        });
+    }
+
+    #[test]
+    fn actual_mysql_actionable_controls_are_at_least_44_points() {
+        let context = egui::Context::default();
+        let mut heights = Vec::new();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            apply_openai_component_style(ui);
+            let mut prefix = String::new();
+            heights.push((
+                "prefix",
+                ui.add(egui::TextEdit::singleline(&mut prefix))
+                    .rect
+                    .height(),
+            ));
+            heights.push(("primary", primary_button(ui, "Primary", true).rect.height()));
+            heights.push((
+                "secondary",
+                secondary_button(ui, "Secondary", true).rect.height(),
+            ));
+        });
+
+        let undersized = heights
+            .into_iter()
+            .filter(|(_, height)| *height < 44.0)
+            .map(|(control, height)| format!("{control}={height}pt"))
+            .collect::<Vec<_>>();
+        assert!(
+            undersized.is_empty(),
+            "MySQL actionable controls must be at least 44pt: {}",
+            undersized.join(", ")
+        );
+    }
+
+    #[test]
+    fn mysql_production_has_no_legacy_gray224_or_32_point_control_path() {
+        let source = include_str!("mysql_explorer.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("unit-test boundary")
+            .0;
+        assert!(!production.contains("from_gray(224)"));
+        assert!(!production.contains("32.0"));
+    }
 }
