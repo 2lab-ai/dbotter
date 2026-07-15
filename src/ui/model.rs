@@ -363,6 +363,11 @@ impl UiModel {
         self.config_uncertain
     }
 
+    pub(crate) fn profiles_operation_is_newer(&self, operation_id: OperationId) -> bool {
+        self.last_profiles_operation
+            .is_none_or(|latest| operation_id.0 > latest.0)
+    }
+
     pub fn fold(&mut self, event: UiEvent) {
         match event {
             UiEvent::ProfilesLoaded {
@@ -794,10 +799,7 @@ impl UiModel {
     }
 
     fn accept_profiles_operation(&mut self, operation_id: OperationId) -> bool {
-        if self
-            .last_profiles_operation
-            .is_some_and(|latest| operation_id.0 <= latest.0)
-        {
+        if !self.profiles_operation_is_newer(operation_id) {
             return false;
         }
         self.last_profiles_operation = Some(operation_id);

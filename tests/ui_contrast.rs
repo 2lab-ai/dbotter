@@ -22,3 +22,22 @@ fn native_layout_uses_three_columns_and_a_bounded_collapse_point() {
     assert!((280.0..=340.0).contains(&NativeLayout::EXPLORER_WIDTH));
     assert!((820.0..=860.0).contains(&NativeLayout::COLLAPSE_WIDTH));
 }
+
+#[test]
+fn native_status_and_error_ui_stays_textual_and_monochrome() {
+    let sources = [
+        include_str!("../src/ui/app.rs"),
+        include_str!("../src/ui/profile_form.rs"),
+    ];
+    for source in sources {
+        for forbidden in ["Color32::RED", "Color32::YELLOW"] {
+            assert!(
+                !source.contains(forbidden),
+                "OpenAI native UI must not use chromatic status color {forbidden}"
+            );
+        }
+    }
+    assert!(sources[0].contains("Warning: result is truncated"));
+    assert!(sources[0].contains("Error: <missing>"));
+    assert!(sources[1].contains("Error: {error}"));
+}

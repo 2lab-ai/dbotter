@@ -24,11 +24,13 @@ use super::theme::OpenAiTheme;
 const REDIS_CA_FILE_FIELD_ID: &str = "profile.redis_tls.ca_file";
 const REDIS_CA_FILE_PICK_ID: &str = "profile.redis_tls.ca_file.pick";
 const PROFILE_NAME_ID: &str = "profile.name";
-const PROFILE_ID_ID: &str = "profile.id";
-const PROFILE_AUTO_ID_ID: &str = "profile.id.auto";
-const PROFILE_SESSION_INTENT_ID: &str = "profile.session.intent";
-const PROFILE_SESSION_REPLACEMENT_ID: &str = "profile.session.replacement";
-const PROFILE_ENVIRONMENT_ID: &str = "profile.environment.name";
+const PROFILE_ID_ID: &str = "profile.connection_id";
+const PROFILE_AUTO_ID_ID: &str = "profile.connection_id.auto";
+const PROFILE_SESSION_KEEP_ID: &str = "profile.credential.session.keep";
+const PROFILE_SESSION_REPLACE_ID: &str = "profile.credential.session.replace";
+const PROFILE_SESSION_FORGET_ID: &str = "profile.credential.session.forget";
+const PROFILE_SESSION_REPLACEMENT_ID: &str = "profile.credential.session.value";
+const PROFILE_ENVIRONMENT_ID: &str = "profile.credential.environment_name";
 const PROFILE_ENVIRONMENT_CHECK_ID: &str = "profile.environment.check";
 const PROFILE_MIGRATION_ID: &str = "profile.migration.confirm";
 const PROFILE_TEST_ID: &str = "profile.test_draft";
@@ -352,6 +354,7 @@ pub(super) struct ProfileEditor {
     session_intent: Option<SessionCredentialIntent>,
     replacement_secret: ReplacementSecretBuffer,
     environment_availability: Option<EnvironmentAvailability>,
+    environment_probe_name: Option<String>,
     migration_confirmed: bool,
     pub draft: ProfileDraft,
     pub errors: ValidationErrors,
@@ -372,6 +375,7 @@ impl ProfileEditor {
             session_intent: None,
             replacement_secret: ReplacementSecretBuffer::default(),
             environment_availability: None,
+            environment_probe_name: None,
             migration_confirmed: false,
             draft: ProfileDraft::new(driver),
             errors: ValidationErrors::default(),
@@ -405,6 +409,7 @@ impl ProfileEditor {
                 .map(|policy| policy.default),
             replacement_secret: ReplacementSecretBuffer::default(),
             environment_availability: None,
+            environment_probe_name: None,
             migration_confirmed: false,
             draft: ProfileDraft::from_profile(profile),
             errors: ValidationErrors::default(),
@@ -449,6 +454,7 @@ impl ProfileEditor {
     pub fn select_credential_mode(&mut self, mode: CredentialMode) {
         self.draft.select_credential_mode(mode);
         self.environment_availability = None;
+        self.environment_probe_name = None;
         self.session_intent =
             session_intent_policy(mode, self.credential_context()).map(|policy| policy.default);
         if mode != CredentialMode::Session {
@@ -488,8 +494,10 @@ impl ProfileEditor {
     }
 
     pub fn probe_environment_availability(&mut self) -> EnvironmentAvailability {
-        let availability = probe_environment(self.draft.secret_env.trim());
+        let environment_name = self.draft.secret_env.clone();
+        let availability = probe_environment(environment_name.trim());
         self.environment_availability = Some(availability);
+        self.environment_probe_name = Some(environment_name);
         availability
     }
 
@@ -513,7 +521,10 @@ impl ProfileEditor {
     }
 
     fn redis_ca_picker_enabled(&self) -> bool {
-        self.redis_ca_picker_visible() && !self.config_uncertain && self.pending_save.is_none()
+        self.redis_ca_picker_visible()
+            && !self.config_uncertain
+            && self.pending_save.is_none()
+            && self.pending_draft_test.is_none()
     }
 
     pub fn pending_operation(&self) -> Option<OperationId> {
@@ -777,8 +788,14 @@ impl ProfileEditor {
                 self.status = "Testing draft connection…".to_owned();
                 DraftTestAttempt::Submitted(operation_id)
             }
-            Err(SubmitError::Busy) => DraftTestAttempt::Busy,
-            Err(SubmitError::Disconnected) => DraftTestAttempt::Disconnected,
+            Err(SubmitError::Busy) => {
+                self.status = "Service is busy; draft was not submitted".to_owned();
+                DraftTestAttempt::Busy
+            }
+            Err(SubmitError::Disconnected) => {
+                self.status = "Service is unavailable".to_owned();
+                DraftTestAttempt::Disconnected
+            }
         }
     }
 
@@ -886,159 +903,7 @@ impl ProfileEditor {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui) -> FormAction {
-        let mut pick_redis_ca_file = false;
-        let mut probe_environment = false;
-        OpenAiTheme::apply(ui.ctx());
-        if self.config_uncertain {
-            ui.disable();
-        }
-        ui.heading(match self.mode {
-            EditorMode::Add => "Add connection profile",
-            EditorMode::Edit { .. } => "Edit connection profile",
-        });
-        ui.separator();
-        ui.label("Driver");
-        let mut selected_driver = self.draft.driver;
-        egui::ComboBox::from_id_salt("profile-driver")
-            .selected_text(driver_name(self.draft.driver))
-            .show_ui(ui, |ui| {
-                for driver in [DriverKind::MySql, DriverKind::Redis, DriverKind::MongoDb] {
-                    if driver == DriverKind::MongoDb && self.draft.driver != DriverKind::MongoDb {
-                        ui.add_enabled_ui(false, |ui| {
-                            ui.selectable_value(&mut selected_driver, driver, "MongoDB (planned)");
-                        });
-                    } else {
-                        ui.selectable_value(&mut selected_driver, driver, driver_name(driver));
-                    }
-                }
-            });
-        if self.draft.driver != selected_driver {
-            self.draft.select_driver(selected_driver);
-        }
-        ui.label("Display name");
-        let name_response =
-            ui.add(egui::TextEdit::singleline(&mut self.draft.name).id_salt(PROFILE_NAME_ID));
-        named_author_id(name_response, PROFILE_NAME_ID, "Profile display name");
-        render_error(ui, self.errors.name.as_deref());
-
-        if matches!(self.mode, EditorMode::Add) {
-            let auto_response = ui.checkbox(&mut self.use_auto_id, "Generate profile id from name");
-            named_author_id(
-                auto_response,
-                PROFILE_AUTO_ID_ID,
-                "Generate profile id automatically",
-            );
-            if let Some(preview) = self.auto_id_preview() {
-                ui.small(format!(
-                    "Will create as {preview}; conflicts receive -2, -3, …"
-                ));
-            }
-        }
-        let id_editable = matches!(self.mode, EditorMode::Add) && !self.use_auto_id;
-        ui.label("Profile id");
-        let id_response = ui.add_enabled(
-            id_editable,
-            egui::TextEdit::singleline(&mut self.draft.id).id_salt(PROFILE_ID_ID),
-        );
-        named_author_id(id_response, PROFILE_ID_ID, "Profile id");
-        render_error(ui, self.errors.id.as_deref());
-        text_field_with_focus(
-            ui,
-            "Host",
-            &mut self.draft.host,
-            self.errors.host.as_deref(),
-            ProfileFieldId::Host,
-            &mut self.focus_field,
-        );
-        text_field(
-            ui,
-            "Port",
-            &mut self.draft.port,
-            self.errors.port.as_deref(),
-        );
-        text_field(
-            ui,
-            if self.draft.driver == DriverKind::Redis {
-                "Database number (optional)"
-            } else {
-                "Database (optional)"
-            },
-            &mut self.draft.database,
-            self.errors.database.as_deref(),
-        );
-        text_field(ui, "Username (optional)", &mut self.draft.username, None);
-        ui.label("TLS");
-        let mut selected_tls = self.draft.tls;
-        egui::ComboBox::from_id_salt(if self.draft.driver == DriverKind::Redis {
-            "profile.redis_tls.mode"
-        } else {
-            "profile.tls.mode"
-        })
-        .selected_text(tls_name(self.draft.tls))
-        .show_ui(ui, |ui| {
-            let choices: &[TlsMode] = if self.draft.driver == DriverKind::Redis {
-                &[TlsMode::Disabled, TlsMode::Required]
-            } else {
-                &[TlsMode::Disabled, TlsMode::Preferred, TlsMode::Required]
-            };
-            for tls in choices {
-                ui.selectable_value(&mut selected_tls, *tls, tls_name(*tls));
-            }
-        });
-        if selected_tls != self.draft.tls {
-            self.draft.select_tls(selected_tls);
-        }
-        render_error(ui, self.errors.tls.as_deref());
-        if self.draft.driver == DriverKind::Redis && self.draft.tls == TlsMode::Preferred {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "Preferred is a legacy Redis mode. Choose Disabled or Required before saving.",
-            );
-        }
-        if self.redis_ca_picker_visible() {
-            let picker_enabled = self.redis_ca_picker_enabled();
-            ui.label("Redis CA file (optional; blank uses OS roots)");
-            ui.horizontal(|ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.draft.redis_ca_file)
-                        .id_source(REDIS_CA_FILE_FIELD_ID),
-                );
-                request_field_focus(response, ProfileFieldId::RedisCaFile, &mut self.focus_field);
-                let picker = ui
-                    .push_id(REDIS_CA_FILE_PICK_ID, |ui| {
-                        ui.add_enabled(picker_enabled, egui::Button::new("Choose…"))
-                    })
-                    .inner;
-                let keyboard_activated = picker.has_focus()
-                    && ui.input(|input| {
-                        input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
-                    });
-                pick_redis_ca_file = picker.clicked() || (picker_enabled && keyboard_activated);
-            });
-            render_error(ui, self.errors.redis_ca_file.as_deref());
-        }
-
-        ui.label("Credential mode");
-        let mut selected_credential_mode = self.draft.credential_mode;
-        egui::ComboBox::from_id_salt("profile.credential.mode")
-            .selected_text(credential_mode_name(self.draft.credential_mode))
-            .show_ui(ui, |ui| {
-                for mode in [
-                    CredentialMode::None,
-                    CredentialMode::Session,
-                    CredentialMode::Environment,
-                ] {
-                    ui.selectable_value(
-                        &mut selected_credential_mode,
-                        mode,
-                        credential_mode_name(mode),
-                    );
-                }
-            });
-        if selected_credential_mode != self.draft.credential_mode {
-            self.select_credential_mode(selected_credential_mode);
-        }
+    fn show_credential_fields(&mut self, ui: &mut egui::Ui, probe_environment: &mut bool) {
         match self.draft.credential_mode {
             CredentialMode::Environment => {
                 ui.label("Secret environment variable");
@@ -1046,17 +911,21 @@ impl ProfileEditor {
                     egui::TextEdit::singleline(&mut self.draft.secret_env)
                         .id_salt(PROFILE_ENVIRONMENT_ID),
                 );
-                named_author_id(
+                let response = named_author_id(
                     response,
                     PROFILE_ENVIRONMENT_ID,
                     "Secret environment variable name",
                 );
+                if response.changed() {
+                    self.environment_availability = None;
+                    self.environment_probe_name = None;
+                }
                 render_error(ui, self.errors.secret_env.as_deref());
                 let check = ui.add_sized(
                     [144.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
                     egui::Button::new("Check availability"),
                 );
-                probe_environment = named_author_id(
+                *probe_environment = named_author_id(
                     check,
                     PROFILE_ENVIRONMENT_CHECK_ID,
                     "Check environment credential availability",
@@ -1074,27 +943,52 @@ impl ProfileEditor {
                 if let Some(policy) =
                     session_intent_policy(CredentialMode::Session, self.credential_context())
                 {
-                    let mut selected_intent = self.session_intent.unwrap_or(policy.default);
-                    let response = egui::ComboBox::from_id_salt(PROFILE_SESSION_INTENT_ID)
-                        .selected_text(session_intent_name(selected_intent))
-                        .show_ui(ui, |ui| {
-                            for intent in policy.allowed {
-                                ui.selectable_value(
-                                    &mut selected_intent,
-                                    intent,
-                                    session_intent_name(intent),
-                                );
+                    let selected_intent = self.session_intent.unwrap_or(policy.default);
+                    let choices = [
+                        (
+                            SessionCredentialIntent::KeepCurrent,
+                            PROFILE_SESSION_KEEP_ID,
+                            "Keep current session credential",
+                        ),
+                        (
+                            SessionCredentialIntent::Replace,
+                            PROFILE_SESSION_REPLACE_ID,
+                            "Replace session credential",
+                        ),
+                        (
+                            SessionCredentialIntent::Forget,
+                            PROFILE_SESSION_FORGET_ID,
+                            "Forget session credential",
+                        ),
+                    ];
+                    let mut requested_intent = None;
+                    for (intent, author_id, author_name) in choices {
+                        let available = policy.allowed.contains(&intent);
+                        let label = if intent == SessionCredentialIntent::KeepCurrent {
+                            if available {
+                                "Keep current · set"
+                            } else {
+                                "Keep current · unavailable"
                             }
-                        })
-                        .response;
-                    named_author_id(
-                        response,
-                        PROFILE_SESSION_INTENT_ID,
-                        "Session credential action",
-                    );
-                    if self.session_intent != Some(selected_intent) {
-                        self.select_session_intent(selected_intent);
+                        } else {
+                            session_intent_name(intent)
+                        };
+                        let response = ui
+                            .add_enabled_ui(available, |ui| {
+                                ui.add_sized(
+                                    [240.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                                    egui::RadioButton::new(selected_intent == intent, label),
+                                )
+                            })
+                            .inner;
+                        if named_author_id(response, author_id, author_name).clicked() {
+                            requested_intent = Some(intent);
+                        }
                     }
+                    if let Some(intent) = requested_intent {
+                        self.select_session_intent(intent);
+                    }
+                    let selected_intent = self.session_intent.unwrap_or(policy.default);
                     if selected_intent == SessionCredentialIntent::Replace {
                         ui.label("Replacement session credential");
                         let response = ui.add(
@@ -1122,18 +1016,211 @@ impl ProfileEditor {
                 ui.small("No credential reference will be stored.");
             }
         }
-        if self.draft.driver == DriverKind::MongoDb {
-            ui.strong("MongoDB is planned. Profile creation and network actions are disabled.");
+    }
+
+    pub fn show(&mut self, ui: &mut egui::Ui) -> FormAction {
+        let mut pick_redis_ca_file = false;
+        let mut probe_environment = false;
+        OpenAiTheme::apply(ui.ctx());
+        if self.environment_availability.is_some()
+            && self.environment_probe_name.as_deref() != Some(self.draft.secret_env.as_str())
+        {
+            self.environment_availability = None;
+            self.environment_probe_name = None;
         }
-        let migration = ui.checkbox(
-            &mut self.migration_confirmed,
-            "Allow a version-1 configuration migration with backup if required",
-        );
-        named_author_id(
-            migration,
-            PROFILE_MIGRATION_ID,
-            "Confirm configuration migration backup",
-        );
+        ui.add_enabled_ui(!self.config_uncertain, |ui| {
+            ui.heading(match self.mode {
+                EditorMode::Add => "Add connection profile",
+                EditorMode::Edit { .. } => "Edit connection profile",
+            });
+            ui.separator();
+            ui.label("Driver");
+            let mut selected_driver = self.draft.driver;
+            egui::ComboBox::from_id_salt("profile-driver")
+                .selected_text(driver_name(self.draft.driver))
+                .show_ui(ui, |ui| {
+                    for driver in [DriverKind::MySql, DriverKind::Redis, DriverKind::MongoDb] {
+                        if driver == DriverKind::MongoDb && self.draft.driver != DriverKind::MongoDb {
+                            ui.add_enabled_ui(false, |ui| {
+                                ui.selectable_value(
+                                    &mut selected_driver,
+                                    driver,
+                                    "MongoDB (planned)",
+                                );
+                            });
+                        } else {
+                            ui.selectable_value(
+                                &mut selected_driver,
+                                driver,
+                                driver_name(driver),
+                            );
+                        }
+                    }
+                });
+            if self.draft.driver != selected_driver {
+                self.draft.select_driver(selected_driver);
+            }
+            ui.label("Display name");
+            let name_response = ui
+                .add(egui::TextEdit::singleline(&mut self.draft.name).id_salt(PROFILE_NAME_ID));
+            named_author_id(name_response, PROFILE_NAME_ID, "Profile display name");
+            render_error(ui, self.errors.name.as_deref());
+
+            if matches!(self.mode, EditorMode::Add) {
+                let auto_response =
+                    ui.checkbox(&mut self.use_auto_id, "Generate connection id from name");
+                named_author_id(
+                    auto_response,
+                    PROFILE_AUTO_ID_ID,
+                    "Generate connection id automatically",
+                );
+                if let Some(preview) = self.auto_id_preview() {
+                    ui.small(format!(
+                        "Will create as {preview}; conflicts receive -2, -3, …"
+                    ));
+                }
+            }
+            let id_editable = matches!(self.mode, EditorMode::Add) && !self.use_auto_id;
+            ui.label("Connection id");
+            let id_response = ui.add_enabled(
+                id_editable,
+                egui::TextEdit::singleline(&mut self.draft.id).id_salt(PROFILE_ID_ID),
+            );
+            let id_response = named_author_id(id_response, PROFILE_ID_ID, "Connection id");
+            request_field_focus(
+                &id_response,
+                ProfileFieldId::ConnectionId,
+                &mut self.focus_field,
+            );
+            render_error(ui, self.errors.id.as_deref());
+            text_field_with_focus(
+                ui,
+                "Host",
+                "Host",
+                &mut self.draft.host,
+                self.errors.host.as_deref(),
+                ProfileFieldId::Host,
+                &mut self.focus_field,
+            );
+            text_field(
+                ui,
+                "Port",
+                &mut self.draft.port,
+                self.errors.port.as_deref(),
+            );
+            text_field(
+                ui,
+                if self.draft.driver == DriverKind::Redis {
+                    "Database number (optional)"
+                } else {
+                    "Database (optional)"
+                },
+                &mut self.draft.database,
+                self.errors.database.as_deref(),
+            );
+            text_field(ui, "Username (optional)", &mut self.draft.username, None);
+            ui.label("TLS");
+            let mut selected_tls = self.draft.tls;
+            egui::ComboBox::from_id_salt(if self.draft.driver == DriverKind::Redis {
+                "profile.redis_tls.mode"
+            } else {
+                "profile.tls.mode"
+            })
+            .selected_text(tls_name(self.draft.tls))
+            .show_ui(ui, |ui| {
+                let choices: &[TlsMode] = if self.draft.driver == DriverKind::Redis {
+                    &[TlsMode::Disabled, TlsMode::Required]
+                } else {
+                    &[TlsMode::Disabled, TlsMode::Preferred, TlsMode::Required]
+                };
+                for tls in choices {
+                    ui.selectable_value(&mut selected_tls, *tls, tls_name(*tls));
+                }
+            });
+            if selected_tls != self.draft.tls {
+                self.draft.select_tls(selected_tls);
+            }
+            render_error(ui, self.errors.tls.as_deref());
+            if self.draft.driver == DriverKind::Redis && self.draft.tls == TlsMode::Preferred {
+                ui.strong(
+                    "Warning: Preferred is a legacy Redis mode. Choose Disabled or Required before saving.",
+                );
+            }
+            if self.redis_ca_picker_visible() {
+                let picker_enabled = self.redis_ca_picker_enabled();
+                ui.label("Redis CA file (optional; blank uses OS roots)");
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.draft.redis_ca_file)
+                            .id_source(REDIS_CA_FILE_FIELD_ID),
+                    );
+                    let response = named_author_id(
+                        response,
+                        REDIS_CA_FILE_FIELD_ID,
+                        "Redis CA file",
+                    );
+                    request_field_focus(
+                        &response,
+                        ProfileFieldId::RedisCaFile,
+                        &mut self.focus_field,
+                    );
+                    let picker = ui
+                        .push_id(REDIS_CA_FILE_PICK_ID, |ui| {
+                            ui.add_enabled(picker_enabled, egui::Button::new("Choose…"))
+                        })
+                        .inner;
+                    let picker = named_author_id(
+                        picker,
+                        REDIS_CA_FILE_PICK_ID,
+                        "Choose Redis CA file",
+                    );
+                    let keyboard_activated = picker.has_focus()
+                        && ui.input(|input| {
+                            input.key_pressed(egui::Key::Enter)
+                                || input.key_pressed(egui::Key::Space)
+                        });
+                    pick_redis_ca_file =
+                        picker.clicked() || (picker_enabled && keyboard_activated);
+                });
+                render_error(ui, self.errors.redis_ca_file.as_deref());
+            }
+
+            ui.label("Credential mode");
+            let mut selected_credential_mode = self.draft.credential_mode;
+            egui::ComboBox::from_id_salt("profile.credential.mode")
+                .selected_text(credential_mode_name(self.draft.credential_mode))
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        CredentialMode::None,
+                        CredentialMode::Session,
+                        CredentialMode::Environment,
+                    ] {
+                        ui.selectable_value(
+                            &mut selected_credential_mode,
+                            mode,
+                            credential_mode_name(mode),
+                        );
+                    }
+                });
+            if selected_credential_mode != self.draft.credential_mode {
+                self.select_credential_mode(selected_credential_mode);
+            }
+            self.show_credential_fields(ui, &mut probe_environment);
+            if self.draft.driver == DriverKind::MongoDb {
+                ui.strong(
+                    "MongoDB is planned. Profile creation and network actions are disabled.",
+                );
+            }
+            let migration = ui.checkbox(
+                &mut self.migration_confirmed,
+                "Allow a version-1 configuration migration with backup if required",
+            );
+            named_author_id(
+                migration,
+                PROFILE_MIGRATION_ID,
+                "Confirm configuration migration backup",
+            );
+        });
         ui.separator();
         let footer_action = ui
             .horizontal(|ui| {
@@ -1166,7 +1253,9 @@ impl ProfileEditor {
                 )
                 .clicked();
                 let cancel = ui.add_enabled(
-                    self.pending_operation().is_none() && self.pending_draft_test.is_none(),
+                    self.config_uncertain
+                        || (self.pending_operation().is_none()
+                            && self.pending_draft_test.is_none()),
                     egui::Button::new("Cancel")
                         .min_size(egui::vec2(96.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
                 );
@@ -1285,6 +1374,7 @@ fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String, error: Option<
 fn text_field_with_focus(
     ui: &mut egui::Ui,
     label: &str,
+    accessibility_name: &'static str,
     value: &mut String,
     error: Option<&str>,
     field: ProfileFieldId,
@@ -1292,12 +1382,13 @@ fn text_field_with_focus(
 ) {
     ui.label(label);
     let response = ui.add(egui::TextEdit::singleline(value).id_source(field.focus_id()));
-    request_field_focus(response, field, focus_field);
+    let response = named_author_id(response, field.focus_id(), accessibility_name);
+    request_field_focus(&response, field, focus_field);
     render_error(ui, error);
 }
 
 fn request_field_focus(
-    response: egui::Response,
+    response: &egui::Response,
     field: ProfileFieldId,
     focus_field: &mut Option<ProfileFieldId>,
 ) {
@@ -1309,7 +1400,7 @@ fn request_field_focus(
 
 fn render_error(ui: &mut egui::Ui, error: Option<&str>) {
     if let Some(error) = error {
-        ui.colored_label(egui::Color32::RED, error);
+        ui.strong(format!("Error: {error}"));
     }
 }
 
@@ -1420,9 +1511,11 @@ mod tests {
 
         let (connection_id, connection_node) = author_node(&update, expected_order[0]);
         assert_eq!(connection_node.role(), accesskit::Role::TextInput);
+        assert_eq!(connection_node.label(), Some("Connection id"));
         assert!(!connection_node.is_disabled());
         let (host_id, host_node) = author_node(&update, expected_order[1]);
         assert_eq!(host_node.role(), accesskit::Role::TextInput);
+        assert_eq!(host_node.label(), Some("Host"));
         assert_eq!(update.focus, host_id);
         assert_ne!(connection_id, host_id);
         assert_eq!(
@@ -1442,6 +1535,23 @@ mod tests {
         assert!(keep.is_disabled(), "Keep is unavailable for a new profile");
         assert!(!replace.is_disabled());
         assert!(!forget.is_disabled());
+
+        let mut connection_focus = valid_editor(DriverKind::MySql);
+        connection_focus.request_focus(crate::model::ProfileFieldId::ConnectionId);
+        let connection_update = profile_accesskit_update(&mut connection_focus);
+        assert_eq!(
+            connection_update.focus,
+            author_node(&connection_update, "profile.connection_id").0
+        );
+
+        let mut ca_focus = valid_editor(DriverKind::Redis);
+        ca_focus.draft.select_tls(TlsMode::Required);
+        ca_focus.request_focus(crate::model::ProfileFieldId::RedisCaFile);
+        let ca_update = profile_accesskit_update(&mut ca_focus);
+        assert_eq!(
+            ca_update.focus,
+            author_node(&ca_update, "profile.redis_tls.ca_file").0
+        );
     }
 
     #[test]

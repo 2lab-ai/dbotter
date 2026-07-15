@@ -10,8 +10,8 @@ use egui_extras::{Column as TableColumn, TableBuilder};
 use crate::model::{
     CatalogRequest, Cell, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
     DEFAULT_REDIS_SCAN_COUNT, DraftId, DriverAvailability, DriverCapabilities, DriverKind,
-    ProfileFieldId, ProfileGeneration, ProfileId, RedisKeyInspectRequest, RedisScanRequest,
-    RequestIdentity,
+    OperationId, ProfileFieldId, ProfileGeneration, ProfileId, RedisKeyInspectRequest,
+    RedisScanRequest, RequestIdentity,
 };
 
 use super::adapter::{SubmitError, UiCommand, UiPort};
@@ -35,7 +35,7 @@ pub struct DbotterApp {
     editor_surface: EditorSurface,
     redis_explorer: RedisExplorer,
     next_draft_id: u64,
-    pending_connect_after_refresh: Option<ProfileId>,
+    pending_connect_after_refresh: Option<(ProfileId, OperationId)>,
 }
 
 impl DbotterApp {
@@ -94,18 +94,23 @@ impl DbotterApp {
                 ProfileEventResult::SavedAndConnect(profile_id, warning) => {
                     self.model.fold(event);
                     self.model.selected_profile = Some(profile_id.clone());
-                    self.pending_connect_after_refresh = Some(profile_id);
                     self.model.status = warning.map_or_else(
                         || "Profile saved; refreshing before connect…".to_owned(),
                         |summary| summary.message().to_owned(),
                     );
                     self.profile_editor = None;
                     let operation_id = self.model.next_operation();
-                    if let Err(error) = self
+                    match self
                         .port
                         .try_submit(UiCommand::RefreshProfiles { operation_id })
                     {
-                        self.report_submit_error(error);
+                        Ok(()) => {
+                            self.pending_connect_after_refresh = Some((profile_id, operation_id));
+                        }
+                        Err(error) => {
+                            self.pending_connect_after_refresh = None;
+                            self.report_submit_error(error);
+                        }
                     }
                     continue;
                 }
@@ -117,11 +122,32 @@ impl DbotterApp {
                 }
                 ProfileEventResult::Ignored => {}
             }
-            let profiles_loaded = matches!(event, UiEvent::ProfilesLoaded { .. });
+            let connect_follow_up = self.pending_connect_after_refresh.as_ref().and_then(
+                |(profile_id, expected_operation)| match &event {
+                    UiEvent::ProfilesLoaded { operation_id, .. }
+                        if operation_id == expected_operation =>
+                    {
+                        Some((
+                            profile_id.clone(),
+                            true,
+                            self.model.profiles_operation_is_newer(*operation_id),
+                        ))
+                    }
+                    UiEvent::ProfilesFailed { operation_id, .. }
+                        if operation_id == expected_operation =>
+                    {
+                        Some((profile_id.clone(), false, false))
+                    }
+                    _ => None,
+                },
+            );
             self.model.fold(event);
-            if profiles_loaded && let Some(profile_id) = self.pending_connect_after_refresh.take() {
-                self.model.selected_profile = Some(profile_id.clone());
-                self.submit_test(profile_id);
+            if let Some((profile_id, loaded, accepted)) = connect_follow_up {
+                self.pending_connect_after_refresh = None;
+                if loaded && accepted && self.model.active_generation(&profile_id).is_some() {
+                    self.model.selected_profile = Some(profile_id.clone());
+                    self.submit_test(profile_id);
+                }
             }
         }
         self.mysql_explorers.retain(|(profile_id, generation), _| {
@@ -554,13 +580,10 @@ impl DbotterApp {
             }
         });
         if profile.availability == DriverAvailability::Planned {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                format!(
-                    "Planned: {}",
-                    profile.planned_reason.as_deref().unwrap_or("not available")
-                ),
-            );
+            ui.strong(format!(
+                "Planned: {}",
+                profile.planned_reason.as_deref().unwrap_or("not available")
+            ));
         }
         if selected && profile.driver == DriverKind::MySql && profile.is_ready() {
             ui.add_space(12.0);
@@ -828,7 +851,7 @@ fn render_result(ui: &mut egui::Ui, result: &crate::model::ResultSnapshot) {
             ui.label(format!("last insert id {last_insert_id}"));
         }
         if result.truncated {
-            ui.colored_label(egui::Color32::YELLOW, "truncated");
+            ui.strong("Warning: result is truncated");
         }
     });
     for notice in &result.notices {
@@ -863,7 +886,7 @@ fn render_result(ui: &mut egui::Ui, result: &crate::model::ResultSnapshot) {
                             ui.label(display_cell(cell));
                         }
                         None => {
-                            ui.colored_label(egui::Color32::RED, "<missing>");
+                            ui.strong("Error: <missing>");
                         }
                     });
                 }
