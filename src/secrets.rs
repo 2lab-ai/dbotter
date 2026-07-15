@@ -92,6 +92,7 @@ impl ReplacementSecretBuffer {
         self.0.as_str()
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) fn as_mut_string(&mut self) -> &mut String {
         &mut self.0
     }

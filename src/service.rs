@@ -442,14 +442,17 @@ enum DraftCredentialSource {
 }
 
 impl TestDraftRequest {
+    #[cfg(feature = "desktop")]
     pub(crate) fn draft_id(&self) -> DraftId {
         self.draft_id
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) fn operation_id(&self) -> OperationId {
         self.operation_id
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
     }
@@ -690,6 +693,7 @@ pub struct CachedSessionIdentity {
     pub connection_fingerprint: ConnectionFingerprint,
 }
 
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub(crate) struct RuntimeUpdateOutcome {
     pub(crate) mutation: ProfileMutationOutcome,
     pub(crate) deferred_session: Option<DeferredSessionFence>,
@@ -711,6 +715,7 @@ pub(crate) struct DeferredRuntimeCleanup {
     retain_secret_profiles: Option<HashSet<ProfileId>>,
 }
 
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub(crate) struct DeferredCleanupTarget {
     profile_id: ProfileId,
     previous_generation: ProfileGeneration,
@@ -728,6 +733,7 @@ impl DeferredRuntimeCleanup {
         }
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) fn targets(&self) -> impl Iterator<Item = (&ProfileId, ProfileGeneration)> {
         self.targets
             .iter()
@@ -735,11 +741,13 @@ impl DeferredRuntimeCleanup {
     }
 }
 
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub(crate) struct RuntimeDeleteOutcome {
     pub(crate) mutation: ProfileMutationOutcome,
     pub(crate) cleanup: DeferredRuntimeCleanup,
 }
 
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub(crate) struct RuntimeCreateOutcome {
     pub(crate) mutation: ProfileMutationOutcome,
     pub(crate) cleanup: DeferredRuntimeCleanup,
@@ -856,14 +864,17 @@ pub(crate) struct DraftSessionLease {
 }
 
 impl DraftSessionLease {
+    #[cfg(feature = "desktop")]
     pub(crate) fn draft_id(&self) -> DraftId {
         self.draft_id
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) fn operation_id(&self) -> OperationId {
         self.operation_id
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -878,6 +889,7 @@ impl DraftSessionLease {
 }
 
 impl SessionLease {
+    #[cfg(feature = "desktop")]
     pub(crate) fn identity(&self) -> &CachedSessionIdentity {
         &self.identity
     }
@@ -1117,6 +1129,7 @@ impl ApplicationService {
             .map_err(ServiceError::Secret)
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) async fn store_session_credential_exact(
         &self,
         operation_id: OperationId,
@@ -1142,6 +1155,7 @@ impl ApplicationService {
             .map_err(ServiceError::Secret)
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) async fn needs_session_credential(
         &self,
         profile_id: &ProfileId,
@@ -1345,6 +1359,7 @@ impl ApplicationService {
         ))
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) fn prepare_replacement_secret_draft_test(
         &self,
         draft_id: DraftId,
@@ -1471,6 +1486,7 @@ impl ApplicationService {
         }
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) async fn create_profile_for_runtime(
         &self,
         request: CreateProfileRequest,
@@ -1615,6 +1631,7 @@ impl ApplicationService {
         }
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) async fn update_profile_for_runtime(
         &self,
         request: UpdateProfileRequest,
@@ -1662,6 +1679,7 @@ impl ApplicationService {
         let retain_idle_session = secret_preserves_connection
             && connection_fingerprint_unchanged
             && expected_profile == updated;
+        #[cfg(feature = "desktop")]
         let retag_eligible = secret_preserves_connection && connection_fingerprint_unchanged;
         let mutation = ConfigMutation::UpdateChecked {
             profile_id: request.profile_id.0.clone(),
@@ -1702,6 +1720,7 @@ impl ApplicationService {
                         UpdateSessionPolicy::Legacy => {
                             LocalSessionPolicy::Resolve(retain_idle_session)
                         }
+                        #[cfg(feature = "desktop")]
                         UpdateSessionPolicy::Defer => LocalSessionPolicy::Defer { retag_eligible },
                     },
                 },
@@ -1729,6 +1748,7 @@ impl ApplicationService {
                 self.apply_deferred_cleanup(cleanup).await?;
                 (None, DeferredRuntimeCleanup::empty())
             }
+            #[cfg(feature = "desktop")]
             UpdateSessionPolicy::Defer => (deferred_session, cleanup),
         };
         Ok(RuntimeUpdateOutcome {
@@ -1757,6 +1777,7 @@ impl ApplicationService {
         }
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) async fn delete_profile_for_runtime(
         &self,
         request: DeleteProfileRequest,
@@ -2735,6 +2756,7 @@ impl ApplicationService {
         }
     }
 
+    #[cfg(feature = "desktop")]
     pub(crate) async fn ensure_profile_generation(
         &self,
         profile_id: &ProfileId,
@@ -3088,8 +3110,9 @@ impl MutationIdentity<'_> {
             Self::Update {
                 session_policy: LocalSessionPolicy::Resolve(retag_eligible),
                 ..
-            }
-            | Self::Update {
+            } => Some(*retag_eligible),
+            #[cfg(feature = "desktop")]
+            Self::Update {
                 session_policy: LocalSessionPolicy::Defer { retag_eligible },
                 ..
             } => Some(*retag_eligible),
@@ -3105,13 +3128,17 @@ impl MutationIdentity<'_> {
 #[derive(Clone, Copy)]
 enum UpdateSessionPolicy {
     Legacy,
+    #[cfg(feature = "desktop")]
     Defer,
 }
 
 #[derive(Clone, Copy)]
 enum LocalSessionPolicy {
     Resolve(bool),
-    Defer { retag_eligible: bool },
+    #[cfg(feature = "desktop")]
+    Defer {
+        retag_eligible: bool,
+    },
 }
 
 struct ReconcileMutationOutcome {
