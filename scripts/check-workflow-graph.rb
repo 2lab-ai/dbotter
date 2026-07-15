@@ -137,6 +137,36 @@ begin
     "verify.yml macOS package live test"
   )
 
+  live = job(workflows["verify"], "live", "verify.yml")
+  fail_contract("verify.yml: live job must depend on hermetic") unless needs(live) == ["hermetic"]
+  fail_contract("verify.yml: live job must use the pinned Linux runner") unless live["runs-on"] == "ubuntu-24.04"
+  live_checkout = unique_named_step(live, "Checkout exact candidate", "verify.yml.live")
+  fail_contract("verify.yml: live checkout is not exact") unless live_checkout["uses"] == "actions/checkout@v4" && live_checkout["with"] == {
+    "ref" => "${{ inputs.candidate_sha }}",
+    "fetch-depth" => 0,
+    "persist-credentials" => false
+  }
+  live_run = unique_named_step(live, "Run mandatory live contracts", "verify.yml.live")
+  fail_contract("verify.yml: live run identity is not explicit") unless live_run["env"] == {
+    "DBOTTER_COMPOSE_PROJECT" => "dbotter-e2e",
+    "DBOTTER_MYSQL_PASSWORD" => "dbotter-local-only",
+    "DBOTTER_REDIS_PASSWORD" => "dbotter-redis-local-only",
+    "GITHUB_RUN_ID" => "${{ github.run_id }}",
+    "GITHUB_RUN_ATTEMPT" => "${{ github.run_attempt }}"
+  }
+  require_substrings(
+    live_run["run"],
+    ["./scripts/verify-live-contracts.sh", '--expected-sha "${{ inputs.candidate_sha }}"'],
+    "verify.yml live run"
+  )
+  live_upload = unique_named_step(live, "Upload live verification receipt", "verify.yml.live")
+  fail_contract("verify.yml: live receipt upload action is wrong") unless live_upload["uses"] == "actions/upload-artifact@v4"
+  fail_contract("verify.yml: live receipt upload is not exact") unless live_upload["with"] == {
+    "name" => "live-contract-verification",
+    "path" => "artifacts/live-contract-receipt.json",
+    "if-no-files-found" => "error"
+  }
+
   preview = workflows["preview"]
   preview_jobs = preview["jobs"]
   exact_keys(preview_jobs, %w[verify plan build publish tap], "preview.yml.jobs")

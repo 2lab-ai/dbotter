@@ -79,6 +79,8 @@ jobs:
           DBOTTER_COMPOSE_PROJECT: dbotter-e2e
           DBOTTER_MYSQL_PASSWORD: dbotter-local-only
           DBOTTER_REDIS_PASSWORD: dbotter-redis-local-only
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: ./scripts/verify-live-contracts.sh --config config/local.example.toml --expected-sha "${{ inputs.candidate_sha }}"
 
       - name: Upload live verification receipt

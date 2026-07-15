@@ -22,10 +22,11 @@ mutation_case() {
   local name="$1"
   local old="$2"
   local new="$3"
+  local workflow="${4:-preview.yml}"
   local case_dir="$tmp_dir/$name"
   mkdir -p "$case_dir"
   cp .github/workflows/*.yml "$case_dir/"
-  python3 - "$case_dir/preview.yml" "$old" "$new" <<'PY'
+  python3 - "$case_dir/$workflow" "$old" "$new" <<'PY'
 import pathlib
 import sys
 
@@ -62,6 +63,16 @@ mutation_case \
   missing_tap_checkout \
   'ref: ${{ needs.plan.outputs.commit }}' \
   'ref: ${{ github.sha }}'
+mutation_case \
+  wrong_live_receipt_path \
+  'path: artifacts/live-contract-receipt.json' \
+  'path: artifacts/live/mysql-catalog-suite.json' \
+  verify.yml
+mutation_case \
+  wrong_live_run_identity \
+  'GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}' \
+  'GITHUB_RUN_ATTEMPT: 1' \
+  verify.yml
 
 duplicate_dir="$tmp_dir/duplicate-key"
 mkdir -p "$duplicate_dir"
