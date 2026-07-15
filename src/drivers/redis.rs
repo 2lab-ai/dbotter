@@ -537,6 +537,32 @@ mod tests {
     }
 
     #[test]
+    fn nested_composite_derived_bytes_never_cross_the_total_snapshot_cap() {
+        let values = (0..200)
+            .map(|_| {
+                ::redis::Value::Map(vec![(
+                    ::redis::Value::SimpleString("payload".to_owned()),
+                    ::redis::Value::BulkString(vec![b'x'; 60 * 1024]),
+                )])
+            })
+            .collect();
+        let (rows, truncated) = value_rows(::redis::Value::Array(values), 200);
+        let derived_bytes = rows
+            .iter()
+            .map(|row| match &row[0] {
+                Cell::Json(value) => serde_json::to_vec(value)
+                    .expect("serialize retained composite")
+                    .len(),
+                _ => 0,
+            })
+            .fold(0_usize, usize::saturating_add);
+
+        assert!(truncated);
+        assert!(derived_bytes <= crate::model::MAX_RESULT_BYTES);
+        assert!(rows.len() < 200);
+    }
+
+    #[test]
     fn complete_nested_composites_and_top_level_bytes_keep_exact_identity() {
         let (rows, truncated) = value_rows(
             ::redis::Value::Array(vec![
