@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 use dbotter::execution::ExecutionTargetError;
 use dbotter::model::{
-    ConnectionProfile, CredentialMode, DriverAvailability, DriverKind, OperationId,
-    OperationKind, ProfileGeneration, ProfileId, QueryLanguage, RedisTlsConfig, TlsMode,
+    ConnectionProfile, CredentialMode, DriverAvailability, DriverKind, OperationId, OperationKind,
+    ProfileGeneration, ProfileId, QueryLanguage, RedisTlsConfig, TlsMode,
 };
 use dbotter::ui::{
     EditorCursor, EditorIntent, EditorSurface, EditorValidationError, ProfileSnapshot, UiCommand,
@@ -55,7 +55,13 @@ fn profile(
 
 #[test]
 fn workspace_defaults_and_explicit_selection_produce_the_exact_command_tuple() {
-    let profile = profile("mysql-a", 7, DriverKind::MySql, Some("app"), TlsMode::Required);
+    let profile = profile(
+        "mysql-a",
+        7,
+        DriverKind::MySql,
+        Some("app"),
+        TlsMode::Required,
+    );
     let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
     let mut model = UiModel::default();
     let workspace = model.workspace_mut(key);
@@ -105,18 +111,12 @@ fn workspace_defaults_and_explicit_selection_produce_the_exact_command_tuple() {
 fn invalid_explicit_selection_and_execute_limits_never_fall_back() {
     let profile = profile("mysql-a", 7, DriverKind::MySql, None, TlsMode::Disabled);
     let mut model = UiModel::default();
-    let workspace = model.workspace_mut(WorkspaceKey::new(
-        profile.id.clone(),
-        profile.generation,
-    ));
+    let workspace = model.workspace_mut(WorkspaceKey::new(profile.id.clone(), profile.generation));
     workspace.editor_text = "SELECT 1; SELECT 2;".to_owned();
 
-    let selection_error = build_execute_intent(
-        &profile,
-        workspace,
-        EditorCursor::with_selection(15, 9..10),
-    )
-    .expect_err("a whitespace selection must not fall back to the caret");
+    let selection_error =
+        build_execute_intent(&profile, workspace, EditorCursor::with_selection(15, 9..10))
+            .expect_err("a whitespace selection must not fall back to the caret");
     assert_eq!(
         selection_error,
         EditorValidationError::Target(ExecutionTargetError::NoCurrentStatement)
@@ -137,13 +137,16 @@ fn invalid_explicit_selection_and_execute_limits_never_fall_back() {
 
 #[test]
 fn redis_caret_uses_one_physical_line_and_keeps_the_correct_language() {
-    let profile = profile("redis-b", 11, DriverKind::Redis, Some("3"), TlsMode::Required);
+    let profile = profile(
+        "redis-b",
+        11,
+        DriverKind::Redis,
+        Some("3"),
+        TlsMode::Required,
+    );
     let mut model = UiModel::default();
-    let workspace = model.workspace_mut(WorkspaceKey::new(
-        profile.id.clone(),
-        profile.generation,
-    ));
-    workspace.editor_text = "PING\nSET key 'a;b'".to_owned();
+    let workspace = model.workspace_mut(WorkspaceKey::new(profile.id.clone(), profile.generation));
+    workspace.editor_text = "PING\nSET key \"a;b\"".to_owned();
     let caret = "PING\nSET".chars().count();
 
     let intent = build_execute_intent(&profile, workspace, EditorCursor::caret(caret))
@@ -152,7 +155,7 @@ fn redis_caret_uses_one_physical_line_and_keeps_the_correct_language() {
     assert_eq!(intent.profile_id(), &ProfileId("redis-b".to_owned()));
     assert_eq!(intent.profile_generation(), ProfileGeneration(11));
     assert_eq!(intent.language(), QueryLanguage::RedisCommand);
-    assert_eq!(intent.text(), "SET key 'a;b'");
+    assert_eq!(intent.text(), "SET key \"a;b\"");
     assert_eq!(intent.operation_kind(), OperationKind::ExecuteMutation);
 
     let target = editor_target_label(&profile);
@@ -164,7 +167,10 @@ fn redis_caret_uses_one_physical_line_and_keeps_the_correct_language() {
         "Redis DB 3",
         "TLS Required",
     ] {
-        assert!(target.contains(expected), "target omitted {expected}: {target}");
+        assert!(
+            target.contains(expected),
+            "target omitted {expected}: {target}"
+        );
     }
 }
 
@@ -210,23 +216,38 @@ fn author_ids(output: &eframe::egui::FullOutput) -> BTreeSet<String> {
 
 #[test]
 fn raw_input_shortcut_submits_once_and_pending_work_exposes_exact_cancel() {
-    let profile = profile("mysql-a", 7, DriverKind::MySql, Some("app"), TlsMode::Required);
+    let profile = profile(
+        "mysql-a",
+        7,
+        DriverKind::MySql,
+        Some("app"),
+        TlsMode::Required,
+    );
     let mut model = UiModel::default();
-    let workspace = model.workspace_mut(WorkspaceKey::new(
-        profile.id.clone(),
-        profile.generation,
-    ));
+    let workspace = model.workspace_mut(WorkspaceKey::new(profile.id.clone(), profile.generation));
     workspace.editor_text = "SELECT 1".to_owned();
 
     let context = Context::default();
     context.enable_accesskit();
     let mut surface = EditorSurface::default();
+    #[cfg(target_os = "macos")]
+    let shortcut_modifiers = Modifiers {
+        mac_cmd: true,
+        command: true,
+        ..Modifiers::default()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let shortcut_modifiers = Modifiers {
+        ctrl: true,
+        command: true,
+        ..Modifiers::default()
+    };
     let shortcut = Event::Key {
         key: Key::Enter,
         physical_key: Some(Key::Enter),
         pressed: true,
         repeat: false,
-        modifiers: Modifiers::COMMAND,
+        modifiers: shortcut_modifiers,
     };
     let input = RawInput {
         events: vec![shortcut],

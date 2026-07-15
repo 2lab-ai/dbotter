@@ -1,6 +1,7 @@
 mod accessibility;
 mod adapter;
 mod app;
+mod editor;
 mod layout;
 mod model;
 mod mysql_explorer;
@@ -15,6 +16,12 @@ mod theme;
 pub use adapter::{
     CONTROL_CAPACITY, EVENT_CAPACITY, MUTATION_CAPACITY, ServicePort, SubmitError, UiCommand,
     UiPort, WORK_CAPACITY, bounded_ports, controller_ports,
+};
+pub use editor::{
+    EDITOR_CANCEL_ID, EDITOR_EXECUTE_ID, EDITOR_INPUT_ID, EDITOR_ROW_LIMIT_ID, EDITOR_TARGET_ID,
+    EDITOR_TIMEOUT_ID, EditorCursor, EditorExecuteIntent, EditorIntent, EditorSurface,
+    EditorValidationError, build_execute_intent, classify_execute_operation, editor_target_label,
+    pending_cancel_intent,
 };
 pub use layout::NativeLayout;
 pub use model::{

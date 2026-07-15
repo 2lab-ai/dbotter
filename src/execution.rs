@@ -37,6 +37,7 @@ impl fmt::Debug for ExecutionTarget {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ValidatedExecutionTarget {
     target: ExecutionTarget,
+    source_text: String,
     row_limit: u32,
     timeout_seconds: u32,
 }
@@ -61,6 +62,24 @@ impl ValidatedExecutionTarget {
     pub fn into_target(self) -> ExecutionTarget {
         self.target
     }
+
+    /// The exact trimmed source span selected by the scanner.
+    /// MySQL shares the target allocation; Redis retains this before argv parsing.
+    #[must_use]
+    pub fn source_text(&self) -> &str {
+        match &self.target {
+            ExecutionTarget::MySqlText(text) => text,
+            ExecutionTarget::RedisArgv(_) => &self.source_text,
+        }
+    }
+
+    #[must_use]
+    pub fn into_source_text(self) -> String {
+        match self.target {
+            ExecutionTarget::MySqlText(text) => text,
+            ExecutionTarget::RedisArgv(_) => self.source_text,
+        }
+    }
 }
 
 impl fmt::Debug for ValidatedExecutionTarget {
@@ -68,6 +87,7 @@ impl fmt::Debug for ValidatedExecutionTarget {
         formatter
             .debug_struct("ValidatedExecutionTarget")
             .field("target", &self.target)
+            .field("source_text", &"<redacted>")
             .field("row_limit", &self.row_limit)
             .field("timeout_seconds", &self.timeout_seconds)
             .finish()
@@ -172,27 +192,37 @@ pub fn extract_and_validate_target(
         .transpose()?
         .map(str::trim);
 
-    let target = match (language, selected) {
+    let (target, source_text) = match (language, selected) {
         (ExecutionLanguage::MySql, Some(selection)) => {
             validate_mysql_selection(selection)?;
-            ExecutionTarget::MySqlText(selection.to_owned())
+            (
+                ExecutionTarget::MySqlText(selection.to_owned()),
+                String::new(),
+            )
         }
         (ExecutionLanguage::MySql, None) => {
             let target = infer_mysql_target(editor_text, caret_byte)?;
-            ExecutionTarget::MySqlText(target.to_owned())
+            (ExecutionTarget::MySqlText(target.to_owned()), String::new())
         }
         (ExecutionLanguage::Redis, Some(selection)) => {
             validate_single_redis_physical_command(selection)?;
-            ExecutionTarget::RedisArgv(validate_redis_target(selection)?)
+            (
+                ExecutionTarget::RedisArgv(validate_redis_target(selection)?),
+                selection.to_owned(),
+            )
         }
         (ExecutionLanguage::Redis, None) => {
             let line = physical_line_at(editor_text, caret_byte).trim();
-            ExecutionTarget::RedisArgv(validate_redis_target(line)?)
+            (
+                ExecutionTarget::RedisArgv(validate_redis_target(line)?),
+                line.to_owned(),
+            )
         }
     };
 
     Ok(ValidatedExecutionTarget {
         target,
+        source_text,
         row_limit,
         timeout_seconds,
     })
