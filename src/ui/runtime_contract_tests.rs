@@ -22,6 +22,7 @@ impl Drop for DropFlag {
     }
 }
 
+#[cfg(test)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_session_blocking_cancel_and_timeout_return_before_running_worker_finishes() {
     for cancel_first in [true, false] {
