@@ -64,6 +64,7 @@ expect_reject() {
 
 expect_reject source-overall source '.source.assertions.overall = false'
 expect_reject package-source package '.package.source_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+expect_reject live-v1-schema live '.live.schema = "dbotter.live-contract-receipt.v1"'
 expect_reject live-source live '.live.source.commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
 expect_reject live-run live '.live.source.run_attempt = 3'
 expect_reject live-missing-case live 'del(.live.suites.mysql_catalog.cases[0])'

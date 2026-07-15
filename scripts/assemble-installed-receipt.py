@@ -16,9 +16,12 @@ import sys
 import tempfile
 from typing import Any
 
+from live_contract import SUITES
+
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+LIVE_PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 SAFE_REPO_PATH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 SAFE_ACTION_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 SAFE_AUTHOR_RE = re.compile(r"^[a-z0-9_.:-]+$")
@@ -121,6 +124,12 @@ def require_positive_integer(value: Any, location: str) -> int:
     return value
 
 
+def require_nonnegative_integer(value: Any, location: str) -> int:
+    if type(value) is not int or value < 0:
+        raise AssembleError(f"{location} must be a nonnegative integer")
+    return value
+
+
 def require_timestamp(value: Any, location: str) -> str:
     if not isinstance(value, str):
         raise AssembleError(f"{location} must be a UTC timestamp")
@@ -129,6 +138,97 @@ def require_timestamp(value: Any, location: str) -> str:
     except ValueError as error:
         raise AssembleError(f"{location} is not a real second-precision UTC timestamp") from error
     return value
+
+
+def require_live_receipt(
+    value: Any, source_sha: str, run_id: int, run_attempt: int
+) -> dict[str, Any]:
+    live = exact(
+        value,
+        {"schema", "source", "project", "started_at", "finished_at", "suites"},
+        "live evidence",
+    )
+    if live["schema"] != "dbotter.live-contract-receipt.v2":
+        raise AssembleError("live evidence schema mismatch")
+    source = exact(
+        live["source"],
+        {"kind", "commit", "run_id", "run_attempt"},
+        "live.source",
+    )
+    if source != {
+        "kind": "ci_expected_sha",
+        "commit": source_sha,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+    }:
+        raise AssembleError("live evidence does not identify the manifest run")
+    project = require_string(live["project"], "live.project")
+    if LIVE_PROJECT_RE.fullmatch(project) is None:
+        raise AssembleError("live.project is not a stable project identifier")
+    live_started = require_timestamp(live["started_at"], "live.started_at")
+    live_finished = require_timestamp(live["finished_at"], "live.finished_at")
+    if live_finished < live_started:
+        raise AssembleError("live evidence timestamps are reversed")
+
+    suites = exact(live["suites"], set(SUITES), "live.suites")
+    for suite_name, contract in SUITES.items():
+        location = f"live.suites.{suite_name}"
+        suite = exact(
+            suites[suite_name],
+            {"test", "started_at", "finished_at", "cases", "measurements"},
+            location,
+        )
+        if suite["test"] != contract["test"]:
+            raise AssembleError(f"{location}.test is not exact")
+        suite_started = require_timestamp(suite["started_at"], f"{location}.started_at")
+        suite_finished = require_timestamp(suite["finished_at"], f"{location}.finished_at")
+        if (
+            suite_finished < suite_started
+            or suite_started < live_started
+            or suite_finished > live_finished
+        ):
+            raise AssembleError(f"{location} timestamps escape the live receipt")
+
+        cases = suite["cases"]
+        if not isinstance(cases, list):
+            raise AssembleError(f"{location}.cases must be an array")
+        case_ids: list[str] = []
+        for index, raw_case in enumerate(cases):
+            case_location = f"{location}.cases[{index}]"
+            case = exact(raw_case, {"id", "executed", "passed"}, case_location)
+            case_id = case["id"]
+            if not isinstance(case_id, str):
+                raise AssembleError(f"{case_location}.id must be a string")
+            executed = require_positive_integer(case["executed"], f"{case_location}.executed")
+            passed = require_positive_integer(case["passed"], f"{case_location}.passed")
+            if passed != executed:
+                raise AssembleError(f"{case_location} did not pass every execution")
+            case_ids.append(case_id)
+        if len(case_ids) != len(set(case_ids)):
+            raise AssembleError(f"{location} contains duplicate case identifiers")
+        if case_ids != sorted(case_ids):
+            raise AssembleError(f"{location}.cases are not sorted")
+        expected_cases: set[str] = contract["cases"]
+        if set(case_ids) != expected_cases:
+            missing = sorted(expected_cases - set(case_ids))
+            unknown = sorted(set(case_ids) - expected_cases)
+            raise AssembleError(
+                f"{location}.cases are not exact; missing={missing}, unknown={unknown}"
+            )
+
+        measurement_contract: dict[str, tuple[int, int | None]] = contract["measurements"]
+        measurements = exact(
+            suite["measurements"], set(measurement_contract), f"{location}.measurements"
+        )
+        for name, (minimum, maximum) in measurement_contract.items():
+            measured = require_nonnegative_integer(
+                measurements[name], f"{location}.measurements.{name}"
+            )
+            if measured < minimum or (maximum is not None and measured > maximum):
+                raise AssembleError(
+                    f"{location}.measurements.{name} is outside [{minimum}, {maximum}]"
+                )
+    return live
 
 
 def require_config(value: Any, location: str) -> dict[str, Any]:
@@ -346,37 +446,16 @@ def assemble(args: argparse.Namespace, documents: dict[str, Any]) -> dict[str, A
     ):
         raise AssembleError("package evidence disagrees with its signed manifest artifact")
 
-    live = exact(
+    live = require_live_receipt(
         documents["live"],
-        {"schema", "source_sha", "started_at", "project", "tests", "assertions"},
-        "live evidence",
+        source_sha,
+        source_record["run_id"],
+        source_record["run_attempt"],
     )
-    if live["schema"] != "dbotter.live-contract-receipt.v1" or live["source_sha"] != source_sha:
-        raise AssembleError("live evidence is not source-bound")
-    require_timestamp(live["started_at"], "live.started_at")
-    require_string(live["project"], "live.project")
-    if exact(live["tests"], {"mysql_catalog", "mysql_prepared_auth", "redis_keyspace_tls_auth"}, "live.tests") != {
-        "mysql_catalog": "p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli",
-        "mysql_prepared_auth": "mysql_contract",
-        "redis_keyspace_tls_auth": "redis_live_receipt",
-    }:
-        raise AssembleError("live evidence does not name every mandatory test")
-    require_boolean_map(
-        live["assertions"],
-        {
-            "mysql_catalog": True,
-            "mysql_prepared_only": True,
-            "mysql_auth": True,
-            "redis_keyspace": True,
-            "redis_auth_plaintext": True,
-            "redis_auth_tls": True,
-            "redis_tls_ca_recovery": True,
-            "redis_tls_host_recovery": True,
-            "redis_plaintext_fallback": False,
-            "overall": True,
-        },
-        "live.assertions",
-    )
+    live_started = live["started_at"]
+    live_finished = live["finished_at"]
+    if live_started < source_started:
+        raise AssembleError("live evidence predates source verification")
 
     formula = exact(
         documents["formula"],
@@ -574,7 +653,7 @@ def assemble(args: argparse.Namespace, documents: dict[str, Any]) -> dict[str, A
     )
 
     finished_at = require_timestamp(args.finished_at, "--finished-at")
-    if finished_at < max(source_finished, live["started_at"], cli["started_at"]):
+    if finished_at < max(source_finished, live_finished, cli["started_at"]):
         raise AssembleError("--finished-at predates required evidence")
 
     return {

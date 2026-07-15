@@ -80,6 +80,7 @@ for schema in \
   packaging/macos/stable-ax-identifiers.json; do
   test -s "$schema" || fail "$schema is missing or empty"
 done
+test -s scripts/live_contract.py || fail "scripts/live_contract.py is missing or empty"
 
 package_version="$(./scripts/package-version.sh)"
 manifest_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -1)"
@@ -106,6 +107,8 @@ require_literal scripts/verify-live-contracts.sh 'redis_live_receipt'
 require_literal scripts/verify-live-contracts.sh 'live checkout does not equal the expected source SHA'
 require_literal scripts/verify-live-contracts.sh '--source-sha "$head_sha"'
 require_literal scripts/verify-live-contracts.sh 'assemble-live-contract-receipt.py'
+require_literal scripts/assemble-live-contract-receipt.py 'from live_contract import SUITES'
+require_literal scripts/assemble-installed-receipt.py 'from live_contract import SUITES'
 require_literal scripts/verify-installed-gui.sh 'profile.connection_id'
 require_literal scripts/verify-installed-gui.sh 'result.export.json'
 require_literal scripts/verify-installed-gui.sh 'DBOTTER_AX_DRIVER'
