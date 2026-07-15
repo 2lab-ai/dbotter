@@ -2953,7 +2953,8 @@ fn display_cell(cell: &Cell) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{
@@ -2961,14 +2962,16 @@ mod tests {
         ProfileEditor,
     };
     use crate::model::{
-        ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
-        OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode,
-        PublicSummary, RedisKeyEntry, RedisKeyFilter, RedisKeyId, RedisKeyPage,
-        RedisScanConsistency, RedisScanRequest, RedisTlsConfig, RequestIdentity, SessionGeneration,
-        TlsMode,
+        Cell, Column, ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind,
+        OperationId, OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration,
+        ProfileId, PublicCode, PublicSummary, QueryResult, RedisKeyEntry, RedisKeyFilter,
+        RedisKeyId, RedisKeyPage, RedisScanConsistency, RedisScanRequest, RedisTlsConfig,
+        RequestIdentity, ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
+        SessionGeneration, TlsMode,
     };
     use crate::public_error::{PublicOperationError, RecoveryAction, SafeContext};
     use crate::service::SessionDisposition;
+    use crate::ui::accessibility::{accesskit_author_node, assert_accesskit_value_confined};
     use crate::ui::adapter::{ServicePort, UiCommand, bounded_ports};
     use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
     use crate::ui::model::{ProfileSnapshot, WorkspaceKey};
@@ -3036,6 +3039,33 @@ mod tests {
             truncated: false,
             stale: false,
         }
+    }
+
+    fn result_snapshot(profile: &ProfileSnapshot, value: &str) -> ResultSnapshot {
+        ResultSnapshot::retain(
+            QueryResult {
+                columns: vec![Column {
+                    name: "value".to_owned(),
+                    type_name: "TEXT".to_owned(),
+                }],
+                rows: vec![vec![Cell::Text(value.to_owned())]],
+                affected_rows: 0,
+                last_insert_id: None,
+                elapsed_ms: 4,
+                truncated: false,
+                backend_notices_present: false,
+            },
+            ResultProvenance {
+                result_id: ResultId(71),
+                profile_id: profile.id.clone(),
+                profile_generation: profile.generation,
+                operation_id: OperationId(72),
+                driver: profile.driver,
+                completed_at_unix_ms: 0,
+                duration_ms: 4,
+            },
+            ResultRetentionPolicy::mysql(1),
+        )
     }
 
     fn redis_keys_for(app: &DbotterApp, key: &WorkspaceKey) -> Option<Vec<Vec<u8>>> {
@@ -4452,6 +4482,192 @@ mod tests {
                 "missing actual app AX id {expected}"
             );
         }
+    }
+
+    #[test]
+    fn actual_app_accesskit_confines_sql_and_result_scalar_to_value_nodes() {
+        const SQL: &str = "SELECT 'dbotter-sql-value-sentinel'";
+        const SCALAR: &str = "dbotter-result-value-sentinel";
+
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        let workspace = app.model.workspace_mut(key);
+        workspace.editor_text = SQL.to_owned();
+        workspace.result = Some(Arc::new(result_snapshot(&profile, SCALAR)));
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let update = context
+            .run_ui(RawInput::default(), |ui| app.editor_and_results(ui))
+            .platform_output
+            .accesskit_update
+            .expect("actual editor/results frame must emit AccessKit");
+
+        assert_accesskit_value_confined(&update, "editor.input", SQL);
+        assert_accesskit_value_confined(&update, "result.cell.0.0", SCALAR);
+
+        let (_, input) = accesskit_author_node(&update, "editor.input");
+        assert_eq!(input.role(), accesskit::Role::MultilineTextInput);
+        assert_eq!(input.label(), Some("Statement or command"));
+        assert!(input.supports_action(accesskit::Action::Focus));
+
+        let (_, execute) = accesskit_author_node(&update, "editor.execute");
+        assert_eq!(execute.author_id(), Some("editor.execute"));
+        assert_eq!(execute.label(), Some("Execute selected or current target"));
+        assert_eq!(execute.role(), accesskit::Role::Button);
+        assert!(execute.supports_action(accesskit::Action::Focus));
+        assert!(execute.supports_action(accesskit::Action::Click));
+    }
+
+    #[test]
+    fn actual_redis_accesskit_confines_key_display_to_exact_action_node() {
+        const KEY: &[u8] = b"dbotter-redis-key-value-sentinel";
+        const KEY_DISPLAY: &str = "dbotter-redis-key-value-sentinel";
+
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = redis_profile("redis-disclosure", 3);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        load_redis_key(&mut app, &mut service, &key, KEY, SessionGeneration(31));
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let update = context
+            .run_ui(RawInput::default(), |ui| app.explorer_contents(ui))
+            .platform_output
+            .accesskit_update
+            .expect("actual Redis explorer frame must emit AccessKit");
+
+        assert_accesskit_value_confined(&update, "redis.key.0", KEY_DISPLAY);
+        let (_, key_node) = accesskit_author_node(&update, "redis.key.0");
+        assert_eq!(key_node.author_id(), Some("redis.key.0"));
+        assert_eq!(key_node.label(), Some("Redis key 1"));
+        assert_eq!(key_node.role(), accesskit::Role::Button);
+        assert!(key_node.supports_action(accesskit::Action::Focus));
+        assert!(key_node.supports_action(accesskit::Action::Click));
+    }
+
+    #[test]
+    fn keyboard_tabs_to_execute_and_activates_the_actual_control() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.model.workspace_mut(key).editor_text = "SELECT 1".to_owned();
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let mut author_ids = HashMap::new();
+        let mut focused_execute = false;
+        for frame in 0..16 {
+            let events = (frame > 0)
+                .then(|| {
+                    vec![
+                        Event::Key {
+                            key: Key::Tab,
+                            physical_key: Some(Key::Tab),
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Modifiers::default(),
+                        },
+                        Event::Key {
+                            key: Key::Tab,
+                            physical_key: Some(Key::Tab),
+                            pressed: false,
+                            repeat: false,
+                            modifiers: Modifiers::default(),
+                        },
+                    ]
+                })
+                .unwrap_or_default();
+            let output = context.run_ui(
+                RawInput {
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| app.editor_and_results(ui),
+            );
+            let update = output
+                .platform_output
+                .accesskit_update
+                .expect("keyboard frame must emit AccessKit");
+            for (node_id, node) in &update.nodes {
+                if let Some(author_id) = node.author_id() {
+                    author_ids.insert(*node_id, author_id.to_owned());
+                }
+            }
+            if author_ids.get(&update.focus).map(String::as_str) == Some("editor.execute") {
+                focused_execute = true;
+                break;
+            }
+        }
+        assert!(
+            focused_execute,
+            "Tab must reach the actual editor.execute control"
+        );
+
+        let settled = context.run_ui(RawInput::default(), |ui| app.editor_and_results(ui));
+        let settled_update = settled
+            .platform_output
+            .accesskit_update
+            .expect("settled keyboard frame must emit AccessKit");
+        for (node_id, node) in &settled_update.nodes {
+            if let Some(author_id) = node.author_id() {
+                author_ids.insert(*node_id, author_id.to_owned());
+            }
+        }
+        assert_eq!(
+            author_ids.get(&settled_update.focus).map(String::as_str),
+            Some("editor.execute"),
+            "keyboard focus readback must settle on the exact action id"
+        );
+
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![
+                    Event::Key {
+                        key: Key::Space,
+                        physical_key: Some(Key::Space),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::default(),
+                    },
+                    Event::Key {
+                        key: Key::Space,
+                        physical_key: Some(Key::Space),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: Modifiers::default(),
+                    },
+                ],
+                ..RawInput::default()
+            },
+            |ui| app.editor_and_results(ui),
+        );
+        let command = service.try_next_command();
+        assert!(
+            matches!(&command, Some(UiCommand::Execute { text, .. }) if text == "SELECT 1"),
+            "Space on the focused Execute control must submit the exact editor value, got {command:?}"
+        );
     }
 
     #[test]

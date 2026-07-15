@@ -1427,6 +1427,7 @@ mod tests {
         ProfileId, RedisTlsConfig, SessionCredentialIntent, TlsMode,
     };
     use crate::secrets::{EnvironmentAvailability, SessionSecretUpdate};
+    use crate::ui::accessibility::{assert_accesskit_omits, assert_accesskit_value_confined};
     use crate::ui::adapter::{DraftTestIntent, UiCommand, bounded_ports};
     use crate::ui::model::UiEvent;
     use eframe::egui::{Context, RawInput, accesskit};
@@ -1561,6 +1562,27 @@ mod tests {
             ca_update.focus,
             author_node(&ca_update, "profile.redis_tls.ca_file").0
         );
+    }
+
+    #[test]
+    fn actual_profile_accesskit_confines_ca_path_and_omits_session_secret() {
+        const CA_PATH: &str = "/tmp/dbotter-ca-value-sentinel.pem";
+        const SECRET: &str = "dbotter-session-secret-sentinel";
+
+        let mut editor = valid_editor(DriverKind::Redis);
+        editor.draft.select_tls(TlsMode::Required);
+        editor.draft.redis_ca_file = CA_PATH.to_owned();
+        editor.select_credential_mode(CredentialMode::Session);
+        editor.select_session_intent(SessionCredentialIntent::Replace);
+        editor.set_replacement_secret(SECRET.to_owned());
+
+        let update = profile_accesskit_update(&mut editor);
+        assert_accesskit_value_confined(&update, "profile.redis_tls.ca_file", CA_PATH);
+        assert_accesskit_omits(&update, SECRET);
+
+        let (_, replacement) = author_node(&update, "profile.credential.session.value");
+        assert_eq!(replacement.role(), accesskit::Role::PasswordInput);
+        assert!(replacement.supports_action(accesskit::Action::Focus));
     }
 
     #[test]
