@@ -371,7 +371,10 @@ fn decode_scalar(value: ::redis::Value, budget: &mut DecodeBudget) -> Option<Dec
         budget.mark_truncated();
         return None;
     };
-    let (retained_bytes, previewable) = scalar_measure(&value);
+    let Some((retained_bytes, previewable)) = scalar_measure(&value) else {
+        budget.mark_truncated();
+        return None;
+    };
     let crosses_limit =
         retained_bytes > MAX_REDIS_CELL_BYTES || retained_bytes > budget.remaining_bytes;
     if crosses_limit && !previewable {
@@ -391,8 +394,8 @@ fn decode_scalar(value: ::redis::Value, budget: &mut DecodeBudget) -> Option<Dec
     })
 }
 
-fn scalar_measure(value: &::redis::Value) -> (usize, bool) {
-    match value {
+fn scalar_measure(value: &::redis::Value) -> Option<(usize, bool)> {
+    Some(match value {
         ::redis::Value::Nil => (4, false),
         ::redis::Value::Int(value) => (signed_decimal_digits(*value), false),
         ::redis::Value::BulkString(value) => (value.len(), true),
@@ -401,10 +404,12 @@ fn scalar_measure(value: &::redis::Value) -> (usize, bool) {
         ::redis::Value::Double(value) => (json_float_bytes(*value), false),
         ::redis::Value::Boolean(value) => (if *value { 4 } else { 5 }, false),
         ::redis::Value::VerbatimString { text, .. } => (text.len(), true),
-        ::redis::Value::BigNumber(value) => (decimal_digits_from_bits(value.bits()), false),
+        ::redis::Value::BigNumber(value) => {
+            (decimal_string_upper_bound_from_bits(value.bits())?, false)
+        }
         ::redis::Value::ServerError(_) => ("[redis-server-error]".len(), false),
         _ => ("[unsupported-resp-value]".len(), false),
-    }
+    })
 }
 
 struct CompositeMeter {
@@ -483,7 +488,9 @@ fn measure_json_value_into(
             measure_json_value_into(data, depth + 1, meter)
         }
         ::redis::Value::VerbatimString { text, .. } => meter.add_bytes(json_string_bytes(text)?),
-        ::redis::Value::BigNumber(value) => meter.add_bytes(decimal_digits_from_bits(value.bits())),
+        ::redis::Value::BigNumber(value) => {
+            meter.add_bytes(decimal_string_upper_bound_from_bits(value.bits())?.checked_add(2)?)
+        }
         ::redis::Value::Push { data, .. } => {
             meter.add_bytes(23)?;
             measure_json_array(data, depth + 1, meter)
@@ -567,12 +574,19 @@ fn json_float_bytes(value: f64) -> usize {
     serde_json::Number::from_f64(value).map_or(4, |number| number.to_string().len())
 }
 
-fn decimal_digits_from_bits(bits: u64) -> usize {
-    usize::try_from(bits)
-        .unwrap_or(usize::MAX)
-        .saturating_mul(30_103)
-        .saturating_div(100_000)
-        .saturating_add(2)
+fn decimal_string_upper_bound_from_bits(bits: u64) -> Option<usize> {
+    const LOG10_2_UPPER_NUMERATOR: usize = 30_103;
+    const LOG10_2_UPPER_DENOMINATOR: usize = 100_000;
+
+    let bits = usize::try_from(bits).ok()?;
+    let magnitude_digits = if bits == 0 {
+        1
+    } else {
+        bits.checked_mul(LOG10_2_UPPER_NUMERATOR)?
+            .checked_add(LOG10_2_UPPER_DENOMINATOR - 1)?
+            .checked_div(LOG10_2_UPPER_DENOMINATOR)?
+    };
+    magnitude_digits.checked_add(1)
 }
 
 fn value_cell_complete(value: ::redis::Value) -> Cell {
@@ -842,6 +856,11 @@ mod tests {
         assert!(truncated);
         assert!(derived_bytes <= crate::model::MAX_RESULT_BYTES);
         assert!(rows.len() < 200);
+    }
+
+    #[test]
+    fn big_number_decimal_bound_fails_closed_on_arithmetic_overflow() {
+        assert_eq!(decimal_string_upper_bound_from_bits(u64::MAX), None);
     }
 
     #[test]
