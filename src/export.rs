@@ -197,7 +197,7 @@ fn write_csv_field<W: Write, F: FnMut() -> bool>(
     writer.write_all(b"\"")?;
     let mut remainder = field;
     while let Some(index) = remainder.find('"') {
-        writer.write_all(remainder[..index].as_bytes())?;
+        writer.write_all(&remainder.as_bytes()[..index])?;
         writer.write_all(b"\"\"")?;
         remainder = &remainder[index + 1..];
     }
@@ -477,7 +477,7 @@ fn push_canonical_json(output: &mut String, value: &serde_json::Value) {
         serde_json::Value::Object(values) => {
             output.push('{');
             let mut fields: Vec<_> = values.iter().collect();
-            fields.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            fields.sort_unstable_by_key(|(key, _)| *key);
             for (index, (key, value)) in fields.into_iter().enumerate() {
                 if index != 0 {
                     output.push(',');
