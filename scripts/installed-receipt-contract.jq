@@ -105,6 +105,8 @@ def safe_ids($pattern):
   and .install.executable.codesign_valid == true
   and (.install.cli_shim | exact_keys(["path", "realpath", "device", "inode", "sha256"]))
   and (.install.cli_shim.path | absolute_path)
+  and (.install.cli_shim.path | endswith("/bin/dbotter"))
+  and .install.cli_shim.path != .install.executable.realpath
   and .install.cli_shim.realpath == .install.executable.realpath
   and .install.cli_shim.device == .install.executable.device
   and .install.cli_shim.inode == .install.executable.inode

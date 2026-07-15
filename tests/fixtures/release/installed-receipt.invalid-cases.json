@@ -41,6 +41,24 @@
     "value": 4243
   },
   {
+    "name": "shim-path-is-embedded-path",
+    "operation": "set",
+    "path": ["install", "cli_shim", "path"],
+    "value": "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2/Dbotter Preview.app/Contents/MacOS/dbotter"
+  },
+  {
+    "name": "shim-path-is-not-homebrew-command",
+    "operation": "set",
+    "path": ["install", "cli_shim", "path"],
+    "value": "/tmp/dbotter"
+  },
+  {
+    "name": "impossible-start-timestamp",
+    "operation": "set",
+    "path": ["started_at"],
+    "value": "2026-07-15T12:99:00Z"
+  },
+  {
     "name": "config-contract-mismatch",
     "operation": "set",
     "path": ["config_contract", "write_version"],
