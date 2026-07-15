@@ -24,6 +24,24 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+typed_config_cases='[
+  {"name":"read_versions_bool","filter":".config_contract.read_versions = [true, 2]"},
+  {"name":"read_versions_float","filter":".config_contract.read_versions = [1.0, 2.0]"},
+  {"name":"write_version_float","filter":".config_contract.write_version = 2.0"}
+]'
+typed_config_case_count="$(jq 'length' <<<"$typed_config_cases")"
+typed_config_case_index=0
+while [ "$typed_config_case_index" -lt "$typed_config_case_count" ]; do
+  name="$(jq -r ".[$typed_config_case_index].name" <<<"$typed_config_cases")"
+  filter="$(jq -r ".[$typed_config_case_index].filter" <<<"$typed_config_cases")"
+  candidate="$tmp_dir/typed-$name.json"
+  jq "$filter" "$valid_manifest" >"$candidate"
+  if ./scripts/check-release-contract.sh --manifest "$candidate" >/dev/null 2>&1; then
+    fail "type-confused config contract was accepted: $name"
+  fi
+  typed_config_case_index=$((typed_config_case_index + 1))
+done
+
 time_cases="tests/fixtures/release/preview-manifest.invalid-time-cases.json"
 time_case_count="$(jq 'length' "$time_cases")"
 time_case_index=0
