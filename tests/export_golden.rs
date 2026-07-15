@@ -225,6 +225,40 @@ fn canonical_json_has_exact_order_all_cell_shapes_and_no_final_newline() {
     assert!(!json.ends_with(b"\n"));
 }
 
+#[test]
+fn mutation_only_result_is_json_only_and_preserves_counts() {
+    let mut result = snapshot(Vec::new(), Vec::new());
+    result.affected_rows = 7;
+    result.last_insert_id = Some(8);
+
+    let mut csv = Vec::new();
+    assert!(matches!(
+        write_export(&result, ExportFormat::Csv, &mut csv),
+        Err(ExportEncodeError::TabularResultRequired)
+    ));
+    let mut tsv = Vec::new();
+    assert!(matches!(
+        write_export(&result, ExportFormat::Tsv, &mut tsv),
+        Err(ExportEncodeError::TabularResultRequired)
+    ));
+    assert!(csv.is_empty());
+    assert!(tsv.is_empty());
+
+    let json = encode(&result, ExportFormat::Json);
+    assert_eq!(
+        json,
+        concat!(
+            "{\"schema\":\"dbotter.result.v1\",",
+            "\"provenance\":{\"operation_id\":17,\"profile_id\":\"profile-export\",",
+            "\"profile_generation\":7,\"driver\":\"redis\",",
+            "\"completed_at\":\"2023-11-14T22:13:20.123Z\",\"elapsed_ms\":19},",
+            "\"columns\":[],\"rows\":[],\"affected_rows\":7,",
+            "\"last_insert_id\":8,\"truncated\":false}"
+        )
+        .as_bytes()
+    );
+}
+
 struct BoundedWrite {
     bytes: usize,
     largest_write: usize,
