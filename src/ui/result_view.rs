@@ -5,18 +5,26 @@ use eframe::egui;
 use egui_extras::{Column as TableColumn, TableBuilder};
 
 use crate::export::{clipboard_scalar, tsv_field};
-use crate::model::{Cell, ExportFormat, ResultId, ResultSnapshot};
+use crate::model::{Cell, ExportFormat, OperationId, ResultId, ResultSnapshot};
 
 use super::accessibility::{named_author_id, named_dynamic_value_author_id};
 
 pub const RESULT_ACTION_HEIGHT: f32 = 44.0;
 pub const RESULT_ROW_HEIGHT: f32 = 44.0;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResultViewIntent {
+    Export(ExportFormat),
+    Cancel(OperationId),
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ResultViewState {
     result_id: Option<ResultId>,
     selected_rows: BTreeSet<usize>,
     selected_cell: Option<(usize, usize)>,
+    needs_initial_selection: bool,
+    pending_export: Option<OperationId>,
 }
 
 impl ResultViewState {
@@ -24,6 +32,8 @@ impl ResultViewState {
         self.result_id = Some(result_id);
         self.selected_rows.clear();
         self.selected_cell = None;
+        self.needs_initial_selection = true;
+        self.pending_export = None;
     }
 
     fn synchronize(&mut self, result: &ResultSnapshot) {
@@ -37,6 +47,29 @@ impl ResultViewState {
         }) {
             self.selected_cell = None;
         }
+        if self.needs_initial_selection {
+            if !result.rows.is_empty() && !result.columns.is_empty() {
+                self.selected_rows.insert(0);
+                self.selected_cell = Some((0, 0));
+            }
+            self.needs_initial_selection = false;
+        }
+    }
+
+    pub(crate) fn begin_export(&mut self, result_id: ResultId, operation_id: OperationId) -> bool {
+        if self.result_id != Some(result_id) || self.pending_export.is_some() {
+            return false;
+        }
+        self.pending_export = Some(operation_id);
+        true
+    }
+
+    pub(crate) fn finish_export(&mut self, result_id: ResultId, operation_id: OperationId) -> bool {
+        if self.result_id != Some(result_id) || self.pending_export != Some(operation_id) {
+            return false;
+        }
+        self.pending_export = None;
+        true
     }
 
     pub(crate) fn show(
@@ -44,14 +77,14 @@ impl ResultViewState {
         ui: &mut egui::Ui,
         result: &ResultSnapshot,
         export_enabled: bool,
-    ) -> Option<ExportFormat> {
+    ) -> Option<ResultViewIntent> {
         self.synchronize(result);
         render_provenance(ui, result);
         for notice in &result.notices {
             ui.small(notice.message());
         }
 
-        let mut export = None;
+        let mut intent = None;
         ui.horizontal_wrapped(|ui| {
             let cell_enabled = self
                 .selected_cell
@@ -120,22 +153,37 @@ impl ResultViewState {
                 ),
             ] {
                 let tabular = !result.columns.is_empty();
-                let enabled = export_enabled && (format == ExportFormat::Json || tabular);
+                let enabled = export_enabled
+                    && self.pending_export.is_none()
+                    && (format == ExportFormat::Json || tabular);
                 let button = ui.add_enabled(
                     enabled,
                     egui::Button::new(label).min_size(egui::vec2(112.0, RESULT_ACTION_HEIGHT)),
                 );
                 if named_author_id(button, author_id, name).clicked() {
-                    export = Some(format);
+                    intent = Some(ResultViewIntent::Export(format));
+                }
+            }
+
+            if let Some(operation_id) = self.pending_export {
+                let status = ui.strong("Exporting…");
+                named_author_id(status, "result.export.status", "Result export in progress");
+                let cancel = ui.add(
+                    egui::Button::new("Cancel export")
+                        .min_size(egui::vec2(112.0, RESULT_ACTION_HEIGHT)),
+                );
+                if named_author_id(cancel, "result.export.cancel", "Cancel result export").clicked()
+                {
+                    intent = Some(ResultViewIntent::Cancel(operation_id));
                 }
             }
         });
 
         if result.columns.is_empty() {
-            return export;
+            return intent;
         }
         render_table(ui, result, self);
-        export
+        intent
     }
 }
 

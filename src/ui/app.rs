@@ -1,18 +1,21 @@
 //! Native three-zone UI. Rendering and state folding perform no I/O.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
 
 use crate::config::MigrationConsent;
+use crate::export_file::confirm_replace;
 use crate::model::{
     CatalogRequest, CredentialMode, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
     DEFAULT_REDIS_SCAN_COUNT, DraftId, DriverAvailability, DriverCapabilities, DriverKind,
-    OperationId, OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration, ProfileId,
-    PublicCode, PublicSummary, RedisKeyInspectRequest, RedisScanRequest, RequestIdentity,
+    ExportFormat, ExportResult, OperationId, OperationKind, OperationRecipeId, OverwritePolicy,
+    ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
+    RedisKeyInspectRequest, RedisScanRequest, RequestIdentity, ResultId, ResultSnapshot,
     SessionGeneration,
 };
 use crate::public_error::{
@@ -37,6 +40,7 @@ use super::profile_form::{
     DraftTestAttempt, FormAction, ProfileEditor, ProfileEventResult, SaveAttempt,
 };
 use super::redis_explorer::{RedisExplorer, RedisExplorerIntent};
+use super::result_view::ResultViewIntent;
 use super::theme::OpenAiTheme;
 
 const EVENT_DRAIN_LIMIT: usize = 128;
@@ -240,6 +244,12 @@ enum DeleteDialogAction {
     Confirm,
 }
 
+struct PendingExportDestination {
+    result_id: ResultId,
+    format: ExportFormat,
+    path: PathBuf,
+}
+
 pub struct DbotterApp {
     port: UiPort,
     model: UiModel,
@@ -258,6 +268,9 @@ pub struct DbotterApp {
     delete_confirmation: Option<DeleteConfirmation>,
     next_draft_id: u64,
     pending_connect_after_refresh: Option<(ProfileId, OperationId)>,
+    pending_export_destinations: HashMap<OperationId, PendingExportDestination>,
+    committed_export_destinations: HashMap<ResultId, PathBuf>,
+    result_export_formats: HashMap<ResultId, ExportFormat>,
 }
 
 impl DbotterApp {
@@ -280,6 +293,9 @@ impl DbotterApp {
             delete_confirmation: None,
             next_draft_id: 1,
             pending_connect_after_refresh: None,
+            pending_export_destinations: HashMap::new(),
+            committed_export_destinations: HashMap::new(),
+            result_export_formats: HashMap::new(),
         };
         let operation_id = app.model.next_operation();
         let _ = app
@@ -300,6 +316,215 @@ impl DbotterApp {
             self.model.config.migration_backup(),
         );
         editor
+    }
+
+    fn result_snapshot(&self, result_id: ResultId) -> Option<Arc<ResultSnapshot>> {
+        self.model.workspaces.values().find_map(|workspace| {
+            workspace
+                .result
+                .as_ref()
+                .filter(|result| result.provenance.result_id == result_id)
+                .cloned()
+        })
+    }
+
+    fn begin_result_export_state(
+        &mut self,
+        result_id: ResultId,
+        operation_id: OperationId,
+    ) -> bool {
+        for workspace in self.model.workspaces.values_mut() {
+            if workspace
+                .result
+                .as_ref()
+                .is_some_and(|result| result.provenance.result_id == result_id)
+            {
+                if workspace.result_view.begin_export(result_id, operation_id) {
+                    return true;
+                }
+                workspace.result_view.reset_for(result_id);
+                return workspace.result_view.begin_export(result_id, operation_id);
+            }
+        }
+        false
+    }
+
+    fn finish_result_export_state(&mut self, result_id: ResultId, operation_id: OperationId) {
+        for workspace in self.model.workspaces.values_mut() {
+            let _ = workspace.result_view.finish_export(result_id, operation_id);
+        }
+    }
+
+    fn handle_export_terminal(&mut self, event: &UiEvent) {
+        let (operation_id, result_id, format, destination_committed) = match event {
+            UiEvent::ResultExported {
+                operation_id,
+                result_id,
+                format,
+                ..
+            } => (*operation_id, *result_id, *format, true),
+            UiEvent::ResultExportFailed {
+                operation_id,
+                result_id,
+                format,
+                destination_committed,
+                ..
+            } => (*operation_id, *result_id, *format, *destination_committed),
+            UiEvent::RuntimeShutdown { .. } => {
+                self.pending_export_destinations.clear();
+                return;
+            }
+            _ => return,
+        };
+        self.finish_result_export_state(result_id, operation_id);
+        self.result_export_formats.insert(result_id, format);
+        let matching = self
+            .pending_export_destinations
+            .get(&operation_id)
+            .is_some_and(|pending| pending.result_id == result_id && pending.format == format);
+        if !matching {
+            return;
+        }
+        if let Some(pending) = self.pending_export_destinations.remove(&operation_id)
+            && destination_committed
+        {
+            self.committed_export_destinations
+                .insert(result_id, pending.path);
+        }
+    }
+
+    fn handle_result_view_intent(
+        &mut self,
+        snapshot: Arc<ResultSnapshot>,
+        intent: ResultViewIntent,
+    ) {
+        match intent {
+            ResultViewIntent::Export(format) => {
+                self.choose_result_export_destination(snapshot, format);
+            }
+            ResultViewIntent::Cancel(operation_id) => {
+                match self
+                    .port
+                    .try_submit(UiCommand::CancelOperation { operation_id })
+                {
+                    Ok(()) => {
+                        self.model.status = format!("Cancelling export {}…", operation_id.0);
+                    }
+                    Err(error) => self.report_submit_error(error),
+                }
+            }
+        }
+    }
+
+    fn choose_result_export_destination(
+        &mut self,
+        snapshot: Arc<ResultSnapshot>,
+        format: ExportFormat,
+    ) {
+        let Some(path) = native_export_destination(snapshot.provenance.result_id, format) else {
+            self.model.status = "Export destination selection cancelled.".to_owned();
+            return;
+        };
+        self.submit_result_export_to(snapshot, format, path);
+    }
+
+    fn submit_result_export_to(
+        &mut self,
+        snapshot: Arc<ResultSnapshot>,
+        format: ExportFormat,
+        path: PathBuf,
+    ) {
+        let result_id = snapshot.provenance.result_id;
+        if self
+            .pending_export_destinations
+            .values()
+            .any(|pending| pending.result_id == result_id)
+        {
+            self.model.status = "An export is already active for this result.".to_owned();
+            return;
+        }
+        let operation_id = self.model.next_operation();
+        let (overwrite_policy, confirmation) = match std::fs::symlink_metadata(&path) {
+            Ok(_) => match confirm_replace(&path) {
+                Ok(confirmation) => (OverwritePolicy::ReplaceConfirmed, Some(confirmation)),
+                Err(_) => {
+                    self.present_local_export_destination_error(result_id, operation_id);
+                    return;
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (OverwritePolicy::DenyOverwrite, None)
+            }
+            Err(_) => {
+                self.present_local_export_destination_error(result_id, operation_id);
+                return;
+            }
+        };
+        let command = UiCommand::ExportResult {
+            request: ExportResult {
+                result_id,
+                operation_id,
+                snapshot,
+                format,
+                destination: path.clone(),
+                overwrite_policy,
+            },
+            confirmation,
+        };
+        match self.port.try_submit(command) {
+            Ok(()) => {
+                let view_started = self.begin_result_export_state(result_id, operation_id);
+                self.pending_export_destinations.insert(
+                    operation_id,
+                    PendingExportDestination {
+                        result_id,
+                        format,
+                        path,
+                    },
+                );
+                self.result_export_formats.insert(result_id, format);
+                self.common_error = None;
+                self.model.status = if view_started {
+                    format!("Exporting {}…", export_format_label(format))
+                } else {
+                    format!(
+                        "Exporting {} for a result that is no longer visible…",
+                        export_format_label(format)
+                    )
+                };
+            }
+            Err(error) => self.report_submit_error(error),
+        }
+    }
+
+    fn present_local_export_destination_error(
+        &mut self,
+        result_id: ResultId,
+        operation_id: OperationId,
+    ) {
+        let error = PublicOperationError::new_or_internal(
+            OperationKind::ExportResult,
+            PublicSummary::InvalidInput,
+            PublicCode::ExportDestination,
+            &crate::public_error::SafeContext::export(result_id, operation_id, false),
+        );
+        self.model.status = error.summary.message().to_owned();
+        self.common_error = Some(VisibleError {
+            operation_id,
+            error,
+        });
+    }
+
+    fn reveal_result_export_destination(&mut self, result_id: ResultId) {
+        let Some(path) = self.committed_export_destinations.get(&result_id) else {
+            self.model.status = "No committed export destination is available.".to_owned();
+            return;
+        };
+        if native_reveal_file(path) {
+            self.model.status = "Showing the exported file.".to_owned();
+        } else {
+            self.model.status = "The exported file is no longer available.".to_owned();
+        }
     }
 
     fn redis_explorer_mut(&mut self, key: &WorkspaceKey) -> &mut RedisExplorer {
@@ -495,6 +720,29 @@ impl DbotterApp {
         }
     }
 
+    fn prune_result_export_state(&mut self) {
+        let current_results = self
+            .model
+            .workspaces
+            .values()
+            .filter_map(|workspace| {
+                workspace
+                    .result
+                    .as_ref()
+                    .map(|result| result.provenance.result_id)
+            })
+            .chain(
+                self.pending_export_destinations
+                    .values()
+                    .map(|pending| pending.result_id),
+            )
+            .collect::<HashSet<_>>();
+        self.committed_export_destinations
+            .retain(|result_id, _| current_results.contains(result_id));
+        self.result_export_formats
+            .retain(|result_id, _| current_results.contains(result_id));
+    }
+
     fn poll_events(&mut self) {
         for mut event in self.port.drain_events(EVENT_DRAIN_LIMIT) {
             match self.redis_resource_event_disposition(&event) {
@@ -506,6 +754,7 @@ impl DbotterApp {
                 }
                 RedisResourceEventDisposition::NotRedis | RedisResourceEventDisposition::Apply => {}
             }
+            self.handle_export_terminal(&event);
             self.attach_retry_recipe(&mut event);
             self.capture_common_error(&event);
             let credential_retry = self.handle_credential_terminal(&event);
@@ -602,6 +851,7 @@ impl DbotterApp {
             self.model.active_generation(profile_id) == Some(*generation)
         });
         self.prune_redis_explorers();
+        self.prune_result_export_state();
         self.prune_active_operations();
         let migration_required = self.model.config.migration_required();
         let migration_backup = self.model.config.migration_backup().map(PathBuf::from);
@@ -722,6 +972,11 @@ impl DbotterApp {
                 ..
             }
             | UiEvent::CredentialsStoreFailed {
+                operation_id,
+                error,
+                ..
+            }
+            | UiEvent::ResultExportFailed {
                 operation_id,
                 error,
                 ..
@@ -1575,11 +1830,20 @@ impl DbotterApp {
                     self.model.status = "That Redis scan is no longer available.".to_owned();
                 }
             }
-            RecoveryCommand::ChooseResultExportDestination(_result_id) => {
-                self.model.status = "Export destination selection is not available yet.".to_owned();
+            RecoveryCommand::ChooseResultExportDestination(result_id) => {
+                let Some(snapshot) = self.result_snapshot(result_id) else {
+                    self.model.status = "That result is no longer available.".to_owned();
+                    return;
+                };
+                let format = self
+                    .result_export_formats
+                    .get(&result_id)
+                    .copied()
+                    .unwrap_or(ExportFormat::Json);
+                self.choose_result_export_destination(snapshot, format);
             }
-            RecoveryCommand::RevealResultExportDestination(_result_id) => {
-                self.model.status = "No committed export destination is available.".to_owned();
+            RecoveryCommand::RevealResultExportDestination(result_id) => {
+                self.reveal_result_export_destination(result_id);
             }
             RecoveryCommand::RevealConfiguredMigrationBackup => {
                 self.model.status = "Migration backup reveal requested.".to_owned();
@@ -2711,6 +2975,7 @@ impl DbotterApp {
             return;
         }
         let mut editor_intent = None;
+        let mut result_intent = None;
         let mut recovery = None;
         egui::CentralPanel::default().show(root_ui, |ui| {
             let selected_workspace_key = self.model.selected_workspace_key();
@@ -2745,13 +3010,18 @@ impl DbotterApp {
                     .map(|result| (result, &mut workspace.result_view))
             }) {
                 let (result, result_view) = result;
-                let _export = result_view.show(ui, result.as_ref(), false);
+                if let Some(intent) = result_view.show(ui, result.as_ref(), true) {
+                    result_intent = Some((result, intent));
+                }
             } else {
                 ui.weak("No result yet");
             }
         });
         if let Some(intent) = editor_intent {
             self.submit_editor_intent(intent);
+        }
+        if let Some((result, intent)) = result_intent {
+            self.handle_result_view_intent(result, intent);
         }
         if let Some((visible, action)) = recovery {
             self.dispatch_error_recovery(visible.operation_id, &visible.error, action);
@@ -2945,6 +3215,80 @@ const fn submit_error_message(error: SubmitError) -> &'static str {
     }
 }
 
+const fn export_format_label(format: ExportFormat) -> &'static str {
+    match format {
+        ExportFormat::Csv => "CSV",
+        ExportFormat::Tsv => "TSV",
+        ExportFormat::Json => "JSON",
+    }
+}
+
+const fn export_format_extension(format: ExportFormat) -> &'static str {
+    match format {
+        ExportFormat::Csv => "csv",
+        ExportFormat::Tsv => "tsv",
+        ExportFormat::Json => "json",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_export_destination(result_id: ResultId, format: ExportFormat) -> Option<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSModalResponseOK, NSSavePanel};
+    use objc2_foundation::NSString;
+
+    let mtm = MainThreadMarker::new()?;
+    let panel = NSSavePanel::savePanel(mtm);
+    let title = NSString::from_str("Export result");
+    let message = NSString::from_str("Choose where to save this result.");
+    let suggested_name = NSString::from_str(&format!(
+        "dbotter-result-{}.{}",
+        result_id.0,
+        export_format_extension(format)
+    ));
+    panel.setTitle(Some(&title));
+    panel.setMessage(Some(&message));
+    panel.setNameFieldStringValue(&suggested_name);
+    panel.setCanCreateDirectories(true);
+    if panel.runModal() != NSModalResponseOK {
+        return None;
+    }
+    let url = panel.URL()?;
+    if !url.isFileURL() {
+        return None;
+    }
+    let representation = url.fileSystemRepresentation();
+    // SAFETY: Foundation guarantees this pointer is a NUL-terminated file-system
+    // representation that remains valid for the lifetime of `url`.
+    let bytes = unsafe { CStr::from_ptr(representation.as_ptr()) }.to_bytes();
+    Some(PathBuf::from(OsStr::from_bytes(bytes)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_export_destination(_result_id: ResultId, _format: ExportFormat) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn native_reveal_file(path: &Path) -> bool {
+    if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+        return false;
+    }
+    std::process::Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_reveal_file(_path: &Path) -> bool {
+    false
+}
+
 #[cfg(target_os = "macos")]
 fn native_redis_ca_file_picker() -> Option<PathBuf> {
     let output = std::process::Command::new("/usr/bin/osascript")
@@ -2981,11 +3325,11 @@ mod tests {
     use crate::config::ConfigSourceVersion;
     use crate::model::{
         Cell, Column, ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind,
-        OperationId, OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration,
-        ProfileId, PublicCode, PublicSummary, QueryResult, RedisKeyEntry, RedisKeyFilter,
-        RedisKeyId, RedisKeyPage, RedisScanConsistency, RedisScanRequest, RedisTlsConfig,
-        RequestIdentity, ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
-        SessionGeneration, TlsMode,
+        ExportFormat, OperationId, OperationKind, OperationRecipeId, OverwritePolicy,
+        ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary, QueryResult,
+        RedisKeyEntry, RedisKeyFilter, RedisKeyId, RedisKeyPage, RedisScanConsistency,
+        RedisScanRequest, RedisTlsConfig, RequestIdentity, ResultId, ResultProvenance,
+        ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
     };
     use crate::public_error::{PublicOperationError, RecoveryAction, SafeContext};
     use crate::secrets::EnvironmentAvailability;
@@ -2993,7 +3337,7 @@ mod tests {
     use crate::ui::accessibility::{accesskit_author_node, assert_accesskit_value_confined};
     use crate::ui::adapter::{ServicePort, UiCommand, bounded_ports};
     use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
-    use crate::ui::model::{ConfigPresentation, ProfileSnapshot, WorkspaceKey};
+    use crate::ui::model::{ConfigPresentation, ProfileSnapshot, UiEvent, WorkspaceKey};
     use crate::ui::redis_explorer::RedisExplorerIntent;
     use eframe::egui::{Context, Event, Key, Modifiers, RawInput, accesskit};
 
@@ -4552,6 +4896,58 @@ mod tests {
         assert_eq!(execute.role(), accesskit::Role::Button);
         assert!(execute.supports_action(accesskit::Action::Focus));
         assert!(execute.supports_action(accesskit::Action::Click));
+    }
+
+    #[test]
+    fn result_export_submission_owns_pending_state_and_commits_only_the_correlated_path() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("result.json");
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        let result = Arc::new(result_snapshot(&profile, "exported"));
+        app.model.workspace_mut(key).result = Some(result.clone());
+
+        app.submit_result_export_to(result.clone(), ExportFormat::Json, destination.clone());
+        let command = service.try_next_command().expect("export command");
+        let UiCommand::ExportResult {
+            request,
+            confirmation,
+        } = command
+        else {
+            panic!("expected export command");
+        };
+        assert_eq!(request.result_id, result.provenance.result_id);
+        assert_eq!(request.format, ExportFormat::Json);
+        assert_eq!(request.overwrite_policy, OverwritePolicy::DenyOverwrite);
+        assert!(confirmation.is_none());
+        assert_eq!(request.destination, destination);
+        assert!(
+            app.pending_export_destinations
+                .contains_key(&request.operation_id)
+        );
+
+        assert!(service.try_emit(UiEvent::ResultExported {
+            operation_id: request.operation_id,
+            result_id: request.result_id,
+            format: request.format,
+            overwrite_policy: request.overwrite_policy,
+            row_count: 1,
+            bytes_written: 12,
+        }));
+        app.poll_events();
+        assert!(app.pending_export_destinations.is_empty());
+        assert_eq!(
+            app.committed_export_destinations.get(&request.result_id),
+            Some(&destination)
+        );
     }
 
     #[test]

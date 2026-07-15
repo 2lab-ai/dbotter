@@ -10,7 +10,7 @@ use dbotter::ui::{
     NativeUiHarness, OpenAiTheme, RESULT_ACTION_HEIGHT, RESULT_ROW_HEIGHT, copy_all_rows,
     copy_cell, copy_selected_rows,
 };
-use eframe::egui::{Context, RawInput};
+use eframe::egui::{Context, RawInput, accesskit};
 
 fn snapshot() -> ResultSnapshot {
     ResultSnapshot::retain(
@@ -111,6 +111,28 @@ fn native_result_inventory_exposes_every_installed_journey_action() {
             ids.contains(expected),
             "missing result author id {expected}"
         );
+    }
+}
+
+#[test]
+fn a_new_result_has_one_valid_initial_cell_and_row_selection() {
+    let context = Context::default();
+    context.enable_accesskit();
+    let mut harness = NativeUiHarness::p7_result();
+    let output = context.run_ui(RawInput::default(), |ui| harness.show(ui));
+    let update = output
+        .platform_output
+        .accesskit_update
+        .expect("the native result harness must emit AccessKit");
+
+    for author_id in ["result.copy.cell", "result.copy.row"] {
+        let node = update
+            .nodes
+            .iter()
+            .find_map(|(_, node)| (node.author_id() == Some(author_id)).then_some(node))
+            .unwrap_or_else(|| panic!("missing {author_id}"));
+        assert!(!node.is_disabled(), "{author_id} must start enabled");
+        assert!(node.supports_action(accesskit::Action::Click));
     }
 }
 

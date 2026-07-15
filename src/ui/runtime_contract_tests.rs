@@ -17,8 +17,9 @@ use crate::secrets::{EnvironmentAvailability, SecretError, SessionSecret, Sessio
 use crate::service::{ApplicationService, DriverConnector, SecretResolver};
 
 use super::runtime::{
-    DraftPermitRegistry, ProfilePermitRegistry, RegisteredTask, TaskClass, TaskRegistry, TaskScope,
-    await_pre_session_blocking, join_registered_for_shutdown_with_grace, snapshots,
+    DraftPermitRegistry, PROCESS_EXPORT_LIMIT, PROCESS_EXPORT_PERMITS, ProfilePermitRegistry,
+    RegisteredTask, TaskClass, TaskRegistry, TaskScope, await_pre_session_blocking,
+    join_registered_for_shutdown_with_grace, snapshots,
 };
 
 struct DropFlag(Arc<AtomicBool>);
@@ -178,6 +179,32 @@ async fn registry_reaps_all_four_closed_scope_variants_without_hybrid_identity()
     let reaped = registry.reap_finished().await;
     assert_eq!(reaped.len(), 4);
     assert!(registry.is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn process_export_pool_has_exactly_two_non_network_slots() {
+    assert_eq!(PROCESS_EXPORT_LIMIT, 2);
+    let first = Arc::clone(&PROCESS_EXPORT_PERMITS)
+        .try_acquire_owned()
+        .expect("first export slot");
+    let second = Arc::clone(&PROCESS_EXPORT_PERMITS)
+        .try_acquire_owned()
+        .expect("second export slot");
+    assert!(
+        Arc::clone(&PROCESS_EXPORT_PERMITS)
+            .try_acquire_owned()
+            .is_err(),
+        "a third process-wide export must be rejected without entering a worker"
+    );
+    drop(first);
+    assert!(
+        Arc::clone(&PROCESS_EXPORT_PERMITS)
+            .try_acquire_owned()
+            .is_ok(),
+        "an export slot must return after its worker exits"
+    );
+    drop(second);
 }
 
 #[cfg(test)]

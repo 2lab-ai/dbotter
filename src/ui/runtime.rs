@@ -32,9 +32,9 @@ use super::model::{
 };
 
 const GLOBAL_NETWORK_LIMIT: usize = 4;
-const PROCESS_EXPORT_LIMIT: usize = 2;
+pub(super) const PROCESS_EXPORT_LIMIT: usize = 2;
 const SHUTDOWN_ASYNC_GRACE: Duration = Duration::from_secs(2);
-static PROCESS_EXPORT_PERMITS: LazyLock<Arc<Semaphore>> =
+pub(super) static PROCESS_EXPORT_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(PROCESS_EXPORT_LIMIT)));
 
 #[derive(Default)]
