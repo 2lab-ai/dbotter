@@ -56,6 +56,7 @@ for executable in \
   scripts/package-version.sh \
   scripts/check-preview-version.py \
   scripts/validate-preview-manifest.py \
+  scripts/validate-tap-dispatch.py \
   scripts/check-installed-receipt-contract.sh \
   scripts/build-macos-app.sh \
   scripts/assemble-preview-manifest.py \

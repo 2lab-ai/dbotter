@@ -40,13 +40,17 @@ linux_url="$(jq -r '.artifacts[] | select(.target == "aarch64-unknown-linux-gnu"
 formula="$tmp_dir/dbotter-preview.rb"
 {
   printf 'class DbotterPreview < Formula\n'
-  printf '  desc "Native desktop database client preview"\n'
+  printf '  desc "Local Rust database client for MySQL and Redis (preview channel)"\n'
   printf '  homepage "https://github.com/2lab-ai/dbotter"\n'
+  printf '  version "%s"\n' "$version"
+  printf '  license "Apache-2.0"\n'
+  printf '\n'
+  printf '  # Immutable release identity:\n'
   printf '  # tag: %s\n' "$tag"
   printf '  # source: %s\n' "$source_sha"
   printf '  # manifest: %s\n' "$manifest_url"
   printf '  # manifest-sha256: %s\n' "$manifest_sha256"
-  printf '  version "%s"\n' "$version"
+  printf '\n'
   printf '  depends_on :macos\n'
   printf '\n'
   printf '  on_macos do\n'
@@ -60,9 +64,18 @@ formula="$tmp_dir/dbotter-preview.rb"
   printf '    end\n'
   printf '  end\n'
   printf '\n'
+  printf '  link_overwrite "bin/dbotter"\n'
+  printf '\n'
   printf '  def install\n'
   printf '    prefix.install "Dbotter Preview.app"\n'
   printf '    bin.install_symlink prefix/"Dbotter Preview.app/Contents/MacOS/dbotter" => "dbotter"\n'
+  printf '  end\n'
+  printf '\n'
+  printf '  test do\n'
+  printf '    assert_predicate prefix/"Dbotter Preview.app", :directory?\n'
+  printf '    assert_predicate prefix/"Dbotter Preview.app/Contents/MacOS/dbotter", :executable?\n'
+  printf '    assert_match "preview", shell_output("#{bin}/dbotter --version")\n'
+  printf '    shell_output("#{bin}/dbotter drivers")\n'
   printf '  end\n'
   printf 'end\n'
 } >"$formula"
@@ -113,6 +126,7 @@ validate=(
   --expected-formula-commit "$formula_commit"
   --expected-formula-blob "$formula_blob"
   --expected-workflow-run-id 9001
+  --expected-workflow-run-attempt 2
 )
 "${validate[@]}" >/dev/null
 
@@ -144,7 +158,8 @@ if ./scripts/validate-tap-dispatch.py \
   --expected-manifest-sha256 "$manifest_sha256" \
   --expected-formula-commit "$formula_commit" \
   --expected-formula-blob "$linux_blob" \
-  --expected-workflow-run-id 9001 >/dev/null 2>&1; then
+  --expected-workflow-run-id 9001 \
+  --expected-workflow-run-attempt 2 >/dev/null 2>&1; then
   fail "formula selected a Linux asset"
 fi
 
@@ -166,12 +181,13 @@ if ./scripts/validate-tap-dispatch.py \
   --expected-manifest-sha256 "$manifest_sha256" \
   --expected-formula-commit "$formula_commit" \
   --expected-formula-blob "$swapped_blob" \
-  --expected-workflow-run-id 9001 >/dev/null 2>&1; then
+  --expected-workflow-run-id 9001 \
+  --expected-workflow-run-attempt 2 >/dev/null 2>&1; then
   fail "formula swapped the arm and Intel artifact mapping"
 fi
 
 duplicate_key="$tmp_dir/duplicate-key.json"
-sed '0,/{/s//{"schema":"dbotter.tap-dispatch.v1",/' "$proof" >"$duplicate_key"
+sed '1s/{/{"schema":"dbotter.tap-dispatch.v1",/' "$proof" >"$duplicate_key"
 if "${validate[@]/$proof/$duplicate_key}" >/dev/null 2>&1; then
   fail "proof accepted a duplicate JSON key"
 fi
