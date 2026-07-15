@@ -98,6 +98,8 @@ require_literal src/build_info.rs 'None => "dev"'
 require_literal src/cli.rs 'version = crate::build_info::version_with_build()'
 
 ./scripts/check-workflow-graph.rb >/dev/null
+require_literal scripts/validate-tap-dispatch.py 'dbotter.tap-dispatch.v1'
+require_literal scripts/validate-tap-dispatch.py 'dbotter.tap-preflight.v1'
 require_literal scripts/verify-hermetic.sh 'cargo fmt --check'
 require_literal scripts/verify-hermetic.sh 'cargo clippy --all-targets --all-features --locked -- -D warnings'
 require_literal scripts/verify-hermetic.sh 'cargo test --all-features --locked'
