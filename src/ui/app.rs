@@ -1563,15 +1563,15 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ActiveOperation, ConnectionState, DbotterApp, PendingDelete, ProfileEditor,
-        SessionCredentialIntent,
+        ActiveOperation, ConnectionState, DbotterApp, MySqlExplorerIntent, PendingDelete,
+        ProfileEditor,
     };
     use crate::model::{
         ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
-        OperationKind, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
-        RedisKeyFilter, RedisKeyId, RedisTlsConfig, SessionGeneration, TlsMode,
+        OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode,
+        PublicSummary, RedisKeyFilter, RedisKeyId, RedisTlsConfig, SessionGeneration, TlsMode,
     };
-    use crate::public_error::{PublicOperationError, SafeContext};
+    use crate::public_error::{PublicOperationError, RecoveryAction, SafeContext};
     use crate::ui::adapter::{UiCommand, bounded_ports};
     use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
     use crate::ui::model::{ProfileSnapshot, WorkspaceKey};
@@ -1955,7 +1955,7 @@ mod tests {
     }
 
     #[test]
-    fn session_prompt_updates_exact_generation_then_retries_non_secret_connect() {
+    fn credential_prompt_stores_exact_generation_then_retries_connect_exactly_once() {
         let (ui_port, mut service) = bounded_ports(4);
         let mut app = DbotterApp::new(ui_port);
         assert!(service.try_next_command().is_some());
@@ -1972,77 +1972,75 @@ mod tests {
 
         app.submit_test(session_profile.id.clone());
         assert!(service.try_next_command().is_none());
-        let editor = app
-            .profile_editor
+        assert!(
+            app.profile_editor.is_none(),
+            "credential entry is not profile editing"
+        );
+        let prompt = app
+            .credential_prompt
             .as_mut()
-            .expect("session credential editor");
-        assert_eq!(
-            editor.requested_focus(),
-            Some(ProfileFieldId::SessionCredential)
-        );
-        assert_eq!(
-            editor.session_intent(),
-            Some(SessionCredentialIntent::Replace)
-        );
-        editor.set_replacement_secret("memory-only-secret".to_owned());
-        let update_operation = app.model.next_operation();
-        assert!(matches!(
-            editor.try_save_with_connect(&app.port, update_operation, true),
-            super::SaveAttempt::Submitted(operation_id) if operation_id == update_operation
-        ));
-        let request = match service.try_next_command() {
-            Some(UiCommand::UpdateProfile(request)) => request,
-            _ => panic!("credential prompt must submit one exact profile update"),
-        };
-        assert_eq!(request.profile_id, session_profile.id);
-        assert_eq!(request.expected_generation, session_profile.generation);
-        assert_eq!(request.operation_id, update_operation);
-        assert_eq!(request.draft.credential_mode, CredentialMode::Session);
-        assert!(matches!(
-            &request.secret_update,
-            crate::secrets::SessionSecretUpdate::Replace(_)
-        ));
-        assert_eq!(
-            request.migration_consent,
-            super::MigrationConsent::Cancelled
-        );
-        assert!(!format!("{request:?}").contains("memory-only-secret"));
-
-        assert!(service.try_emit(crate::ui::UiEvent::ProfileSaved {
-            operation_id: update_operation,
-            profile_id: session_profile.id.clone(),
-            previous_generation: Some(session_profile.generation),
-            profile_generation: ProfileGeneration(2),
-            session_retained: false,
-            warning: None,
-        }));
-        app.poll_events();
-        let refresh_operation = match service.try_next_command() {
-            Some(UiCommand::RefreshProfiles { operation_id }) => operation_id,
-            _ => panic!("Save & Connect must refresh the accepted generation"),
+            .expect("protected credential prompt");
+        prompt.secret =
+            crate::secrets::ReplacementSecretBuffer::new("memory-only-secret".to_owned());
+        app.submit_credential_prompt();
+        let store_operation = match service.try_next_command() {
+            Some(UiCommand::StoreCredentials {
+                operation_id,
+                profile_id,
+                profile_generation,
+                source_operation,
+                ..
+            }) => {
+                assert_eq!(profile_id, session_profile.id);
+                assert_eq!(profile_generation, session_profile.generation);
+                assert_eq!(source_operation, OperationKind::ConnectProfile);
+                operation_id
+            }
+            _ => panic!("credential prompt must submit one StoreCredentials command"),
         };
         assert!(service.try_next_command().is_none());
-        let mut refreshed = session_profile;
-        refreshed.generation = ProfileGeneration(2);
-        refreshed.has_current_session_secret = true;
-        assert!(service.try_emit(crate::ui::UiEvent::ProfilesLoaded {
-            operation_id: refresh_operation,
-            profiles: vec![refreshed.clone()],
+        assert!(service.try_emit(crate::ui::UiEvent::CredentialsStored {
+            operation_id: store_operation,
+            profile_id: session_profile.id.clone(),
+            profile_generation: session_profile.generation,
         }));
         app.poll_events();
-        assert!(matches!(
-            service.try_next_command(),
+        let retry_operation = match service.try_next_command() {
             Some(UiCommand::TestConnection {
+                operation_id,
                 profile_id,
-                profile_generation: ProfileGeneration(2),
-                ..
-            }) if profile_id == refreshed.id
-        ));
+                profile_generation,
+                timeout_ms,
+            }) => {
+                assert_eq!(profile_id, session_profile.id);
+                assert_eq!(profile_generation, session_profile.generation);
+                assert_eq!(timeout_ms, super::DEFAULT_TIMEOUT_MS);
+                operation_id
+            }
+            _ => panic!("successful credential storage retries the exact connect recipe"),
+        };
+        assert_ne!(retry_operation, store_operation);
+        assert_eq!(
+            app.model.active_generation(&session_profile.id),
+            Some(session_profile.generation),
+            "credential storage must not mutate profile generation"
+        );
+
+        assert!(service.try_emit(crate::ui::UiEvent::CredentialsStored {
+            operation_id: store_operation,
+            profile_id: session_profile.id.clone(),
+            profile_generation: session_profile.generation,
+        }));
+        app.poll_events();
+        assert!(
+            service.try_next_command().is_none(),
+            "store ack retries only once"
+        );
     }
 
     #[test]
-    fn rejected_credential_and_delete_submissions_keep_secret_and_pending_state_local() {
-        let (ui_port, mut service) = bounded_ports(1);
+    fn credential_cancel_store_failure_and_generation_change_never_retry() {
+        let (ui_port, mut service) = bounded_ports(4);
         let mut app = DbotterApp::new(ui_port);
         assert!(service.try_next_command().is_some());
         let mut session_profile = profile(DriverKind::MySql, DriverAvailability::Ready);
@@ -2051,28 +2049,38 @@ mod tests {
         app.model
             .active_generations
             .insert(session_profile.id.clone(), session_profile.generation);
+
         app.open_session_credential_prompt(session_profile.id.clone());
-        let editor = app.profile_editor.as_mut().expect("credential editor");
-        editor.set_replacement_secret("still-local".to_owned());
-        assert_eq!(
-            app.port.try_submit(UiCommand::RefreshProfiles {
-                operation_id: OperationId(901),
-            }),
-            Ok(())
-        );
-        assert_eq!(
-            editor.try_save_with_connect(&app.port, OperationId(902), true),
-            super::SaveAttempt::Busy
-        );
-        assert!(editor.replacement_is_set());
-        assert!(matches!(
-            service.try_next_command(),
-            Some(UiCommand::RefreshProfiles {
-                operation_id: OperationId(901)
-            })
-        ));
+        app.credential_prompt.as_mut().expect("prompt").secret =
+            crate::secrets::ReplacementSecretBuffer::new("cancelled-secret".to_owned());
+        app.cancel_credential_prompt();
+        assert!(app.credential_prompt.is_none());
         assert!(service.try_next_command().is_none());
 
+        app.open_session_credential_prompt(session_profile.id.clone());
+        app.credential_prompt.as_mut().expect("prompt").secret =
+            crate::secrets::ReplacementSecretBuffer::new("stale-secret".to_owned());
+        app.submit_credential_prompt();
+        let store_operation = match service.try_next_command() {
+            Some(UiCommand::StoreCredentials { operation_id, .. }) => operation_id,
+            _ => panic!("StoreCredentials command"),
+        };
+        app.model.active_generations.insert(
+            session_profile.id.clone(),
+            ProfileGeneration(session_profile.generation.0 + 1),
+        );
+        assert!(service.try_emit(crate::ui::UiEvent::CredentialsStored {
+            operation_id: store_operation,
+            profile_id: session_profile.id.clone(),
+            profile_generation: session_profile.generation,
+        }));
+        app.poll_events();
+        assert!(app.credential_prompt.is_none());
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn rejected_delete_submission_keeps_confirmation_and_pending_state_local() {
         let (ui_port, mut service) = bounded_ports(1);
         let mut blocked_delete = DbotterApp::new(ui_port);
         assert!(service.try_next_command().is_some());
@@ -2102,6 +2110,275 @@ mod tests {
                 operation_id: OperationId(903)
             })
         ));
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn generation_checked_catalog_and_redis_recipes_replay_exact_requests() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let mysql = profile(DriverKind::MySql, DriverAvailability::Ready);
+        app.model.profiles = vec![mysql.clone()];
+        app.model.selected_profile = Some(mysql.id.clone());
+        app.model
+            .active_generations
+            .insert(mysql.id.clone(), mysql.generation);
+        app.submit_mysql_explorer_intent(
+            &mysql,
+            MySqlExplorerIntent::RefreshSchemas {
+                prefix: Some("app".to_owned()),
+            },
+        );
+        let request = match service.try_next_command() {
+            Some(UiCommand::BrowseCatalog(request)) => request,
+            _ => panic!("catalog request"),
+        };
+        let recipe_id = OperationRecipeId(request.operation_id().0);
+        let error = PublicOperationError::new_or_internal(
+            OperationKind::BrowseMySql,
+            PublicSummary::ResourceStale,
+            PublicCode::None,
+            &SafeContext::profile_with_recipe(mysql.id.clone(), request.operation_id(), recipe_id),
+        );
+        assert!(service.try_emit(crate::ui::UiEvent::CatalogPageFailed {
+            request: request.clone(),
+            summary: error.summary,
+            error: error.clone(),
+            session_generation: None,
+            session_disposition: None,
+        }));
+        app.poll_events();
+        app.dispatch_error_recovery(
+            request.operation_id(),
+            &error,
+            RecoveryAction::Retry(recipe_id),
+        );
+        let retried = match service.try_next_command() {
+            Some(UiCommand::BrowseCatalog(request)) => request,
+            _ => panic!("typed catalog Retry must replay one exact request"),
+        };
+        assert_eq!(retried.profile_id(), request.profile_id());
+        assert_eq!(retried.profile_generation(), request.profile_generation());
+        assert_ne!(retried.operation_id(), request.operation_id());
+
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let redis = profile(DriverKind::Redis, DriverAvailability::Ready);
+        app.model.profiles = vec![redis.clone()];
+        app.model.selected_profile = Some(redis.id.clone());
+        app.model
+            .active_generations
+            .insert(redis.id.clone(), redis.generation);
+        app.submit_redis_intent(RedisExplorerIntent::Scan {
+            filter: RedisKeyFilter::LiteralPrefix("orders:".to_owned()),
+            cursor: 41,
+            restart: false,
+        });
+        let request = match service.try_next_command() {
+            Some(UiCommand::ScanRedisKeys(request)) => request,
+            _ => panic!("Redis scan request"),
+        };
+        let recipe_id = OperationRecipeId(request.operation_id().0);
+        let error = PublicOperationError::new_or_internal(
+            OperationKind::BrowseRedis,
+            PublicSummary::ResourceStale,
+            PublicCode::None,
+            &SafeContext::profile_with_recipe(redis.id.clone(), request.operation_id(), recipe_id),
+        );
+        assert!(service.try_emit(crate::ui::UiEvent::RedisKeysFailed {
+            request: request.clone(),
+            error: error.clone(),
+            session_generation: None,
+            session_disposition: None,
+            connection_outcome: crate::ui::ConnectionFailureOutcome::Preserve,
+        }));
+        app.poll_events();
+        app.dispatch_error_recovery(
+            request.operation_id(),
+            &error,
+            RecoveryAction::Retry(recipe_id),
+        );
+        let retried = match service.try_next_command() {
+            Some(UiCommand::ScanRedisKeys(request)) => request,
+            _ => panic!("typed Redis Retry must replay one exact request"),
+        };
+        assert_eq!(retried.filter, request.filter);
+        assert_eq!(retried.cursor, request.cursor);
+        assert_eq!(retried.profile_generation(), request.profile_generation());
+        assert_ne!(retried.operation_id(), request.operation_id());
+    }
+
+    #[test]
+    fn actual_app_renders_common_catalog_and_redis_typed_recovery_actions() {
+        let render_ids = |app: &mut DbotterApp, explorer_only: bool| {
+            let context = Context::default();
+            context.enable_accesskit();
+            context
+                .run_ui(RawInput::default(), |ui| {
+                    if explorer_only {
+                        app.explorer_contents(ui);
+                    } else {
+                        app.show_native(ui);
+                    }
+                })
+                .platform_output
+                .accesskit_update
+                .expect("actual recovery frame must emit AccessKit")
+                .nodes
+                .into_iter()
+                .filter_map(|(_, node)| node.author_id().map(str::to_owned))
+                .collect::<BTreeSet<_>>()
+        };
+
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut common = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let mysql = profile(DriverKind::MySql, DriverAvailability::Ready);
+        common.model.profiles = vec![mysql.clone()];
+        common.model.selected_profile = Some(mysql.id.clone());
+        common
+            .model
+            .active_generations
+            .insert(mysql.id.clone(), mysql.generation);
+        common.submit_test(mysql.id.clone());
+        let operation_id = match service.try_next_command() {
+            Some(UiCommand::TestConnection { operation_id, .. }) => operation_id,
+            _ => panic!("connect command"),
+        };
+        let recipe_id = OperationRecipeId(operation_id.0);
+        let error = PublicOperationError::new_or_internal(
+            OperationKind::ConnectProfile,
+            PublicSummary::NetworkUnavailable,
+            PublicCode::None,
+            &SafeContext::profile_with_recipe(mysql.id.clone(), operation_id, recipe_id),
+        );
+        assert!(service.try_emit(crate::ui::UiEvent::OperationFailed {
+            operation_id,
+            profile_id: mysql.id.clone(),
+            profile_generation: mysql.generation,
+            session_generation: None,
+            kind: OperationKind::ConnectProfile,
+            summary: error.summary,
+            error,
+            session_disposition: None,
+            connection_outcome: crate::ui::ConnectionFailureOutcome::Disconnected,
+        }));
+        common.poll_events();
+        let ids = render_ids(&mut common, false);
+        assert!(ids.contains("recovery.common.edit_profile"));
+        assert!(ids.contains("recovery.common.reconnect"));
+        assert!(ids.contains("recovery.common.retry"));
+
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut catalog = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        catalog.model.profiles = vec![mysql.clone()];
+        catalog.model.selected_profile = Some(mysql.id.clone());
+        catalog
+            .model
+            .active_generations
+            .insert(mysql.id.clone(), mysql.generation);
+        catalog.submit_mysql_explorer_intent(
+            &mysql,
+            MySqlExplorerIntent::RefreshSchemas { prefix: None },
+        );
+        let request = match service.try_next_command() {
+            Some(UiCommand::BrowseCatalog(request)) => request,
+            _ => panic!("catalog command"),
+        };
+        let recipe_id = OperationRecipeId(request.operation_id().0);
+        let error = PublicOperationError::new_or_internal(
+            OperationKind::BrowseMySql,
+            PublicSummary::ResourceStale,
+            PublicCode::None,
+            &SafeContext::profile_with_recipe(mysql.id.clone(), request.operation_id(), recipe_id),
+        );
+        assert!(service.try_emit(crate::ui::UiEvent::CatalogPageFailed {
+            request,
+            summary: error.summary,
+            error,
+            session_generation: None,
+            session_disposition: None,
+        }));
+        catalog.poll_events();
+        assert!(render_ids(&mut catalog, true).contains("recovery.catalog.retry"));
+
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut redis_app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let redis = profile(DriverKind::Redis, DriverAvailability::Ready);
+        redis_app.model.profiles = vec![redis.clone()];
+        redis_app.model.selected_profile = Some(redis.id.clone());
+        redis_app
+            .model
+            .active_generations
+            .insert(redis.id.clone(), redis.generation);
+        redis_app.submit_redis_intent(RedisExplorerIntent::Scan {
+            filter: RedisKeyFilter::Glob("*".to_owned()),
+            cursor: 0,
+            restart: true,
+        });
+        let request = match service.try_next_command() {
+            Some(UiCommand::ScanRedisKeys(request)) => request,
+            _ => panic!("Redis command"),
+        };
+        let recipe_id = OperationRecipeId(request.operation_id().0);
+        let error = PublicOperationError::new_or_internal(
+            OperationKind::BrowseRedis,
+            PublicSummary::ResourceStale,
+            PublicCode::None,
+            &SafeContext::profile_with_recipe(redis.id.clone(), request.operation_id(), recipe_id),
+        );
+        assert!(service.try_emit(crate::ui::UiEvent::RedisKeysFailed {
+            request,
+            error,
+            session_generation: None,
+            session_disposition: None,
+            connection_outcome: crate::ui::ConnectionFailureOutcome::Preserve,
+        }));
+        redis_app.poll_events();
+        assert!(render_ids(&mut redis_app, true).contains("recovery.redis_scan.retry"));
+    }
+
+    #[test]
+    fn mutation_execute_never_registers_or_dispatches_retry() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let mysql = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(mysql.id.clone(), mysql.generation);
+        app.model.profiles = vec![mysql.clone()];
+        app.model.selected_profile = Some(mysql.id.clone());
+        app.model
+            .active_generations
+            .insert(mysql.id.clone(), mysql.generation);
+        app.model.workspace_mut(key.clone()).editor_text =
+            "UPDATE inventory SET count = count + 1".to_owned();
+        let intent = build_execute_intent(
+            &mysql,
+            app.model.workspace(&key).expect("workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("mutation intent");
+        assert_eq!(intent.operation_kind(), OperationKind::ExecuteMutation);
+        app.submit_editor_intent(EditorIntent::Execute(intent));
+        let operation_id = match service.try_next_command() {
+            Some(UiCommand::Execute { operation_id, .. }) => operation_id,
+            _ => panic!("mutation command"),
+        };
+        let recipe_id = OperationRecipeId(operation_id.0);
+        assert!(!app.retry_recipes.contains(recipe_id));
+
+        let forged = PublicOperationError {
+            operation: OperationKind::ExecuteMutation,
+            category: crate::public_error::ErrorCategory::Network,
+            code: PublicCode::None,
+            summary: PublicSummary::NetworkUnavailable,
+            recovery: crate::public_error::NonEmpty::new(RecoveryAction::Retry(recipe_id)),
+        };
+        app.dispatch_error_recovery(operation_id, &forged, RecoveryAction::Retry(recipe_id));
         assert!(service.try_next_command().is_none());
     }
 
