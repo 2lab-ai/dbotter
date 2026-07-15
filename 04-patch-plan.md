@@ -1,9 +1,8 @@
 # dbotter — usable MVP implementation and conformance plan
 
-Status: **P0 documentation baseline complete. P1, P2, and P3 foundations are
-independently reviewed GREEN. P4 implementation and mandatory live evidence
-are locally GREEN pending independent review. T0 remains RED overall;
-T1–T5/T8/T9 are Implementing; P5–P9 and T6/T7/T10 are Not started.**
+Status: **P0 documentation baseline complete. P1, P2, P3, and P4 are
+independently reviewed GREEN, including P4 mandatory live evidence. T0 remains
+RED overall; T1–T5/T8/T9 are Implementing; P5–P9 and T6/T7/T10 are Not started.**
 
 This file routes implementation work. The full ordered plan is frozen at
 `docs/usable-mvp/plan.md`; this repository-facing ledger must not weaken it.
@@ -52,7 +51,7 @@ substitute for a slice's RED/GREEN/live/installed evidence.
 | P1 | config/profile/credential/public-error foundation | T0, T1, T2, T8, T9 | GREEN (independently reviewed foundation) |
 | P2 | generations/cache/controller/reload/shutdown | T2, T3, T9 | GREEN (independently reviewed foundation) |
 | P3 | typed prepared execution/resource/result/CLI seams | T4, shared T5/T6 | GREEN (independently reviewed foundation) |
-| P4 | lazy paginated MySQL catalog | T5 | GREEN locally (hermetic + mandatory live; independent review pending) |
+| P4 | lazy paginated MySQL catalog | T5 | GREEN (independently reviewed; hermetic + mandatory live) |
 | P5 | Redis SCAN/inspect and verified Required TLS | T6 | Not started |
 | P6 | profile-scoped native UI/recovery/accessibility | T0–T6, T8, T9 | Not started |
 | P7 | exact copy and streaming atomic export | T7 | Not started |
@@ -213,8 +212,9 @@ The independently reviewed P3 checkpoint implemented and proved:
   P4 has since made only `CATALOG` ready with mandatory live proof.
 
 T4 is Implementing because its P3 hermetic core is GREEN while P6 RawInput/AX
-and mandatory execute proof remain. T5 is now Implementing with P4 locally
-GREEN; T6 remains Not started and P3 provides only its shared seam.
+and mandatory execute proof remain. T5 is now Implementing with P4
+independently reviewed GREEN; T6 remains Not started and P3 provides only its
+shared seam.
 
 Checkpoint gates passed:
 
@@ -243,13 +243,39 @@ two independent reviewers each returned `NO P3 BLOCKER`.
 9e43c9732be5a642873063f91a75364f9ad7f310735b17accaa3c24be0f95556  target/release/dbotter
 ```
 
-## P4 — MySQL catalog local GREEN checkpoint
+## P4 — MySQL catalog independently reviewed GREEN checkpoint
 
-Code commit `e4599152daf0ca066baf6619048dae89c43cc6e4` implements and
-proves T5's level-specific prepared information-schema queries, binary keyset
-pagination, context-bound tokens, count/4-MiB recovery, restricted and denied
-permission behavior, shared CLI, and the real OpenAI-reference Explorer.
-`CATALOG` becomes ready in that same commit.
+Original code commit `e4599152daf0ca066baf6619048dae89c43cc6e4`
+implements T5's level-specific prepared information-schema queries, binary
+keyset pagination, retained caps/recovery, restricted and denied permission
+behavior, shared CLI, and the real OpenAI-reference Explorer. RED contract
+commit `31bd052f0d550e8c9e13e4f743f245ee4be6eba2` captures five review
+blockers; code commit `0aa007b3476a458bc83eeb241f30cc67e26e911d`
+closes them. Cross-process continuation RED
+`ede07e766be198d1140d966667857092665cba70` is closed by persistent-root
+fix `f51b3618f004b64e3601ca73f8072719ac273558`; static failure mapping and
+test-seam follow-ups are `7b11adb4d15f9a6406f58d9d94ee6325d30f9b80` and
+`c7b607c62ef807cb62898d1c12cbdffd6964b867`. Same-path connection rewrite
+RED `7b622757b2405d6fb2859923d5a7bf868835630b` is closed by final fix
+`05ad72f20e415b44f2d90ce7d5971c3d7a75b520`:
+
+- token integrity uses a lazily created, private 0600, race-safe per-config
+  CSPRNG 32-byte root sidecar; HMAC-SHA256 domain separation derives a
+  non-serializable/redacted per-connection subkey from a canonical digest of
+  every `ConnectionFingerprint` field, with full page-context binding;
+- unchanged same-config services and CLI subprocesses share valid
+  continuations, while different config roots and same-path connection-field
+  rewrites fail closed without raw profile values entering tokens, Debug,
+  receipts, or the sidecar;
+- cancel/outer-timeout drops the catalog driver future before exact acquired
+  session compare-remove/close, retaining stale pages and protecting a
+  replacement session;
+- one typed session generation/disposition is identical through cache, event,
+  and UI truth, including auto-connect outcomes;
+- Load more reuses the exact prefix/parent/page-size/token context captured by
+  the existing page; edited input affects Refresh/new expansion only;
+- OpenAI-style ordinary text passes a numerical WCAG AA ratio of at least
+  4.5:1 on white.
 
 Checkpoint gates passed:
 
@@ -263,21 +289,33 @@ cargo test --locked --offline --all-targets --all-features
 cargo test --locked --offline --all-features --doc
 cargo build --locked --offline --release --all-features
 DBOTTER_MYSQL_PASSWORD=dbotter-local-only \
-  cargo test --locked --offline --all-features --test live_mysql -- --ignored
+  cargo test --locked --offline --test live_mysql \
+  p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli -- --ignored --exact
+DBOTTER_MYSQL_PASSWORD=dbotter-local-only \
+  cargo test --locked --offline --all-features --test live_mysql \
+  p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli -- --ignored --exact
 ```
 
-Evidence: 236 regular tests, 18 doctests, and the isolated `dbotter-p4`
-mandatory MySQL live test 1/1 passed. The live fixture covers multi-page binary
-order, table/view, wide columns, both count and real metadata-byte caps with
-clear/prefix recovery, restricted omission, unauthorized-default
-Check/Execute Permission, stale Retry, and CLI JSON. Independent P4 review is
-still required before calling the slice independently reviewed or T5 Verified.
+Evidence: 249 regular tests, 19 doctests, and the isolated `dbotter-p4`
+mandatory MySQL live test 1/1 in both default and all-features configurations
+passed. Focused review contracts cover public-SHA rewrite/re-sign and tamper,
+cross-config/profile rejection, unchanged-config cross-process acceptance,
+same-path connection rewrite rejection, exact lifecycle/replacement races,
+cache/event/UI session identity, stale retention, immutable continuation, and
+numerical contrast. The live fixture covers multi-page binary order,
+table/view, wide columns, both count and real metadata-byte caps with
+clear/prefix recovery, restricted omission, unauthorized-default Check/Execute
+Permission, stale Retry, and CLI JSON. Two independent reviews of exact final
+implementation commit `05ad72f20e415b44f2d90ce7d5971c3d7a75b520` reported
+`NO P4 BLOCKER` and `NO P4 SECURITY BLOCKER`. P4 is independently reviewed
+GREEN; T5 remains Implementing only because P6 native/installed accessibility
+evidence is not yet complete.
 
 ```text
-359fc91428dc933cbfa36fcf88adf75968e9873d17040acf6abe44dc618adcda  P4 source+test review input
-504a094cab732c58869fab629871e94800dc96efc0b1da88282f6b498afe7deb  production snapshot
-34cdd805be0f09a722421fb8464b4dfac9f124e4415fada0cb6a17333020e063  tests snapshot
-21f5c572daea43ee1d16d84defda704ab550e91afd45424fc2601a4bdd9bffe3  target/release/dbotter
+ac9abfd2b6434fec58e7280d4da958125737a342fed01b7a7db2c190860dc120  P4 review source+test input
+718d90023bcaae1e1d70947d74de2fe2248bc5d79d7fca8bbf3b5586fbe414cf  production snapshot
+d7a7f9b7d2032c4bdf4d1d77a9d6013d5053a04599fed1c23ac0872e950ac2e2  tests snapshot
+4d4a8dd94668954b110946b6442a4ad7fca41c06bc85cd8ad831a1fd5ff616da  target/release/dbotter
 ```
 
 ## P5 — remaining live-gated Redis resource slice

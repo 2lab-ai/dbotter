@@ -1,9 +1,9 @@
 # dbotter — usable MVP architecture
 
-Status: **approved target architecture with P1, P2, and P3 independently
-reviewed GREEN and the P4 MySQL catalog implementation/live gate locally GREEN
-pending review. T0 remains RED overall; T1–T5, T8, and T9 are Implementing;
-T6, T7, and T10 are Not started.**
+Status: **approved target architecture with P1, P2, P3, and P4 independently
+reviewed GREEN. P4's MySQL catalog mandatory live gate is GREEN; T5 remains
+Implementing for P6 native/installed accessibility evidence. T0 remains RED
+overall; T1–T5, T8, and T9 are Implementing; T6, T7, and T10 are Not started.**
 
 Normative detail lives in `docs/usable-mvp/{spec,trace,plan}.md`. This document
 is the repository architecture entrypoint and must remain consistent with those
@@ -45,12 +45,17 @@ session eviction; and one typed session disposition reaches cache, event, and
 UI outcome. T4 is therefore Implementing with its P3 hermetic core GREEN.
 
 P4 implements the MySQL half of the resource seam: three static prepared
-catalog plans, deterministic binary keysets, context-bound page tokens,
-per-profile retention, typed permission mapping, shared CLI dispatch, and a
-profile-generation-scoped Explorer. Its isolated MySQL 8.4 live gate is GREEN,
-so `CATALOG` is ready in the same code commit. P5 still owns Redis keyspace/TLS,
-and P6 still owns native RawInput/AccessKit and installed AX completion; no
-complete T4–T6 installed journey is claimed.
+catalog plans, deterministic binary keysets, HMAC-authenticated context-bound
+page tokens, per-profile retention, typed permission mapping, shared CLI
+dispatch, and a profile-generation-scoped Explorer. Review fixes give every
+config path a lazily created private 0600 CSPRNG root sidecar and derive a
+per-connection signing subkey from a redacted canonical digest of all
+`ConnectionFingerprint` fields. They also make catalog lifecycle and session
+identity mirror P2/P3 exactly, freeze existing Load more context, and enforce
+numerical ordinary-text contrast. Its isolated MySQL 8.4 live gate and exact
+implementation/security reviews are GREEN, so `CATALOG` is ready. P5 still owns
+Redis keyspace/TLS, and P6 still owns native RawInput/AccessKit and installed AX
+completion; no complete T4–T6 installed journey is claimed.
 
 ## Target topology
 
@@ -186,10 +191,11 @@ contracts reject user-text use of `sqlx::raw_sql`,
 Static/bound catalog statements are prepared too.
 
 MySQL `CATALOG` and Redis `KEYSPACE_BROWSE` are independent capability bits.
-`CATALOG` is ready with P4's hermetic and mandatory live proof in code commit
-`e4599152daf0ca066baf6619048dae89c43cc6e4`; `KEYSPACE_BROWSE` remains planned
-for P5. MongoDB remains a Planned descriptor with a future document-native
-seam; it is never coerced into SQL.
+`CATALOG` is ready with P4's hermetic and mandatory live proof from
+original implementation `e4599152daf0ca066baf6619048dae89c43cc6e4` plus
+review fixes through `05ad72f20e415b44f2d90ce7d5971c3d7a75b520`;
+`KEYSPACE_BROWSE` remains planned for P5. MongoDB remains a Planned descriptor
+with a future document-native seam; it is never coerced into SQL.
 
 ## Runtime state and shutdown
 
@@ -204,6 +210,10 @@ still current.
   or connection-affecting edits evict it after the new-generation fence.
 - Cancel/timeout drops client waiting, joins, reports server state Unknown, and
   evicts only the exact used session generation.
+- Catalog work drops its scoped driver future before exact acquired-session
+  compare-remove/close. One typed `SessionDisposition` and session generation
+  drives cache mutation, terminal event, and UI truth; an old event cannot
+  evict or hide a replacement session, and stale catalog pages remain visible.
 - Async network work has a bounded abort grace. Blocking export checks
   cancellation per row/chunk and Shutdown waits for actual worker/temp cleanup.
 - Registry/permit/temp cleanup precedes terminal event delivery, including
@@ -220,12 +230,17 @@ The checkpoint passed 227 regular tests and 18 doctests, strict locked/offline
 Clippy, formatting, diff, release-contract, receipt, all-target/all-feature
 tests, and the release build.
 
-P4's review input is
-`359fc91428dc933cbfa36fcf88adf75968e9873d17040acf6abe44dc618adcda`.
-It passed 236 regular tests, 18 doctests, the same strict gates, and the
-isolated all-features `dbotter-p4` MySQL live test 1/1. Independent review is
-pending; the implementation, test, and release-binary hashes are recorded in
-`01-spec.md` and `04-patch-plan.md`.
+P4's final review input is
+`ac9abfd2b6434fec58e7280d4da958125737a342fed01b7a7db2c190860dc120`.
+Review RED contract commit `31bd052f0d550e8c9e13e4f743f245ee4be6eba2`
+and the later restart-scope RED commits are closed by code commits through
+`05ad72f20e415b44f2d90ce7d5971c3d7a75b520`. The fixed checkpoint passed
+249 regular tests, 19 doctests, the same strict
+gates, and the isolated `dbotter-p4` MySQL live test 1/1 in default and
+all-features configurations. Independent exact-commit reviews reported
+`NO P4 BLOCKER` and `NO P4 SECURITY BLOCKER`; T5 remains Implementing only for
+P6 native/installed accessibility evidence. The production, test, and
+release-binary hashes are recorded in `01-spec.md` and `04-patch-plan.md`.
 
 ## UI architecture and accessibility
 
@@ -236,9 +251,12 @@ owns no client or secret value.
 The P4 MySQL Explorer adds only generation-keyed display/retention state. It
 submits typed `CatalogRequest` values through the bounded controller, preserves
 stale pages and exact Retry recipes, and inserts quoted `LIMIT 500` templates
-without executing them. Its local OpenAI component tokens are flat white/black
-with sharp corners, visible focus, and textual states; P6 remains responsible
-for the complete native accessibility surface.
+without executing them. A branch retains its exact continuation request, so a
+changed prefix affects Refresh/new expansion but cannot rewrite an existing
+Load more token context. Its local OpenAI component tokens are flat white/black
+with sharp corners, visible focus, textual states, and numerically tested WCAG
+AA ordinary-text contrast; P6 remains responsible for the complete native
+accessibility surface.
 
 The form distinguishes Create from Update and holds a `DraftId`. Test uses
 temporary resources and has no path to config/cache/store/workspace mutation.

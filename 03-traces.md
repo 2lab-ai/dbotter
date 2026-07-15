@@ -1,10 +1,10 @@
 # dbotter — authoritative vertical trace index
 
-Status: **P1, P2, and P3 foundations are independently reviewed GREEN. P4's
-MySQL catalog implementation and mandatory live gate are locally GREEN pending
-review. T0 remains RED overall; T1–T5, T8, and T9 are Implementing; T6, T7,
-and T10 are Not started.** Update this document before changing cross-layer
-behavior.
+Status: **P1, P2, P3, and P4 are independently reviewed GREEN. P4's MySQL
+catalog mandatory live gate is GREEN; T5 remains Implementing for P6
+native/installed accessibility evidence. T0 remains RED overall; T1–T5, T8,
+and T9 are Implementing; T6, T7, and T10 are Not started.** Update this document before
+changing cross-layer behavior.
 
 The frozen normative trace is `docs/usable-mvp/trace.md` at SHA-256
 `91bfbe89874e88e2c97c7252073cbf7348778192f2a6a349a68b903e1baceaa4`.
@@ -35,7 +35,7 @@ Allowed implementation states are `Not started`, `RED`, `Implementing`,
 | T2 | confirmed atomic profile delete | P1/P2/P6 | Implementing (P1/P2 core GREEN; P6 remains) | failpoint/order/tombstone/AX |
 | T3 | controller, reload, connect/disconnect/reconnect/shutdown | P2/P6 | Implementing (P2 core GREEN; P6 native/AX remains; not fully GREEN/Verified) | state/cache/race/shutdown/AX |
 | T4 | exact target, prepared-only execute, cancel | P3/P6 | Implementing (P3 hermetic core GREEN; P6 RawInput/AX and mandatory live proof remain) | scanner/source/live/RawInput |
-| T5 | lazy paginated MySQL catalog | P4/P6 | Implementing (P4 hermetic/live/CLI/UI core GREEN locally; review and P6 native AX remain) | hermetic + mandatory live + CLI |
+| T5 | lazy paginated MySQL catalog | P4/P6 | Implementing (P4 review fixes and hermetic/live/CLI/UI core independently GREEN; P6 native/installed AX remains) | hermetic + mandatory live + CLI |
 | T6 | Redis SCAN/inspect and verified TLS | P5/P6 | Not started (P3 shared typed seam only) | hermetic + auth/TLS live + CLI |
 | T7 | result/copy/streaming atomic export | P7 | Not started | byte goldens/filesystem failpoints |
 | T8 | static errors, total recovery, accessibility | P1/P6 | Implementing (P1 core GREEN; P6 remains) | Cartesian table/RawInput/AccessKit |
@@ -200,10 +200,11 @@ Remaining P6/live owner/evidence:
 
 ## T5 — lazy paginated MySQL catalog
 
-Status: **Implementing** — P4 code and its hermetic/mandatory-live/CLI/UI core
-are locally GREEN; independent P4 review and P6 native RawInput/AccessKit plus
-installed AX remain. `CATALOG` is ready in the same P4 code commit that carries
-the live proof. Contract source: frozen trace T5; slices P4/P6.
+Status: **Implementing** — P4 code, review fixes, hermetic/mandatory-live/CLI/UI
+core, and exact implementation/security reviews are GREEN. P6 native
+RawInput/AccessKit plus installed AX remain. `CATALOG` is ready in the P4
+implementation/review-fix chain that carries the live proof. Contract source:
+frozen trace T5; slices P4/P6.
 
 Typed `CatalogRequest::{Schemas, Relations, Columns}` flows through
 `CatalogBrowser`. Each static/bound prepared information-schema query requests
@@ -213,14 +214,44 @@ when the extra row exists. Per-level/count/4-MiB caps expose reachable Load
 more, Clear catalog, and prefix narrowing. Failed refresh retains stale prior
 state. Restricted-user omission is not fabricated Permission.
 
-P4 GREEN evidence includes the three injected/static prepared plans,
-profile/generation/parent/prefix-bound token checks, cap reachability, quoting,
+Review RED commit `31bd052f0d550e8c9e13e4f743f245ee4be6eba2` proves that a
+public SHA-256 token rewrite/re-sign, catalog cancel/timeout lifecycle, mutable
+Load more prefix, missing event session identity, and `#919191` ordinary text
+were blockers. Fix commit `0aa007b3476a458bc83eeb241f30cc67e26e911d`
+closes all five. Cross-process RED `ede07e766be198d1140d966667857092665cba70`
+is closed by persistent-root fix `f51b3618f004b64e3601ca73f8072719ac273558`,
+and same-path rewrite RED `7b622757b2405d6fb2859923d5a7bf868835630b`
+is closed by connection-scope fix
+`05ad72f20e415b44f2d90ce7d5971c3d7a75b520`. A lazily created private
+0600 CSPRNG root sidecar is stable across processes, while HMAC-SHA256 domain
+separation derives a redacted per-connection subkey from every
+`ConnectionFingerprint` field. The scoped driver future drops before exact
+session eviction; one typed generation/disposition reaches cache/event/UI;
+continuation context is immutable; and ordinary text passes numerical WCAG AA.
+
+P4 GREEN evidence includes public-SHA rewrite, tamper, cross-config and
+cross-profile token rejection, unchanged-config CLI subprocess continuation,
+and same-path connection rewrite rejection; cancel, outer-timeout, and
+replacement races;
+cache/event/UI identity equality; stale retention; exact Load more context;
+three injected/static prepared plans, cap reachability, quoting,
 successful-empty and Permission/stale contracts, real Explorer state, and the
 headless JSON path. The isolated MySQL 8.4 fixture proves multi-page binary
 ordering, table/view and wide columns, 2,000-relation and real 4 MiB metadata
 caps with recovery, restricted omission, separate unauthorized Check/Execute
-Permission, stale Retry, and CLI JSON. Remaining owner/evidence is independent
-P4 review plus P6 native/installed accessibility expansion.
+Permission, stale Retry, and CLI JSON. It passed 1/1 in both default and
+all-features configurations. The hermetic checkpoint passed 249 regular tests
+and 19 doctests. Two independent reviews of exact implementation commit
+`05ad72f20e415b44f2d90ce7d5971c3d7a75b520` reported `NO P4 BLOCKER`
+and `NO P4 SECURITY BLOCKER`. Remaining owner/evidence is P6
+native/installed accessibility expansion.
+
+```text
+ac9abfd2b6434fec58e7280d4da958125737a342fed01b7a7db2c190860dc120  P4 review source+test input
+718d90023bcaae1e1d70947d74de2fe2248bc5d79d7fca8bbf3b5586fbe414cf  production snapshot
+d7a7f9b7d2032c4bdf4d1d77a9d6013d5053a04599fed1c23ac0872e950ac2e2  tests snapshot
+4d4a8dd94668954b110946b6442a4ad7fca41c06bc85cd8ad831a1fd5ff616da  target/release/dbotter
+```
 
 ## T6 — Redis SCAN/inspect and verified Required TLS
 
@@ -460,13 +491,13 @@ trace row before that row may become Verified.
 
 ## Conformance record
 
-P0 changed documentation only. The independently reviewed P1, P2, and P3
-foundations are GREEN, and P4's implementation/live checkpoint is locally
-GREEN pending review, but no complete native journey is claimed GREEN: T0
-remains RED; T1/T8 remain Implementing for P6; T2/T3/T9 remain Implementing for
-P6 native/AX evidence; T4 remains Implementing for P6 RawInput/AX plus execute
-live proof; and T5 remains Implementing for P4 review plus P6 native AX. T6,
-T7, and T10, and slices P5–P9, remain Not started.
+P0 changed documentation only. The independently reviewed P1, P2, P3, and P4
+foundations are GREEN, but no complete native journey is claimed
+GREEN: T0 remains RED; T1/T8 remain Implementing for P6; T2/T3/T9 remain
+Implementing for P6 native/AX evidence; T4 remains Implementing for P6
+RawInput/AX plus execute live proof; and T5 remains Implementing for P6 native
+AX. T6, T7, and T10, and slices P5–P9, remain Not
+started.
 Any production deviation is recorded here before code with an ADDED/MODIFIED/
 REMOVED/RENAMED classification, affected trace ids, migration impact, and
 contract evidence.

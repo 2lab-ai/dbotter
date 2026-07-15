@@ -5,7 +5,7 @@ Redis preview. MongoDB remains honestly Planned.
 
 ## Current status
 
-The approved contract and P1/P2/P3 foundations plus the local P4 checkpoint are
+The approved contract and P1/P2/P3/P4 foundations are
 complete at this branch point:
 
 - P0 repository documentation baseline: complete;
@@ -15,8 +15,8 @@ complete at this branch point:
   GREEN;
 - P3 typed prepared execution/resource/result/CLI seams: independently reviewed
   GREEN;
-- P4 lazy paginated MySQL catalog: hermetic and mandatory live gates GREEN
-  locally; independent review pending;
+- P4 lazy paginated MySQL catalog: review fixes, hermetic gates, and mandatory
+  live gates independently reviewed GREEN;
 - T0 overall: RED because P6 first-run RawInput/AccessKit proof is missing; the
   P1 config portion is GREEN;
 - T1 and T8: Implementing with P1 core GREEN and P6 remaining;
@@ -25,17 +25,17 @@ complete at this branch point:
   not fully GREEN or Verified;
 - T4: Implementing with the P3 hermetic core GREEN and P6 RawInput/AX plus
   mandatory live proof remaining;
-- T5: Implementing with P4's catalog/CLI/Explorer/live core GREEN locally and
-  P6 native AX plus independent review remaining;
+- T5: Implementing with P4's catalog/CLI/Explorer/live review fixes GREEN
+  and only P6 native/installed AX remaining;
 - T6: Not started; P5 retains Redis keyspace/TLS capability and live-proof
   ownership;
 - T9: Implementing with P1/P2 core GREEN and P6 remaining;
 - T7 and T10, and slices P5–P9: Not started.
 
 The P3 checkpoint is evidence for its hermetic typed execution/resource
-foundation only. P4 now makes MySQL `CATALOG` ready in the same code commit as
-its mandatory live proof; Redis `KEYSPACE_BROWSE` remains planned for P5. The
-P4 Explorer applies the local OpenAI component reference, while P6 native
+foundation only. P4 keeps MySQL `CATALOG` ready with its mandatory live
+proof and review-fix contracts; Redis `KEYSPACE_BROWSE` remains planned for P5.
+The P4 Explorer applies the local OpenAI component reference, while P6 native
 RawInput/AccessKit and installed AX work remain future work.
 Historical demo code and release machinery remain **not** proof of the
 remaining usable MVP or of an installed/verified preview.
@@ -125,24 +125,39 @@ ad649d256286f2e8dd8fa630bba8b64bb9f3ac5e6c5930f7ef432d85d0e8bd97  docs/usable-mv
 
 ## P4 MySQL catalog checkpoint
 
-Implementation commit `e4599152daf0ca066baf6619048dae89c43cc6e4`
-adds three static server-prepared catalog plans, profile-bound opaque keyset
-tokens, retained count/4-MiB recovery, exact quoting and bounded templates,
-shared CLI output, and the real generation-scoped MySQL Explorer.
+Original implementation commit `e4599152daf0ca066baf6619048dae89c43cc6e4`
+adds the three static server-prepared catalog plans, retained count/4-MiB
+recovery, exact quoting and bounded templates, shared CLI output, and the real
+generation-scoped MySQL Explorer. Review RED commit
+`31bd052f0d550e8c9e13e4f743f245ee4be6eba2` captures five blockers; fix commit
+`0aa007b3476a458bc83eeb241f30cc67e26e911d` closes them. Cross-process RED
+`ede07e766be198d1140d966667857092665cba70` is closed by persistent-root
+fix `f51b3618f004b64e3601ca73f8072719ac273558`; same-path connection
+rewrite RED `7b622757b2405d6fb2859923d5a7bf868835630b` is closed by final
+fix `05ad72f20e415b44f2d90ce7d5971c3d7a75b520`. A private 0600 per-config
+CSPRNG root sidecar persists across processes, and HMAC-SHA256 domain
+separation derives a redacted per-connection signing subkey from every
+`ConnectionFingerprint` field. Exact cancel/timeout compare-remove lifecycle,
+one session disposition/generation through cache-event-UI, immutable Load more
+context, and WCAG AA ordinary-text contrast remain enforced.
 
 The strict formatting, Clippy, all-target/all-feature, doctest, release build,
-release-contract, receipt secret-negative, diff, and frozen-hash gates passed.
-The hermetic run is 236/236, doctests are 18/18, and the isolated MySQL 8.4
-`dbotter-p4` mandatory live test is 1/1. That live test covers multi-page
-binary order, table/view and wide columns, count and actual metadata-byte caps,
-restricted visibility, separate unauthorized Permission, stale Retry, and CLI
-JSON. Independent review is pending.
+release-contract, receipt secret-negative, credential-pattern, diff, UI skill,
+and frozen-hash gates passed after the fixes. The hermetic run is 249/249,
+doctests are 19/19, and the isolated MySQL 8.4 `dbotter-p4` mandatory live test
+is 1/1 in both default and all-features configurations. That live test covers
+multi-page binary order, table/view and wide columns, count and actual
+metadata-byte caps, restricted visibility, separate unauthorized Permission,
+stale Retry, cross-process CLI continuation, and same-path connection rewrite
+rejection. Independent exact-commit reviews reported `NO P4 BLOCKER` and
+`NO P4 SECURITY BLOCKER`; T5 remains Implementing only for P6 native/installed
+accessibility evidence.
 
 ```text
-359fc91428dc933cbfa36fcf88adf75968e9873d17040acf6abe44dc618adcda  P4 source+test review input
-504a094cab732c58869fab629871e94800dc96efc0b1da88282f6b498afe7deb  production snapshot
-34cdd805be0f09a722421fb8464b4dfac9f124e4415fada0cb6a17333020e063  tests snapshot
-21f5c572daea43ee1d16d84defda704ab550e91afd45424fc2601a4bdd9bffe3  target/release/dbotter
+ac9abfd2b6434fec58e7280d4da958125737a342fed01b7a7db2c190860dc120  P4 review source+test input
+718d90023bcaae1e1d70947d74de2fe2248bc5d79d7fca8bbf3b5586fbe414cf  production snapshot
+d7a7f9b7d2032c4bdf4d1d77a9d6013d5053a04599fed1c23ac0872e950ac2e2  tests snapshot
+4d4a8dd94668954b110946b6442a4ad7fca41c06bc85cd8ad831a1fd5ff616da  target/release/dbotter
 ```
 
 ## Implementation gates
