@@ -87,7 +87,11 @@ jq -n \
   --arg formula_commit "$formula_commit" \
   --arg formula_blob "$formula_blob" \
   --arg formula_sha256 "$formula_sha256" \
+  --slurpfile release_manifest "$manifest" \
   '{
+    release_manifest: $release_manifest[0]
+  } as $context
+  | {
     schema: "dbotter.tap-dispatch.v1",
     dispatch: {
       tag: $tag,
@@ -102,7 +106,27 @@ jq -n \
       formula_blob: $formula_blob,
       formula_sha256: $formula_sha256
     },
-    workflow: {run_id: 9001, run_attempt: 2}
+    workflow: {run_id: 9001, run_attempt: 2},
+    preflight: {
+      schema: "dbotter.tap-preflight.v1",
+      artifacts: (
+        $context.release_manifest.artifacts
+        | map({target, url, bytes, sha256})
+        | sort_by(.target)
+      ),
+      candidate: {
+        target: "x86_64-unknown-linux-gnu",
+        identity: {
+          package_version: $context.release_manifest.package_version,
+          channel: "preview",
+          build_id: ($tag | sub("^preview-"; "")),
+          source_sha: $source_sha,
+          target: "x86_64-unknown-linux-gnu",
+          arch: "x86_64"
+        },
+        config_contract: $context.release_manifest.config_contract
+      }
+    }
   }' >"$proof"
 
 fake_gh="$tmp_dir/bin/gh"

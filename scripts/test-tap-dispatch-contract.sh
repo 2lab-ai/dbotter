@@ -92,7 +92,11 @@ jq -n \
   --arg formula_commit "$formula_commit" \
   --arg formula_blob "$formula_blob" \
   --arg formula_sha256 "$formula_sha256" \
+  --slurpfile release_manifest "$manifest" \
   '{
+    release_manifest: $release_manifest[0]
+  } as $context
+  | {
     schema: "dbotter.tap-dispatch.v1",
     dispatch: {
       tag: $tag,
@@ -110,6 +114,26 @@ jq -n \
     workflow: {
       run_id: 9001,
       run_attempt: 2
+    },
+    preflight: {
+      schema: "dbotter.tap-preflight.v1",
+      artifacts: (
+        $context.release_manifest.artifacts
+        | map({target, url, bytes, sha256})
+        | sort_by(.target)
+      ),
+      candidate: {
+        target: "x86_64-unknown-linux-gnu",
+        identity: {
+          package_version: $context.release_manifest.package_version,
+          channel: "preview",
+          build_id: ($tag | sub("^preview-"; "")),
+          source_sha: $source_sha,
+          target: "x86_64-unknown-linux-gnu",
+          arch: "x86_64"
+        },
+        config_contract: $context.release_manifest.config_contract
+      }
     }
   }' >"$proof"
 
@@ -129,6 +153,31 @@ validate=(
   --expected-workflow-run-attempt 2
 )
 "${validate[@]}" >/dev/null
+
+missing_preflight="$tmp_dir/missing-preflight.json"
+jq 'del(.preflight)' "$proof" >"$missing_preflight"
+if "${validate[@]/$proof/$missing_preflight}" >/dev/null 2>&1; then
+  fail "proof accepted a missing measured tap preflight"
+fi
+
+wrong_asset_measurement="$tmp_dir/wrong-asset-measurement.json"
+jq '.preflight.artifacts[0].bytes += 1' "$proof" >"$wrong_asset_measurement"
+if "${validate[@]/$proof/$wrong_asset_measurement}" >/dev/null 2>&1; then
+  fail "proof accepted an artifact measurement that disagrees with the manifest"
+fi
+
+wrong_candidate_identity="$tmp_dir/wrong-candidate-identity.json"
+jq '.preflight.candidate.identity.channel = "dev"' "$proof" >"$wrong_candidate_identity"
+if "${validate[@]/$proof/$wrong_candidate_identity}" >/dev/null 2>&1; then
+  fail "proof accepted a candidate identity that disagrees with the preview"
+fi
+
+wrong_candidate_config="$tmp_dir/wrong-candidate-config.json"
+jq '.preflight.candidate.config_contract.write_version = 1' \
+  "$proof" >"$wrong_candidate_config"
+if "${validate[@]/$proof/$wrong_candidate_config}" >/dev/null 2>&1; then
+  fail "proof accepted a candidate config contract that disagrees with the manifest"
+fi
 
 wrong_commit="$tmp_dir/wrong-commit.json"
 jq '.tap.formula_commit = "2222222222222222222222222222222222222222"' "$proof" >"$wrong_commit"
