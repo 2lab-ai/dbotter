@@ -51,7 +51,8 @@ receipt_candidate_has_static_leak() {
   # These are public local-fixture values, but their presence still proves that
   # a receipt serialized credential material instead of evidence about it.
   if receipt_candidate_contains_secret "$receipt_static_candidate" 'dbotter-local-only' \
-    || receipt_candidate_contains_secret "$receipt_static_candidate" 'root-local-only'; then
+    || receipt_candidate_contains_secret "$receipt_static_candidate" 'root-local-only' \
+    || receipt_candidate_contains_secret "$receipt_static_candidate" 'dbotter-redis-local-only'; then
     return 0
   fi
 
