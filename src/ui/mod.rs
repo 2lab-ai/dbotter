@@ -8,6 +8,7 @@ mod mysql_explorer;
 mod native_harness;
 mod profile_form;
 mod redis_explorer;
+mod result_view;
 mod runtime;
 #[cfg(test)]
 mod runtime_contract_tests;
@@ -31,6 +32,9 @@ pub use model::{
 };
 pub use mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 pub use native_harness::NativeUiHarness;
+pub use result_view::{
+    RESULT_ACTION_HEIGHT, RESULT_ROW_HEIGHT, copy_all_rows, copy_cell, copy_selected_rows,
+};
 pub use runtime::{RegisteredTask, RuntimeHandle, TaskScope, spawn_with_service};
 pub use theme::OpenAiTheme;
 

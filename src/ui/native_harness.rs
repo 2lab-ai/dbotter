@@ -1,12 +1,19 @@
 use eframe::egui;
 
+use crate::model::{
+    Cell, Column, DriverKind, OperationId, ProfileGeneration, ProfileId, QueryResult, ResultId,
+    ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
+};
+
 use super::accessibility::named_author_id;
+use super::result_view::ResultViewState;
 use super::theme::OpenAiTheme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HarnessSurface {
     FirstRun,
     Inventory,
+    Result,
 }
 
 /// A deterministic `RawInput` surface that uses the same author-id helpers as
@@ -19,6 +26,8 @@ pub struct NativeUiHarness {
     editor_target: String,
     row_limit: String,
     timeout: String,
+    result_state: ResultViewState,
+    result: ResultSnapshot,
 }
 
 impl NativeUiHarness {
@@ -30,6 +39,10 @@ impl NativeUiHarness {
         Self::new(HarnessSurface::Inventory)
     }
 
+    pub fn p7_result() -> Self {
+        Self::new(HarnessSurface::Result)
+    }
+
     fn new(surface: HarnessSurface) -> Self {
         Self {
             surface,
@@ -39,6 +52,8 @@ impl NativeUiHarness {
             editor_target: "mysql-local · mysql · localhost:3306".to_owned(),
             row_limit: "500".to_owned(),
             timeout: "30".to_owned(),
+            result_state: ResultViewState::default(),
+            result: sample_result(),
         }
     }
 
@@ -47,6 +62,9 @@ impl NativeUiHarness {
         match self.surface {
             HarnessSurface::FirstRun => show_first_run(ui),
             HarnessSurface::Inventory => self.show_inventory(ui),
+            HarnessSurface::Result => {
+                let _export = self.result_state.show(ui, &self.result, true);
+            }
         }
     }
 
@@ -99,6 +117,33 @@ impl NativeUiHarness {
             "Active operation delete warning",
         );
     }
+}
+
+fn sample_result() -> ResultSnapshot {
+    ResultSnapshot::retain(
+        QueryResult {
+            columns: vec![Column {
+                name: "value".to_owned(),
+                type_name: "TEXT".to_owned(),
+            }],
+            rows: vec![vec![Cell::Text("sample".to_owned())]],
+            affected_rows: 0,
+            last_insert_id: None,
+            elapsed_ms: 1,
+            truncated: false,
+            backend_notices_present: false,
+        },
+        ResultProvenance {
+            result_id: ResultId(1),
+            profile_id: ProfileId("sample".to_owned()),
+            profile_generation: ProfileGeneration(1),
+            operation_id: OperationId(1),
+            driver: DriverKind::MySql,
+            completed_at_unix_ms: 0,
+            duration_ms: 1,
+        },
+        ResultRetentionPolicy::mysql(1),
+    )
 }
 
 pub(crate) fn show_first_run(ui: &mut egui::Ui) {

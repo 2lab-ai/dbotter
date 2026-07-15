@@ -28,6 +28,7 @@ fn native_status_and_error_ui_stays_textual_and_monochrome() {
     let sources = [
         include_str!("../src/ui/app.rs"),
         include_str!("../src/ui/profile_form.rs"),
+        include_str!("../src/ui/result_view.rs"),
     ];
     for source in sources {
         for forbidden in ["Color32::RED", "Color32::YELLOW"] {
@@ -37,7 +38,15 @@ fn native_status_and_error_ui_stays_textual_and_monochrome() {
             );
         }
     }
-    assert!(sources[0].contains("Warning: result is truncated"));
-    assert!(sources[0].contains("Error: <missing>"));
+    assert!(
+        sources
+            .iter()
+            .any(|source| source.contains("Warning: result is truncated"))
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|source| source.contains("Error: <missing>"))
+    );
     assert!(sources[1].contains("Error: {error}"));
 }

@@ -17,6 +17,8 @@ use crate::public_error::PublicOperationError;
 use crate::secrets::EnvironmentAvailability;
 use crate::service::SessionDisposition;
 
+use super::result_view::ResultViewState;
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConfigPresentation {
     source_version: ConfigSourceVersion,
@@ -92,6 +94,7 @@ pub struct ProfileWorkspace {
     pub timeout_seconds: String,
     pub pending_execute: Option<OperationId>,
     pub result: Option<Arc<ResultSnapshot>>,
+    pub(crate) result_view: ResultViewState,
     pub error: Option<PublicOperationError>,
     pub catalog_page: Option<CatalogPage>,
     pub catalog_retry: Option<CatalogRequest>,
@@ -649,6 +652,7 @@ impl UiModel {
                         }
                         workspace.pending_execute = None;
                         workspace.error = None;
+                        workspace.result_view.reset_for(result.provenance.result_id);
                         workspace.result = Some(Arc::new(result));
                     }
                     self.status = format!("Query finished in {duration_ms} ms");

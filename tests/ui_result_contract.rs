@@ -59,10 +59,7 @@ fn snapshot() -> ResultSnapshot {
 fn copy_cell_is_literal_and_has_no_header_or_final_newline() {
     let snapshot = snapshot();
 
-    assert_eq!(
-        copy_cell(&snapshot, 1, 0).as_deref(),
-        Some("line\nbreak\\")
-    );
+    assert_eq!(copy_cell(&snapshot, 1, 0).as_deref(), Some("line\nbreak\\"));
     assert_eq!(copy_cell(&snapshot, 0, 1).as_deref(), Some(""));
     assert_eq!(copy_cell(&snapshot, 99, 0), None);
 }
@@ -110,14 +107,17 @@ fn native_result_inventory_exposes_every_installed_journey_action() {
         "result.export.tsv",
         "result.export.json",
     ] {
-        assert!(ids.contains(expected), "missing result author id {expected}");
+        assert!(
+            ids.contains(expected),
+            "missing result author id {expected}"
+        );
     }
 }
 
 #[test]
 fn result_actions_follow_the_openai_control_geometry() {
-    assert!(RESULT_ACTION_HEIGHT >= OpenAiTheme::MIN_CONTROL_HEIGHT);
-    assert!(RESULT_ROW_HEIGHT >= OpenAiTheme::MIN_CONTROL_HEIGHT);
+    assert!(std::hint::black_box(RESULT_ACTION_HEIGHT) >= OpenAiTheme::MIN_CONTROL_HEIGHT);
+    assert!(std::hint::black_box(RESULT_ROW_HEIGHT) >= OpenAiTheme::MIN_CONTROL_HEIGHT);
 
     let source = include_str!("../src/ui/result_view.rs");
     for forbidden in ["CornerRadius", "Shadow", "Color32::RED", "Color32::YELLOW"] {

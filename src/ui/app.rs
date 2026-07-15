@@ -6,11 +6,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui;
-use egui_extras::{Column as TableColumn, TableBuilder};
 
 use crate::config::MigrationConsent;
 use crate::model::{
-    CatalogRequest, Cell, CredentialMode, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
+    CatalogRequest, CredentialMode, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
     DEFAULT_REDIS_SCAN_COUNT, DraftId, DriverAvailability, DriverCapabilities, DriverKind,
     OperationId, OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration, ProfileId,
     PublicCode, PublicSummary, RedisKeyInspectRequest, RedisScanRequest, RequestIdentity,
@@ -2738,12 +2737,15 @@ impl DbotterApp {
             }
             ui.separator();
             ui.heading("Results");
-            if let Some(result) = selected_workspace_key
-                .as_ref()
-                .and_then(|key| self.model.workspace(key))
-                .and_then(|workspace| workspace.result.as_ref())
-            {
-                render_result(ui, result.as_ref());
+            if let Some(result) = selected_workspace_key.and_then(|key| {
+                let workspace = self.model.workspace_mut(key);
+                workspace
+                    .result
+                    .clone()
+                    .map(|result| (result, &mut workspace.result_view))
+            }) {
+                let (result, result_view) = result;
+                let _export = result_view.show(ui, result.as_ref(), false);
             } else {
                 ui.weak("No result yet");
             }
@@ -2963,74 +2965,6 @@ fn native_redis_ca_file_picker() -> Option<PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn native_redis_ca_file_picker() -> Option<PathBuf> {
     None
-}
-
-fn render_result(ui: &mut egui::Ui, result: &crate::model::ResultSnapshot) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(format!("{} rows", result.rows.len()));
-        ui.label(format!("{} affected", result.affected_rows));
-        ui.label(format!("{} ms", result.provenance.duration_ms));
-        if let Some(last_insert_id) = result.last_insert_id {
-            ui.label(format!("last insert id {last_insert_id}"));
-        }
-        if result.truncated {
-            ui.strong("Warning: result is truncated");
-        }
-    });
-    for notice in &result.notices {
-        ui.small(notice.message());
-    }
-    if result.columns.is_empty() {
-        return;
-    }
-    let column_count = result.columns.len();
-    let mut table = TableBuilder::new(ui)
-        .striped(true)
-        .resizable(true)
-        .column(TableColumn::auto());
-    if column_count > 1 {
-        table = table.columns(TableColumn::remainder(), column_count - 1);
-    }
-    table
-        .header(24.0, |mut header| {
-            for column in &result.columns {
-                header.col(|ui| {
-                    ui.strong(&column.name);
-                    ui.small(&column.type_name);
-                });
-            }
-        })
-        .body(|body| {
-            body.rows(22.0, result.rows.len(), |mut row| {
-                let row_index = row.index();
-                let cells = &result.rows[row_index];
-                for index in 0..column_count {
-                    row.col(|ui| match cells.get(index) {
-                        Some(cell) => {
-                            let value = display_cell(cell);
-                            let response = ui.label(&value);
-                            named_dynamic_value_author_id(
-                                response,
-                                format!("result.cell.{row_index}.{index}"),
-                                format!("Result row {} column {}", row_index + 1, index + 1),
-                                value,
-                            );
-                        }
-                        None => {
-                            ui.strong("Error: <missing>");
-                        }
-                    });
-                }
-            });
-        });
-}
-
-fn display_cell(cell: &Cell) -> String {
-    if matches!(cell, Cell::Null) {
-        "NULL".to_owned()
-    } else {
-        crate::export::clipboard_scalar(cell)
-    }
 }
 
 #[cfg(test)]
