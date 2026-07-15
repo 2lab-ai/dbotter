@@ -1,8 +1,5 @@
 name: Preview
 
-# Publishes a prerelease `preview-<YYYY-MM-DD-HHMM>-<sha12>` with four
-# desktop-capable binaries plus SHA256SUMS on every main/master push.
-
 on:
   workflow_dispatch:
   push:
@@ -16,8 +13,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  preflight:
-    runs-on: ubuntu-latest
+  verify:
+    uses: ./.github/workflows/verify.yml
+    with:
+      candidate_sha: ${{ github.sha }}
+
+  plan:
+    needs: verify
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     outputs:
@@ -25,69 +28,105 @@ jobs:
       tag: ${{ steps.plan.outputs.tag }}
       commit: ${{ steps.plan.outputs.commit }}
       version: ${{ steps.plan.outputs.version }}
+      package_version: ${{ steps.plan.outputs.package_version }}
+      created_at: ${{ steps.plan.outputs.created_at }}
+      current_version: ${{ steps.plan.outputs.current_version }}
+      manifest_url: ${{ steps.plan.outputs.manifest_url }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout verified candidate
+        uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Check release contract
-        run: ./scripts/check-release-contract.sh
-
-      - name: Compute build identity
+      - name: Compute immutable preview identity
         id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           commit="$(git rev-parse HEAD)"
-          short_sha="$(git rev-parse --short=12 HEAD)"
-          stamp="$(date -u +%Y-%m-%d-%H%M)"
-          build_id="$stamp-$short_sha"
-          cargo_version="$(./scripts/package-version.sh)"
+          test "$commit" = "${{ github.sha }}"
+          short_sha="${commit:0:12}"
+          stamp="$(date -u +%Y-%m-%d-%H%M%S)"
+          build_id="$stamp-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$short_sha"
+          tag=preview-$build_id
+          version="${stamp:0:4}.${stamp:5:2}.${stamp:8:2}.${stamp:11:6}.$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          created_at="${stamp:0:4}-${stamp:5:2}-${stamp:8:2}T${stamp:11:2}:${stamp:13:2}:${stamp:15:2}Z"
+          package_version="$(./scripts/package-version.sh)"
+          formula_content="$(gh api repos/2lab-ai/homebrew-tap/contents/Formula/dbotter-preview.rb --jq .content | tr -d '\n' | base64 --decode)"
+          current_version="$(sed -n 's/^[[:space:]]*version "\([0-9.]*\)".*/\1/p' <<<"$formula_content" | head -1)"
+          test -n "$current_version"
+          ./scripts/check-preview-version.py --candidate "$version" --greater-than "$current_version"
+          manifest_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/preview-manifest.json"
           {
             echo "commit=$commit"
             echo "build_id=$build_id"
-            echo "tag=preview-$build_id"
-            echo "version=$cargo_version"
-          } >> "$GITHUB_OUTPUT"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "package_version=$package_version"
+            echo "created_at=$created_at"
+            echo "current_version=$current_version"
+            echo "manifest_url=$manifest_url"
+          } >>"$GITHUB_OUTPUT"
 
   build:
-    needs: preflight
-    permissions:
-      contents: read
+    needs: [verify, plan]
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-latest
-            name: dbotter-macos-aarch64
+            arch: aarch64
+            host_arch: arm64
+            os: macos-15
+            kind: macos
           - target: x86_64-apple-darwin
-            os: macos-latest
-            name: dbotter-macos-x86_64
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: dbotter-linux-x86_64
+            arch: x86_64
+            host_arch: x86_64
+            os: macos-15-intel
+            kind: macos
           - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            host_arch: aarch64
             os: ubuntu-24.04-arm
-            name: dbotter-linux-aarch64
+            kind: linux
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            host_arch: x86_64
+            os: ubuntu-24.04
+            kind: linux
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 45
+    permissions:
+      contents: read
     env:
       DBOTTER_BUILD_CHANNEL: preview
-      DBOTTER_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
+      DBOTTER_BUILD_ID: ${{ needs.plan.outputs.build_id }}
+      DBOTTER_SOURCE_SHA: ${{ needs.plan.outputs.commit }}
+      DBOTTER_EXPECTED_SOURCE_SHA: ${{ needs.plan.outputs.commit }}
+      DBOTTER_EXPECTED_TAG: ${{ needs.plan.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout verified candidate
+        uses: actions/checkout@v4
         with:
-          ref: ${{ needs.preflight.outputs.commit }}
+          ref: ${{ needs.plan.outputs.commit }}
+          fetch-depth: 0
           persist-credentials: false
 
+      - name: Verify native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "${{ matrix.host_arch }}"
+
       - name: Install Linux desktop build dependencies
-        if: runner.os == 'Linux'
+        if: matrix.kind == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
 
-      - name: Install Rust
+      - name: Install Rust target
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -95,112 +134,182 @@ jobs:
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: preview-${{ matrix.target }}
+          key: preview-${{ matrix.target }}-${{ needs.plan.outputs.commit }}
 
-      - name: Build desktop binary
-        run: cargo build --release --all-features --locked --target ${{ matrix.target }}
+      - name: Build exact all-feature target
+        run: cargo build --release --all-features --locked --target "${{ matrix.target }}"
 
-      - name: Package artifact
-        shell: bash
-        run: cp "target/${{ matrix.target }}/release/dbotter" "${{ matrix.name }}"
-
-      - name: Verify embedded preview identity
-        if: runner.arch == 'X64' && matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Verify exact binary contracts
         shell: bash
         run: |
           set -euo pipefail
-          actual="$("./${{ matrix.name }}" --version)"
-          expected="dbotter ${{ needs.preflight.outputs.version }} (preview $DBOTTER_BUILD_ID)"
-          test "$actual" = "$expected"
+          binary="target/${{ matrix.target }}/release/dbotter"
+          identity="$($binary version --format json)"
+          config="$($binary config-contract --format json)"
+          jq -e \
+            --arg package_version "${{ needs.plan.outputs.package_version }}" \
+            --arg build_id "$DBOTTER_BUILD_ID" \
+            --arg source_sha "$DBOTTER_SOURCE_SHA" \
+            --arg target "${{ matrix.target }}" \
+            --arg arch "${{ matrix.arch }}" '
+              (keys | sort) == ["arch", "build_id", "channel", "package_version", "source_sha", "target"]
+              and .package_version == $package_version
+              and .channel == "preview"
+              and .build_id == $build_id
+              and .source_sha == $source_sha
+              and .target == $target
+              and .arch == $arch
+            ' <<<"$identity" >/dev/null
+          jq -e '
+            (keys | sort) == ["migration_backup_suffix", "read_versions", "write_version"]
+            and .read_versions == [1, 2]
+            and .write_version == 2
+            and .migration_backup_suffix == ".v1.bak"
+          ' <<<"$config" >/dev/null
 
-      - name: Upload artifact
+      - name: Package signed macOS app
+        if: matrix.kind == 'macos'
+        run: |
+          mkdir -p out
+          ./scripts/build-macos-app.sh \
+            --channel preview \
+            --binary "target/${{ matrix.target }}/release/dbotter" \
+            --output out
+
+      - name: Stage Linux executable
+        if: matrix.kind == 'linux'
+        run: |
+          mkdir -p out
+          cp "target/${{ matrix.target }}/release/dbotter" "out/dbotter-preview-linux-${{ matrix.arch }}"
+          chmod 0755 "out/dbotter-preview-linux-${{ matrix.arch }}"
+
+      - name: Upload macOS package
+        if: matrix.kind == 'macos'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          name: package-${{ matrix.arch }}
+          path: |
+            out/dbotter-preview-${{ matrix.arch }}.tar.gz
+            out/preview-artifact-${{ matrix.arch }}.json
+            out/package-receipt-${{ matrix.arch }}.json
+          if-no-files-found: error
+
+      - name: Upload Linux executable
+        if: matrix.kind == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-linux-${{ matrix.arch }}
+          path: out/dbotter-preview-linux-${{ matrix.arch }}
+          if-no-files-found: error
 
   publish:
-    needs: [preflight, build]
-    runs-on: ubuntu-latest
+    needs: [verify, plan, build]
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
-    env:
-      TAP_DISPATCH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+    outputs:
+      manifest_sha256: ${{ steps.manifest.outputs.manifest_sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout verified candidate
+        uses: actions/checkout@v4
         with:
+          ref: ${{ needs.plan.outputs.commit }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Download all artifacts
+      - name: Download target artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Assemble release files
+      - name: Assemble and validate immutable release files
+        id: manifest
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release
-          for asset in dbotter-macos-aarch64 dbotter-macos-x86_64 dbotter-linux-aarch64 dbotter-linux-x86_64; do
-            cp "artifacts/$asset/$asset" "release/$asset"
-          done
-          (cd release && sha256sum dbotter-* > SHA256SUMS)
-          cat release/SHA256SUMS
-          {
-            echo "Preview build \`${{ needs.preflight.outputs.build_id }}\` from \`${{ needs.preflight.outputs.commit }}\`."
-            echo
-            echo "Install: \`brew install 2lab-ai/tap/dbotter-preview\`"
-            echo
-            echo '```'
-            cat release/SHA256SUMS
-            echo '```'
-          } > PREVIEW_NOTES.md
+          cp artifacts/package-aarch64/dbotter-preview-aarch64.tar.gz release/
+          cp artifacts/package-x86_64/dbotter-preview-x86_64.tar.gz release/
+          cp artifacts/package-linux-aarch64/dbotter-preview-linux-aarch64 release/
+          cp artifacts/package-linux-x86_64/dbotter-preview-linux-x86_64 release/
+          ./scripts/assemble-preview-manifest.py \
+            --artifact artifacts/package-aarch64/preview-artifact-aarch64.json \
+            --artifact artifacts/package-x86_64/preview-artifact-x86_64.json \
+            --output release/preview-manifest.json
+          ./scripts/validate-preview-manifest.py \
+            release/preview-manifest.json \
+            --expected-source-sha "${{ needs.plan.outputs.commit }}" \
+            --expected-tag "${{ needs.plan.outputs.tag }}" \
+            --greater-than "${{ needs.plan.outputs.current_version }}"
+          manifest_sha256="$(sha256sum release/preview-manifest.json | awk '{print $1}')"
+          echo "manifest_sha256=$manifest_sha256" >>"$GITHUB_OUTPUT"
+          chmod 0755 release/dbotter-preview-linux-*
+          (cd release && sha256sum dbotter-preview-* preview-manifest.json >SHA256SUMS)
 
-      - name: Create preview prerelease
+      - name: Reject tag or release replacement
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/${{ needs.plan.outputs.tag }}" >/dev/null 2>&1; then
+            echo "tag already exists; immutable preview replacement refused" >&2
+            exit 1
+          fi
+          if gh release view "${{ needs.plan.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release already exists; immutable preview replacement refused" >&2
+            exit 1
+          fi
+
+      - name: Write safe release notes
+        shell: bash
+        run: |
+          {
+            echo "Preview ${{ needs.plan.outputs.tag }}"
+            echo
+            echo "Source: ${{ needs.plan.outputs.commit }}"
+            echo "Homebrew version: ${{ needs.plan.outputs.version }}"
+            echo "Manifest: ${{ needs.plan.outputs.manifest_url }}"
+            echo
+            echo 'Install with `brew install 2lab-ai/tap/dbotter-preview` after the explicit tap dispatch completes.'
+          } >PREVIEW_NOTES.md
+
+      - name: Create immutable preview prerelease
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.preflight.outputs.tag }}
-          name: Preview build ${{ needs.preflight.outputs.build_id }}
+          tag_name: ${{ needs.plan.outputs.tag }}
+          name: Dbotter Preview ${{ needs.plan.outputs.version }}
           body_path: PREVIEW_NOTES.md
           prerelease: true
           make_latest: false
-          target_commitish: ${{ needs.preflight.outputs.commit }}
+          target_commitish: ${{ needs.plan.outputs.commit }}
           files: |
-            release/dbotter-macos-aarch64
-            release/dbotter-macos-x86_64
-            release/dbotter-linux-aarch64
-            release/dbotter-linux-x86_64
+            release/dbotter-preview-aarch64.tar.gz
+            release/dbotter-preview-x86_64.tar.gz
+            release/dbotter-preview-linux-aarch64
+            release/dbotter-preview-linux-x86_64
+            release/preview-manifest.json
             release/SHA256SUMS
 
-      - name: Prune old preview prereleases (keep 15)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isPrerelease,createdAt > preview-releases.json
-          python3 - <<'PY' > old-preview-tags.txt
-          import json
-          with open("preview-releases.json", encoding="utf-8") as handle:
-              releases = json.load(handle)
-          previews = [
-              release for release in releases
-              if release.get("isPrerelease")
-              and str(release.get("tagName", "")).startswith("preview-")
-          ]
-          previews.sort(key=lambda release: str(release.get("createdAt", "")), reverse=True)
-          for release in previews[15:]:
-              print(release["tagName"])
-          PY
-          while IFS= read -r tag; do
-            [ -n "$tag" ] || continue
-            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-          done < old-preview-tags.txt
-
-      - name: Bump Homebrew tap to this preview
-        if: ${{ env.TAP_DISPATCH_TOKEN != '' }}
+  tap:
+    needs: [verify, plan, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      TAP_DISPATCH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+    steps:
+      - name: Dispatch exact immutable tap inputs
         env:
           GH_TOKEN: ${{ env.TAP_DISPATCH_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
-          gh workflow run bump.yml --repo 2lab-ai/homebrew-tap
-          echo "dispatched homebrew-tap bump.yml for ${{ needs.preflight.outputs.tag }}"
+          test -n "$TAP_DISPATCH_TOKEN"
+          gh workflow run bump.yml \
+            --repo 2lab-ai/homebrew-tap \
+            -f "tag=${{ needs.plan.outputs.tag }}" \
+            -f "source_sha=${{ needs.plan.outputs.commit }}" \
+            -f "version=${{ needs.plan.outputs.version }}" \
+            -f "manifest_url=${{ needs.plan.outputs.manifest_url }}" \
+            -f "manifest_sha256=${{ needs.publish.outputs.manifest_sha256 }}"

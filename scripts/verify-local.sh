@@ -5,8 +5,34 @@ repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_dir"
 . "$repo_dir/scripts/receipt-security.sh"
 
+config_argument=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --config)
+      [ "$#" -ge 2 ] || {
+        echo "error: --config requires a path" >&2
+        exit 1
+      }
+      [ -z "$config_argument" ] || {
+        echo "error: --config may be provided only once" >&2
+        exit 1
+      }
+      config_argument=$2
+      shift 2
+      ;;
+    *)
+      echo "error: unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
 : "${DBOTTER_MYSQL_PASSWORD:?set DBOTTER_MYSQL_PASSWORD for the local fixture}"
-export DBOTTER_CONFIG=${DBOTTER_CONFIG:-"$repo_dir/config/local.example.toml"}
+if [ -n "$config_argument" ]; then
+  export DBOTTER_CONFIG=$config_argument
+else
+  export DBOTTER_CONFIG=${DBOTTER_CONFIG:-"$repo_dir/config/local.example.toml"}
+fi
 project_name=dbotter-e2e
 compose_file=$repo_dir/docker-compose.yml
 redis_expiry_seconds=300
