@@ -10,10 +10,12 @@ use crate::model::{
     CatalogRequest, OperationId, PublicSummary,
 };
 
+use super::theme::OpenAiTheme;
+
 const OPENAI_CANVAS: egui::Color32 = egui::Color32::WHITE;
 const OPENAI_INK: egui::Color32 = egui::Color32::BLACK;
 const OPENAI_INK_60: egui::Color32 = egui::Color32::from_gray(102);
-const OPENAI_HAIRLINE: egui::Color32 = egui::Color32::from_gray(224);
+const OPENAI_HAIRLINE: egui::Color32 = egui::Color32::from_gray(0x91);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum BranchKey {
@@ -209,12 +211,7 @@ impl MySqlExplorerState {
                             .color(OPENAI_INK)
                             .strong(),
                     );
-                    let prefix_response = ui.add(
-                        egui::TextEdit::singleline(&mut self.prefix)
-                            .id(egui::Id::new("mysql.catalog.prefix"))
-                            .hint_text("Optional literal prefix")
-                            .desired_width(f32::INFINITY),
-                    );
+                    let prefix_response = catalog_prefix_field(ui, &mut self.prefix);
                     if prefix_response.has_focus() {
                         ui.label(
                             egui::RichText::new(
@@ -577,7 +574,9 @@ fn normalized_prefix(prefix: &str) -> Option<String> {
 }
 
 fn apply_openai_component_style(ui: &mut egui::Ui) {
-    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+    let spacing = ui.spacing_mut();
+    spacing.item_spacing = egui::vec2(8.0, 8.0);
+    spacing.interact_size.y = spacing.interact_size.y.max(OpenAiTheme::MIN_CONTROL_HEIGHT);
     let visuals = ui.visuals_mut();
     visuals.dark_mode = false;
     visuals.override_text_color = Some(OPENAI_INK);
@@ -601,6 +600,16 @@ fn apply_openai_component_style(ui: &mut egui::Ui) {
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, OPENAI_INK);
 }
 
+fn catalog_prefix_field(ui: &mut egui::Ui, prefix: &mut String) -> egui::Response {
+    ui.add_sized(
+        [ui.available_width(), OpenAiTheme::MIN_CONTROL_HEIGHT],
+        egui::TextEdit::singleline(prefix)
+            .id(egui::Id::new("mysql.catalog.prefix"))
+            .hint_text("Optional literal prefix")
+            .desired_width(f32::INFINITY),
+    )
+}
+
 fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
     ui.add_enabled(
         enabled,
@@ -608,7 +617,7 @@ fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Respon
             .fill(OPENAI_INK)
             .stroke(egui::Stroke::new(1.0, OPENAI_INK))
             .corner_radius(egui::CornerRadius::ZERO)
-            .min_size(egui::vec2(0.0, 32.0)),
+            .min_size(egui::vec2(0.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
     )
 }
 
@@ -619,7 +628,7 @@ fn secondary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Resp
             .fill(OPENAI_CANVAS)
             .stroke(egui::Stroke::new(1.0, OPENAI_INK))
             .corner_radius(egui::CornerRadius::ZERO)
-            .min_size(egui::vec2(0.0, 32.0)),
+            .min_size(egui::vec2(0.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
     )
 }
 
@@ -796,6 +805,18 @@ mod tests {
             egui::Color32::from_gray(0x91),
             "MySQL boundaries must use exact #919191"
         );
+        assert!(
+            OpenAiTheme::contrast(
+                [
+                    OPENAI_HAIRLINE.r(),
+                    OPENAI_HAIRLINE.g(),
+                    OPENAI_HAIRLINE.b(),
+                    OPENAI_HAIRLINE.a(),
+                ],
+                OpenAiTheme::CANVAS,
+            ) >= 3.0,
+            "MySQL boundary must keep at least 3:1 non-text contrast"
+        );
 
         let context = egui::Context::default();
         let _ = context.run_ui(egui::RawInput::default(), |ui| {
@@ -824,9 +845,7 @@ mod tests {
             let mut prefix = String::new();
             heights.push((
                 "prefix",
-                ui.add(egui::TextEdit::singleline(&mut prefix))
-                    .rect
-                    .height(),
+                catalog_prefix_field(ui, &mut prefix).rect.height(),
             ));
             heights.push(("primary", primary_button(ui, "Primary", true).rect.height()));
             heights.push((
@@ -856,5 +875,7 @@ mod tests {
             .0;
         assert!(!production.contains("from_gray(224)"));
         assert!(!production.contains("32.0"));
+        assert!(!production.contains("Shadow"));
+        assert!(!production.to_ascii_lowercase().contains("gradient"));
     }
 }
