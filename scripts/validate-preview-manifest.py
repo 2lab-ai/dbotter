@@ -126,6 +126,23 @@ def require_positive_integer(value: Any, location: str) -> int:
     return value
 
 
+def require_config_contract(value: Any, location: str) -> dict[str, Any]:
+    config = require_exact_object(value, CONFIG_KEYS, location)
+    read_versions = config["read_versions"]
+    if (
+        not isinstance(read_versions, list)
+        or len(read_versions) != 2
+        or any(type(version) is not int for version in read_versions)
+        or read_versions != [1, 2]
+        or type(config["write_version"]) is not int
+        or config["write_version"] != 2
+        or type(config["migration_backup_suffix"]) is not str
+        or config["migration_backup_suffix"] != ".v1.bak"
+    ):
+        raise ContractError(f"{location} is not the exact typed three-field contract")
+    return config
+
+
 def version_tuple(value: str) -> tuple[int, ...]:
     match = VERSION_RE.fullmatch(value)
     if match is None:
@@ -223,13 +240,7 @@ def validate_manifest(
     if greater_than is not None and version_tuple(version) <= baseline_version_tuple(greater_than):
         raise ContractError("preview version is not strictly greater than the current version")
 
-    config = require_exact_object(manifest["config_contract"], CONFIG_KEYS, "config_contract")
-    if config != {
-        "read_versions": [1, 2],
-        "write_version": 2,
-        "migration_backup_suffix": ".v1.bak",
-    }:
-        raise ContractError("config_contract is not the exact approved three-field object")
+    require_config_contract(manifest["config_contract"], "config_contract")
 
     artifacts = manifest["artifacts"]
     if not isinstance(artifacts, list) or len(artifacts) != 4:
