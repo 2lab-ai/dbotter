@@ -1852,6 +1852,10 @@ impl ResultSnapshot {
         let mut retained_bytes = 0_usize;
         for column in source_columns.into_iter().take(MAX_RESULT_COLUMNS) {
             let column_bytes = column.name.len().saturating_add(column.type_name.len());
+            if column_bytes > MAX_RESULT_CELL_BYTES {
+                push_result_notice(&mut notices, ResultNotice::SnapshotByteLimitReached);
+                break;
+            }
             if retained_bytes.saturating_add(column_bytes) > MAX_RESULT_BYTES {
                 push_result_notice(&mut notices, ResultNotice::SnapshotByteLimitReached);
                 break;

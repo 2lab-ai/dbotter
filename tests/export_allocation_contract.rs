@@ -1,5 +1,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{self, Write};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use dbotter::export::{
@@ -15,6 +16,7 @@ struct TrackingAllocator;
 static OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static MEASURING: AtomicBool = AtomicBool::new(false);
+static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 fn record_allocation(size: usize) {
     let outstanding = OUTSTANDING.fetch_add(size, Ordering::SeqCst) + size;
@@ -114,15 +116,19 @@ fn measured_peak(snapshot: &ResultSnapshot, format: ExportFormat) -> usize {
 
 #[test]
 fn transient_allocation_is_one_retained_value_and_never_scales_with_row_count() {
+    let _serial = TEST_SERIAL
+        .lock()
+        .expect("serialize allocator measurements");
     let single_large = snapshot(vec![vec![
         Cell::Text("\u{1}".repeat(MAX_RESULT_CELL_BYTES)),
         Cell::Bytes {
             retained: vec![0xff; MAX_RESULT_CELL_BYTES],
             original_len: MAX_RESULT_CELL_BYTES,
         },
-        Cell::Json(serde_json::json!({
-            "payload": "\u{1}".repeat(MAX_RESULT_CELL_BYTES)
-        })),
+        Cell::JsonPreview {
+            preview: "\u{1}".repeat(MAX_RESULT_CELL_BYTES),
+            original_len: MAX_RESULT_CELL_BYTES + 1,
+        },
     ]]);
     for format in [ExportFormat::Csv, ExportFormat::Tsv, ExportFormat::Json] {
         let peak = measured_peak(&single_large, format);
@@ -131,6 +137,15 @@ fn transient_allocation_is_one_retained_value_and_never_scales_with_row_count() 
             "{format:?} peak {peak} exceeded {MAX_EXPORT_TRANSIENT_BYTES}"
         );
     }
+
+    let mut maximum_metadata = snapshot(Vec::new());
+    maximum_metadata.columns[0].name =
+        "\u{1}".repeat(MAX_RESULT_CELL_BYTES.saturating_sub("VALUE".len()));
+    let metadata_peak = measured_peak(&maximum_metadata, ExportFormat::Json);
+    assert!(
+        metadata_peak <= MAX_EXPORT_TRANSIENT_BYTES,
+        "metadata peak {metadata_peak} exceeded {MAX_EXPORT_TRANSIENT_BYTES}"
+    );
 
     let one_row = snapshot(vec![vec![Cell::Text("x".repeat(1024))]]);
     let many_rows = snapshot(
@@ -162,6 +177,7 @@ impl Write for AlwaysFails {
 
 #[test]
 fn writer_io_failure_and_cooperative_cancellation_remain_distinct() {
+    let _serial = TEST_SERIAL.lock().expect("serialize allocator tests");
     let result = snapshot(vec![vec![Cell::Text("value".to_owned())]]);
     let io_error = write_export_with_cancel(&result, ExportFormat::Csv, &mut AlwaysFails, || false)
         .expect_err("writer failure");

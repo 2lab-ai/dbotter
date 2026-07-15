@@ -5,14 +5,16 @@ use base64::Engine as _;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rust_decimal::Decimal;
 
-use crate::model::{Cell, ExportFormat, ResultSnapshot};
+use crate::model::{Cell, ExportFormat, MAX_RESULT_CELL_BYTES, ResultSnapshot};
 
 const STREAM_CHUNK_BYTES: usize = 4 * 1024;
 
 /// Maximum transient encoder allocation for one already-retained cell or
-/// metadata value. The initial RED contract replaces this placeholder with
-/// the measured, row-count-independent bound.
-pub const MAX_EXPORT_TRANSIENT_BYTES: usize = 0;
+/// metadata value. JSON control escaping can expand it sixfold; the power-of-
+/// two `String` growth ceiling is eightfold plus one streaming chunk.
+pub const MAX_EXPORT_TRANSIENT_BYTES: usize = MAX_RESULT_CELL_BYTES
+    .saturating_mul(8)
+    .saturating_add(STREAM_CHUNK_BYTES);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportEncodeError {

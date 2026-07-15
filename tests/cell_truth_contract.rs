@@ -1,6 +1,6 @@
 use dbotter::model::{
     Cell, Column, DriverKind, OperationId, ProfileGeneration, ProfileId, QueryResult, ResultId,
-    ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
+    ResultNotice, ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
 };
 
 fn provenance(driver: DriverKind) -> ResultProvenance {
@@ -84,4 +84,67 @@ fn retained_bytes_keep_raw_identity_and_exact_original_length() {
     assert_eq!(retained, &[0, 0xff, b'a']);
     assert_eq!(*original_len, 9);
     assert_eq!(snapshot.cell_truncations[0].original_len, Some(9));
+}
+
+#[test]
+fn metadata_retention_stops_at_an_oversized_entry_and_preserves_row_width() {
+    let exact_boundary_name = "x".repeat(
+        dbotter::model::MAX_RESULT_CELL_BYTES
+            .checked_sub("TEXT".len())
+            .expect("metadata boundary exceeds the fixture type name"),
+    );
+    let snapshot = ResultSnapshot::retain(
+        QueryResult {
+            columns: vec![
+                Column {
+                    name: exact_boundary_name.clone(),
+                    type_name: "TEXT".to_owned(),
+                },
+                Column {
+                    name: "y".repeat(dbotter::model::MAX_RESULT_CELL_BYTES + 1),
+                    type_name: String::new(),
+                },
+                Column {
+                    name: "must-not-be-retained".to_owned(),
+                    type_name: "TEXT".to_owned(),
+                },
+            ],
+            rows: vec![vec![
+                Cell::Text("first".to_owned()),
+                Cell::Text("second".to_owned()),
+                Cell::Text("third".to_owned()),
+            ]],
+            affected_rows: 0,
+            last_insert_id: None,
+            elapsed_ms: 19,
+            truncated: false,
+            backend_notices_present: false,
+        },
+        provenance(DriverKind::MySql),
+        ResultRetentionPolicy::mysql(1),
+    );
+
+    assert_eq!(snapshot.columns.len(), 1);
+    assert_eq!(snapshot.columns[0].name, exact_boundary_name);
+    assert_eq!(
+        snapshot.columns[0].name.len() + snapshot.columns[0].type_name.len(),
+        dbotter::model::MAX_RESULT_CELL_BYTES,
+        "an entry exactly at the boundary must be retained"
+    );
+    assert!(snapshot.truncated);
+    assert!(snapshot.notices.contains(&ResultNotice::ColumnLimitReached));
+    assert!(
+        snapshot
+            .notices
+            .contains(&ResultNotice::SnapshotByteLimitReached)
+    );
+    assert_eq!(snapshot.rows.len(), 1);
+    assert!(
+        snapshot
+            .rows
+            .iter()
+            .all(|row| row.len() == snapshot.columns.len()),
+        "every retained row must remain positional with the retained schema"
+    );
+    assert_eq!(snapshot.rows[0], vec![Cell::Text("first".to_owned())]);
 }
