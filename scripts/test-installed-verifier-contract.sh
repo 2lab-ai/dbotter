@@ -25,6 +25,10 @@ for literal in \
   'inspect redis key'; do
   grep -Fq -- "$literal" "$cli" || fail "CLI verifier is missing: $literal"
 done
+grep -Fq -- 'expected_shim="$(brew --prefix)/bin/dbotter"' "$cli" \
+  || fail "CLI verifier does not require the exact Homebrew shim path"
+grep -Fq -- 'receipt_candidate_has_static_leak "$temporary"' "$cli" \
+  || fail "CLI verifier does not leak-scan generated evidence"
 
 gui="$root/scripts/verify-installed-gui.sh"
 for required_id in \
@@ -67,5 +71,23 @@ for fail_closed in \
   'export_contracts'; do
   grep -Fq -- "$fail_closed" "$gui" || fail "GUI verifier omits fail-closed contract: $fail_closed"
 done
+
+for provenance in \
+  DBOTTER_AX_DRIVER_SHA256 \
+  DBOTTER_AX_DRIVER_SOURCE \
+  DBOTTER_AX_DRIVER_SOURCE_SHA256 \
+  'git ls-files --error-unmatch' \
+  'receipt_sha256_file "$ax_driver"' \
+  'source_repo_path: $source_repo_path' \
+  'receipt_candidate_has_static_leak "$output_temporary"'; do
+  grep -Fq -- "$provenance" "$gui" \
+    || fail "GUI verifier omits reviewed driver provenance/evidence safety: $provenance"
+done
+
+launch_line="$(grep -n -- '--phase launch' "$gui" | cut -d: -f1)"
+identity_line="$(grep -n -- 'lsof -a -p' "$gui" | cut -d: -f1)"
+journey_line="$(grep -n -- '--phase journey' "$gui" | cut -d: -f1)"
+[ "$launch_line" -lt "$identity_line" ] && [ "$identity_line" -lt "$journey_line" ] \
+  || fail "GUI verifier does not prove PID identity before the AX journey"
 
 echo "installed verifier contract: ok"

@@ -53,6 +53,9 @@ required_inputs=(
   scripts/test-installed-receipt-contract.sh
   scripts/test-macos-package-contract.sh
   scripts/test-workflow-contract.sh
+  scripts/test-installed-verifier-contract.sh
+  scripts/verify-installed.sh
+  scripts/verify-installed-gui.sh
   packaging/macos/Info.plist
   packaging/release/preview-manifest.schema.json
   packaging/release/installed-receipt.schema.json
@@ -68,6 +71,7 @@ done
 ./scripts/test-installed-receipt-contract.sh
 ./scripts/test-macos-package-contract.sh
 ./scripts/test-workflow-contract.sh
+./scripts/test-installed-verifier-contract.sh
 ./scripts/test-receipt-contract.sh
 cargo fmt --check
 cargo clippy --all-targets --all-features --locked -- -D warnings

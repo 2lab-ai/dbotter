@@ -61,6 +61,8 @@ for executable in \
   scripts/assemble-preview-manifest.py \
   scripts/verify-hermetic.sh \
   scripts/verify-live-contracts.sh \
+  scripts/verify-installed.sh \
+  scripts/verify-installed-gui.sh \
   scripts/verify-local.sh; do
   test -x "$executable" || fail "$executable is missing or not executable"
 done
@@ -96,6 +98,9 @@ require_literal scripts/verify-hermetic.sh 'src/export.rs'
 require_literal scripts/verify-hermetic.sh 'tests/export_file_contract.rs'
 require_literal scripts/verify-live-contracts.sh 'p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli'
 require_literal scripts/verify-live-contracts.sh 'redis_live_receipt'
+require_literal scripts/verify-installed-gui.sh 'profile.connection_id'
+require_literal scripts/verify-installed-gui.sh 'result.export.json'
+require_literal scripts/verify-installed-gui.sh 'DBOTTER_AX_DRIVER'
 
 for workflow in \
   .github/workflows/ci.yml \
