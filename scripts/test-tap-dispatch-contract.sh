@@ -154,6 +154,58 @@ validate=(
 )
 "${validate[@]}" >/dev/null
 
+assert_type_confused_manifest_rejected() {
+  local name="${1:?case name required}"
+  local filter="${2:?jq filter required}"
+  local candidate_manifest="$tmp_dir/typed-manifest-$name.json"
+  local candidate_manifest_sha candidate_formula candidate_formula_blob
+  local candidate_formula_sha candidate_proof
+
+  jq "$filter" "$manifest" >"$candidate_manifest"
+  candidate_manifest_sha="$(sha256_file "$candidate_manifest")"
+  candidate_formula="$tmp_dir/typed-formula-$name.rb"
+  sed "s/$manifest_sha256/$candidate_manifest_sha/g" "$formula" >"$candidate_formula"
+  candidate_formula_blob="$(git hash-object "$candidate_formula")"
+  candidate_formula_sha="$(sha256_file "$candidate_formula")"
+  candidate_proof="$tmp_dir/typed-proof-$name.json"
+  jq \
+    --arg manifest_sha256 "$candidate_manifest_sha" \
+    --arg formula_blob "$candidate_formula_blob" \
+    --arg formula_sha256 "$candidate_formula_sha" '
+      .dispatch.manifest_sha256 = $manifest_sha256
+      | .tap.formula_blob = $formula_blob
+      | .tap.formula_sha256 = $formula_sha256
+      | .preflight.candidate.config_contract = {
+          read_versions: [1, 2],
+          write_version: 2,
+          migration_backup_suffix: ".v1.bak"
+        }
+    ' "$proof" >"$candidate_proof"
+
+  if ./scripts/validate-tap-dispatch.py \
+    --proof "$candidate_proof" \
+    --manifest "$candidate_manifest" \
+    --formula "$candidate_formula" \
+    --expected-tag "$tag" \
+    --expected-source-sha "$source_sha" \
+    --expected-version "$version" \
+    --expected-manifest-url "$manifest_url" \
+    --expected-manifest-sha256 "$candidate_manifest_sha" \
+    --expected-formula-commit "$formula_commit" \
+    --expected-formula-blob "$candidate_formula_blob" \
+    --expected-workflow-run-id 9001 \
+    --expected-workflow-run-attempt 2 >/dev/null 2>&1; then
+    fail "tap dispatch accepted a type-confused manifest: $name"
+  fi
+}
+
+assert_type_confused_manifest_rejected \
+  read_versions_bool '.config_contract.read_versions = [true, 2]'
+assert_type_confused_manifest_rejected \
+  read_versions_float '.config_contract.read_versions = [1.0, 2.0]'
+assert_type_confused_manifest_rejected \
+  write_version_float '.config_contract.write_version = 2.0'
+
 missing_preflight="$tmp_dir/missing-preflight.json"
 jq 'del(.preflight)' "$proof" >"$missing_preflight"
 if "${validate[@]/$proof/$missing_preflight}" >/dev/null 2>&1; then
