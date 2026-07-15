@@ -1,6 +1,8 @@
 #![cfg(feature = "desktop")]
 
-use dbotter::model::{ProfileGeneration, ProfileId};
+use std::time::Duration;
+
+use dbotter::model::{CatalogRequest, OperationId, ProfileGeneration, ProfileId, RequestIdentity};
 use dbotter::ui::{NativeUiHarness, UiModel, WorkspaceKey};
 use eframe::egui::{Context, RawInput};
 
@@ -24,7 +26,17 @@ fn profile_workspaces_are_isolated_by_profile_and_generation() {
 
     model.workspace_mut(first.clone()).editor_text = "SELECT 'first'".to_owned();
     model.workspace_mut(replacement.clone()).editor_text = "SELECT 'replacement'".to_owned();
-    model.workspace_mut(first.clone()).catalog_retry_pending = true;
+    model.workspace_mut(first.clone()).catalog_retry = Some(CatalogRequest::Schemas {
+        identity: RequestIdentity::new(
+            first.profile_id.clone(),
+            first.profile_generation,
+            OperationId(1),
+        ),
+        prefix: None,
+        page_token: None,
+        page_size: 100,
+        timeout: Duration::from_secs(5),
+    });
 
     assert_eq!(
         model
@@ -41,7 +53,7 @@ fn profile_workspaces_are_isolated_by_profile_and_generation() {
     assert_eq!(
         model
             .workspace(&first)
-            .map(|workspace| workspace.catalog_retry_pending),
+            .map(|workspace| workspace.has_catalog_retry()),
         Some(true),
         "resource and retry state belongs to the same exact workspace key"
     );

@@ -1,6 +1,8 @@
 //! Pure UI snapshots and event folding. No driver or network client belongs here.
 
 use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
 
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionProfile, CredentialMode, DraftId, DriverAvailability,
@@ -29,11 +31,27 @@ impl WorkspaceKey {
 #[derive(Clone, Debug, Default)]
 pub struct ProfileWorkspace {
     pub editor_text: String,
+    pub caret_character_index: usize,
+    pub selection_character_range: Option<Range<usize>>,
     pub row_limit: String,
     pub timeout_seconds: String,
     pub pending_execute: Option<OperationId>,
-    pub result: Option<ResultSnapshot>,
+    pub result: Option<Arc<ResultSnapshot>>,
     pub error: Option<PublicOperationError>,
+    pub catalog_page: Option<CatalogPage>,
+    pub catalog_retry: Option<CatalogRequest>,
+    pub redis_key_page: Option<RedisKeyPage>,
+    pub redis_scan_retry: Option<RedisScanRequest>,
+    pub redis_scan_error: Option<PublicOperationError>,
+    pub redis_value_preview: Option<RedisValuePreview>,
+    pub redis_inspect_retry: Option<RedisKeyInspectRequest>,
+    pub redis_inspect_error: Option<PublicOperationError>,
+}
+
+impl ProfileWorkspace {
+    pub fn has_catalog_retry(&self) -> bool {
+        self.catalog_retry.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,17 +258,6 @@ pub struct UiModel {
     pub tombstones: HashMap<ProfileId, ProfileGeneration>,
     pub connection_states: HashMap<ProfileId, ConnectionState>,
     pub workspaces: HashMap<WorkspaceKey, ProfileWorkspace>,
-    pub editor_text: String,
-    pub pending_execute: Option<(OperationId, ProfileId, ProfileGeneration)>,
-    pub result: Option<ResultSnapshot>,
-    pub catalog_pages: HashMap<ProfileId, CatalogPage>,
-    pub catalog_retry: HashMap<ProfileId, CatalogRequest>,
-    pub redis_key_pages: HashMap<ProfileId, RedisKeyPage>,
-    pub redis_scan_retry: HashMap<ProfileId, RedisScanRequest>,
-    pub redis_scan_errors: HashMap<ProfileId, PublicOperationError>,
-    pub redis_value_previews: HashMap<ProfileId, RedisValuePreview>,
-    pub redis_inspect_retry: HashMap<ProfileId, RedisKeyInspectRequest>,
-    pub redis_inspect_errors: HashMap<ProfileId, PublicOperationError>,
     pub status: String,
     config_uncertain: bool,
     last_profiles_operation: Option<OperationId>,
@@ -267,17 +274,6 @@ impl Default for UiModel {
             tombstones: HashMap::new(),
             connection_states: HashMap::new(),
             workspaces: HashMap::new(),
-            editor_text: String::new(),
-            pending_execute: None,
-            result: None,
-            catalog_pages: HashMap::new(),
-            catalog_retry: HashMap::new(),
-            redis_key_pages: HashMap::new(),
-            redis_scan_retry: HashMap::new(),
-            redis_scan_errors: HashMap::new(),
-            redis_value_previews: HashMap::new(),
-            redis_inspect_retry: HashMap::new(),
-            redis_inspect_errors: HashMap::new(),
             status: "Loading profiles…".to_owned(),
             config_uncertain: false,
             last_profiles_operation: None,
@@ -305,6 +301,24 @@ impl UiModel {
     pub fn selected_workspace_key(&self) -> Option<WorkspaceKey> {
         let profile = self.selected_profile_snapshot()?;
         Some(WorkspaceKey::new(profile.id.clone(), profile.generation))
+    }
+
+    pub fn selected_workspace(&self) -> Option<&ProfileWorkspace> {
+        let key = self.selected_workspace_key()?;
+        self.workspace(&key)
+    }
+
+    pub fn selected_workspace_mut(&mut self) -> Option<&mut ProfileWorkspace> {
+        let key = self.selected_workspace_key()?;
+        Some(self.workspace_mut(key))
+    }
+
+    fn exact_workspace_mut(
+        &mut self,
+        profile_id: &ProfileId,
+        profile_generation: ProfileGeneration,
+    ) -> &mut ProfileWorkspace {
+        self.workspace_mut(WorkspaceKey::new(profile_id.clone(), profile_generation))
     }
 
     pub fn next_operation(&mut self) -> OperationId {
@@ -446,10 +460,22 @@ impl UiModel {
             UiEvent::DraftConnectionReady { elapsed_ms, .. } => {
                 self.status = format!("Draft connection ready in {elapsed_ms} ms");
             }
-            UiEvent::DraftOperationFailed { summary, .. }
-            | UiEvent::ExecuteUnavailable { summary, .. } => {
-                self.pending_execute = None;
+            UiEvent::DraftOperationFailed { summary, .. } => {
                 self.status = summary.message().to_owned();
+            }
+            UiEvent::ExecuteUnavailable {
+                operation_id,
+                profile_id,
+                profile_generation,
+                summary,
+            } => {
+                if self.event_is_current(&profile_id, profile_generation) {
+                    let workspace = self.exact_workspace_mut(&profile_id, profile_generation);
+                    if workspace.pending_execute == Some(operation_id) {
+                        workspace.pending_execute = None;
+                    }
+                    self.status = summary.message().to_owned();
+                }
             }
             UiEvent::QueryFinished {
                 operation_id,
@@ -458,13 +484,18 @@ impl UiModel {
                 session_generation,
                 result,
             } => {
-                if self.event_is_current(&profile_id, profile_generation)
-                    && self.pending_execute.as_ref()
-                        == Some(&(operation_id, profile_id.clone(), profile_generation))
-                {
-                    self.pending_execute = None;
-                    self.status = format!("Query finished in {} ms", result.provenance.duration_ms);
-                    self.result = Some(result);
+                if self.event_is_current(&profile_id, profile_generation) {
+                    let duration_ms = result.provenance.duration_ms;
+                    {
+                        let workspace = self.exact_workspace_mut(&profile_id, profile_generation);
+                        if workspace.pending_execute != Some(operation_id) {
+                            return;
+                        }
+                        workspace.pending_execute = None;
+                        workspace.error = None;
+                        workspace.result = Some(Arc::new(result));
+                    }
+                    self.status = format!("Query finished in {duration_ms} ms");
                     self.connection_states.insert(
                         profile_id,
                         ConnectionState::Connected {
@@ -486,8 +517,10 @@ impl UiModel {
                         Some(session_generation),
                         Some(session_disposition),
                     );
-                    self.catalog_retry.remove(&profile_id);
-                    self.catalog_pages.insert(profile_id, page);
+                    let workspace =
+                        self.exact_workspace_mut(&profile_id, page.identity.profile_generation);
+                    workspace.catalog_retry = None;
+                    workspace.catalog_page = Some(page);
                     self.status = "Catalog page loaded".to_owned();
                 }
             }
@@ -500,10 +533,12 @@ impl UiModel {
                 let profile_id = request.profile_id().clone();
                 if self.event_is_current(&profile_id, request.profile_generation()) {
                     self.fold_catalog_session(&profile_id, session_generation, session_disposition);
-                    if let Some(page) = self.catalog_pages.get_mut(&profile_id) {
+                    let workspace =
+                        self.exact_workspace_mut(&profile_id, request.profile_generation());
+                    if let Some(page) = workspace.catalog_page.as_mut() {
                         page.stale = true;
                     }
-                    self.catalog_retry.insert(profile_id, request);
+                    workspace.catalog_retry = Some(request);
                     self.status = summary.message().to_owned();
                 }
             }
@@ -514,9 +549,11 @@ impl UiModel {
             } => {
                 let profile_id = page.identity.profile_id.clone();
                 if self.event_is_current(&profile_id, page.identity.profile_generation) {
-                    self.redis_scan_retry.remove(&profile_id);
-                    self.redis_scan_errors.remove(&profile_id);
-                    self.redis_key_pages.insert(profile_id.clone(), page);
+                    let workspace =
+                        self.exact_workspace_mut(&profile_id, page.identity.profile_generation);
+                    workspace.redis_scan_retry = None;
+                    workspace.redis_scan_error = None;
+                    workspace.redis_key_page = Some(page);
                     self.apply_redis_session_truth(
                         profile_id,
                         Some(session_generation),
@@ -535,12 +572,15 @@ impl UiModel {
             } => {
                 let profile_id = request.profile_id().clone();
                 if self.event_is_current(&profile_id, request.profile_generation()) {
-                    if let Some(page) = self.redis_key_pages.get_mut(&profile_id) {
+                    let status = error.summary.message().to_owned();
+                    let workspace =
+                        self.exact_workspace_mut(&profile_id, request.profile_generation());
+                    if let Some(page) = workspace.redis_key_page.as_mut() {
                         page.stale = true;
                     }
-                    self.redis_scan_retry.insert(profile_id.clone(), request);
-                    self.status = error.summary.message().to_owned();
-                    self.redis_scan_errors.insert(profile_id.clone(), error);
+                    workspace.redis_scan_retry = Some(request);
+                    workspace.redis_scan_error = Some(error);
+                    self.status = status;
                     self.apply_redis_session_truth(
                         profile_id,
                         session_generation,
@@ -556,10 +596,11 @@ impl UiModel {
             } => {
                 let profile_id = preview.identity.profile_id.clone();
                 if self.event_is_current(&profile_id, preview.identity.profile_generation) {
-                    self.redis_inspect_retry.remove(&profile_id);
-                    self.redis_inspect_errors.remove(&profile_id);
-                    self.redis_value_previews
-                        .insert(profile_id.clone(), preview);
+                    let workspace =
+                        self.exact_workspace_mut(&profile_id, preview.identity.profile_generation);
+                    workspace.redis_inspect_retry = None;
+                    workspace.redis_inspect_error = None;
+                    workspace.redis_value_preview = Some(preview);
                     self.apply_redis_session_truth(
                         profile_id,
                         Some(session_generation),
@@ -578,12 +619,15 @@ impl UiModel {
             } => {
                 let profile_id = request.profile_id().clone();
                 if self.event_is_current(&profile_id, request.profile_generation()) {
-                    if let Some(preview) = self.redis_value_previews.get_mut(&profile_id) {
+                    let status = error.summary.message().to_owned();
+                    let workspace =
+                        self.exact_workspace_mut(&profile_id, request.profile_generation());
+                    if let Some(preview) = workspace.redis_value_preview.as_mut() {
                         preview.stale = true;
                     }
-                    self.redis_inspect_retry.insert(profile_id.clone(), request);
-                    self.status = error.summary.message().to_owned();
-                    self.redis_inspect_errors.insert(profile_id.clone(), error);
+                    workspace.redis_inspect_retry = Some(request);
+                    workspace.redis_inspect_error = Some(error);
+                    self.status = status;
                     self.apply_redis_session_truth(
                         profile_id,
                         session_generation,
@@ -639,10 +683,9 @@ impl UiModel {
                         }
                     }
                     OperationKind::ExecuteRead | OperationKind::ExecuteMutation => {
-                        if self.pending_execute.as_ref()
-                            == Some(&(operation_id, profile_id.clone(), profile_generation))
-                        {
-                            self.pending_execute = None;
+                        let workspace = self.exact_workspace_mut(&profile_id, profile_generation);
+                        if workspace.pending_execute == Some(operation_id) {
+                            workspace.pending_execute = None;
                             self.status = summary.message().to_owned();
                         }
                     }
@@ -676,7 +719,9 @@ impl UiModel {
                 self.config_uncertain = true;
                 self.pending_retags.clear();
                 self.connection_states.clear();
-                self.pending_execute = None;
+                for workspace in self.workspaces.values_mut() {
+                    workspace.pending_execute = None;
+                }
                 self.status = "Configuration state is uncertain.".to_owned();
             }
             UiEvent::RuntimeShutdown { .. } => {
@@ -684,7 +729,9 @@ impl UiModel {
                     self.connection_states
                         .insert(profile_id.clone(), ConnectionState::Closing);
                 }
-                self.pending_execute = None;
+                for workspace in self.workspaces.values_mut() {
+                    workspace.pending_execute = None;
+                }
                 self.status = "Runtime shut down".to_owned();
             }
         }
@@ -803,24 +850,10 @@ impl UiModel {
         self.active_generations.remove(&profile_id);
         self.profiles.retain(|profile| profile.id != profile_id);
         self.connection_states.remove(&profile_id);
-        self.catalog_pages.remove(&profile_id);
-        self.catalog_retry.remove(&profile_id);
-        self.redis_key_pages.remove(&profile_id);
-        self.redis_scan_retry.remove(&profile_id);
-        self.redis_scan_errors.remove(&profile_id);
-        self.redis_value_previews.remove(&profile_id);
-        self.redis_inspect_retry.remove(&profile_id);
-        self.redis_inspect_errors.remove(&profile_id);
-        if self
-            .pending_execute
-            .as_ref()
-            .is_some_and(|(_, pending_profile, _)| pending_profile == &profile_id)
-        {
-            self.pending_execute = None;
-        }
+        self.workspaces
+            .retain(|key, _| key.profile_id != profile_id);
         if self.selected_profile.as_ref() == Some(&profile_id) {
             self.selected_profile = self.profiles.first().map(|profile| profile.id.clone());
-            self.clear_workspace();
         }
         self.status = if server_state_unknown {
             "Profile deleted; server state is unknown.".to_owned()
@@ -850,13 +883,6 @@ impl UiModel {
                     .is_none_or(|tombstone| profile.generation.0 > tombstone.0)
             })
             .collect::<Vec<_>>();
-        let selected_changed = self.selected_profile.as_ref().is_some_and(|selected| {
-            let previous = self.profiles.iter().find(|profile| profile.id == *selected);
-            let refreshed = profiles.iter().find(|profile| profile.id == *selected);
-            !matches!((previous, refreshed), (Some(previous), Some(refreshed)) if
-                previous.generation == refreshed.generation
-                    && previous.persisted == refreshed.persisted)
-        });
         self.connection_states.retain(|profile_id, _| {
             let previous = self
                 .profiles
@@ -878,6 +904,9 @@ impl UiModel {
             })
             .map(|profile| (profile.id.clone(), profile.generation))
             .collect();
+        self.workspaces.retain(|key, _| {
+            self.active_generations.get(&key.profile_id).copied() == Some(key.profile_generation)
+        });
         if self
             .selected_profile
             .as_ref()
@@ -894,28 +923,20 @@ impl UiModel {
                     .insert(profile.id.clone(), ConnectionState::NeedsCredential);
             }
         }
-        if selected_changed {
-            self.clear_workspace();
-        }
         self.pending_retags.clear();
         self.config_uncertain = false;
         self.status = format!("{} profiles loaded", self.profiles.len());
-    }
-
-    fn clear_workspace(&mut self) {
-        self.editor_text.clear();
-        self.pending_execute = None;
-        self.result = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{
         ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot, UiEvent,
-        UiModel,
+        UiModel, WorkspaceKey,
     };
     use crate::model::{
         CatalogLevel, CatalogPage, CatalogRequest, CatalogRetainedCounts, ConnectionProfile,
@@ -1004,10 +1025,14 @@ mod tests {
         };
         let mut model = UiModel {
             active_generations: [(profile_id.clone(), generation)].into(),
-            catalog_pages: [(profile_id.clone(), catalog_page.clone())].into(),
-            redis_key_pages: [(profile_id.clone(), redis_page.clone())].into(),
             ..UiModel::default()
         };
+        let key = WorkspaceKey::new(profile_id.clone(), generation);
+        {
+            let workspace = model.workspace_mut(key.clone());
+            workspace.catalog_page = Some(catalog_page.clone());
+            workspace.redis_key_page = Some(redis_page.clone());
+        }
 
         model.fold(UiEvent::CatalogPageFailed {
             request: catalog_request.clone(),
@@ -1028,10 +1053,21 @@ mod tests {
             connection_outcome: ConnectionFailureOutcome::Preserve,
         });
 
-        assert!(model.catalog_pages[&profile_id].stale);
-        assert_eq!(model.catalog_retry[&profile_id], catalog_request);
-        assert!(model.redis_key_pages[&profile_id].stale);
-        assert_eq!(model.redis_scan_retry[&profile_id], redis_request);
+        let workspace = model.workspace(&key).expect("profile workspace");
+        assert!(
+            workspace
+                .catalog_page
+                .as_ref()
+                .is_some_and(|page| page.stale)
+        );
+        assert_eq!(workspace.catalog_retry.as_ref(), Some(&catalog_request));
+        assert!(
+            workspace
+                .redis_key_page
+                .as_ref()
+                .is_some_and(|page| page.stale)
+        );
+        assert_eq!(workspace.redis_scan_retry.as_ref(), Some(&redis_request));
 
         model.fold(UiEvent::CatalogPageLoaded {
             page: catalog_page,
@@ -1044,10 +1080,21 @@ mod tests {
             session_disposition: SessionDisposition::Keep,
         });
 
-        assert!(!model.catalog_pages[&profile_id].stale);
-        assert!(!model.catalog_retry.contains_key(&profile_id));
-        assert!(!model.redis_key_pages[&profile_id].stale);
-        assert!(!model.redis_scan_retry.contains_key(&profile_id));
+        let workspace = model.workspace(&key).expect("profile workspace");
+        assert!(
+            workspace
+                .catalog_page
+                .as_ref()
+                .is_some_and(|page| !page.stale)
+        );
+        assert!(workspace.catalog_retry.is_none());
+        assert!(
+            workspace
+                .redis_key_page
+                .as_ref()
+                .is_some_and(|page| !page.stale)
+        );
+        assert!(workspace.redis_scan_retry.is_none());
         assert_eq!(
             model.connection_state(&profile_id),
             &ConnectionState::Connected {
@@ -1106,8 +1153,11 @@ mod tests {
             connection_outcome: ConnectionFailureOutcome::Disconnected,
         });
         assert_eq!(
-            model.redis_scan_errors[&profile_id].code,
-            PublicCode::TlsHostnameMismatch
+            model
+                .workspace(&WorkspaceKey::new(profile_id.clone(), generation))
+                .and_then(|workspace| workspace.redis_scan_error.as_ref())
+                .map(|error| error.code),
+            Some(PublicCode::TlsHostnameMismatch)
         );
         assert_eq!(
             model.connection_state(&profile_id),
@@ -1121,10 +1171,14 @@ mod tests {
         let generation = ProfileGeneration(1);
         let mut model = UiModel {
             active_generations: [(profile_id.clone(), generation)].into(),
-            pending_execute: Some((OperationId(2), profile_id.clone(), generation)),
-            result: Some(result(7)),
             ..UiModel::default()
         };
+        let key = WorkspaceKey::new(profile_id.clone(), generation);
+        {
+            let workspace = model.workspace_mut(key.clone());
+            workspace.pending_execute = Some(OperationId(2));
+            workspace.result = Some(Arc::new(result(7)));
+        }
 
         model.fold(UiEvent::QueryFinished {
             operation_id: OperationId(1),
@@ -1135,13 +1189,15 @@ mod tests {
         });
 
         assert_eq!(
-            model.pending_execute.map(|pending| pending.0),
+            model
+                .workspace(&key)
+                .and_then(|workspace| workspace.pending_execute),
             Some(OperationId(2))
         );
         assert_eq!(
             model
-                .result
-                .as_ref()
+                .workspace(&key)
+                .and_then(|workspace| workspace.result.as_ref())
                 .map(|value| value.provenance.duration_ms),
             Some(7)
         );
@@ -1238,10 +1294,11 @@ mod tests {
                 active_generations: [(profile_id.clone(), generation)].into(),
                 connection_states: [(profile_id.clone(), ConnectionState::Pending(reconnect))]
                     .into(),
-                pending_execute: Some((execute, profile_id.clone(), generation)),
                 status: "Executing…".to_owned(),
                 ..UiModel::default()
             };
+            let key = WorkspaceKey::new(profile_id.clone(), generation);
+            execute_model.workspace_mut(key.clone()).pending_execute = Some(execute);
             execute_model.fold(UiEvent::OperationFailed {
                 operation_id: execute,
                 profile_id: profile_id.clone(),
@@ -1257,7 +1314,11 @@ mod tests {
                 &ConnectionState::Pending(reconnect),
                 "a correlated execute terminal may clear execute state but not another operation's pending connection"
             );
-            assert!(execute_model.pending_execute.is_none());
+            assert!(
+                execute_model
+                    .workspace(&key)
+                    .is_some_and(|workspace| workspace.pending_execute.is_none())
+            );
             assert_eq!(
                 execute_model.status,
                 PublicSummary::OperationCancelled.message()

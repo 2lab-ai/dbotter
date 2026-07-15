@@ -21,7 +21,7 @@ use super::profile_form::{FormAction, ProfileEditor, ProfileEventResult, SaveAtt
 use super::redis_explorer::{RedisExplorer, RedisExplorerIntent};
 
 const EVENT_DRAIN_LIMIT: usize = 128;
-const DEFAULT_ROW_LIMIT: u32 = 1_000;
+pub const DEFAULT_EXECUTE_ROW_LIMIT: u32 = 500;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 pub struct DbotterApp {
@@ -191,19 +191,28 @@ impl DbotterApp {
             self.model.status = "Reload profiles before executing.".to_owned();
             return;
         }
-        if self.model.pending_execute.is_some() {
-            self.model.status = "Execute is already pending".to_owned();
-            return;
-        }
         let Some(profile) = self.model.selected_profile_snapshot().cloned() else {
             self.model.status = "Select a connection profile".to_owned();
             return;
         };
+        let workspace_key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+        if self
+            .model
+            .workspace(&workspace_key)
+            .is_some_and(|workspace| workspace.pending_execute.is_some())
+        {
+            self.model.status = "Execute is already pending".to_owned();
+            return;
+        }
         if !profile.is_ready() {
             self.model.status = "MongoDB is planned; execute is disabled".to_owned();
             return;
         }
-        let text = self.model.editor_text.trim().to_owned();
+        let text = self
+            .model
+            .workspace(&workspace_key)
+            .map_or("", |workspace| workspace.editor_text.trim())
+            .to_owned();
         if text.is_empty() {
             self.model.status = "Enter a statement or command".to_owned();
             return;
@@ -217,11 +226,11 @@ impl DbotterApp {
             profile_generation,
             language: profile.driver.language(),
             text,
-            row_limit: DEFAULT_ROW_LIMIT,
+            row_limit: DEFAULT_EXECUTE_ROW_LIMIT,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         }) {
             Ok(()) => {
-                self.model.pending_execute = Some((operation_id, profile_id, profile_generation));
+                self.model.workspace_mut(workspace_key).pending_execute = Some(operation_id);
                 self.model.status = "Executing…".to_owned();
             }
             Err(error) => self.report_submit_error(error),
@@ -241,7 +250,8 @@ impl DbotterApp {
         intent: MySqlExplorerIntent,
     ) {
         if let MySqlExplorerIntent::InsertTemplate(template) = intent {
-            self.model.editor_text = template;
+            let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+            self.model.workspace_mut(key).editor_text = template;
             self.model.status = "Bounded SELECT template inserted; it was not executed".to_owned();
             return;
         }
@@ -583,6 +593,7 @@ impl DbotterApp {
             return;
         }
         let mut redis_intent = None;
+        let mut execute_requested = false;
         egui::CentralPanel::default().show(root_ui, |ui| {
             let selected_redis = self
                 .model
@@ -606,28 +617,43 @@ impl DbotterApp {
                     ));
                 }
             });
-            ui.add_enabled(
-                !self.model.is_config_uncertain(),
-                egui::TextEdit::multiline(&mut self.model.editor_text)
-                    .code_editor()
-                    .desired_rows(10)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("SELECT 1  or  PING"),
-            );
+            let selected_workspace_key = self.model.selected_workspace_key();
+            if let Some(key) = selected_workspace_key.clone() {
+                let editor_enabled = !self.model.is_config_uncertain();
+                let workspace = self.model.workspace_mut(key);
+                ui.add_enabled(
+                    editor_enabled,
+                    egui::TextEdit::multiline(&mut workspace.editor_text)
+                        .code_editor()
+                        .desired_rows(10)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("SELECT 1  or  PING"),
+                );
+            } else {
+                ui.weak("Select a connection to edit a statement or command.");
+            }
             let execute_enabled = self
                 .model
                 .selected_profile_snapshot()
                 .is_some_and(ProfileSnapshot::is_ready)
-                && self.model.pending_execute.is_none()
+                && selected_workspace_key.as_ref().is_none_or(|key| {
+                    self.model
+                        .workspace(key)
+                        .is_none_or(|workspace| workspace.pending_execute.is_none())
+                })
                 && !self.model.is_config_uncertain();
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(execute_enabled, egui::Button::new("Execute"))
                     .clicked()
                 {
-                    self.submit_execute();
+                    execute_requested = true;
                 }
-                if let Some((operation_id, _, _)) = &self.model.pending_execute {
+                if let Some(operation_id) = selected_workspace_key
+                    .as_ref()
+                    .and_then(|key| self.model.workspace(key))
+                    .and_then(|workspace| workspace.pending_execute)
+                {
                     ui.spinner();
                     ui.label(format!("operation {}", operation_id.0));
                 }
@@ -636,14 +662,21 @@ impl DbotterApp {
             });
             ui.separator();
             ui.heading("Results");
-            if let Some(result) = &self.model.result {
-                render_result(ui, result);
+            if let Some(result) = selected_workspace_key
+                .as_ref()
+                .and_then(|key| self.model.workspace(key))
+                .and_then(|workspace| workspace.result.as_ref())
+            {
+                render_result(ui, result.as_ref());
             } else {
                 ui.weak("No result yet");
             }
         });
         if let Some(intent) = redis_intent {
             self.submit_redis_intent(intent);
+        }
+        if execute_requested {
+            self.submit_execute();
         }
     }
 }
@@ -831,7 +864,7 @@ mod tests {
         TlsMode,
     };
     use crate::ui::adapter::{UiCommand, bounded_ports};
-    use crate::ui::model::ProfileSnapshot;
+    use crate::ui::model::{ProfileSnapshot, WorkspaceKey};
     use crate::ui::redis_explorer::RedisExplorerIntent;
 
     fn profile(driver: DriverKind, availability: DriverAvailability) -> ProfileSnapshot {
@@ -876,7 +909,12 @@ mod tests {
         ));
         app.model.profiles = vec![profile(DriverKind::MySql, DriverAvailability::Ready)];
         app.model.selected_profile = Some(ProfileId("profile".to_owned()));
-        app.model.editor_text = "SELECT 1".to_owned();
+        app.model
+            .workspace_mut(WorkspaceKey::new(
+                ProfileId("profile".to_owned()),
+                ProfileGeneration(1),
+            ))
+            .editor_text = "SELECT 1".to_owned();
 
         app.submit_execute();
         app.submit_execute();
@@ -895,7 +933,12 @@ mod tests {
         assert!(service.try_next_command().is_some());
         app.model.profiles = vec![profile(DriverKind::MongoDb, DriverAvailability::Planned)];
         app.model.selected_profile = Some(ProfileId("profile".to_owned()));
-        app.model.editor_text = "{}".to_owned();
+        app.model
+            .workspace_mut(WorkspaceKey::new(
+                ProfileId("profile".to_owned()),
+                ProfileGeneration(1),
+            ))
+            .editor_text = "{}".to_owned();
 
         app.submit_execute();
 
@@ -909,7 +952,12 @@ mod tests {
         assert!(service.try_next_command().is_some());
         app.model.profiles = vec![profile(DriverKind::MySql, DriverAvailability::Ready)];
         app.model.selected_profile = Some(ProfileId("profile".to_owned()));
-        app.model.editor_text = "SELECT 1".to_owned();
+        app.model
+            .workspace_mut(WorkspaceKey::new(
+                ProfileId("profile".to_owned()),
+                ProfileGeneration(1),
+            ))
+            .editor_text = "SELECT 1".to_owned();
         app.model.fold(crate::ui::UiEvent::ConfigUncertain {
             operation_id: crate::model::OperationId(10),
         });

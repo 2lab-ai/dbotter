@@ -26,7 +26,7 @@ use dbotter::service::{
 use dbotter::ui::{
     CONTROL_CAPACITY, ConnectionFailureOutcome, ConnectionState, EVENT_CAPACITY, MUTATION_CAPACITY,
     PostCloseState, ProfileSnapshot, SubmitError, TaskScope, UiCommand, UiEvent, UiModel, UiPort,
-    WORK_CAPACITY, bounded_ports, controller_ports, spawn_with_service,
+    WORK_CAPACITY, WorkspaceKey, bounded_ports, controller_ports, spawn_with_service,
 };
 
 #[test]
@@ -458,7 +458,8 @@ fn ui_connection_state_table_covers_credentials_cache_disposition_and_shutdown()
         dbotter::ui::ConnectionState::Disconnected
     ));
 
-    model.pending_execute = Some((OperationId(43), profile_id.clone(), generation));
+    let workspace_key = WorkspaceKey::new(profile_id.clone(), generation);
+    model.workspace_mut(workspace_key.clone()).pending_execute = Some(OperationId(43));
     model.fold(UiEvent::QueryFinished {
         operation_id: OperationId(43),
         profile_id: profile_id.clone(),
@@ -474,7 +475,7 @@ fn ui_connection_state_table_covers_credentials_cache_disposition_and_shutdown()
         }
     ));
 
-    model.pending_execute = Some((OperationId(44), profile_id.clone(), generation));
+    model.workspace_mut(workspace_key.clone()).pending_execute = Some(OperationId(44));
     model.fold(UiEvent::OperationFailed {
         operation_id: OperationId(44),
         profile_id: profile_id.clone(),
@@ -514,7 +515,7 @@ fn ui_connection_state_table_covers_credentials_cache_disposition_and_shutdown()
                 elapsed_ms: 1,
             },
         );
-        model.pending_execute = Some((operation_id, profile_id.clone(), generation));
+        model.workspace_mut(workspace_key.clone()).pending_execute = Some(operation_id);
         model.fold(UiEvent::OperationFailed {
             operation_id,
             profile_id: profile_id.clone(),
@@ -648,9 +649,13 @@ fn changed_removed_and_stale_save_fences_clear_only_the_exact_profile_workspace(
         ],
     });
     model.selected_profile = Some(target.clone());
-    model.editor_text = "target-only statement".to_owned();
-    model.pending_execute = Some((OperationId(51), target.clone(), ProfileGeneration(1)));
-    model.result = Some(empty_query_result());
+    let original_key = WorkspaceKey::new(target.clone(), ProfileGeneration(1));
+    {
+        let workspace = model.workspace_mut(original_key.clone());
+        workspace.editor_text = "target-only statement".to_owned();
+        workspace.pending_execute = Some(OperationId(51));
+        workspace.result = Some(Arc::new(empty_query_result()));
+    }
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(52),
         profiles: vec![
@@ -658,12 +663,15 @@ fn changed_removed_and_stale_save_fences_clear_only_the_exact_profile_workspace(
             snapshot(survivor.clone(), ProfileGeneration(2)),
         ],
     });
-    assert!(model.editor_text.is_empty());
-    assert!(model.pending_execute.is_none());
-    assert!(model.result.is_none());
+    assert!(model.workspace(&original_key).is_none());
+    let replacement_key = WorkspaceKey::new(target.clone(), ProfileGeneration(3));
+    assert!(model.workspace(&replacement_key).is_none());
 
-    model.editor_text = "deleted target statement".to_owned();
-    model.result = Some(empty_query_result());
+    {
+        let workspace = model.workspace_mut(replacement_key.clone());
+        workspace.editor_text = "deleted target statement".to_owned();
+        workspace.result = Some(Arc::new(empty_query_result()));
+    }
     model.selected_profile = Some(target.clone());
     model.fold(UiEvent::ProfileDeleted {
         operation_id: OperationId(53),
@@ -672,8 +680,7 @@ fn changed_removed_and_stale_save_fences_clear_only_the_exact_profile_workspace(
         server_state_unknown: false,
     });
     assert_eq!(model.selected_profile, Some(survivor.clone()));
-    assert!(model.editor_text.is_empty());
-    assert!(model.result.is_none());
+    assert!(model.workspace(&replacement_key).is_none());
 
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(54),
@@ -689,8 +696,12 @@ fn changed_removed_and_stale_save_fences_clear_only_the_exact_profile_workspace(
             elapsed_ms: 1,
         },
     );
-    model.editor_text = "new generation workspace".to_owned();
-    model.result = Some(empty_query_result());
+    let current_key = WorkspaceKey::new(target.clone(), ProfileGeneration(5));
+    {
+        let workspace = model.workspace_mut(current_key.clone());
+        workspace.editor_text = "new generation workspace".to_owned();
+        workspace.result = Some(Arc::new(empty_query_result()));
+    }
     model.fold(UiEvent::ProfileSaved {
         operation_id: OperationId(55),
         profile_id: target.clone(),
@@ -700,8 +711,17 @@ fn changed_removed_and_stale_save_fences_clear_only_the_exact_profile_workspace(
         warning: None,
     });
     assert_eq!(model.active_generation(&target), Some(ProfileGeneration(5)));
-    assert_eq!(model.editor_text, "new generation workspace");
-    assert!(model.result.is_some());
+    assert_eq!(
+        model
+            .workspace(&current_key)
+            .map(|workspace| workspace.editor_text.as_str()),
+        Some("new generation workspace")
+    );
+    assert!(
+        model
+            .workspace(&current_key)
+            .is_some_and(|workspace| workspace.result.is_some())
+    );
     assert!(matches!(
         model.connection_state(&target),
         dbotter::ui::ConnectionState::Connected { .. }
@@ -1046,14 +1066,22 @@ async fn p4_catalog_cancel_and_outer_timeout_drop_driver_future_before_exact_ses
             },
         )]
         .into();
-        model.catalog_pages = [(profile.profile_id.clone(), prior_page)].into();
+        let workspace_key =
+            WorkspaceKey::new(profile.profile_id.clone(), profile.profile_generation);
+        model.workspace_mut(workspace_key.clone()).catalog_page = Some(prior_page);
         model.fold(terminal);
         assert_eq!(
             model.connection_state(&profile.profile_id),
             &ConnectionState::Disconnected
         );
-        assert!(model.catalog_pages[&profile.profile_id].stale);
-        assert_eq!(model.catalog_retry[&profile.profile_id], request);
+        let workspace = model.workspace(&workspace_key).expect("profile workspace");
+        assert!(
+            workspace
+                .catalog_page
+                .as_ref()
+                .is_some_and(|page| page.stale)
+        );
+        assert_eq!(workspace.catalog_retry.as_ref(), Some(&request));
         shutdown(&ui, runtime, OperationId(218 + index as u64)).await;
     }
 }

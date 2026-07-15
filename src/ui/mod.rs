@@ -16,6 +16,7 @@ pub use adapter::{
     CONTROL_CAPACITY, EVENT_CAPACITY, MUTATION_CAPACITY, ServicePort, SubmitError, UiCommand,
     UiPort, WORK_CAPACITY, bounded_ports, controller_ports,
 };
+pub use app::DEFAULT_EXECUTE_ROW_LIMIT;
 pub use layout::NativeLayout;
 pub use model::{
     ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot, ProfileWorkspace,
