@@ -1,8 +1,9 @@
 # dbotter — usable MVP architecture
 
-Status: **approved target architecture with the P1, P2, and P3 foundations
-independently reviewed GREEN. T0 remains RED overall; T1, T2, T3, T4, T8, and
-T9 are Implementing; T5–T7 and T10 are Not started.**
+Status: **approved target architecture with P1, P2, and P3 independently
+reviewed GREEN and the P4 MySQL catalog implementation/live gate locally GREEN
+pending review. T0 remains RED overall; T1–T5, T8, and T9 are Implementing;
+T6, T7, and T10 are Not started.**
 
 Normative detail lives in `docs/usable-mvp/{spec,trace,plan}.md`. This document
 is the repository architecture entrypoint and must remain consistent with those
@@ -19,7 +20,7 @@ The UI owns pure/display state only. Live sessions, task registry, config
 writer, secrets, and filesystem export workers stay behind typed service and
 runtime boundaries. No lock crosses `.await`.
 
-### P1/P2/P3 checkpoint boundary
+### P1/P2/P3/P4 checkpoint boundary
 
 P1 implements the config/profile mutation and reconciliation foundation,
 credential storage/resolution types, atomic observed-state and session-cache
@@ -41,9 +42,15 @@ has one prepared-only entry and no prepared-rejection fallback; Redis command
 policy is constructor-bound and rechecked before I/O; decode and retained
 result budgets are explicit; cancellation drops client work before exact
 session eviction; and one typed session disposition reaches cache, event, and
-UI outcome. T4 is therefore Implementing with its P3 hermetic core GREEN. P4,
-P5, and P6 still own live catalog/keyspace capabilities and native RawInput/AX
-work, so no complete T4–T6 or visual journey is claimed.
+UI outcome. T4 is therefore Implementing with its P3 hermetic core GREEN.
+
+P4 implements the MySQL half of the resource seam: three static prepared
+catalog plans, deterministic binary keysets, context-bound page tokens,
+per-profile retention, typed permission mapping, shared CLI dispatch, and a
+profile-generation-scoped Explorer. Its isolated MySQL 8.4 live gate is GREEN,
+so `CATALOG` is ready in the same code commit. P5 still owns Redis keyspace/TLS,
+and P6 still owns native RawInput/AccessKit and installed AX completion; no
+complete T4–T6 installed journey is claimed.
 
 ## Target topology
 
@@ -179,9 +186,10 @@ contracts reject user-text use of `sqlx::raw_sql`,
 Static/bound catalog statements are prepared too.
 
 MySQL `CATALOG` and Redis `KEYSPACE_BROWSE` are independent capability bits.
-Each stays planned until its hermetic and mandatory live contract turns green
-in the same reviewed change. MongoDB remains a Planned descriptor with a
-future document-native seam; it is never coerced into SQL.
+`CATALOG` is ready with P4's hermetic and mandatory live proof in code commit
+`e4599152daf0ca066baf6619048dae89c43cc6e4`; `KEYSPACE_BROWSE` remains planned
+for P5. MongoDB remains a Planned descriptor with a future document-native
+seam; it is never coerced into SQL.
 
 ## Runtime state and shutdown
 
@@ -212,11 +220,25 @@ The checkpoint passed 227 regular tests and 18 doctests, strict locked/offline
 Clippy, formatting, diff, release-contract, receipt, all-target/all-feature
 tests, and the release build.
 
+P4's review input is
+`359fc91428dc933cbfa36fcf88adf75968e9873d17040acf6abe44dc618adcda`.
+It passed 236 regular tests, 18 doctests, the same strict gates, and the
+isolated all-features `dbotter-p4` MySQL live test 1/1. Independent review is
+pending; the implementation, test, and release-binary hashes are recorded in
+`01-spec.md` and `04-patch-plan.md`.
+
 ## UI architecture and accessibility
 
 `UiModel` owns profile-generation workspaces, editor text, pending ids,
 historical/current result snapshots, connection state, and public errors. It
 owns no client or secret value.
+
+The P4 MySQL Explorer adds only generation-keyed display/retention state. It
+submits typed `CatalogRequest` values through the bounded controller, preserves
+stale pages and exact Retry recipes, and inserts quoted `LIMIT 500` templates
+without executing them. Its local OpenAI component tokens are flat white/black
+with sharp corners, visible focus, and textual states; P6 remains responsible
+for the complete native accessibility surface.
 
 The form distinguishes Create from Update and holds a `DraftId`. Test uses
 temporary resources and has no path to config/cache/store/workspace mutation.

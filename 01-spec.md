@@ -1,9 +1,10 @@
 # dbotter — usable MVP product contract
 
-Status: **P1, P2, and P3 foundations independently reviewed GREEN. T0 remains
-RED overall; T1, T2, T3, T4, T8, and T9 are Implementing; T5–T7 and T10 are
-Not started.** This file describes the approved target and the bounded
-P1/P2/P3 implementation checkpoint.
+Status: **P1, P2, and P3 foundations are independently reviewed GREEN. The P4
+MySQL catalog implementation and mandatory live gate are locally GREEN with
+independent review pending. T0 remains RED overall; T1–T5, T8, and T9 are
+Implementing; T6, T7, and T10 are Not started.** This file describes the
+approved target and the bounded P1–P4 implementation checkpoint.
 
 ## Authority and change control
 
@@ -48,7 +49,7 @@ copied.
 | T2 | confirmed atomic delete | Implementing; P1/P2 core GREEN, P6 remains |
 | T3 | controller, reload, connect/disconnect/reconnect/shutdown | Implementing; P2 core GREEN, P6 native/AX remains; not fully GREEN/Verified |
 | T4 | exact target, prepared-only MySQL/Redis execute, cancel | Implementing; P3 hermetic core GREEN, P6 RawInput/AX and mandatory live proof remain |
-| T5 | lazy paginated MySQL catalog | Not started; P3 shared typed seam only, P4 remains |
+| T5 | lazy paginated MySQL catalog | Implementing; P4 hermetic/live/CLI/UI core GREEN locally, independent review and P6 native AX remain |
 | T6 | Redis SCAN/inspect and verified Required TLS | Not started; P3 shared typed seam only, P5 remains |
 | T7 | profile result, exact copy, streaming atomic export | Not started |
 | T8 | static errors, total recovery, native accessibility | Implementing; P1 core GREEN, P6 remains |
@@ -109,9 +110,10 @@ is GREEN or Verified. Status moves only through the ledger rules in
 
 ### Drivers, execution, browsing, and bounds
 
-- Ready capability bits are truthful and separate: MySQL `CATALOG`, Redis
-  `KEYSPACE_BROWSE`. Neither becomes ready before its mandatory live contract
-  passes in the same reviewed change. MongoDB remains Planned.
+- Ready capability bits are truthful and separate. MySQL `CATALOG` is ready in
+  the P4 implementation commit that includes its GREEN hermetic and mandatory
+  live contracts. Redis `KEYSPACE_BROWSE` remains planned until P5 supplies the
+  equivalent proof. MongoDB remains Planned.
 - MySQL user text enters only `MySqlPreparedExecution` and server
   `COM_STMT_PREPARE` → `COM_STMT_EXECUTE`. SQLx 0.9 may negotiate
   `CLIENT_MULTI_STATEMENTS`; that flag is not the safety proof. User text never
@@ -206,9 +208,10 @@ command policy enforced at construction and the driver boundary, typed catalog
 and keyspace models with separate planned capability bits, bounded retained
 snapshots and pre-snapshot decode budgets, exact provenance, stale-page retry
 state, and cancellation cleanup before exact-session close. T4 remains
-Implementing because P6 RawInput/AX and mandatory live proof remain. T5/T6
-remain Not started until P4/P5 implement and live-prove their capability bits.
-No P6 native/AX or visual-style completion is claimed.
+Implementing because P6 RawInput/AX and mandatory execute proof remain. T5 is
+now Implementing with P4 locally GREEN; T6 remains Not started until P5
+implements and live-proves its capability bit. No P6 native/AX completion is
+claimed.
 
 The final checkpoint passed formatting, diff, release-contract, receipt,
 strict locked/offline Clippy, all-target/all-feature tests, doctests, and the
@@ -223,6 +226,37 @@ The recorded production, test, and release-binary SHA-256 values are:
 59a348c8a5e7f4bc63a15631cdac7be14444aebc57c84fb34ebbcb795692fec7  production snapshot
 1b7a9ca40dea4994126f101dfcab1fc33fa6019b773627699c77e24167ac5b95  tests snapshot
 9e43c9732be5a642873063f91a75364f9ad7f310735b17accaa3c24be0f95556  target/release/dbotter
+```
+
+## P4 implementation checkpoint
+
+P4 code commit `e4599152daf0ca066baf6619048dae89c43cc6e4` implements
+three level-specific static/bound server-prepared `information_schema` queries,
+binary keyset pagination with profile/generation/parent/prefix-bound opaque
+tokens, all retained count and 4 MiB caps, prefix/Clear recovery, identifier
+quoting, and the bounded non-executing SELECT template. The shared CLI and a
+real profile-generation-scoped egui Explorer use the same service path.
+
+The Explorer follows the requested local OpenAI UI reference: white/black
+tokens, inverted black primary action, sharp corners, flat hairlines, no
+decorative shadow/gradient, visible focus, loading spinner, and textual
+stale/permission/cap states. This is P4 component evidence, not a claim that P6
+native RawInput/AccessKit and installed AX work is complete.
+
+The checkpoint passed 236 regular all-target/all-feature tests and 18 doctests,
+strict locked/offline Clippy, formatting, diff, release-contract, receipt
+secret-negative checks, and the release build. The isolated `dbotter-p4`
+MySQL 8.4 live gate passed 1/1 and proves multi-page schema/relation/column
+ordering, table/view identity, count and real metadata-byte caps with recovery,
+restricted visibility, unauthorized-default Check/Execute Permission, stale
+retry state, and headless CLI JSON. Independent P4 review remains pending, so
+T5 stays Implementing rather than Verified.
+
+```text
+359fc91428dc933cbfa36fcf88adf75968e9873d17040acf6abe44dc618adcda  P4 source+test review input
+504a094cab732c58869fab629871e94800dc96efc0b1da88282f6b498afe7deb  production snapshot
+34cdd805be0f09a722421fb8464b4dfac9f124e4415fada0cb6a17333020e063  tests snapshot
+21f5c572daea43ee1d16d84defda704ab550e91afd45424fc2601a4bdd9bffe3  target/release/dbotter
 ```
 
 Frozen approval integrity remains checked with:

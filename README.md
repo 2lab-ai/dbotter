@@ -5,7 +5,8 @@ Redis preview. MongoDB remains honestly Planned.
 
 ## Current status
 
-The approved contract and P1/P2/P3 foundations are complete at this checkpoint:
+The approved contract and P1/P2/P3 foundations plus the local P4 checkpoint are
+complete at this branch point:
 
 - P0 repository documentation baseline: complete;
 - P1 config/profile/credential/public-error foundation: independently reviewed
@@ -14,6 +15,8 @@ The approved contract and P1/P2/P3 foundations are complete at this checkpoint:
   GREEN;
 - P3 typed prepared execution/resource/result/CLI seams: independently reviewed
   GREEN;
+- P4 lazy paginated MySQL catalog: hermetic and mandatory live gates GREEN
+  locally; independent review pending;
 - T0 overall: RED because P6 first-run RawInput/AccessKit proof is missing; the
   P1 config portion is GREEN;
 - T1 and T8: Implementing with P1 core GREEN and P6 remaining;
@@ -22,15 +25,18 @@ The approved contract and P1/P2/P3 foundations are complete at this checkpoint:
   not fully GREEN or Verified;
 - T4: Implementing with the P3 hermetic core GREEN and P6 RawInput/AX plus
   mandatory live proof remaining;
-- T5 and T6: Not started; P3 supplies only their shared typed seams while P4
-  and P5 retain the capability and live-proof owners;
+- T5: Implementing with P4's catalog/CLI/Explorer/live core GREEN locally and
+  P6 native AX plus independent review remaining;
+- T6: Not started; P5 retains Redis keyspace/TLS capability and live-proof
+  ownership;
 - T9: Implementing with P1/P2 core GREEN and P6 remaining;
-- T7 and T10, and slices P4–P9: Not started.
+- T7 and T10, and slices P5–P9: Not started.
 
 The P3 checkpoint is evidence for its hermetic typed execution/resource
-foundation only. MySQL `CATALOG` and Redis `KEYSPACE_BROWSE` remain planned and
-off until P4/P5 supply mandatory live proof in their reviewed changes. P6
-native accessibility and OpenAI-style visual work remain future work.
+foundation only. P4 now makes MySQL `CATALOG` ready in the same code commit as
+its mandatory live proof; Redis `KEYSPACE_BROWSE` remains planned for P5. The
+P4 Explorer applies the local OpenAI component reference, while P6 native
+RawInput/AccessKit and installed AX work remain future work.
 Historical demo code and release machinery remain **not** proof of the
 remaining usable MVP or of an installed/verified preview.
 
@@ -117,6 +123,28 @@ Expected frozen SHA-256 values:
 ad649d256286f2e8dd8fa630bba8b64bb9f3ac5e6c5930f7ef432d85d0e8bd97  docs/usable-mvp/plan.md
 ```
 
+## P4 MySQL catalog checkpoint
+
+Implementation commit `e4599152daf0ca066baf6619048dae89c43cc6e4`
+adds three static server-prepared catalog plans, profile-bound opaque keyset
+tokens, retained count/4-MiB recovery, exact quoting and bounded templates,
+shared CLI output, and the real generation-scoped MySQL Explorer.
+
+The strict formatting, Clippy, all-target/all-feature, doctest, release build,
+release-contract, receipt secret-negative, diff, and frozen-hash gates passed.
+The hermetic run is 236/236, doctests are 18/18, and the isolated MySQL 8.4
+`dbotter-p4` mandatory live test is 1/1. That live test covers multi-page
+binary order, table/view and wide columns, count and actual metadata-byte caps,
+restricted visibility, separate unauthorized Permission, stale Retry, and CLI
+JSON. Independent review is pending.
+
+```text
+359fc91428dc933cbfa36fcf88adf75968e9873d17040acf6abe44dc618adcda  P4 source+test review input
+504a094cab732c58869fab629871e94800dc96efc0b1da88282f6b498afe7deb  production snapshot
+34cdd805be0f09a722421fb8464b4dfac9f124e4415fada0cb6a17333020e063  tests snapshot
+21f5c572daea43ee1d16d84defda704ab550e91afd45424fc2601a4bdd9bffe3  target/release/dbotter
+```
+
 ## Implementation gates
 
 Later slices must start from failing trace-derived contracts. Their full fixed
@@ -130,7 +158,16 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 ```
 
-The mandatory live interface, once P4/P5/P8 implement it, is:
+P4's isolated live command is:
+
+```sh
+docker compose -f docker-compose.yml \
+  -f tests/fixtures/mysql-catalog/compose.yml -p dbotter-p4 up -d --wait mysql
+DBOTTER_MYSQL_PASSWORD=dbotter-local-only \
+  cargo test --locked --offline --all-features --test live_mysql -- --ignored
+```
+
+The remaining integrated live interface for P5/P8 is:
 
 ```sh
 docker compose -p dbotter-e2e up -d --wait mysql redis-auth redis-tls-auth

@@ -1,8 +1,9 @@
 # dbotter — usable MVP implementation and conformance plan
 
 Status: **P0 documentation baseline complete. P1, P2, and P3 foundations are
-independently reviewed GREEN. T0 remains RED overall; T1/T2/T3/T4/T8/T9 are
-Implementing; P4–P9 and T5–T7/T10 are Not started.**
+independently reviewed GREEN. P4 implementation and mandatory live evidence
+are locally GREEN pending independent review. T0 remains RED overall;
+T1–T5/T8/T9 are Implementing; P5–P9 and T6/T7/T10 are Not started.**
 
 This file routes implementation work. The full ordered plan is frozen at
 `docs/usable-mvp/plan.md`; this repository-facing ledger must not weaken it.
@@ -51,7 +52,7 @@ substitute for a slice's RED/GREEN/live/installed evidence.
 | P1 | config/profile/credential/public-error foundation | T0, T1, T2, T8, T9 | GREEN (independently reviewed foundation) |
 | P2 | generations/cache/controller/reload/shutdown | T2, T3, T9 | GREEN (independently reviewed foundation) |
 | P3 | typed prepared execution/resource/result/CLI seams | T4, shared T5/T6 | GREEN (independently reviewed foundation) |
-| P4 | lazy paginated MySQL catalog | T5 | Not started |
+| P4 | lazy paginated MySQL catalog | T5 | GREEN locally (hermetic + mandatory live; independent review pending) |
 | P5 | Redis SCAN/inspect and verified Required TLS | T6 | Not started |
 | P6 | profile-scoped native UI/recovery/accessibility | T0–T6, T8, T9 | Not started |
 | P7 | exact copy and streaming atomic export | T7 | Not started |
@@ -162,7 +163,8 @@ The independently reviewed P2 checkpoint implemented and proved:
 P2 is GREEN only for that runtime foundation. T2, T3, and T9 remain
 Implementing because P6 native/RawInput/AccessKit and installed AX evidence
 remain. No P6 visual-style implementation is claimed. P3 is now independently
-reviewed GREEN; P4–P9 remain Not started.
+reviewed GREEN; P4 has since reached its local GREEN/live checkpoint, while
+P5–P9 remain Not started.
 
 Checkpoint gates passed:
 
@@ -207,12 +209,12 @@ The independently reviewed P3 checkpoint implemented and proved:
 - exact cancel drop-before-close, one typed session disposition through cache,
   event, and UI outcome, stale prior-page retention, and stable headless CLI
   parser/JSON schemas;
-- independent planned `CATALOG` and `KEYSPACE_BROWSE` bits that remain off for
-  P4/P5 mandatory live proof.
+- independent planned `CATALOG` and `KEYSPACE_BROWSE` bits at the P3 boundary;
+  P4 has since made only `CATALOG` ready with mandatory live proof.
 
 T4 is Implementing because its P3 hermetic core is GREEN while P6 RawInput/AX
-and mandatory live proof remain. T5/T6 remain Not started; P3 provides only
-their shared seams.
+and mandatory execute proof remain. T5 is now Implementing with P4 locally
+GREEN; T6 remains Not started and P3 provides only its shared seam.
 
 Checkpoint gates passed:
 
@@ -241,11 +243,45 @@ two independent reviewers each returned `NO P3 BLOCKER`.
 9e43c9732be5a642873063f91a75364f9ad7f310735b17accaa3c24be0f95556  target/release/dbotter
 ```
 
-## P4/P5 — live-gated resource slices
+## P4 — MySQL catalog local GREEN checkpoint
 
-- P4 implements T5's level-specific prepared information-schema queries,
-  keyset pagination, cap recovery, permission behavior, CLI, UI, and mandatory
-  live fixture. `CATALOG` becomes ready only with that proof.
+Code commit `e4599152daf0ca066baf6619048dae89c43cc6e4` implements and
+proves T5's level-specific prepared information-schema queries, binary keyset
+pagination, context-bound tokens, count/4-MiB recovery, restricted and denied
+permission behavior, shared CLI, and the real OpenAI-reference Explorer.
+`CATALOG` becomes ready in that same commit.
+
+Checkpoint gates passed:
+
+```sh
+cargo fmt --all -- --check
+git diff --check
+./scripts/check-release-contract.sh
+sh scripts/test-receipt-contract.sh
+cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+cargo test --locked --offline --all-targets --all-features
+cargo test --locked --offline --all-features --doc
+cargo build --locked --offline --release --all-features
+DBOTTER_MYSQL_PASSWORD=dbotter-local-only \
+  cargo test --locked --offline --all-features --test live_mysql -- --ignored
+```
+
+Evidence: 236 regular tests, 18 doctests, and the isolated `dbotter-p4`
+mandatory MySQL live test 1/1 passed. The live fixture covers multi-page binary
+order, table/view, wide columns, both count and real metadata-byte caps with
+clear/prefix recovery, restricted omission, unauthorized-default
+Check/Execute Permission, stale Retry, and CLI JSON. Independent P4 review is
+still required before calling the slice independently reviewed or T5 Verified.
+
+```text
+359fc91428dc933cbfa36fcf88adf75968e9873d17040acf6abe44dc618adcda  P4 source+test review input
+504a094cab732c58869fab629871e94800dc96efc0b1da88282f6b498afe7deb  production snapshot
+34cdd805be0f09a722421fb8464b4dfac9f124e4415fada0cb6a17333020e063  tests snapshot
+21f5c572daea43ee1d16d84defda704ab550e91afd45424fc2601a4bdd9bffe3  target/release/dbotter
+```
+
+## P5 — remaining live-gated Redis resource slice
+
 - P5 implements T6's SCAN/inspect/raw identity/TTL/bounds/classifier and
   verified Required TLS/auth matrix. `KEYSPACE_BROWSE` becomes ready only with
   that proof. CA failure, Host failure, and plaintext-fallback counts are
@@ -263,8 +299,8 @@ P4–P7 UI authoring follows the local `ui-ux` OpenAI design reference translate
 to egui: true white/black neutrals, black inverted primary actions, sharp
 corners, no gradients or decorative shadows, generous whitespace, precise
 alignment, visible keyboard focus, and field-local error/loading states. Color
-never carries meaning alone. This is a forward implementation constraint, not
-a P3 visual-completion claim.
+never carries meaning alone. P4 applies these rules to its Explorer component;
+this is not a P6 native/AX visual-completion claim.
 
 P7 implements exact `clipboard_scalar`, `tsv_field`, CSV/TSV/canonical JSON,
 immutable provenance, streaming export, 0600/no-clobber/confirmed-replace,
@@ -284,7 +320,7 @@ higher preview after exact config-contract preflight; tags/assets are immutable.
 ## Fixed verification interfaces
 
 The following commands are the full interfaces for later slice claims. P1,
-P2, and P3 passed checkpoint subsets are recorded above. A missing command or
+P2, P3, and P4 passed checkpoint subsets are recorded above. A missing command or
 failure is evidence that its owning slice is not Verified, not permission to
 weaken the contract.
 

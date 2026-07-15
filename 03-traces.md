@@ -1,8 +1,10 @@
 # dbotter — authoritative vertical trace index
 
-Status: **P1, P2, and P3 foundations independently reviewed GREEN. T0 remains
-RED overall; T1, T2, T3, T4, T8, and T9 are Implementing; T5–T7 and T10 are
-Not started.** Update this document before changing cross-layer behavior.
+Status: **P1, P2, and P3 foundations are independently reviewed GREEN. P4's
+MySQL catalog implementation and mandatory live gate are locally GREEN pending
+review. T0 remains RED overall; T1–T5, T8, and T9 are Implementing; T6, T7,
+and T10 are Not started.** Update this document before changing cross-layer
+behavior.
 
 The frozen normative trace is `docs/usable-mvp/trace.md` at SHA-256
 `91bfbe89874e88e2c97c7252073cbf7348778192f2a6a349a68b903e1baceaa4`.
@@ -33,7 +35,7 @@ Allowed implementation states are `Not started`, `RED`, `Implementing`,
 | T2 | confirmed atomic profile delete | P1/P2/P6 | Implementing (P1/P2 core GREEN; P6 remains) | failpoint/order/tombstone/AX |
 | T3 | controller, reload, connect/disconnect/reconnect/shutdown | P2/P6 | Implementing (P2 core GREEN; P6 native/AX remains; not fully GREEN/Verified) | state/cache/race/shutdown/AX |
 | T4 | exact target, prepared-only execute, cancel | P3/P6 | Implementing (P3 hermetic core GREEN; P6 RawInput/AX and mandatory live proof remain) | scanner/source/live/RawInput |
-| T5 | lazy paginated MySQL catalog | P4/P6 | Not started (P3 shared typed seam only) | hermetic + mandatory live + CLI |
+| T5 | lazy paginated MySQL catalog | P4/P6 | Implementing (P4 hermetic/live/CLI/UI core GREEN locally; review and P6 native AX remain) | hermetic + mandatory live + CLI |
 | T6 | Redis SCAN/inspect and verified TLS | P5/P6 | Not started (P3 shared typed seam only) | hermetic + auth/TLS live + CLI |
 | T7 | result/copy/streaming atomic export | P7 | Not started | byte goldens/filesystem failpoints |
 | T8 | static errors, total recovery, accessibility | P1/P6 | Implementing (P1 core GREEN; P6 remains) | Cartesian table/RawInput/AccessKit |
@@ -186,8 +188,8 @@ P3 GREEN evidence:
 - prepared-only MySQL and constructor-bound/rechecked Redis execution seams;
 - pre-network bounds, bounded decode/retained snapshots, exact provenance, and
   typed session-disposition/cancel lifecycle contracts;
-- stable headless execute/browse/inspect parser and JSON schemas while catalog
-  and keyspace capability bits remain planned.
+- stable headless execute/browse/inspect parser and JSON schemas; P4 has since
+  made only MySQL `CATALOG` ready, while Redis keyspace remains planned.
 
 Remaining P6/live owner/evidence:
 
@@ -198,10 +200,10 @@ Remaining P6/live owner/evidence:
 
 ## T5 — lazy paginated MySQL catalog
 
-Status: **Not started** — P3 supplies only the independently reviewed typed
-catalog request/page/service/CLI seam and keeps `CATALOG` planned. P4/P6 still
-own implementation, live proof, and UI. Contract source: frozen trace T5;
-slices P4/P6.
+Status: **Implementing** — P4 code and its hermetic/mandatory-live/CLI/UI core
+are locally GREEN; independent P4 review and P6 native RawInput/AccessKit plus
+installed AX remain. `CATALOG` is ready in the same P4 code commit that carries
+the live proof. Contract source: frozen trace T5; slices P4/P6.
 
 Typed `CatalogRequest::{Schemas, Relations, Columns}` flows through
 `CatalogBrowser`. Each static/bound prepared information-schema query requests
@@ -211,9 +213,14 @@ when the extra row exists. Per-level/count/4-MiB caps expose reachable Load
 more, Clear catalog, and prefix narrowing. Failed refresh retains stale prior
 state. Restricted-user omission is not fabricated Permission.
 
-RED owner/evidence: injected typed seam, token integrity, cap reachability,
-identifier quoting, permission cases, multi-page mandatory live fixture,
-headless `browse mysql` JSON, then GUI/AX expansion.
+P4 GREEN evidence includes the three injected/static prepared plans,
+profile/generation/parent/prefix-bound token checks, cap reachability, quoting,
+successful-empty and Permission/stale contracts, real Explorer state, and the
+headless JSON path. The isolated MySQL 8.4 fixture proves multi-page binary
+ordering, table/view and wide columns, 2,000-relation and real 4 MiB metadata
+caps with recovery, restricted omission, separate unauthorized Check/Execute
+Permission, stale Retry, and CLI JSON. Remaining owner/evidence is independent
+P4 review plus P6 native/installed accessibility expansion.
 
 ## T6 — Redis SCAN/inspect and verified Required TLS
 
@@ -425,7 +432,16 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 ```
 
-P4–P8 mandatory live gate:
+P4 isolated mandatory live gate (passed):
+
+```sh
+docker compose -f docker-compose.yml \
+  -f tests/fixtures/mysql-catalog/compose.yml -p dbotter-p4 up -d --wait mysql
+DBOTTER_MYSQL_PASSWORD=dbotter-local-only \
+  cargo test --locked --offline --all-features --test live_mysql -- --ignored
+```
+
+Remaining P5–P8 integrated mandatory live gate:
 
 ```sh
 docker compose -p dbotter-e2e up -d --wait mysql redis-auth redis-tls-auth
@@ -445,10 +461,12 @@ trace row before that row may become Verified.
 ## Conformance record
 
 P0 changed documentation only. The independently reviewed P1, P2, and P3
-foundations are GREEN, but no complete native journey is claimed GREEN: T0
+foundations are GREEN, and P4's implementation/live checkpoint is locally
+GREEN pending review, but no complete native journey is claimed GREEN: T0
 remains RED; T1/T8 remain Implementing for P6; T2/T3/T9 remain Implementing for
-P6 native/AX evidence; and T4 remains Implementing for P6 RawInput/AX plus
-mandatory live proof. T5–T7 and T10, and slices P4–P9, remain Not started.
+P6 native/AX evidence; T4 remains Implementing for P6 RawInput/AX plus execute
+live proof; and T5 remains Implementing for P4 review plus P6 native AX. T6,
+T7, and T10, and slices P5–P9, remain Not started.
 Any production deviation is recorded here before code with an ADDED/MODIFIED/
 REMOVED/RENAMED classification, affected trace ids, migration impact, and
 contract evidence.
