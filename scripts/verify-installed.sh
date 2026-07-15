@@ -55,11 +55,16 @@ done
   || fail "--config must be a readable regular file, not a symlink"
 [[ "$(uname -s)" == "Darwin" ]] || fail "installed verification requires macOS"
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-for dependency in brew jq python3 plutil codesign stat; do
+for dependency in brew git jq python3 plutil codesign stat; do
   command -v "$dependency" >/dev/null 2>&1 || fail "$dependency is required"
 done
 
 "$ROOT/scripts/validate-preview-manifest.py" "$manifest" >/dev/null
+source_sha="$(jq -r '.source_sha' "$manifest")"
+[[ "$(git rev-parse HEAD)" == "$source_sha" ]] \
+  || fail "installed verifier checkout does not equal the manifest source SHA"
+git diff --quiet && git diff --cached --quiet \
+  || fail "installed verifier has tracked source changes"
 manifest_sha256="$(receipt_sha256_file "$manifest")"
 prefix="$(brew --prefix dbotter-preview)"
 [[ "$prefix" == /* && "$prefix" != */ ]] || fail "Homebrew formula prefix is not canonical"
@@ -81,6 +86,7 @@ print(os.path.realpath(sys.argv[1]))
 PY
 }
 executable_realpath="$(realpath_of "$executable")"
+app_realpath="$(realpath_of "$app_path")"
 shim_realpath="$(realpath_of "$shim")"
 [[ "$shim" != "$executable_realpath" ]] || fail "CLI command path must remain a Homebrew bin identity"
 [[ "$shim_realpath" == "$executable_realpath" ]] \
@@ -163,8 +169,10 @@ bytes="$(stat -L -f '%z' "$executable")"
 jq -n \
   --arg started_at "$started_at" \
   --arg manifest_sha256 "$manifest_sha256" \
+  --arg source_sha "$source_sha" \
   --arg formula_version "$formula_version" \
   --arg app_path "$app_path" \
+  --arg app_realpath "$app_realpath" \
   --arg executable_realpath "$executable_realpath" \
   --arg shim_path "$shim" \
   --arg shim_realpath "$shim_realpath" \
@@ -177,10 +185,12 @@ jq -n \
   {
     schema: "dbotter.installed-cli-evidence.v1",
     started_at: $started_at,
+    source_sha: $source_sha,
     manifest_sha256: $manifest_sha256,
     formula: {name: "dbotter-preview", version: $formula_version},
     app: {
       path: $app_path,
+      resolved_path: $app_realpath,
       bundle_id: "ai.2lab.dbotter.preview",
       executable: {
         realpath: $executable_realpath,

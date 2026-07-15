@@ -65,10 +65,18 @@ expect_reject() {
 expect_reject source-overall source '.source.assertions.overall = false'
 expect_reject package-source package '.package.source_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
 expect_reject live-tls live '.live.assertions.redis_auth_tls = false'
+expect_reject live-source live '.live.source_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
 expect_reject cli-leak cli '.cli.leak = "dbotter-redis-local-only"'
-expect_reject gui-driver gui '.gui.driver.source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+expect_reject cli-source cli '.cli.source_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+expect_reject cli-shim cli '.cli.shim.path = "/tmp/bin/dbotter"'
+expect_reject cli-resolved-app cli '.cli.app.resolved_path = .cli.app.path'
+expect_reject gui-driver gui '.gui.driver.source_sha256 = "invalid"'
+expect_reject gui-source gui '.gui.source_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+expect_reject gui-required-ax gui '.gui.ax_identifiers -= ["profile.connection_id"]'
 expect_reject p7-digest p7 '.p7.external_export_verifier[0].actual_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+expect_reject p7-user-leak p7 '.p7.assertions.user_content_leak = true'
 expect_reject formula-version formula '.formula.version = "2026.07.14.1149"'
+expect_reject formula-cellar-prefix formula '.formula.prefix = "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2"'
 
 if "$assembler" --manifest "$manifest" >/dev/null 2>&1; then
   fail "assembler accepted missing evidence inputs"

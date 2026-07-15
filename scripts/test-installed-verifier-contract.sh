@@ -27,6 +27,10 @@ for literal in \
 done
 grep -Fq -- 'expected_shim="$(brew --prefix)/bin/dbotter"' "$cli" \
   || fail "CLI verifier does not require the exact Homebrew shim path"
+grep -Fq -- 'resolved_path: $app_realpath' "$cli" \
+  || fail "CLI verifier does not record the resolved Cellar app path"
+grep -Fq -- 'installed verifier checkout does not equal the manifest source SHA' "$cli" \
+  || fail "CLI verifier is not source-bound"
 grep -Fq -- 'receipt_candidate_has_static_leak "$temporary"' "$cli" \
   || fail "CLI verifier does not leak-scan generated evidence"
 
@@ -83,6 +87,8 @@ for provenance in \
   grep -Fq -- "$provenance" "$gui" \
     || fail "GUI verifier omits reviewed driver provenance/evidence safety: $provenance"
 done
+grep -Fq -- 'installed GUI verifier checkout does not equal the manifest source SHA' "$gui" \
+  || fail "GUI verifier is not source-bound"
 
 launch_line="$(grep -n -- '--phase launch' "$gui" | cut -d: -f1)"
 identity_line="$(grep -n -- 'lsof -a -p' "$gui" | cut -d: -f1)"

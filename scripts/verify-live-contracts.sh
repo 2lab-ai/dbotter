@@ -10,12 +10,19 @@ fail() {
 }
 
 config=""
+expected_sha=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config)
       [[ $# -ge 2 ]] || fail "--config requires a path"
       [[ -z "$config" ]] || fail "--config may be provided only once"
       config="$2"
+      shift 2
+      ;;
+    --expected-sha)
+      [[ $# -ge 2 ]] || fail "--expected-sha requires a value"
+      [[ -z "$expected_sha" ]] || fail "--expected-sha may be provided only once"
+      expected_sha="$2"
       shift 2
       ;;
     *)
@@ -27,10 +34,17 @@ done
 [[ -r "$config" && -f "$config" && ! -L "$config" ]] \
   || fail "--config must be a readable regular file, not a symlink"
 config="$(cd "$(dirname "$config")" && pwd -P)/$(basename "$config")"
+started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-for dependency in docker cargo jq openssl; do
+for dependency in docker cargo git jq openssl; do
   command -v "$dependency" >/dev/null 2>&1 || fail "$dependency is required"
 done
+head_sha="$(git rev-parse HEAD)"
+[[ -n "$expected_sha" ]] || expected_sha="$head_sha"
+[[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || fail "--expected-sha must be one full Git SHA"
+[[ "$head_sha" == "$expected_sha" ]] || fail "live checkout does not equal the expected source SHA"
+[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] \
+  || fail "live checkout is not clean before generated fixtures"
 docker info >/dev/null 2>&1 || fail "Docker is unavailable"
 [[ "${DBOTTER_MYSQL_PASSWORD:-}" == "dbotter-local-only" ]] \
   || fail "DBOTTER_MYSQL_PASSWORD does not match the mandatory fixture"
@@ -80,12 +94,14 @@ cargo test --locked --all-features --test live_redis "$redis_test" -- \
 
 mkdir -p artifacts
 jq -n \
-  --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg source_sha "$head_sha" \
+  --arg started_at "$started_at" \
   --arg project "$project" \
   --arg mysql_test "$mysql_test" \
   --arg redis_test "$redis_test" '
   {
     schema: "dbotter.live-contract-receipt.v1",
+    source_sha: $source_sha,
     started_at: $started_at,
     project: $project,
     tests: {

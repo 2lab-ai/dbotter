@@ -77,6 +77,7 @@ def safe_ids($pattern):
   and .formula.version == .release.version
   and (.formula.prefix | absolute_path)
   and (.formula.prefix | endswith("/") | not)
+  and (.formula.prefix | endswith("/opt/dbotter-preview"))
   and (.identity | binary_identity)
   and .identity.package_version == $release_manifest.package_version
   and .identity.build_id == ($release_manifest.tag | sub("^preview-"; ""))
@@ -88,7 +89,10 @@ def safe_ids($pattern):
     "requested_app_path", "resolved_app_path", "bundle_id", "arch", "executable", "cli_shim"
   ]))
   and .install.requested_app_path == (.formula.prefix + "/Dbotter Preview.app")
-  and .install.resolved_app_path == .install.requested_app_path
+  and .install.resolved_app_path == (
+    (.formula.prefix | sub("/opt/dbotter-preview$"; ""))
+    + "/Cellar/dbotter-preview/" + .release.version + "/Dbotter Preview.app"
+  )
   and .install.bundle_id == "ai.2lab.dbotter.preview"
   and .install.bundle_id == $artifact.bundle_id
   and .install.arch == .identity.arch
@@ -105,7 +109,7 @@ def safe_ids($pattern):
   and .install.executable.codesign_valid == true
   and (.install.cli_shim | exact_keys(["path", "realpath", "device", "inode", "sha256"]))
   and (.install.cli_shim.path | absolute_path)
-  and (.install.cli_shim.path | endswith("/bin/dbotter"))
+  and .install.cli_shim.path == ((.formula.prefix | sub("/opt/dbotter-preview$"; "")) + "/bin/dbotter")
   and .install.cli_shim.path != .install.executable.realpath
   and .install.cli_shim.realpath == .install.executable.realpath
   and .install.cli_shim.device == .install.executable.device
@@ -118,7 +122,7 @@ def safe_ids($pattern):
   and (.checks | all_true)
   and (.ax | exact_keys([
     "app_path", "pid", "stale_process_disposition", "pid_executable",
-    "author_ids", "action_ids", "public_codes"
+    "driver", "author_ids", "action_ids", "public_codes"
   ]))
   and .ax.app_path == .install.requested_app_path
   and (.ax.pid | type == "number" and . > 0 and floor == .)
@@ -128,6 +132,10 @@ def safe_ids($pattern):
   and .ax.pid_executable.device == .install.executable.device
   and .ax.pid_executable.inode == .install.executable.inode
   and .ax.pid_executable.sha256 == .install.executable.sha256
+  and (.ax.driver | exact_keys(["executable_sha256", "source_repo_path", "source_sha256"]))
+  and (.ax.driver.executable_sha256 | sha256)
+  and (.ax.driver.source_repo_path | type == "string" and test("^[A-Za-z0-9._/-]+$") and (startswith("/") | not) and (contains("..") | not))
+  and (.ax.driver.source_sha256 | sha256)
   and (.ax.author_ids | safe_ids("^[a-z0-9_.:-]+$"))
   and (.ax.action_ids | safe_ids("^[a-zA-Z0-9_.:-]+$"))
   and (.ax.public_codes | safe_ids("^[A-Z0-9_]+$"))

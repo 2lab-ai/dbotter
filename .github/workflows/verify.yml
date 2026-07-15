@@ -79,7 +79,7 @@ jobs:
           DBOTTER_COMPOSE_PROJECT: dbotter-e2e
           DBOTTER_MYSQL_PASSWORD: dbotter-local-only
           DBOTTER_REDIS_PASSWORD: dbotter-redis-local-only
-        run: ./scripts/verify-live-contracts.sh --config config/local.example.toml
+        run: ./scripts/verify-live-contracts.sh --config config/local.example.toml --expected-sha "${{ inputs.candidate_sha }}"
 
       - name: Upload live verification receipt
         uses: actions/upload-artifact@v4

@@ -59,6 +59,7 @@ for executable in \
   scripts/check-installed-receipt-contract.sh \
   scripts/build-macos-app.sh \
   scripts/assemble-preview-manifest.py \
+  scripts/assemble-installed-receipt.py \
   scripts/verify-hermetic.sh \
   scripts/verify-live-contracts.sh \
   scripts/verify-installed.sh \
@@ -90,6 +91,7 @@ require_literal .github/workflows/verify.yml 'workflow_call:'
 require_literal .github/workflows/verify.yml 'candidate_sha:'
 require_literal .github/workflows/verify.yml './scripts/verify-hermetic.sh --expected-sha'
 require_literal .github/workflows/verify.yml './scripts/verify-live-contracts.sh --config config/local.example.toml'
+require_literal .github/workflows/verify.yml '--expected-sha "${{ inputs.candidate_sha }}"'
 require_literal .github/workflows/verify.yml 'needs: hermetic'
 require_literal scripts/verify-hermetic.sh 'cargo fmt --check'
 require_literal scripts/verify-hermetic.sh 'cargo clippy --all-targets --all-features --locked -- -D warnings'
@@ -98,9 +100,13 @@ require_literal scripts/verify-hermetic.sh 'src/export.rs'
 require_literal scripts/verify-hermetic.sh 'tests/export_file_contract.rs'
 require_literal scripts/verify-live-contracts.sh 'p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli'
 require_literal scripts/verify-live-contracts.sh 'redis_live_receipt'
+require_literal scripts/verify-live-contracts.sh 'live checkout does not equal the expected source SHA'
+require_literal scripts/verify-live-contracts.sh 'source_sha: $source_sha'
 require_literal scripts/verify-installed-gui.sh 'profile.connection_id'
 require_literal scripts/verify-installed-gui.sh 'result.export.json'
 require_literal scripts/verify-installed-gui.sh 'DBOTTER_AX_DRIVER'
+require_literal scripts/assemble-installed-receipt.py 'dbotter.p7-installed-evidence.v1'
+require_literal scripts/assemble-installed-receipt.py 'dbotter.formula-install-evidence.v1'
 
 for workflow in \
   .github/workflows/ci.yml \

@@ -1,0 +1,260 @@
+{
+  "source": {
+    "schema": "dbotter.source-verification.v1",
+    "source": {
+      "kind": "ci_expected_sha",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "expected_sha": "0123456789abcdef0123456789abcdef01234567",
+      "clean": true,
+      "run_id": 123456789,
+      "run_attempt": 2
+    },
+    "build": {
+      "profile": "release",
+      "features": ["desktop", "mongodb"],
+      "rustc_version": "rustc 1.94.0",
+      "cargo_version": "cargo 1.94.0",
+      "identity": {
+        "package_version": "0.1.0",
+        "channel": "preview",
+        "build_id": "2026-07-15-123456-123456789-2-0123456789ab",
+        "source_sha": "0123456789abcdef0123456789abcdef01234567",
+        "target": "x86_64-unknown-linux-gnu",
+        "arch": "x86_64"
+      },
+      "config_contract": {
+        "read_versions": [1, 2],
+        "write_version": 2,
+        "migration_backup_suffix": ".v1.bak"
+      }
+    },
+    "started_at": "2026-07-15T13:00:00Z",
+    "finished_at": "2026-07-15T13:01:00Z",
+    "assertions": {
+      "source": true,
+      "release_contract": true,
+      "receipt_contracts": true,
+      "format": true,
+      "clippy": true,
+      "tests": true,
+      "identity": true,
+      "config_contract": true,
+      "overall": true
+    }
+  },
+  "package": {
+    "schema": "dbotter.package-receipt.v1",
+    "tag": "preview-2026-07-15-123456-123456789-2-0123456789ab",
+    "source_sha": "0123456789abcdef0123456789abcdef01234567",
+    "target": "x86_64-apple-darwin",
+    "arch": "x86_64",
+    "unsigned_executable_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "post_sign_executable_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "archive_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "archive_bytes": 23456,
+    "bundle_id": "ai.2lab.dbotter.preview",
+    "bundle_short_version": "0.1.0",
+    "bundle_build_version": "123456789.2",
+    "icon": {
+      "source": "assets/dbotter-icon.png",
+      "sha256": "5548922d61e5d3bc0dda0abe795e8dd77afda63a763c5482815e262d718559bd"
+    },
+    "signing": {"identity": "-", "verified": true},
+    "identity": {
+      "package_version": "0.1.0",
+      "channel": "preview",
+      "build_id": "2026-07-15-123456-123456789-2-0123456789ab",
+      "source_sha": "0123456789abcdef0123456789abcdef01234567",
+      "target": "x86_64-apple-darwin",
+      "arch": "x86_64"
+    },
+    "config_contract": {
+      "read_versions": [1, 2],
+      "write_version": 2,
+      "migration_backup_suffix": ".v1.bak"
+    }
+  },
+  "live": {
+    "schema": "dbotter.live-contract-receipt.v1",
+    "source_sha": "0123456789abcdef0123456789abcdef01234567",
+    "started_at": "2026-07-15T13:02:00Z",
+    "project": "dbotter-e2e",
+    "tests": {
+      "mysql_catalog": "p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli",
+      "mysql_prepared_auth": "mysql_contract",
+      "redis_keyspace_tls_auth": "redis_live_receipt"
+    },
+    "assertions": {
+      "mysql_catalog": true,
+      "mysql_prepared_only": true,
+      "mysql_auth": true,
+      "redis_keyspace": true,
+      "redis_auth_plaintext": true,
+      "redis_auth_tls": true,
+      "redis_tls_ca_recovery": true,
+      "redis_tls_host_recovery": true,
+      "redis_plaintext_fallback": false,
+      "overall": true
+    }
+  },
+  "cli": {
+    "schema": "dbotter.installed-cli-evidence.v1",
+    "started_at": "2026-07-15T13:05:00Z",
+    "source_sha": "0123456789abcdef0123456789abcdef01234567",
+    "manifest_sha256": "47abed9f0df8bba1ace09b8c27583bf779bd6cfa56554ae59c26060ec4ce7767",
+    "formula": {"name": "dbotter-preview", "version": "2026.07.15.123456.123456789.2"},
+    "app": {
+      "path": "/usr/local/opt/dbotter-preview/Dbotter Preview.app",
+      "resolved_path": "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2/Dbotter Preview.app",
+      "bundle_id": "ai.2lab.dbotter.preview",
+      "executable": {
+        "realpath": "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2/Dbotter Preview.app/Contents/MacOS/dbotter",
+        "device": 42,
+        "inode": 4242,
+        "bytes": 123456,
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "codesign_valid": true
+      }
+    },
+    "shim": {
+      "path": "/usr/local/bin/dbotter",
+      "realpath": "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2/Dbotter Preview.app/Contents/MacOS/dbotter",
+      "device": 42,
+      "inode": 4242,
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "identity": {
+      "package_version": "0.1.0",
+      "channel": "preview",
+      "build_id": "2026-07-15-123456-123456789-2-0123456789ab",
+      "source_sha": "0123456789abcdef0123456789abcdef01234567",
+      "target": "x86_64-apple-darwin",
+      "arch": "x86_64"
+    },
+    "config_contract": {
+      "read_versions": [1, 2],
+      "write_version": 2,
+      "migration_backup_suffix": ".v1.bak"
+    },
+    "assertions": {
+      "formula": true,
+      "app_bundle": true,
+      "executable_hash": true,
+      "shim_same_executable": true,
+      "identity": true,
+      "config_contract": true,
+      "check": true,
+      "exec": true,
+      "mysql_browse": true,
+      "redis_browse": true,
+      "redis_inspect": true,
+      "overall": true
+    }
+  },
+  "gui": {
+    "schema": "dbotter.installed-gui-evidence.v1",
+    "source_sha": "0123456789abcdef0123456789abcdef01234567",
+    "driver": {
+      "executable_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "source_repo_path": "scripts/verify-installed-gui.sh",
+      "source_sha256": "958d3815a888b354be963ba561ea922575899f81365d857920a04b3fba657e4b"
+    },
+    "app_path": "/usr/local/opt/dbotter-preview/Dbotter Preview.app",
+    "bundle_id": "ai.2lab.dbotter.preview",
+    "pid": 1234,
+    "pid_executable": {
+      "realpath": "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2/Dbotter Preview.app/Contents/MacOS/dbotter",
+      "device": 42,
+      "inode": 4242,
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "stale_process_disposition": "none",
+    "ax_identifiers": [
+      "connection.new",
+      "connection.new.mysql",
+      "connection.new.redis",
+      "connection.mongodb.planned",
+      "profile.connection_id",
+      "profile.host",
+      "profile.redis_tls.ca_file",
+      "profile.redis_tls.ca_file.pick",
+      "profile.credential.session.keep",
+      "profile.credential.session.replace",
+      "profile.credential.session.forget",
+      "profile.delete.active_warning",
+      "editor.target",
+      "editor.input",
+      "editor.row_limit",
+      "editor.timeout",
+      "editor.execute",
+      "editor.cancel",
+      "result.table",
+      "result.copy.cell",
+      "result.copy.row",
+      "result.copy.all",
+      "result.export.csv",
+      "result.export.tsv",
+      "result.export.json"
+    ],
+    "assertions": {
+      "accessibility": true,
+      "ax_identifier_readback": true,
+      "clipboard_contracts": true,
+      "contrast": true,
+      "create_recovery": true,
+      "disclosure": true,
+      "export_contracts": true,
+      "overall": true,
+      "pid_identity": true,
+      "recovery_totality": true,
+      "session_intents": true,
+      "stale_process_handled": true,
+      "tls_split_recovery": true
+    }
+  },
+  "p7": {
+    "schema": "dbotter.p7-installed-evidence.v1",
+    "action_ids": ["EditDraft", "FocusEditor", "Reconnect"],
+    "public_codes": ["PROFILE_ID_CONFLICT", "TLS_HOSTNAME_MISMATCH", "OPERATION_TIMED_OUT"],
+    "external_export_verifier": [
+      {
+        "fixture_id": "seeded.csv",
+        "expected_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "actual_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "verdict": true
+      },
+      {
+        "fixture_id": "seeded.tsv",
+        "expected_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "actual_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "verdict": true
+      },
+      {
+        "fixture_id": "seeded.json",
+        "expected_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "actual_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "verdict": true
+      }
+    ],
+    "assertions": {
+      "clipboard": true,
+      "export": true,
+      "disclosure": true,
+      "recovery_totality": true,
+      "credential_leak": false,
+      "user_content_leak": false,
+      "overall": true
+    }
+  },
+  "formula": {
+    "schema": "dbotter.formula-install-evidence.v1",
+    "repository": "2lab-ai/homebrew-tap",
+    "commit": "fedcba9876543210fedcba9876543210fedcba98",
+    "name": "dbotter-preview",
+    "version": "2026.07.15.123456.123456789.2",
+    "prefix": "/usr/local/opt/dbotter-preview",
+    "manifest_url": "https://github.com/2lab-ai/dbotter/releases/download/preview-2026-07-15-123456-123456789-2-0123456789ab/preview-manifest.json",
+    "manifest_sha256": "47abed9f0df8bba1ace09b8c27583bf779bd6cfa56554ae59c26060ec4ce7767",
+    "assertions": {"tap_dispatch": true, "manifest": true, "install": true, "overall": true}
+  }
+}

@@ -115,6 +115,11 @@ codesign --verify --deep --strict "$app_path"
 [[ "$(plutil -extract CFBundleIdentifier raw "$app_path/Contents/Info.plist")" == "ai.2lab.dbotter.preview" ]] \
   || fail "bundle id mismatch"
 "$ROOT/scripts/validate-preview-manifest.py" "$manifest" >/dev/null
+source_sha="$(jq -r '.source_sha' "$manifest")"
+[[ "$(git rev-parse HEAD)" == "$source_sha" ]] \
+  || fail "installed GUI verifier checkout does not equal the manifest source SHA"
+git diff --quiet && git diff --cached --quiet \
+  || fail "installed GUI verifier has tracked source changes"
 
 case "$(uname -m)" in
   arm64) target=aarch64-apple-darwin ;;
@@ -276,11 +281,13 @@ output_parent="$(dirname "$output")"
 mkdir -p "$output_parent"
 output_temporary="$(mktemp "$output_parent/.installed-gui.XXXXXX.json")"
 jq \
+  --arg source_sha "$source_sha" \
   --arg executable_sha256 "$ax_driver_sha256" \
   --arg source_repo_path "$ax_driver_source_repo_path" \
   --arg source_sha256 "$ax_driver_source_sha256" '
     .schema = "dbotter.installed-gui-evidence.v1"
     | . + {
+        source_sha: $source_sha,
         driver: {
           executable_sha256: $executable_sha256,
           source_repo_path: $source_repo_path,

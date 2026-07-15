@@ -29,15 +29,15 @@
     "commit": "fedcba9876543210fedcba9876543210fedcba98",
     "name": "dbotter-preview",
     "version": "2026.07.15.123456.123456789.2",
-    "prefix": "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2"
+    "prefix": "/usr/local/opt/dbotter-preview"
   },
   "install": {
-    "requested_app_path": "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2/Dbotter Preview.app",
+    "requested_app_path": "/usr/local/opt/dbotter-preview/Dbotter Preview.app",
     "resolved_app_path": "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2/Dbotter Preview.app",
     "bundle_id": "ai.2lab.dbotter.preview",
     "arch": "x86_64",
     "executable": {
-      "path": "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2/Dbotter Preview.app/Contents/MacOS/dbotter",
+      "path": "/usr/local/opt/dbotter-preview/Dbotter Preview.app/Contents/MacOS/dbotter",
       "realpath": "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2/Dbotter Preview.app/Contents/MacOS/dbotter",
       "device": 42,
       "inode": 4242,
@@ -80,7 +80,7 @@
     "redis_inspect": true
   },
   "ax": {
-    "app_path": "/usr/local/Cellar/dbotter-preview/2026.07.15.123456.123456789.2/Dbotter Preview.app",
+    "app_path": "/usr/local/opt/dbotter-preview/Dbotter Preview.app",
     "pid": 1234,
     "stale_process_disposition": "none",
     "pid_executable": {
@@ -89,7 +89,38 @@
       "inode": 4242,
       "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
     },
-    "author_ids": ["profile.connection_id", "editor.row_limit", "editor.timeout"],
+    "driver": {
+      "executable_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "source_repo_path": "scripts/verify-installed-gui.sh",
+      "source_sha256": "958d3815a888b354be963ba561ea922575899f81365d857920a04b3fba657e4b"
+    },
+    "author_ids": [
+      "connection.new",
+      "connection.new.mysql",
+      "connection.new.redis",
+      "connection.mongodb.planned",
+      "profile.connection_id",
+      "profile.host",
+      "profile.redis_tls.ca_file",
+      "profile.redis_tls.ca_file.pick",
+      "profile.credential.session.keep",
+      "profile.credential.session.replace",
+      "profile.credential.session.forget",
+      "profile.delete.active_warning",
+      "editor.target",
+      "editor.input",
+      "editor.row_limit",
+      "editor.timeout",
+      "editor.execute",
+      "editor.cancel",
+      "result.table",
+      "result.copy.cell",
+      "result.copy.row",
+      "result.copy.all",
+      "result.export.csv",
+      "result.export.tsv",
+      "result.export.json"
+    ],
     "action_ids": ["EditDraft", "FocusEditor", "Reconnect"],
     "public_codes": ["PROFILE_ID_CONFLICT", "TLS_HOSTNAME_MISMATCH", "OPERATION_TIMED_OUT"]
   },

@@ -75,5 +75,16 @@
     "operation": "set",
     "path": ["external_export_verifier", 0, "actual_sha256"],
     "value": "9999999999999999999999999999999999999999999999999999999999999999"
+  },
+  {
+    "name": "missing-reviewed-ax-driver-provenance",
+    "operation": "remove",
+    "path": ["ax", "driver"]
+  },
+  {
+    "name": "requested-app-falsely-equals-resolved-app",
+    "operation": "set",
+    "path": ["install", "resolved_app_path"],
+    "value": "/usr/local/opt/dbotter-preview/Dbotter Preview.app"
   }
 ]
