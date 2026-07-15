@@ -14,6 +14,7 @@ use crate::model::{
     DEFAULT_REDIS_SCAN_COUNT, DraftId, DriverAvailability, DriverCapabilities, DriverKind,
     OperationId, OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration, ProfileId,
     PublicCode, PublicSummary, RedisKeyInspectRequest, RedisScanRequest, RequestIdentity,
+    SessionGeneration,
 };
 use crate::public_error::{
     PublicOperationError, RecoveryAction, RecoveryCommand, RecoveryCommandDispatcher,
@@ -28,7 +29,7 @@ use super::editor::{
     EDITOR_INPUT_ID, EDITOR_ROW_LIMIT_ID, EDITOR_TIMEOUT_ID, EditorIntent, EditorSurface,
 };
 use super::layout::NativeLayout;
-use super::model::{ConnectionState, ProfileSnapshot, UiEvent, UiModel};
+use super::model::{ConnectionState, ProfileSnapshot, UiEvent, UiModel, WorkspaceKey};
 use super::mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 use super::profile_form::{
     DraftTestAttempt, FormAction, ProfileEditor, ProfileEventResult, SaveAttempt,
@@ -46,6 +47,14 @@ struct ActiveOperation {
     operation_id: OperationId,
     profile_generation: ProfileGeneration,
     kind: OperationKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedisResourceEventDisposition {
+    NotRedis,
+    Apply,
+    Ignore,
+    StaleTerminal(OperationId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,7 +226,8 @@ pub struct DbotterApp {
     mysql_explorers: HashMap<(ProfileId, ProfileGeneration), MySqlExplorerState>,
     profile_editor: Option<ProfileEditor>,
     editor_surface: EditorSurface,
-    redis_explorer: RedisExplorer,
+    redis_explorers: HashMap<WorkspaceKey, RedisExplorer>,
+    visible_redis_workspace: Option<WorkspaceKey>,
     first_run_driver: DriverKind,
     active_operations: HashMap<ProfileId, ActiveOperation>,
     pending_deletes: HashMap<ProfileId, PendingDelete>,
@@ -238,7 +248,8 @@ impl DbotterApp {
             mysql_explorers: HashMap::new(),
             profile_editor: None,
             editor_surface: EditorSurface::default(),
-            redis_explorer: RedisExplorer::default(),
+            redis_explorers: HashMap::new(),
+            visible_redis_workspace: None,
             first_run_driver: DriverKind::MySql,
             active_operations: HashMap::new(),
             pending_deletes: HashMap::new(),
@@ -263,14 +274,216 @@ impl DbotterApp {
         draft_id
     }
 
+    fn redis_explorer_mut(&mut self, key: &WorkspaceKey) -> &mut RedisExplorer {
+        self.redis_explorers.entry(key.clone()).or_insert_with(|| {
+            let mut explorer = RedisExplorer::default();
+            explorer.set_profile(Some((key.profile_id.clone(), key.profile_generation)));
+            explorer
+        })
+    }
+
+    fn redis_resource_event_identity(
+        event: &UiEvent,
+    ) -> Option<(
+        WorkspaceKey,
+        OperationId,
+        OperationKind,
+        Option<SessionGeneration>,
+    )> {
+        match event {
+            UiEvent::RedisKeysLoaded {
+                page,
+                session_generation,
+                ..
+            } => Some((
+                WorkspaceKey::new(
+                    page.identity.profile_id.clone(),
+                    page.identity.profile_generation,
+                ),
+                page.identity.operation_id,
+                OperationKind::BrowseRedis,
+                Some(*session_generation),
+            )),
+            UiEvent::RedisKeysFailed {
+                request,
+                session_generation,
+                ..
+            } => Some((
+                WorkspaceKey::new(request.profile_id().clone(), request.profile_generation()),
+                request.operation_id(),
+                OperationKind::BrowseRedis,
+                *session_generation,
+            )),
+            UiEvent::RedisKeyInspected {
+                preview,
+                session_generation,
+                ..
+            } => Some((
+                WorkspaceKey::new(
+                    preview.identity.profile_id.clone(),
+                    preview.identity.profile_generation,
+                ),
+                preview.identity.operation_id,
+                OperationKind::InspectRedis,
+                Some(*session_generation),
+            )),
+            UiEvent::RedisKeyInspectFailed {
+                request,
+                session_generation,
+                ..
+            } => Some((
+                WorkspaceKey::new(request.profile_id().clone(), request.profile_generation()),
+                request.operation_id(),
+                OperationKind::InspectRedis,
+                *session_generation,
+            )),
+            _ => None,
+        }
+    }
+
+    fn redis_resource_event_disposition(&self, event: &UiEvent) -> RedisResourceEventDisposition {
+        let Some((key, operation_id, kind, session_generation)) =
+            Self::redis_resource_event_identity(event)
+        else {
+            return RedisResourceEventDisposition::NotRedis;
+        };
+        if self.model.is_config_uncertain()
+            || self.model.active_generation(&key.profile_id) != Some(key.profile_generation)
+            || !self
+                .active_operations
+                .get(&key.profile_id)
+                .is_some_and(|active| {
+                    active.operation_id == operation_id
+                        && active.profile_generation == key.profile_generation
+                        && active.kind == kind
+                })
+        {
+            return RedisResourceEventDisposition::Ignore;
+        }
+        if self
+            .model
+            .connection_state(&key.profile_id)
+            .accepts_redis_event_session(session_generation)
+        {
+            RedisResourceEventDisposition::Apply
+        } else {
+            RedisResourceEventDisposition::StaleTerminal(operation_id)
+        }
+    }
+
+    fn fold_redis_explorer_event(&mut self, event: &UiEvent) {
+        if let Some((key, ..)) = Self::redis_resource_event_identity(event) {
+            if let Some(explorer) = self.redis_explorers.get_mut(&key) {
+                explorer.handle_event(event);
+            }
+            return;
+        }
+        let clear = match event {
+            UiEvent::ConnectionClosed {
+                operation_id,
+                profile_id,
+                profile_generation,
+                ..
+            } => self
+                .active_operations
+                .get(profile_id)
+                .is_some_and(|active| {
+                    active.operation_id == *operation_id
+                        && active.profile_generation == *profile_generation
+                        && active.kind == OperationKind::DisconnectProfile
+                })
+                .then(|| WorkspaceKey::new(profile_id.clone(), *profile_generation)),
+            UiEvent::ConnectionReady {
+                operation_id,
+                profile_id,
+                profile_generation,
+                ..
+            } => self
+                .active_operations
+                .get(profile_id)
+                .is_some_and(|active| {
+                    active.operation_id == *operation_id
+                        && active.profile_generation == *profile_generation
+                        && matches!(
+                            active.kind,
+                            OperationKind::ConnectProfile | OperationKind::ReconnectProfile
+                        )
+                })
+                .then(|| WorkspaceKey::new(profile_id.clone(), *profile_generation)),
+            UiEvent::OperationFailed {
+                operation_id,
+                profile_id,
+                profile_generation,
+                kind,
+                connection_outcome,
+                ..
+            } if matches!(
+                kind,
+                OperationKind::DisconnectProfile | OperationKind::ReconnectProfile
+            ) && !matches!(
+                connection_outcome,
+                super::model::ConnectionFailureOutcome::Preserve
+            ) =>
+            {
+                self.active_operations
+                    .get(profile_id)
+                    .is_some_and(|active| {
+                        active.operation_id == *operation_id
+                            && active.profile_generation == *profile_generation
+                            && active.kind == *kind
+                    })
+                    .then(|| WorkspaceKey::new(profile_id.clone(), *profile_generation))
+            }
+            UiEvent::ConfigUncertain { .. } | UiEvent::RuntimeShutdown { .. } => {
+                self.redis_explorers.clear();
+                self.visible_redis_workspace = None;
+                None
+            }
+            _ => None,
+        };
+        if let Some(key) = clear {
+            self.redis_explorers.remove(&key);
+            if self.visible_redis_workspace.as_ref() == Some(&key) {
+                self.visible_redis_workspace = None;
+            }
+        }
+    }
+
+    fn prune_redis_explorers(&mut self) {
+        if self.model.is_config_uncertain() {
+            self.redis_explorers.clear();
+            self.visible_redis_workspace = None;
+            return;
+        }
+        self.redis_explorers.retain(|key, _| {
+            self.model.active_generation(&key.profile_id) == Some(key.profile_generation)
+        });
+        if self
+            .visible_redis_workspace
+            .as_ref()
+            .is_some_and(|key| !self.redis_explorers.contains_key(key))
+        {
+            self.visible_redis_workspace = None;
+        }
+    }
+
     fn poll_events(&mut self) {
         for mut event in self.port.drain_events(EVENT_DRAIN_LIMIT) {
+            match self.redis_resource_event_disposition(&event) {
+                RedisResourceEventDisposition::Ignore => continue,
+                RedisResourceEventDisposition::StaleTerminal(operation_id) => {
+                    self.finish_active_operation(&event);
+                    self.retry_recipes.remove(OperationRecipeId(operation_id.0));
+                    continue;
+                }
+                RedisResourceEventDisposition::NotRedis | RedisResourceEventDisposition::Apply => {}
+            }
             self.attach_retry_recipe(&mut event);
             self.capture_common_error(&event);
             let credential_retry = self.handle_credential_terminal(&event);
+            self.fold_redis_explorer_event(&event);
             self.finish_active_operation(&event);
             self.fold_mysql_explorer_event(&event);
-            self.redis_explorer.handle_event(&event);
             let profile_result = self
                 .profile_editor
                 .as_mut()
@@ -360,6 +573,7 @@ impl DbotterApp {
         self.mysql_explorers.retain(|(profile_id, generation), _| {
             self.model.active_generation(profile_id) == Some(*generation)
         });
+        self.prune_redis_explorers();
         self.prune_active_operations();
         if let Some(editor) = self.profile_editor.as_mut() {
             editor.set_config_uncertain(self.model.is_config_uncertain());
@@ -1354,7 +1568,8 @@ impl DbotterApp {
         {
             self.common_error = None;
         }
-        for workspace in self.model.workspaces.values_mut() {
+        let mut redis_workspaces = Vec::new();
+        for (key, workspace) in &mut self.model.workspaces {
             if workspace
                 .catalog_retry
                 .as_ref()
@@ -1368,6 +1583,7 @@ impl DbotterApp {
                 .is_some_and(|request| request.operation_id() == operation_id)
             {
                 workspace.redis_scan_error = None;
+                redis_workspaces.push(key.clone());
             }
             if workspace
                 .redis_inspect_retry
@@ -1375,12 +1591,19 @@ impl DbotterApp {
                 .is_some_and(|request| request.operation_id() == operation_id)
             {
                 workspace.redis_inspect_error = None;
+                if !redis_workspaces.contains(key) {
+                    redis_workspaces.push(key.clone());
+                }
             }
         }
         for explorer in self.mysql_explorers.values_mut() {
             explorer.dismiss_error();
         }
-        self.redis_explorer.dismiss_errors();
+        for key in redis_workspaces {
+            if let Some(explorer) = self.redis_explorers.get_mut(&key) {
+                explorer.dismiss_errors();
+            }
+        }
         self.model.status = "Error dismissed.".to_owned();
     }
 
@@ -1471,18 +1694,49 @@ impl DbotterApp {
     }
 
     fn submit_redis_intent(&mut self, intent: RedisExplorerIntent) {
+        let Some(key) = self.visible_redis_workspace.clone() else {
+            self.model.status = "Redis explorer context is unavailable.".to_owned();
+            return;
+        };
+        if self.model.selected_workspace_key().as_ref() != Some(&key) {
+            self.redis_explorer_mut(&key)
+                .submission_failed("Redis explorer context changed; retry from the visible panel.");
+            self.model.status =
+                "Redis explorer context changed; no command was submitted.".to_owned();
+            return;
+        }
+        self.submit_redis_intent_for(&key, intent);
+    }
+
+    fn submit_redis_intent_for(&mut self, key: &WorkspaceKey, intent: RedisExplorerIntent) {
         if let RedisExplorerIntent::Cancel { operation_id } = &intent {
             let operation_id = *operation_id;
+            if !self
+                .active_operations
+                .get(&key.profile_id)
+                .is_some_and(|active| {
+                    active.operation_id == operation_id
+                        && active.profile_generation == key.profile_generation
+                        && matches!(
+                            active.kind,
+                            OperationKind::BrowseRedis | OperationKind::InspectRedis
+                        )
+                })
+            {
+                self.redis_explorer_mut(key)
+                    .submission_failed("That Redis operation is no longer active.");
+                return;
+            }
             match self
                 .port
                 .try_submit(UiCommand::CancelOperation { operation_id })
             {
                 Ok(()) => {
-                    self.redis_explorer.cancel_submitted(operation_id);
+                    self.redis_explorer_mut(key).cancel_submitted(operation_id);
                     self.model.status = "Cancelling Redis operation…".to_owned();
                 }
                 Err(error) => {
-                    self.redis_explorer
+                    self.redis_explorer_mut(key)
                         .submission_failed(submit_error_message(error));
                     self.report_submit_error(error);
                 }
@@ -1490,13 +1744,26 @@ impl DbotterApp {
             return;
         }
         if self.model.is_config_uncertain() {
-            self.redis_explorer
+            self.redis_explorer_mut(key)
                 .submission_failed("Reload profiles before browsing Redis.");
             return;
         }
-        let Some(profile) = self.model.selected_profile_snapshot().cloned() else {
-            self.redis_explorer
-                .submission_failed("Select a Redis profile.");
+        if self.model.active_generation(&key.profile_id) != Some(key.profile_generation) {
+            self.redis_explorer_mut(key)
+                .submission_failed("That Redis workspace is no longer current.");
+            return;
+        }
+        let Some(profile) = self
+            .model
+            .profiles
+            .iter()
+            .find(|profile| {
+                profile.id == key.profile_id && profile.generation == key.profile_generation
+            })
+            .cloned()
+        else {
+            self.redis_explorer_mut(key)
+                .submission_failed("That Redis workspace is no longer current.");
             return;
         };
         let keyspace_ready = profile.driver == DriverKind::Redis
@@ -1510,12 +1777,12 @@ impl DbotterApp {
                         .contains(DriverCapabilities::KEYSPACE_BROWSE)
                 });
         if !keyspace_ready {
-            self.redis_explorer
+            self.redis_explorer_mut(key)
                 .submission_failed("Redis keyspace browsing is unavailable.");
             return;
         }
         if self.active_operations.contains_key(&profile.id) {
-            self.redis_explorer
+            self.redis_explorer_mut(key)
                 .submission_failed("Another operation is active for this connection.");
             return;
         }
@@ -1546,8 +1813,12 @@ impl DbotterApp {
                                 restart,
                             },
                         );
-                        self.redis_explorer
-                            .begin_scan(operation_id, filter, cursor, restart);
+                        self.redis_explorer_mut(key).begin_scan(
+                            operation_id,
+                            filter,
+                            cursor,
+                            restart,
+                        );
                         self.active_operations.insert(
                             profile.id.clone(),
                             ActiveOperation {
@@ -1559,16 +1830,16 @@ impl DbotterApp {
                         self.model.status = "Scanning Redis keys…".to_owned();
                     }
                     Err(error) => {
-                        self.redis_explorer
+                        self.redis_explorer_mut(key)
                             .submission_failed(submit_error_message(error));
                         self.report_submit_error(error);
                     }
                 }
             }
-            RedisExplorerIntent::Inspect { key } => {
+            RedisExplorerIntent::Inspect { key: redis_key } => {
                 let request = RedisKeyInspectRequest {
                     identity,
-                    key: key.clone(),
+                    key: redis_key.clone(),
                     timeout: Duration::from_secs(5),
                 };
                 match self
@@ -1578,7 +1849,8 @@ impl DbotterApp {
                     Ok(()) => {
                         self.retry_recipes
                             .register(operation_id, RetryRecipe::RedisInspect(request.clone()));
-                        self.redis_explorer.begin_inspect(operation_id, key);
+                        self.redis_explorer_mut(key)
+                            .begin_inspect(operation_id, redis_key);
                         self.active_operations.insert(
                             profile.id.clone(),
                             ActiveOperation {
@@ -1590,7 +1862,7 @@ impl DbotterApp {
                         self.model.status = "Inspecting Redis key…".to_owned();
                     }
                     Err(error) => {
-                        self.redis_explorer
+                        self.redis_explorer_mut(key)
                             .submission_failed(submit_error_message(error));
                         self.report_submit_error(error);
                     }
@@ -1640,6 +1912,7 @@ impl DbotterApp {
     fn retry_redis_scan(&mut self, request: RedisScanRequest, restart: bool) {
         let profile_id = request.profile_id().clone();
         let profile_generation = request.profile_generation();
+        let workspace_key = WorkspaceKey::new(profile_id.clone(), profile_generation);
         if self.active_operations.contains_key(&profile_id) {
             self.model.status = "Another operation is active for this connection".to_owned();
             return;
@@ -1664,7 +1937,7 @@ impl DbotterApp {
                         restart,
                     },
                 );
-                self.redis_explorer.begin_scan(
+                self.redis_explorer_mut(&workspace_key).begin_scan(
                     operation_id,
                     request.filter.clone(),
                     request.cursor,
@@ -1681,7 +1954,7 @@ impl DbotterApp {
                 self.model.status = "Retrying Redis scan…".to_owned();
             }
             Err(error) => {
-                self.redis_explorer
+                self.redis_explorer_mut(&workspace_key)
                     .submission_failed(submit_error_message(error));
                 self.report_submit_error(error);
             }
@@ -1691,6 +1964,7 @@ impl DbotterApp {
     fn retry_redis_inspect(&mut self, request: RedisKeyInspectRequest) {
         let profile_id = request.profile_id().clone();
         let profile_generation = request.profile_generation();
+        let workspace_key = WorkspaceKey::new(profile_id.clone(), profile_generation);
         if self.active_operations.contains_key(&profile_id) {
             self.model.status = "Another operation is active for this connection".to_owned();
             return;
@@ -1708,7 +1982,7 @@ impl DbotterApp {
             Ok(()) => {
                 self.retry_recipes
                     .register(operation_id, RetryRecipe::RedisInspect(request.clone()));
-                self.redis_explorer
+                self.redis_explorer_mut(&workspace_key)
                     .begin_inspect(operation_id, request.key.clone());
                 self.active_operations.insert(
                     profile_id,
@@ -1721,7 +1995,7 @@ impl DbotterApp {
                 self.model.status = "Retrying Redis inspection…".to_owned();
             }
             Err(error) => {
-                self.redis_explorer
+                self.redis_explorer_mut(&workspace_key)
                     .submission_failed(submit_error_message(error));
                 self.report_submit_error(error);
             }
@@ -2109,9 +2383,9 @@ impl DbotterApp {
     fn explorer_contents(&mut self, ui: &mut egui::Ui) {
         let selected = self.model.selected_profile_snapshot().cloned();
         let mut recovery = None;
+        self.visible_redis_workspace = None;
         match selected {
             Some(profile) if profile.driver == DriverKind::MySql && profile.is_ready() => {
-                self.redis_explorer.set_profile(None);
                 let intents = self
                     .mysql_explorers
                     .entry((profile.id.clone(), profile.generation))
@@ -2134,15 +2408,13 @@ impl DbotterApp {
                 }
             }
             Some(profile) if profile.driver == DriverKind::Redis && profile.is_ready() => {
-                self.redis_explorer
-                    .set_profile(Some((profile.id.clone(), profile.generation)));
-                if let Some(intent) = self
-                    .redis_explorer
-                    .show(ui, !self.model.is_config_uncertain())
-                {
+                let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+                self.visible_redis_workspace = Some(key.clone());
+                let actions_enabled = !self.model.is_config_uncertain();
+                let intent = self.redis_explorer_mut(&key).show(ui, actions_enabled);
+                if let Some(intent) = intent {
                     self.submit_redis_intent(intent);
                 }
-                let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
                 let (scan, inspect) =
                     self.model
                         .workspace(&key)
@@ -2174,11 +2446,9 @@ impl DbotterApp {
                 }
             }
             Some(profile) => {
-                self.redis_explorer.set_profile(None);
                 ui.weak(format!("{} explorer is unavailable", profile.driver));
             }
             None => {
-                self.redis_explorer.set_profile(None);
                 ui.weak("Select a connection to browse resources.");
             }
         }
@@ -2684,6 +2954,7 @@ fn display_cell(cell: &Cell) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
     use super::{
         ActiveOperation, ConnectionState, DbotterApp, MySqlExplorerIntent, PendingDelete,
@@ -2693,7 +2964,8 @@ mod tests {
         ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
         OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode,
         PublicSummary, RedisKeyEntry, RedisKeyFilter, RedisKeyId, RedisKeyPage,
-        RedisScanConsistency, RedisScanRequest, RedisTlsConfig, SessionGeneration, TlsMode,
+        RedisScanConsistency, RedisScanRequest, RedisTlsConfig, RequestIdentity, SessionGeneration,
+        TlsMode,
     };
     use crate::public_error::{PublicOperationError, RecoveryAction, SafeContext};
     use crate::service::SessionDisposition;
@@ -2767,9 +3039,9 @@ mod tests {
     }
 
     fn redis_keys_for(app: &DbotterApp, key: &WorkspaceKey) -> Option<Vec<Vec<u8>>> {
-        let (profile_id, generation) = app.redis_explorer.test_workspace_keys()?;
-        (profile_id == &key.profile_id && generation == key.profile_generation)
-            .then(|| app.redis_explorer.test_retained_raw_keys())
+        app.redis_explorers
+            .get(key)
+            .map(|explorer| explorer.test_retained_raw_keys())
     }
 
     fn load_redis_key(
@@ -2779,6 +3051,13 @@ mod tests {
         raw_key: &[u8],
         session_generation: SessionGeneration,
     ) {
+        app.model.connection_states.insert(
+            key.profile_id.clone(),
+            ConnectionState::Connected {
+                session_generation,
+                elapsed_ms: 0,
+            },
+        );
         app.model.selected_profile = Some(key.profile_id.clone());
         render_redis_explorer(app);
         app.submit_redis_intent(RedisExplorerIntent::Scan {
@@ -3514,6 +3793,7 @@ mod tests {
         app.model
             .active_generations
             .insert(redis.id.clone(), redis.generation);
+        render_redis_explorer(&mut app);
         app.submit_redis_intent(RedisExplorerIntent::Scan {
             filter: RedisKeyFilter::LiteralPrefix("orders:".to_owned()),
             cursor: 41,
@@ -3658,6 +3938,7 @@ mod tests {
             .model
             .active_generations
             .insert(redis.id.clone(), redis.generation);
+        render_redis_explorer(&mut redis_app);
         redis_app.submit_redis_intent(RedisExplorerIntent::Scan {
             filter: RedisKeyFilter::Glob("*".to_owned()),
             cursor: 0,
@@ -4379,6 +4660,10 @@ mod tests {
         assert!(service.try_next_command().is_some());
         app.model.profiles = vec![profile(DriverKind::Redis, DriverAvailability::Ready)];
         app.model.selected_profile = Some(ProfileId("profile".to_owned()));
+        app.model
+            .active_generations
+            .insert(ProfileId("profile".to_owned()), ProfileGeneration(1));
+        render_redis_explorer(&mut app);
 
         app.submit_redis_intent(RedisExplorerIntent::Scan {
             filter: RedisKeyFilter::LiteralPrefix("orders:[".to_owned()),
@@ -4453,7 +4738,11 @@ mod tests {
         assert!(service.try_next_command().is_some());
         app.model.profiles = vec![profile(DriverKind::Redis, DriverAvailability::Ready)];
         app.model.selected_profile = Some(ProfileId("profile".to_owned()));
+        app.model
+            .active_generations
+            .insert(ProfileId("profile".to_owned()), ProfileGeneration(1));
         let raw_key = RedisKeyId(vec![b'b', 0, 0xff, b'k']);
+        render_redis_explorer(&mut app);
 
         app.submit_redis_intent(RedisExplorerIntent::Inspect {
             key: raw_key.clone(),
@@ -4577,16 +4866,48 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_redis_session_generation_event_mutates_no_ui_state() {
-        let (ui, mut service) = bounded_ports(4);
+    fn app_redis_session_correlation_matrix_is_fail_closed() {
+        let (ui, mut service) = bounded_ports(2);
         let mut app = DbotterApp::new(ui);
         assert!(service.try_next_command().is_some());
-        let profile = redis_profile("redis-current", 1);
-        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        let profile = redis_profile("redis-matrix", 1);
         app.model.profiles = vec![profile.clone()];
         app.model
             .active_generations
             .insert(profile.id.clone(), profile.generation);
+        let request = RedisScanRequest {
+            identity: RequestIdentity::new(profile.id.clone(), profile.generation, OperationId(77)),
+            filter: RedisKeyFilter::Glob("*".to_owned()),
+            cursor: 0,
+            count_hint: 100,
+            timeout: Duration::from_secs(5),
+        };
+        app.active_operations.insert(
+            profile.id.clone(),
+            ActiveOperation {
+                operation_id: request.operation_id(),
+                profile_generation: profile.generation,
+                kind: OperationKind::BrowseRedis,
+            },
+        );
+        let loaded = |session_generation| crate::ui::UiEvent::RedisKeysLoaded {
+            page: redis_page(&request, b"matrix"),
+            session_generation,
+            session_disposition: SessionDisposition::Keep,
+        };
+        let failed = || crate::ui::UiEvent::RedisKeysFailed {
+            request: request.clone(),
+            error: PublicOperationError::new_or_internal(
+                OperationKind::BrowseRedis,
+                PublicSummary::ResourceStale,
+                PublicCode::None,
+                &SafeContext::profile(profile.id.clone(), request.operation_id()),
+            ),
+            session_generation: None,
+            session_disposition: None,
+            connection_outcome: crate::ui::ConnectionFailureOutcome::Preserve,
+        };
+
         app.model.connection_states.insert(
             profile.id.clone(),
             ConnectionState::Connected {
@@ -4594,8 +4915,38 @@ mod tests {
                 elapsed_ms: 0,
             },
         );
-        app.model.selected_profile = Some(profile.id.clone());
-        render_redis_explorer(&mut app);
+        assert_eq!(
+            app.redis_resource_event_disposition(&loaded(SessionGeneration(9))),
+            super::RedisResourceEventDisposition::Apply
+        );
+        assert_eq!(
+            app.redis_resource_event_disposition(&loaded(SessionGeneration(8))),
+            super::RedisResourceEventDisposition::StaleTerminal(request.operation_id())
+        );
+        assert_eq!(
+            app.redis_resource_event_disposition(&failed()),
+            super::RedisResourceEventDisposition::StaleTerminal(request.operation_id())
+        );
+
+        app.model
+            .connection_states
+            .insert(profile.id.clone(), ConnectionState::Disconnected);
+        assert_eq!(
+            app.redis_resource_event_disposition(&loaded(SessionGeneration(9))),
+            super::RedisResourceEventDisposition::StaleTerminal(request.operation_id())
+        );
+        assert_eq!(
+            app.redis_resource_event_disposition(&failed()),
+            super::RedisResourceEventDisposition::Apply
+        );
+    }
+
+    #[test]
+    fn mismatched_redis_session_generation_event_mutates_no_ui_state() {
+        let (ui, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let (alpha, _, alpha_key, beta_key) = seed_two_redis_workspaces(&mut app, &mut service);
         app.submit_redis_intent(RedisExplorerIntent::Scan {
             filter: RedisKeyFilter::Glob("*".to_owned()),
             cursor: 0,
@@ -4607,32 +4958,54 @@ mod tests {
         };
         assert!(service.try_emit(crate::ui::UiEvent::RedisKeysLoaded {
             page: redis_page(&request, b"stale-session"),
-            session_generation: SessionGeneration(8),
+            session_generation: SessionGeneration(10),
             session_disposition: SessionDisposition::Keep,
         }));
         app.poll_events();
 
+        assert!(!app.active_operations.contains_key(&alpha.id));
         assert!(
-            app.active_operations
-                .get(&profile.id)
-                .is_some_and(|active| {
-                    active.operation_id == request.operation_id()
-                        && active.profile_generation == profile.generation
-                })
-        );
-        assert_eq!(redis_keys_for(&app, &key), Some(Vec::new()));
-        assert!(
-            app.model
-                .workspace(&key)
-                .is_none_or(|workspace| workspace.redis_key_page.is_none())
+            !app.retry_recipes
+                .contains(OperationRecipeId(request.operation_id().0)),
+            "a stale terminal must release its exact retry bookkeeping"
         );
         assert_eq!(
-            app.model.connection_state(&profile.id),
+            redis_keys_for(&app, &alpha_key),
+            Some(vec![b"alpha:key".to_vec()]),
+            "stale session terminal cannot mutate the exact explorer"
+        );
+        assert_eq!(
+            redis_keys_for(&app, &beta_key),
+            Some(vec![b"beta:key".to_vec()]),
+            "stale session terminal cannot mutate an unrelated explorer"
+        );
+        assert_eq!(
+            app.model.connection_state(&alpha.id),
             &ConnectionState::Connected {
-                session_generation: SessionGeneration(9),
+                session_generation: SessionGeneration(11),
                 elapsed_ms: 0,
             }
         );
+        assert_eq!(
+            app.model
+                .workspace(&alpha_key)
+                .and_then(|workspace| workspace.redis_key_page.as_ref())
+                .and_then(|page| page.keys.first())
+                .map(|entry| entry.id.as_bytes()),
+            Some(b"alpha:key".as_slice())
+        );
+
+        app.submit_redis_intent(RedisExplorerIntent::Scan {
+            filter: RedisKeyFilter::Glob("next:*".to_owned()),
+            cursor: 0,
+            restart: true,
+        });
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::ScanRedisKeys(next))
+                if next.operation_id() != request.operation_id()
+                    && next.profile_id() == &alpha.id
+        ));
     }
 
     #[test]

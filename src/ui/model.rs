@@ -132,6 +132,23 @@ impl ConnectionState {
     pub fn is_pending(&self) -> bool {
         matches!(self, Self::Pending(_))
     }
+
+    pub(crate) fn accepts_redis_event_session(
+        &self,
+        event_session: Option<SessionGeneration>,
+    ) -> bool {
+        match (self, event_session) {
+            (
+                Self::Connected {
+                    session_generation: current,
+                    ..
+                },
+                Some(event),
+            ) => *current == event,
+            (Self::Connected { .. }, None) | (_, Some(_)) => false,
+            (_, None) => true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -622,7 +639,11 @@ impl UiModel {
                 session_disposition,
             } => {
                 let profile_id = page.identity.profile_id.clone();
-                if self.event_is_current(&profile_id, page.identity.profile_generation) {
+                if self.redis_event_is_current(
+                    &profile_id,
+                    page.identity.profile_generation,
+                    Some(session_generation),
+                ) {
                     let workspace =
                         self.exact_workspace_mut(&profile_id, page.identity.profile_generation);
                     workspace.redis_scan_retry = None;
@@ -645,7 +666,11 @@ impl UiModel {
                 connection_outcome,
             } => {
                 let profile_id = request.profile_id().clone();
-                if self.event_is_current(&profile_id, request.profile_generation()) {
+                if self.redis_event_is_current(
+                    &profile_id,
+                    request.profile_generation(),
+                    session_generation,
+                ) {
                     let status = error.summary.message().to_owned();
                     let workspace =
                         self.exact_workspace_mut(&profile_id, request.profile_generation());
@@ -669,7 +694,11 @@ impl UiModel {
                 session_disposition,
             } => {
                 let profile_id = preview.identity.profile_id.clone();
-                if self.event_is_current(&profile_id, preview.identity.profile_generation) {
+                if self.redis_event_is_current(
+                    &profile_id,
+                    preview.identity.profile_generation,
+                    Some(session_generation),
+                ) {
                     let workspace =
                         self.exact_workspace_mut(&profile_id, preview.identity.profile_generation);
                     workspace.redis_inspect_retry = None;
@@ -692,7 +721,11 @@ impl UiModel {
                 connection_outcome,
             } => {
                 let profile_id = request.profile_id().clone();
-                if self.event_is_current(&profile_id, request.profile_generation()) {
+                if self.redis_event_is_current(
+                    &profile_id,
+                    request.profile_generation(),
+                    session_generation,
+                ) {
                     let status = error.summary.message().to_owned();
                     let workspace =
                         self.exact_workspace_mut(&profile_id, request.profile_generation());
@@ -863,6 +896,18 @@ impl UiModel {
                 .tombstones
                 .get(profile_id)
                 .is_none_or(|tombstone| generation.0 > tombstone.0)
+    }
+
+    fn redis_event_is_current(
+        &self,
+        profile_id: &ProfileId,
+        generation: ProfileGeneration,
+        session_generation: Option<SessionGeneration>,
+    ) -> bool {
+        self.event_is_current(profile_id, generation)
+            && self
+                .connection_state(profile_id)
+                .accepts_redis_event_session(session_generation)
     }
 
     fn fold_catalog_session(
@@ -1056,6 +1101,30 @@ mod tests {
     }
 
     #[test]
+    fn redis_session_correlation_matrix_is_fail_closed() {
+        let connected = ConnectionState::Connected {
+            session_generation: SessionGeneration(7),
+            elapsed_ms: 0,
+        };
+        assert!(connected.accepts_redis_event_session(Some(SessionGeneration(7))));
+        assert!(!connected.accepts_redis_event_session(Some(SessionGeneration(8))));
+        assert!(!connected.accepts_redis_event_session(None));
+
+        for state in [
+            ConnectionState::Disconnected,
+            ConnectionState::Pending(OperationId(1)),
+            ConnectionState::NeedsCredential,
+            ConnectionState::Failed {
+                summary: PublicSummary::NetworkUnavailable,
+            },
+            ConnectionState::Closing,
+        ] {
+            assert!(state.accepts_redis_event_session(None));
+            assert!(!state.accepts_redis_event_session(Some(SessionGeneration(7))));
+        }
+    }
+
+    #[test]
     fn resource_failures_preserve_last_pages_as_stale_and_success_clears_retry() {
         let profile_id = ProfileId("mysql-local".to_owned());
         let generation = ProfileGeneration(1);
@@ -1127,8 +1196,8 @@ mod tests {
                 PublicCode::None,
                 &SafeContext::profile(profile_id.clone(), OperationId(11)),
             ),
-            session_generation: None,
-            session_disposition: None,
+            session_generation: Some(SessionGeneration(31)),
+            session_disposition: Some(SessionDisposition::Keep),
             connection_outcome: ConnectionFailureOutcome::Preserve,
         });
 
@@ -1155,7 +1224,7 @@ mod tests {
         });
         model.fold(UiEvent::RedisKeysLoaded {
             page: redis_page,
-            session_generation: SessionGeneration(22),
+            session_generation: SessionGeneration(31),
             session_disposition: SessionDisposition::Keep,
         });
 
@@ -1177,7 +1246,7 @@ mod tests {
         assert_eq!(
             model.connection_state(&profile_id),
             &ConnectionState::Connected {
-                session_generation: SessionGeneration(22),
+                session_generation: SessionGeneration(31),
                 elapsed_ms: 0,
             }
         );
@@ -1196,6 +1265,14 @@ mod tests {
         };
         let mut model = UiModel {
             active_generations: [(profile_id.clone(), generation)].into(),
+            connection_states: [(
+                profile_id.clone(),
+                ConnectionState::Connected {
+                    session_generation: SessionGeneration(41),
+                    elapsed_ms: 0,
+                },
+            )]
+            .into(),
             ..UiModel::default()
         };
 
