@@ -8,13 +8,15 @@ use egui_extras::{Column as TableColumn, TableBuilder};
 
 use crate::model::{
     CatalogRequest, Cell, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT, DraftId,
-    DriverAvailability, DriverKind, ProfileGeneration, ProfileId, RequestIdentity,
+    DEFAULT_REDIS_SCAN_COUNT, DriverAvailability, DriverCapabilities, DriverKind,
+    ProfileGeneration, ProfileId, RedisKeyInspectRequest, RedisScanRequest, RequestIdentity,
 };
 
 use super::adapter::{SubmitError, UiCommand, UiPort};
 use super::model::{ConnectionState, ProfileSnapshot, UiEvent, UiModel};
 use super::mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 use super::profile_form::{FormAction, ProfileEditor, ProfileEventResult, SaveAttempt};
+use super::redis_explorer::{RedisExplorer, RedisExplorerIntent};
 
 const EVENT_DRAIN_LIMIT: usize = 128;
 const DEFAULT_ROW_LIMIT: u32 = 1_000;
@@ -25,6 +27,7 @@ pub struct DbotterApp {
     model: UiModel,
     mysql_explorers: HashMap<(ProfileId, ProfileGeneration), MySqlExplorerState>,
     profile_editor: Option<ProfileEditor>,
+    redis_explorer: RedisExplorer,
     next_draft_id: u64,
 }
 
@@ -35,6 +38,7 @@ impl DbotterApp {
             model: UiModel::default(),
             mysql_explorers: HashMap::new(),
             profile_editor: None,
+            redis_explorer: RedisExplorer::default(),
             next_draft_id: 1,
         };
         let operation_id = app.model.next_operation();
@@ -53,6 +57,7 @@ impl DbotterApp {
     fn poll_events(&mut self) {
         for event in self.port.drain_events(EVENT_DRAIN_LIMIT) {
             self.fold_mysql_explorer_event(&event);
+            self.redis_explorer.handle_event(&event);
             let profile_result = self
                 .profile_editor
                 .as_mut()
@@ -299,6 +304,100 @@ impl DbotterApp {
         }
     }
 
+    fn submit_redis_intent(&mut self, intent: RedisExplorerIntent) {
+        if let RedisExplorerIntent::Cancel { operation_id } = &intent {
+            let operation_id = *operation_id;
+            match self
+                .port
+                .try_submit(UiCommand::CancelOperation { operation_id })
+            {
+                Ok(()) => {
+                    self.redis_explorer.cancel_submitted(operation_id);
+                    self.model.status = "Cancelling Redis operation…".to_owned();
+                }
+                Err(error) => {
+                    self.redis_explorer
+                        .submission_failed(submit_error_message(error));
+                    self.report_submit_error(error);
+                }
+            }
+            return;
+        }
+        if self.model.is_config_uncertain() {
+            self.redis_explorer
+                .submission_failed("Reload profiles before browsing Redis.");
+            return;
+        }
+        let Some(profile) = self.model.selected_profile_snapshot().cloned() else {
+            self.redis_explorer
+                .submission_failed("Select a Redis profile.");
+            return;
+        };
+        let keyspace_ready = profile.driver == DriverKind::Redis
+            && profile.is_ready()
+            && crate::drivers::descriptors()
+                .into_iter()
+                .find(|descriptor| descriptor.kind == DriverKind::Redis)
+                .is_some_and(|descriptor| {
+                    descriptor
+                        .capabilities
+                        .contains(DriverCapabilities::KEYSPACE_BROWSE)
+                });
+        if !keyspace_ready {
+            self.redis_explorer
+                .submission_failed("Redis keyspace browsing is unavailable.");
+            return;
+        }
+        let operation_id = self.model.next_operation();
+        let identity = RequestIdentity::new(profile.id.clone(), profile.generation, operation_id);
+        match intent {
+            RedisExplorerIntent::Scan {
+                filter,
+                cursor,
+                restart,
+            } => {
+                let request = RedisScanRequest {
+                    identity,
+                    filter: filter.clone(),
+                    cursor,
+                    count_hint: DEFAULT_REDIS_SCAN_COUNT,
+                    timeout: Duration::from_secs(5),
+                };
+                match self.port.try_submit(UiCommand::ScanRedisKeys(request)) {
+                    Ok(()) => {
+                        self.redis_explorer
+                            .begin_scan(operation_id, filter, cursor, restart);
+                        self.model.status = "Scanning Redis keys…".to_owned();
+                    }
+                    Err(error) => {
+                        self.redis_explorer
+                            .submission_failed(submit_error_message(error));
+                        self.report_submit_error(error);
+                    }
+                }
+            }
+            RedisExplorerIntent::Inspect { key } => {
+                let request = RedisKeyInspectRequest {
+                    identity,
+                    key: key.clone(),
+                    timeout: Duration::from_secs(5),
+                };
+                match self.port.try_submit(UiCommand::InspectRedisKey(request)) {
+                    Ok(()) => {
+                        self.redis_explorer.begin_inspect(operation_id, key);
+                        self.model.status = "Inspecting Redis key…".to_owned();
+                    }
+                    Err(error) => {
+                        self.redis_explorer
+                            .submission_failed(submit_error_message(error));
+                        self.report_submit_error(error);
+                    }
+                }
+            }
+            RedisExplorerIntent::Cancel { .. } => unreachable!("handled above"),
+        }
+    }
+
     fn connections(&mut self, root_ui: &mut egui::Ui) {
         egui::Panel::left("connections")
             .resizable(true)
@@ -400,6 +499,10 @@ impl DbotterApp {
             for intent in intents {
                 self.submit_mysql_explorer_intent(profile, intent);
             }
+        } else if profile.driver == DriverKind::Redis && profile.is_ready() {
+            ui.weak("Keyspace browser ready · SCAN semantics");
+        } else {
+            ui.weak("Resource browser availability follows driver capabilities");
         }
     }
 
@@ -442,7 +545,20 @@ impl DbotterApp {
             }
             return;
         }
+        let mut redis_intent = None;
         egui::CentralPanel::default().show(root_ui, |ui| {
+            let selected_redis = self
+                .model
+                .selected_profile_snapshot()
+                .filter(|profile| profile.driver == DriverKind::Redis)
+                .map(|profile| (profile.id.clone(), profile.generation));
+            self.redis_explorer.set_profile(selected_redis.clone());
+            if selected_redis.is_some() {
+                redis_intent = self
+                    .redis_explorer
+                    .show(ui, !self.model.is_config_uncertain());
+                ui.add_space(16.0);
+            }
             ui.horizontal(|ui| {
                 ui.heading("Editor");
                 if let Some(profile) = self.model.selected_profile_snapshot() {
@@ -489,6 +605,9 @@ impl DbotterApp {
                 ui.weak("No result yet");
             }
         });
+        if let Some(intent) = redis_intent {
+            self.submit_redis_intent(intent);
+        }
     }
 }
 
@@ -572,6 +691,13 @@ fn connection_label(state: &ConnectionState) -> String {
     }
 }
 
+const fn submit_error_message(error: SubmitError) -> &'static str {
+    match error {
+        SubmitError::Busy => "The service queue is busy; try again.",
+        SubmitError::Disconnected => "The service is unavailable.",
+    }
+}
+
 fn render_result(ui: &mut egui::Ui, result: &crate::model::ResultSnapshot) {
     ui.horizontal_wrapped(|ui| {
         ui.label(format!("{} rows", result.rows.len()));
@@ -641,11 +767,12 @@ fn display_cell(cell: &Cell) -> String {
 mod tests {
     use super::DbotterApp;
     use crate::model::{
-        ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind,
-        ProfileGeneration, ProfileId, RedisTlsConfig, TlsMode,
+        ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
+        ProfileGeneration, ProfileId, RedisKeyFilter, RedisKeyId, RedisTlsConfig, TlsMode,
     };
     use crate::ui::adapter::{UiCommand, bounded_ports};
     use crate::ui::model::ProfileSnapshot;
+    use crate::ui::redis_explorer::RedisExplorerIntent;
 
     fn profile(driver: DriverKind, availability: DriverAvailability) -> ProfileSnapshot {
         let persisted = ConnectionProfile {
@@ -745,5 +872,79 @@ mod tests {
         assert_eq!(app.allocate_draft_id(), DraftId(1));
         assert_eq!(app.allocate_draft_id(), DraftId(2));
         assert_eq!(app.allocate_draft_id(), DraftId(3));
+    }
+
+    #[test]
+    fn redis_scan_intent_submits_exact_profile_generation_filter_and_cursor() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        app.model.profiles = vec![profile(DriverKind::Redis, DriverAvailability::Ready)];
+        app.model.selected_profile = Some(ProfileId("profile".to_owned()));
+
+        app.submit_redis_intent(RedisExplorerIntent::Scan {
+            filter: RedisKeyFilter::LiteralPrefix("orders:[".to_owned()),
+            cursor: 41,
+            restart: false,
+        });
+
+        let Some(UiCommand::ScanRedisKeys(request)) = service.try_next_command() else {
+            panic!("expected one Redis SCAN command");
+        };
+        assert_eq!(request.identity.profile_id, ProfileId("profile".to_owned()));
+        assert_eq!(request.identity.profile_generation, ProfileGeneration(1));
+        assert_eq!(
+            request.filter,
+            RedisKeyFilter::LiteralPrefix("orders:[".to_owned())
+        );
+        assert_eq!(request.cursor, 41);
+        assert_eq!(request.count_hint, crate::model::DEFAULT_REDIS_SCAN_COUNT);
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn redis_inspect_and_cancel_commands_preserve_raw_identity_and_operation_id() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        app.model.profiles = vec![profile(DriverKind::Redis, DriverAvailability::Ready)];
+        app.model.selected_profile = Some(ProfileId("profile".to_owned()));
+        let raw_key = RedisKeyId(vec![b'b', 0, 0xff, b'k']);
+
+        app.submit_redis_intent(RedisExplorerIntent::Inspect {
+            key: raw_key.clone(),
+        });
+        let Some(UiCommand::InspectRedisKey(request)) = service.try_next_command() else {
+            panic!("expected one Redis inspect command");
+        };
+        assert_eq!(request.key, raw_key);
+        let operation_id = request.identity.operation_id;
+
+        app.submit_redis_intent(RedisExplorerIntent::Cancel { operation_id });
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::CancelOperation {
+                operation_id: submitted
+            }) if submitted == operation_id
+        ));
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn redis_browse_is_blocked_for_unready_profile_without_consuming_operation() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        app.model.profiles = vec![profile(DriverKind::Redis, DriverAvailability::Planned)];
+        app.model.selected_profile = Some(ProfileId("profile".to_owned()));
+
+        app.submit_redis_intent(RedisExplorerIntent::Scan {
+            filter: RedisKeyFilter::Glob("*".to_owned()),
+            cursor: 0,
+            restart: true,
+        });
+
+        assert!(service.try_next_command().is_none());
+        assert_eq!(app.model.next_operation(), OperationId(2));
     }
 }

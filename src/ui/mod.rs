@@ -3,6 +3,7 @@ mod app;
 mod model;
 mod mysql_explorer;
 mod profile_form;
+mod redis_explorer;
 mod runtime;
 #[cfg(test)]
 mod runtime_contract_tests;
