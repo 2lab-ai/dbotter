@@ -58,6 +58,9 @@ required_inputs=(
   scripts/validate-tap-dispatch.py
   scripts/test-installed-receipt-contract.sh
   scripts/test-macos-package-contract.sh
+  scripts/test-macos-package-live.sh
+  scripts/validate-macos-package.py
+  scripts/build-icns.py
   scripts/test-workflow-contract.sh
   scripts/check-workflow-graph.rb
   scripts/test-installed-verifier-contract.sh

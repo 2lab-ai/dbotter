@@ -87,3 +87,45 @@ jobs:
           name: live-contract-verification
           path: artifacts/live-contract-receipt.json
           if-no-files-found: error
+
+  macos-package:
+    needs: hermetic
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Plan preview package identity
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate="${{ inputs.candidate_sha }}"
+          stamp="$(date -u +%Y-%m-%d-%H%M%S)"
+          build_id="$stamp-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${candidate:0:12}"
+          {
+            echo "build_id=$build_id"
+            echo "tag=preview-$build_id"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Build exact preview binary
+        env:
+          DBOTTER_BUILD_CHANNEL: preview
+          DBOTTER_BUILD_ID: ${{ steps.package.outputs.build_id }}
+          DBOTTER_SOURCE_SHA: ${{ inputs.candidate_sha }}
+        run: cargo build --release --all-features --locked
+
+      - name: Build and verify real macOS package
+        run: |
+          ./scripts/test-macos-package-live.sh \
+            --binary target/release/dbotter \
+            --expected-source-sha "${{ inputs.candidate_sha }}" \
+            --expected-tag "${{ steps.package.outputs.tag }}"

@@ -117,6 +117,26 @@ begin
     fail_contract("#{name}.yml: verify candidate_sha is not wired") unless verify_job.dig("with", "candidate_sha") == expression
   end
 
+  macos_package = job(workflows["verify"], "macos-package", "verify.yml")
+  fail_contract("verify.yml: macOS package job must depend on hermetic") unless needs(macos_package) == ["hermetic"]
+  fail_contract("verify.yml: macOS package job must use the pinned native runner") unless macos_package["runs-on"] == "macos-15"
+  macos_checkout = unique_named_step(macos_package, "Checkout exact candidate", "verify.yml.macos-package")
+  fail_contract("verify.yml: macOS package checkout is not exact") unless macos_checkout["uses"] == "actions/checkout@v4" && macos_checkout["with"] == {
+    "ref" => "${{ inputs.candidate_sha }}",
+    "fetch-depth" => 0,
+    "persist-credentials" => false
+  }
+  macos_live = unique_named_step(macos_package, "Build and verify real macOS package", "verify.yml.macos-package")
+  require_substrings(
+    macos_live["run"],
+    [
+      "./scripts/test-macos-package-live.sh",
+      '--expected-source-sha "${{ inputs.candidate_sha }}"',
+      '--expected-tag "${{ steps.package.outputs.tag }}"'
+    ],
+    "verify.yml macOS package live test"
+  )
+
   preview = workflows["preview"]
   preview_jobs = preview["jobs"]
   exact_keys(preview_jobs, %w[verify plan build publish tap], "preview.yml.jobs")
