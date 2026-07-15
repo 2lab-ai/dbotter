@@ -56,3 +56,20 @@ fn prepared_unsupported_is_static_and_never_resubmits_user_text() {
     assert!(public_error.contains("RecoveryAction::FocusEditor"));
     assert!(public_error.contains("RecoveryAction::DismissError"));
 }
+
+#[test]
+fn mysql_authentication_handshake_is_classified_before_pool_retry_and_shares_timeout() {
+    let mysql = source("src/drivers/mysql.rs");
+    let direct = mysql
+        .find("MySqlConnection::connect_with(&options)")
+        .expect("single direct authentication handshake");
+    let pool = mysql
+        .find("MySqlPoolOptions::new()")
+        .expect("bounded MySQL pool connect");
+    assert!(
+        direct < pool,
+        "pool retry must not erase the server auth code"
+    );
+    assert!(mysql.contains("checked_sub(started.elapsed())"));
+    assert!(mysql.contains("acquire_timeout(remaining)"));
+}
