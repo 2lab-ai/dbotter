@@ -222,3 +222,51 @@ fn production_source_has_no_keys_command_or_plaintext_tls_fallback() {
     assert!(!required.contains("ConnectionAddr::Tcp{"));
     assert!(!required.contains("or_else("));
 }
+
+#[test]
+fn redis_ui_events_must_preserve_typed_public_error_and_exact_session_truth() {
+    let model = include_str!("../src/ui/model.rs");
+    let runtime = include_str!("../src/ui/runtime.rs");
+
+    assert!(
+        model.contains("error: PublicOperationError"),
+        "Redis failure events currently collapse PublicCode into PublicSummary"
+    );
+    assert!(
+        model.contains("session_generation: SessionGeneration")
+            && model.contains("session_disposition: SessionDisposition"),
+        "Redis success events must publish their exact acquired session truth"
+    );
+    assert!(
+        runtime.contains("ControllerMessage::SessionAcquired")
+            && runtime.contains("failed_redis_resource_event"),
+        "Redis runtime must use the scoped lease lifecycle and typed error carrier"
+    );
+}
+
+#[test]
+fn required_redis_tls_ui_must_have_stable_ca_ids_and_real_picker_binding() {
+    let profile_form = include_str!("../src/ui/profile_form.rs");
+    let app = include_str!("../src/ui/app.rs");
+
+    for required in [
+        "profile.redis_tls.ca_file",
+        "profile.redis_tls.ca_file.pick",
+        "PickRedisCaFile",
+        "bind_redis_ca_file",
+    ] {
+        assert!(
+            profile_form.contains(required) || app.contains(required),
+            "missing Required TLS UI contract: {required}"
+        );
+    }
+}
+
+#[test]
+fn redis_load_more_must_be_bound_to_the_page_filter_context() {
+    let explorer = include_str!("../src/ui/redis_explorer.rs");
+    assert!(
+        explorer.contains("page_filter_matches_draft"),
+        "editing the draft filter must require Refresh before cursor reuse"
+    );
+}

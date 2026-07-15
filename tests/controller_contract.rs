@@ -8,13 +8,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dbotter::config::{ConfigWriter, MigrationConsent, MutationFailpoint, MutationFaultInjector};
 use dbotter::drivers::{
-    CatalogBrowser, ConnectedResources, ConnectionPing, DriverError, MySqlPreparedExecution,
+    CatalogBrowser, ConnectedResources, ConnectionPing, DriverError, KeyspaceBrowser,
+    MySqlPreparedExecution, RedisExecution,
 };
 use dbotter::model::{
     CatalogLevel, CatalogPage, CatalogRequest, CatalogRetainedCounts, ConnectionDraft,
     CredentialMode, DraftId, DriverKind, MySqlPublicErrorCode, OperationId, PreparedMySqlRequest,
-    ProfileGeneration, ProfileId, QueryResult, RedisKeyFilter, RedisKeyId, RedisKeyInspectRequest,
-    RedisScanRequest, RequestIdentity, ResultId, ResultProvenance, ResultRetentionPolicy,
+    ProfileGeneration, ProfileId, QueryResult, RedisExecuteRequest, RedisKeyFilter, RedisKeyId,
+    RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, RequestIdentity,
+    ResultId, ResultProvenance, ResultRetentionPolicy,
     ResultSnapshot, SessionGeneration,
 };
 use dbotter::secrets::{SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate};
@@ -1168,6 +1170,114 @@ async fn p4_catalog_stale_cancel_cannot_evict_or_hide_a_replacement_session() {
         }
     );
     shutdown(&ui, runtime, OperationId(269)).await;
+}
+
+#[tokio::test]
+async fn p5_redis_scan_cancel_drops_driver_future_before_exact_session_close() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let session = Arc::new(RedisLifecycleSession::new(RedisLifecycleOperation::Scan));
+    let service = test_service_with_connector(
+        &path,
+        Arc::new(RedisLifecycleConnector {
+            session: session.clone(),
+        }),
+    );
+    let mut create = create_request("redis-p5-scan-cancel", OperationId(212));
+    create.draft = ConnectionDraft::for_driver(DriverKind::Redis);
+    create.draft.name = "redis-p5-scan-cancel".to_owned();
+    create.draft.credential_mode = CredentialMode::None;
+    let profile = service.create_profile(create).await.expect("redis profile");
+    let (mut ui, service_port) = controller_ports();
+    let runtime = spawn_with_service(service_port, service.clone());
+
+    ui.try_submit(UiCommand::ScanRedisKeys(RedisScanRequest {
+        identity: RequestIdentity::new(
+            profile.profile_id,
+            profile.profile_generation,
+            OperationId(213),
+        ),
+        filter: RedisKeyFilter::LiteralPrefix("p5:".to_owned()),
+        cursor: 0,
+        count_hint: 100,
+        timeout: Duration::from_secs(5),
+    }))
+    .expect("scan submits");
+    session.resources.wait_until_started().await;
+    ui.try_submit(UiCommand::CancelOperation {
+        operation_id: OperationId(213),
+    })
+    .expect("cancel submits");
+    wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::RedisKeysFailed {
+                request,
+                summary: dbotter::model::PublicSummary::OperationCancelled,
+            } if request.operation_id() == OperationId(213)
+        )
+    })
+    .await;
+
+    assert!(session.resources.driver_dropped.load(Ordering::SeqCst));
+    assert!(
+        !session.close_before_driver_drop.load(Ordering::SeqCst),
+        "the SCAN future must drop before exact cached-session close"
+    );
+    assert_eq!(session.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(service.cached_session_count().await, 0);
+    shutdown(&ui, runtime, OperationId(219)).await;
+}
+
+#[tokio::test]
+async fn p5_redis_inspect_outer_timeout_drops_driver_future_before_exact_session_close() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let session = Arc::new(RedisLifecycleSession::new(RedisLifecycleOperation::Inspect));
+    let service = test_service_with_connector(
+        &path,
+        Arc::new(RedisLifecycleConnector {
+            session: session.clone(),
+        }),
+    );
+    let mut create = create_request("redis-p5-inspect-timeout", OperationId(214));
+    create.draft = ConnectionDraft::for_driver(DriverKind::Redis);
+    create.draft.name = "redis-p5-inspect-timeout".to_owned();
+    create.draft.credential_mode = CredentialMode::None;
+    let profile = service.create_profile(create).await.expect("redis profile");
+    let (mut ui, service_port) = controller_ports();
+    let runtime = spawn_with_service(service_port, service.clone());
+
+    ui.try_submit(UiCommand::InspectRedisKey(RedisKeyInspectRequest {
+        identity: RequestIdentity::new(
+            profile.profile_id,
+            profile.profile_generation,
+            OperationId(215),
+        ),
+        key: RedisKeyId(b"p5:blocked".to_vec()),
+        timeout: Duration::from_secs(1),
+    }))
+    .expect("inspect submits");
+    session.resources.wait_until_started().await;
+    wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::RedisKeyInspectFailed {
+                request,
+                summary: dbotter::model::PublicSummary::OperationTimedOut,
+            } if request.operation_id() == OperationId(215)
+        )
+    })
+    .await;
+
+    assert!(session.resources.driver_dropped.load(Ordering::SeqCst));
+    assert!(
+        !session.close_before_driver_drop.load(Ordering::SeqCst),
+        "the inspect future must drop before exact cached-session close"
+    );
+    assert_eq!(session.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(service.cached_session_count().await, 0);
+    shutdown(&ui, runtime, OperationId(219)).await;
 }
 
 #[tokio::test]
@@ -3532,6 +3642,20 @@ impl Drop for CatalogDropGuard {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RedisLifecycleOperation {
+    Scan,
+    Inspect,
+}
+
+struct RedisLifecycleDropGuard(Arc<AtomicBool>);
+
+impl Drop for RedisLifecycleDropGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 #[derive(Default)]
 struct CatalogLifecycleResources {
     started: AtomicBool,
@@ -3547,8 +3671,46 @@ impl CatalogLifecycleResources {
     }
 }
 
+struct RedisLifecycleResources {
+    operation: RedisLifecycleOperation,
+    started: AtomicBool,
+    started_notify: tokio::sync::Notify,
+    driver_dropped: Arc<AtomicBool>,
+}
+
+impl RedisLifecycleResources {
+    fn new(operation: RedisLifecycleOperation) -> Self {
+        Self {
+            operation,
+            started: AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
+            driver_dropped: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    async fn wait_until_started(&self) {
+        while !self.started.load(Ordering::SeqCst) {
+            self.started_notify.notified().await;
+        }
+    }
+
+    async fn block<T>(&self) -> Result<T, DriverError> {
+        let _guard = RedisLifecycleDropGuard(self.driver_dropped.clone());
+        self.started.store(true, Ordering::SeqCst);
+        self.started_notify.notify_waiters();
+        std::future::pending::<Result<T, DriverError>>().await
+    }
+}
+
 #[async_trait]
 impl ConnectionPing for CatalogLifecycleResources {
+    async fn ping(&self, _timeout: Duration) -> Result<(), DriverError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ConnectionPing for RedisLifecycleResources {
     async fn ping(&self, _timeout: Duration) -> Result<(), DriverError> {
         Ok(())
     }
@@ -3565,6 +3727,19 @@ impl MySqlPreparedExecution for CatalogLifecycleResources {
 }
 
 #[async_trait]
+impl RedisExecution for RedisLifecycleResources {
+    async fn execute_command(
+        &self,
+        _request: &RedisExecuteRequest,
+    ) -> Result<QueryResult, DriverError> {
+        Err(DriverError::Unsupported {
+            driver: DriverKind::Redis,
+            operation: "test Redis execution".to_owned(),
+        })
+    }
+}
+
+#[async_trait]
 impl CatalogBrowser for CatalogLifecycleResources {
     async fn load_page(
         &self,
@@ -3575,6 +3750,34 @@ impl CatalogBrowser for CatalogLifecycleResources {
         self.started.store(true, Ordering::SeqCst);
         self.started_notify.notify_waiters();
         std::future::pending::<Result<CatalogPage, DriverError>>().await
+    }
+}
+
+#[async_trait]
+impl KeyspaceBrowser for RedisLifecycleResources {
+    async fn scan_keys(&self, _request: &RedisScanRequest) -> Result<RedisKeyPage, DriverError> {
+        if self.operation == RedisLifecycleOperation::Scan {
+            self.block().await
+        } else {
+            Err(DriverError::Unsupported {
+                driver: DriverKind::Redis,
+                operation: "unexpected test SCAN".to_owned(),
+            })
+        }
+    }
+
+    async fn inspect_key(
+        &self,
+        _request: &RedisKeyInspectRequest,
+    ) -> Result<RedisValuePreview, DriverError> {
+        if self.operation == RedisLifecycleOperation::Inspect {
+            self.block().await
+        } else {
+            Err(DriverError::Unsupported {
+                driver: DriverKind::Redis,
+                operation: "unexpected test inspect".to_owned(),
+            })
+        }
     }
 }
 
@@ -3608,6 +3811,45 @@ impl SessionHandle for CatalogLifecycleSession {
     }
 }
 
+struct RedisLifecycleSession {
+    resources: Arc<RedisLifecycleResources>,
+    closes: AtomicUsize,
+    close_before_driver_drop: AtomicBool,
+}
+
+impl RedisLifecycleSession {
+    fn new(operation: RedisLifecycleOperation) -> Self {
+        Self {
+            resources: Arc::new(RedisLifecycleResources::new(operation)),
+            closes: AtomicUsize::new(0),
+            close_before_driver_drop: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionHandle for RedisLifecycleSession {
+    async fn ping(&self, _timeout: Duration) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    fn connected_resources(&self) -> Option<ConnectedResources> {
+        Some(ConnectedResources::Redis {
+            ping: self.resources.clone(),
+            execution: self.resources.clone(),
+            keyspace: self.resources.clone(),
+        })
+    }
+
+    async fn close(&self) -> Result<(), DriverError> {
+        if !self.resources.driver_dropped.load(Ordering::SeqCst) {
+            self.close_before_driver_drop.store(true, Ordering::SeqCst);
+        }
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 struct CatalogLifecycleConnector {
     session: Arc<CatalogLifecycleSession>,
 }
@@ -3635,6 +3877,22 @@ impl SessionConnector for CatalogReplacementConnector {
 
 #[async_trait]
 impl SessionConnector for CatalogLifecycleConnector {
+    async fn connect(
+        &self,
+        _profile: &dbotter::model::ConnectionProfile,
+        _secret: Option<&SessionSecret>,
+        _timeout: Duration,
+    ) -> Result<Arc<dyn SessionHandle>, DriverError> {
+        Ok(self.session.clone())
+    }
+}
+
+struct RedisLifecycleConnector {
+    session: Arc<RedisLifecycleSession>,
+}
+
+#[async_trait]
+impl SessionConnector for RedisLifecycleConnector {
     async fn connect(
         &self,
         _profile: &dbotter::model::ConnectionProfile,
