@@ -8,8 +8,9 @@ use secrecy::{ExposeSecret as _, SecretString};
 use crate::drivers::{DriverError, RedisTlsFailure};
 use crate::model::{
     Cell, Column, ConnectionProfile, DriverAvailability, DriverCapabilities, DriverDescriptor,
-    DriverKind, MAX_REDIS_CELLS, MAX_REDIS_DEPTH, QueryLanguage, QueryResult, RedisExecuteRequest,
-    RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, TlsMode,
+    DriverKind, MAX_REDIS_CELL_BYTES, MAX_REDIS_CELLS, MAX_REDIS_DEPTH, MAX_RESULT_BYTES,
+    QueryLanguage, QueryResult, RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage,
+    RedisScanRequest, RedisValuePreview, TlsMode,
 };
 
 pub const DESCRIPTOR: DriverDescriptor = DriverDescriptor {
@@ -273,47 +274,308 @@ fn redis_tls_failure(error: &(dyn std::error::Error + 'static)) -> Option<RedisT
 
 struct DecodeBudget {
     remaining_nodes: usize,
+    remaining_bytes: usize,
     truncated: bool,
 }
 
 impl DecodeBudget {
-    fn consume(&mut self) -> bool {
-        let Some(remaining) = self.remaining_nodes.checked_sub(1) else {
-            return false;
-        };
-        self.remaining_nodes = remaining;
-        true
+    fn mark_truncated(&mut self) {
+        self.truncated = true;
     }
+}
+
+struct DecodedCell {
+    cell: Cell,
+    stop_after: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CompositeMeasure {
+    nodes: usize,
+    encoded_bytes: usize,
 }
 
 fn value_rows(value: ::redis::Value, row_limit: usize) -> (Vec<Vec<Cell>>, bool) {
     let mut budget = DecodeBudget {
         remaining_nodes: MAX_REDIS_CELLS,
+        remaining_bytes: MAX_RESULT_BYTES,
         truncated: false,
     };
     match value {
         ::redis::Value::Array(values) => {
-            let truncated = values.len() > row_limit;
-            let rows = values
-                .into_iter()
-                .take(row_limit)
-                .map(|value| vec![value_cell(value, &mut budget, 0)])
-                .collect();
+            let mut truncated = values.len() > row_limit;
+            let mut rows = Vec::with_capacity(values.len().min(row_limit));
+            for value in values.into_iter().take(row_limit) {
+                let Some(decoded) = decode_value_cell(value, &mut budget) else {
+                    truncated = true;
+                    break;
+                };
+                rows.push(vec![decoded.cell]);
+                if decoded.stop_after {
+                    truncated = true;
+                    break;
+                }
+            }
             (rows, truncated || budget.truncated)
         }
         _ if row_limit == 0 => (Vec::new(), true),
         value => {
-            let cell = value_cell(value, &mut budget, 0);
-            (vec![vec![cell]], budget.truncated)
+            let Some(decoded) = decode_value_cell(value, &mut budget) else {
+                return (Vec::new(), true);
+            };
+            (
+                vec![vec![decoded.cell]],
+                decoded.stop_after || budget.truncated,
+            )
         }
     }
 }
 
-fn value_cell(value: ::redis::Value, budget: &mut DecodeBudget, depth: usize) -> Cell {
-    if depth >= MAX_REDIS_DEPTH || !budget.consume() {
-        budget.truncated = true;
-        return Cell::Text("[dbotter-truncated]".to_owned());
+fn decode_value_cell(value: ::redis::Value, budget: &mut DecodeBudget) -> Option<DecodedCell> {
+    if is_composite(&value) {
+        return decode_composite(value, budget);
     }
+    decode_scalar(value, budget)
+}
+
+fn is_composite(value: &::redis::Value) -> bool {
+    matches!(
+        value,
+        ::redis::Value::Array(_)
+            | ::redis::Value::Map(_)
+            | ::redis::Value::Attribute { .. }
+            | ::redis::Value::Set(_)
+            | ::redis::Value::Push { .. }
+    )
+}
+
+fn decode_composite(value: ::redis::Value, budget: &mut DecodeBudget) -> Option<DecodedCell> {
+    let Some(measure) = measure_composite(
+        &value,
+        budget.remaining_nodes,
+        budget.remaining_bytes.min(MAX_REDIS_CELL_BYTES),
+    ) else {
+        budget.mark_truncated();
+        return None;
+    };
+    budget.remaining_nodes = budget.remaining_nodes.saturating_sub(measure.nodes);
+    budget.remaining_bytes = budget.remaining_bytes.saturating_sub(measure.encoded_bytes);
+    Some(DecodedCell {
+        cell: value_cell_complete(value),
+        stop_after: false,
+    })
+}
+
+fn decode_scalar(value: ::redis::Value, budget: &mut DecodeBudget) -> Option<DecodedCell> {
+    let Some(remaining_nodes) = budget.remaining_nodes.checked_sub(1) else {
+        budget.mark_truncated();
+        return None;
+    };
+    let (retained_bytes, previewable) = scalar_measure(&value);
+    let crosses_limit =
+        retained_bytes > MAX_REDIS_CELL_BYTES || retained_bytes > budget.remaining_bytes;
+    if crosses_limit && !previewable {
+        budget.mark_truncated();
+        return None;
+    }
+    budget.remaining_nodes = remaining_nodes;
+    if crosses_limit {
+        budget.remaining_bytes = 0;
+        budget.mark_truncated();
+    } else {
+        budget.remaining_bytes = budget.remaining_bytes.saturating_sub(retained_bytes);
+    }
+    Some(DecodedCell {
+        cell: value_cell_complete(value),
+        stop_after: crosses_limit,
+    })
+}
+
+fn scalar_measure(value: &::redis::Value) -> (usize, bool) {
+    match value {
+        ::redis::Value::Nil => (4, false),
+        ::redis::Value::Int(value) => (signed_decimal_digits(*value), false),
+        ::redis::Value::BulkString(value) => (value.len(), true),
+        ::redis::Value::SimpleString(value) => (value.len(), true),
+        ::redis::Value::Okay => (2, true),
+        ::redis::Value::Double(value) => (json_float_bytes(*value), false),
+        ::redis::Value::Boolean(value) => (if *value { 4 } else { 5 }, false),
+        ::redis::Value::VerbatimString { text, .. } => (text.len(), true),
+        ::redis::Value::BigNumber(value) => (decimal_digits_from_bits(value.bits()), false),
+        ::redis::Value::ServerError(_) => ("[redis-server-error]".len(), false),
+        _ => ("[unsupported-resp-value]".len(), false),
+    }
+}
+
+struct CompositeMeter {
+    remaining_nodes: usize,
+    remaining_bytes: usize,
+    nodes: usize,
+    encoded_bytes: usize,
+}
+
+impl CompositeMeter {
+    fn consume_node(&mut self, depth: usize) -> Option<()> {
+        if depth >= MAX_REDIS_DEPTH {
+            return None;
+        }
+        self.remaining_nodes = self.remaining_nodes.checked_sub(1)?;
+        self.nodes = self.nodes.checked_add(1)?;
+        Some(())
+    }
+
+    fn add_bytes(&mut self, bytes: usize) -> Option<()> {
+        self.remaining_bytes = self.remaining_bytes.checked_sub(bytes)?;
+        self.encoded_bytes = self.encoded_bytes.checked_add(bytes)?;
+        Some(())
+    }
+}
+
+fn measure_composite(
+    value: &::redis::Value,
+    remaining_nodes: usize,
+    byte_limit: usize,
+) -> Option<CompositeMeasure> {
+    let mut meter = CompositeMeter {
+        remaining_nodes,
+        remaining_bytes: byte_limit,
+        nodes: 0,
+        encoded_bytes: 0,
+    };
+    measure_json_value_into(value, 0, &mut meter)?;
+    Some(CompositeMeasure {
+        nodes: meter.nodes,
+        encoded_bytes: meter.encoded_bytes,
+    })
+}
+
+fn measure_json_value_into(
+    value: &::redis::Value,
+    depth: usize,
+    meter: &mut CompositeMeter,
+) -> Option<()> {
+    meter.consume_node(depth)?;
+    match value {
+        ::redis::Value::Nil => meter.add_bytes(4),
+        ::redis::Value::Int(value) => meter.add_bytes(signed_decimal_digits(*value)),
+        ::redis::Value::BulkString(value) => match std::str::from_utf8(value) {
+            Ok(text) => meter.add_bytes(json_string_bytes(text)?),
+            Err(_) => {
+                let encoded = base64_encoded_bytes(value.len())?;
+                meter.add_bytes(
+                    47_usize
+                        .checked_add(encoded)?
+                        .checked_add(decimal_digits(value.len()))?,
+                )
+            }
+        },
+        ::redis::Value::SimpleString(value) => meter.add_bytes(json_string_bytes(value)?),
+        ::redis::Value::Okay => meter.add_bytes(4),
+        ::redis::Value::Double(value) => meter.add_bytes(json_float_bytes(*value)),
+        ::redis::Value::Boolean(value) => meter.add_bytes(if *value { 4 } else { 5 }),
+        ::redis::Value::Array(values) | ::redis::Value::Set(values) => {
+            measure_json_array(values, depth + 1, meter)
+        }
+        ::redis::Value::Map(entries) => measure_json_entries(entries, depth + 1, meter),
+        ::redis::Value::Attribute { data, attributes } => {
+            meter.add_bytes(23)?;
+            measure_json_entries(attributes, depth + 1, meter)?;
+            measure_json_value_into(data, depth + 1, meter)
+        }
+        ::redis::Value::VerbatimString { text, .. } => meter.add_bytes(json_string_bytes(text)?),
+        ::redis::Value::BigNumber(value) => meter.add_bytes(decimal_digits_from_bits(value.bits())),
+        ::redis::Value::Push { data, .. } => {
+            meter.add_bytes(23)?;
+            measure_json_array(data, depth + 1, meter)
+        }
+        ::redis::Value::ServerError(_) => {
+            meter.add_bytes(json_string_bytes("[redis-server-error]")?)
+        }
+        _ => meter.add_bytes(json_string_bytes("[unsupported-resp-value]")?),
+    }
+}
+
+fn measure_json_array(
+    values: &[::redis::Value],
+    depth: usize,
+    meter: &mut CompositeMeter,
+) -> Option<()> {
+    meter.add_bytes(2_usize.checked_add(values.len().saturating_sub(1))?)?;
+    for value in values {
+        measure_json_value_into(value, depth, meter)?;
+    }
+    Some(())
+}
+
+fn measure_json_entries(
+    entries: &[(::redis::Value, ::redis::Value)],
+    depth: usize,
+    meter: &mut CompositeMeter,
+) -> Option<()> {
+    meter.add_bytes(2_usize.checked_add(entries.len().saturating_sub(1))?)?;
+    for (key, value) in entries {
+        meter.add_bytes(17)?;
+        measure_json_value_into(key, depth, meter)?;
+        measure_json_value_into(value, depth, meter)?;
+    }
+    Some(())
+}
+
+fn json_string_bytes(value: &str) -> Option<usize> {
+    let mut bytes = 2_usize;
+    for character in value.chars() {
+        let encoded = match character {
+            '"' | '\\' | '\u{08}' | '\u{0c}' | '\n' | '\r' | '\t' => 2,
+            character if character <= '\u{1f}' => 6,
+            character => character.len_utf8(),
+        };
+        bytes = bytes.checked_add(encoded)?;
+    }
+    Some(bytes)
+}
+
+fn base64_encoded_bytes(bytes: usize) -> Option<usize> {
+    bytes.checked_add(2)?.checked_div(3)?.checked_mul(4)
+}
+
+fn decimal_digits(mut value: usize) -> usize {
+    if value == 0 {
+        return 1;
+    }
+    let mut digits = 0;
+    while value != 0 {
+        digits += 1;
+        value /= 10;
+    }
+    digits
+}
+
+fn signed_decimal_digits(value: i64) -> usize {
+    let mut magnitude = value.unsigned_abs();
+    let mut digits = usize::from(value.is_negative());
+    if magnitude == 0 {
+        return 1;
+    }
+    while magnitude != 0 {
+        digits += 1;
+        magnitude /= 10;
+    }
+    digits
+}
+
+fn json_float_bytes(value: f64) -> usize {
+    serde_json::Number::from_f64(value).map_or(4, |number| number.to_string().len())
+}
+
+fn decimal_digits_from_bits(bits: u64) -> usize {
+    usize::try_from(bits)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(30_103)
+        .saturating_div(100_000)
+        .saturating_add(2)
+}
+
+fn value_cell_complete(value: ::redis::Value) -> Cell {
     match value {
         ::redis::Value::Nil => Cell::Null,
         ::redis::Value::Int(value) => Cell::Int(value),
@@ -324,66 +586,44 @@ fn value_cell(value: ::redis::Value, budget: &mut DecodeBudget, depth: usize) ->
         ::redis::Value::Okay => Cell::Text("OK".to_owned()),
         ::redis::Value::Double(value) => Cell::Float(value),
         ::redis::Value::Boolean(value) => Cell::Bool(value),
-        ::redis::Value::Array(values) | ::redis::Value::Set(values) => Cell::Json(
-            serde_json::Value::Array(values_json(values, budget, depth + 1)),
-        ),
-        ::redis::Value::Map(entries) => Cell::Json(serde_json::Value::Array(entries_json(
-            entries,
-            budget,
-            depth + 1,
-        ))),
+        ::redis::Value::Array(values) | ::redis::Value::Set(values) => {
+            Cell::Json(serde_json::Value::Array(values_json_complete(values)))
+        }
+        ::redis::Value::Map(entries) => {
+            Cell::Json(serde_json::Value::Array(entries_json_complete(entries)))
+        }
         ::redis::Value::Attribute { data, attributes } => {
-            let data = value_json(*data, budget, depth + 1);
-            let attributes = entries_json(attributes, budget, depth + 1);
+            let data = value_json_complete(*data);
+            let attributes = entries_json_complete(attributes);
             Cell::Json(serde_json::json!({ "data": data, "attributes": attributes }))
         }
         ::redis::Value::VerbatimString { text, .. } => Cell::Text(text),
         ::redis::Value::BigNumber(value) => Cell::Decimal(value.to_string()),
         ::redis::Value::Push { data, .. } => Cell::Json(serde_json::json!({
             "type": "push",
-            "data": values_json(data, budget, depth + 1)
+            "data": values_json_complete(data)
         })),
         ::redis::Value::ServerError(_) => Cell::Text("[redis-server-error]".to_owned()),
         _ => Cell::Text("[unsupported-resp-value]".to_owned()),
     }
 }
 
-fn values_json(
-    values: Vec<::redis::Value>,
-    budget: &mut DecodeBudget,
-    depth: usize,
-) -> Vec<serde_json::Value> {
-    let mut decoded = Vec::with_capacity(values.len().min(budget.remaining_nodes));
-    for value in values {
-        if budget.remaining_nodes == 0 || depth >= MAX_REDIS_DEPTH {
-            budget.truncated = true;
-            break;
-        }
-        decoded.push(value_json(value, budget, depth));
-    }
-    decoded
+fn values_json_complete(values: Vec<::redis::Value>) -> Vec<serde_json::Value> {
+    values.into_iter().map(value_json_complete).collect()
 }
 
-fn entries_json(
-    entries: Vec<(::redis::Value, ::redis::Value)>,
-    budget: &mut DecodeBudget,
-    depth: usize,
-) -> Vec<serde_json::Value> {
-    let mut decoded = Vec::with_capacity(entries.len().min(budget.remaining_nodes / 2));
+fn entries_json_complete(entries: Vec<(::redis::Value, ::redis::Value)>) -> Vec<serde_json::Value> {
+    let mut decoded = Vec::with_capacity(entries.len());
     for (key, value) in entries {
-        if budget.remaining_nodes == 0 || depth >= MAX_REDIS_DEPTH {
-            budget.truncated = true;
-            break;
-        }
-        let key = value_json(key, budget, depth);
-        let value = value_json(value, budget, depth);
+        let key = value_json_complete(key);
+        let value = value_json_complete(value);
         decoded.push(serde_json::json!({ "key": key, "value": value }));
     }
     decoded
 }
 
-fn value_json(value: ::redis::Value, budget: &mut DecodeBudget, depth: usize) -> serde_json::Value {
-    match value_cell(value, budget, depth) {
+fn value_json_complete(value: ::redis::Value) -> serde_json::Value {
+    match value_cell_complete(value) {
         Cell::Null => serde_json::Value::Null,
         Cell::Bool(value) => value.into(),
         Cell::Int(value) => value.into(),
@@ -429,6 +669,38 @@ fn bytes_cell(bytes: Vec<u8>) -> Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retain_decoded(rows: Vec<Vec<Cell>>, truncated: bool) -> crate::model::ResultSnapshot {
+        use crate::model::{
+            OperationId, ProfileGeneration, ProfileId, ResultId, ResultProvenance,
+            ResultRetentionPolicy, ResultSnapshot,
+        };
+
+        ResultSnapshot::retain(
+            QueryResult {
+                columns: vec![Column {
+                    name: "value".to_owned(),
+                    type_name: "RESP".to_owned(),
+                }],
+                rows,
+                affected_rows: 0,
+                last_insert_id: None,
+                elapsed_ms: 0,
+                truncated,
+                backend_notices_present: false,
+            },
+            ResultProvenance {
+                result_id: ResultId(71),
+                profile_id: ProfileId("profile-redis-decode".to_owned()),
+                profile_generation: ProfileGeneration(7),
+                operation_id: OperationId(17),
+                driver: DriverKind::Redis,
+                completed_at_unix_ms: 1_700_000_000_123,
+                duration_ms: 19,
+            },
+            ResultRetentionPolicy::redis(1),
+        )
+    }
 
     #[test]
     fn flat_array_becomes_one_row_per_value() {
@@ -563,6 +835,58 @@ mod tests {
     }
 
     #[test]
+    fn nested_composite_accepts_the_exact_cell_byte_boundary_and_rejects_the_next_byte() {
+        const MAP_WRAPPER_BYTES: usize = 30;
+        let value = |payload_bytes| {
+            ::redis::Value::Map(vec![(
+                ::redis::Value::SimpleString("payload".to_owned()),
+                ::redis::Value::BulkString(vec![b'x'; payload_bytes]),
+            )])
+        };
+
+        let (exact_rows, exact_truncated) =
+            value_rows(value(MAX_REDIS_CELL_BYTES - MAP_WRAPPER_BYTES), 1);
+        assert!(!exact_truncated);
+        let Cell::Json(exact) = &exact_rows[0][0] else {
+            panic!("exact-boundary composite must stay complete");
+        };
+        assert_eq!(
+            serde_json::to_vec(exact)
+                .expect("serialize exact-boundary composite")
+                .len(),
+            MAX_REDIS_CELL_BYTES
+        );
+
+        let (oversized_rows, oversized_truncated) =
+            value_rows(value(MAX_REDIS_CELL_BYTES - MAP_WRAPPER_BYTES + 1), 1);
+        assert!(oversized_truncated);
+        assert!(oversized_rows.is_empty());
+    }
+
+    #[test]
+    fn exact_depth_and_node_boundaries_remain_complete() {
+        let mut exact_depth = ::redis::Value::Int(1);
+        for _ in 0..MAX_REDIS_DEPTH - 1 {
+            exact_depth = ::redis::Value::Array(vec![exact_depth]);
+        }
+        let (depth_rows, depth_truncated) = value_rows(exact_depth, 1);
+        assert!(!depth_truncated);
+        assert_eq!(depth_rows.len(), 1);
+
+        let exact_nodes = ::redis::Value::Set(
+            (0..MAX_REDIS_CELLS - 1)
+                .map(|_| ::redis::Value::Int(0))
+                .collect(),
+        );
+        let (node_rows, node_truncated) = value_rows(exact_nodes, 1);
+        assert!(!node_truncated);
+        let Cell::Json(serde_json::Value::Array(values)) = &node_rows[0][0] else {
+            panic!("exact-node-boundary composite must stay complete");
+        };
+        assert_eq!(values.len(), MAX_REDIS_CELLS - 1);
+    }
+
+    #[test]
     fn complete_nested_composites_and_top_level_bytes_keep_exact_identity() {
         let (rows, truncated) = value_rows(
             ::redis::Value::Array(vec![
@@ -588,5 +912,33 @@ mod tests {
                 }],
             ]
         );
+    }
+
+    #[test]
+    fn oversized_top_level_text_and_bytes_reach_snapshot_preview_truth_without_a_copy() {
+        let original_len = MAX_REDIS_CELL_BYTES + 1;
+        let (text_rows, text_truncated) =
+            value_rows(::redis::Value::BulkString(vec![b'x'; original_len]), 1);
+        let text = retain_decoded(text_rows, text_truncated);
+        assert!(text_truncated);
+        assert!(matches!(
+            &text.rows[0][0],
+            Cell::TextPreview {
+                preview,
+                original_len: retained_original_len,
+            } if preview.len() == MAX_REDIS_CELL_BYTES && *retained_original_len == original_len
+        ));
+
+        let (byte_rows, byte_truncated) =
+            value_rows(::redis::Value::BulkString(vec![0xff; original_len]), 1);
+        let bytes = retain_decoded(byte_rows, byte_truncated);
+        assert!(byte_truncated);
+        assert!(matches!(
+            &bytes.rows[0][0],
+            Cell::Bytes {
+                retained,
+                original_len: retained_original_len,
+            } if retained.len() == MAX_REDIS_CELL_BYTES && *retained_original_len == original_len
+        ));
     }
 }
