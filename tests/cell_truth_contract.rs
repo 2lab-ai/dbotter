@@ -63,3 +63,25 @@ fn retained_json_exposes_utf8_preview_truth_in_the_cell_variant() {
     assert_eq!(encoded["value"]["original_len"], original_len);
     assert!(encoded["value"]["preview"].is_string());
 }
+
+#[test]
+fn retained_bytes_keep_raw_identity_and_exact_original_length() {
+    let snapshot = retain(
+        Cell::Bytes {
+            retained: vec![0, 0xff, b'a'],
+            original_len: 9,
+        },
+        DriverKind::Redis,
+    );
+
+    let Cell::Bytes {
+        retained,
+        original_len,
+    } = &snapshot.rows[0][0]
+    else {
+        panic!("expected retained byte cell");
+    };
+    assert_eq!(retained, &[0, 0xff, b'a']);
+    assert_eq!(*original_len, 9);
+    assert_eq!(snapshot.cell_truncations[0].original_len, Some(9));
+}

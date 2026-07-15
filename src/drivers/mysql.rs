@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
@@ -254,7 +253,8 @@ impl DecodedRowBudget {
 fn cell_heap_bytes(cell: &Cell) -> usize {
     match cell {
         Cell::Decimal(value) | Cell::Text(value) | Cell::DateTime(value) => value.capacity(),
-        Cell::Bytes { preview, .. } => preview.capacity(),
+        Cell::TextPreview { preview, .. } | Cell::JsonPreview { preview, .. } => preview.capacity(),
+        Cell::Bytes { retained, .. } => retained.capacity(),
         Cell::Json(value) => json_heap_bytes(value),
         Cell::Null | Cell::Bool(_) | Cell::Int(_) | Cell::UInt(_) | Cell::Float(_) => 0,
     }
@@ -358,16 +358,10 @@ fn decode_cell(row: &MySqlRow, index: usize) -> Result<Cell, sqlx::Error> {
 }
 
 fn bytes_cell(bytes: Vec<u8>) -> Cell {
-    let mut preview = String::new();
-    for byte in bytes.iter().take(32) {
-        let _ = write!(&mut preview, "{byte:02x}");
-    }
-    if bytes.len() > 32 {
-        preview.push('…');
-    }
+    let original_len = bytes.len();
     Cell::Bytes {
-        preview,
-        len: bytes.len(),
+        retained: bytes,
+        original_len,
     }
 }
 
@@ -382,12 +376,16 @@ mod tests {
     }
 
     #[test]
-    fn bytes_are_bounded_and_counted() {
-        let Cell::Bytes { preview, len } = bytes_cell(vec![0xab; 40]) else {
+    fn decoded_bytes_remain_complete_until_the_snapshot_retention_boundary() {
+        let Cell::Bytes {
+            retained,
+            original_len,
+        } = bytes_cell(vec![0xab; 40])
+        else {
             panic!("bytes cell expected");
         };
-        assert_eq!(len, 40);
-        assert!(preview.ends_with('…'));
+        assert_eq!(original_len, 40);
+        assert_eq!(retained, vec![0xab; 40]);
     }
 
     #[test]

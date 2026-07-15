@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use redis::IntoConnectionInfo as _;
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -389,23 +390,39 @@ fn value_json(value: ::redis::Value, budget: &mut DecodeBudget, depth: usize) ->
         Cell::UInt(value) => value.into(),
         Cell::Float(value) => serde_json::json!(value),
         Cell::Decimal(value) | Cell::Text(value) | Cell::DateTime(value) => value.into(),
-        Cell::Bytes { preview, len } => serde_json::json!({ "preview": preview, "len": len }),
+        Cell::TextPreview {
+            preview,
+            original_len,
+        } => serde_json::json!({
+            "preview": preview,
+            "original_len": original_len,
+            "truncated": true,
+        }),
+        Cell::Bytes {
+            retained,
+            original_len,
+        } => serde_json::json!({
+            "base64": base64::engine::general_purpose::STANDARD.encode(&retained),
+            "original_len": original_len,
+            "truncated": retained.len() < original_len,
+        }),
         Cell::Json(value) => value,
+        Cell::JsonPreview {
+            preview,
+            original_len,
+        } => serde_json::json!({
+            "preview": preview,
+            "original_len": original_len,
+            "truncated": true,
+        }),
     }
 }
 
 fn bytes_cell(bytes: Vec<u8>) -> Cell {
-    let mut preview = String::with_capacity(bytes.len().min(32) * 2 + 1);
-    for byte in bytes.iter().take(32) {
-        use std::fmt::Write as _;
-        let _ = write!(&mut preview, "{byte:02x}");
-    }
-    if bytes.len() > 32 {
-        preview.push('…');
-    }
+    let original_len = bytes.len();
     Cell::Bytes {
-        preview,
-        len: bytes.len(),
+        retained: bytes,
+        original_len,
     }
 }
 

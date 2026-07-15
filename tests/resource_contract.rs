@@ -304,10 +304,15 @@ fn result_snapshot_enforces_mysql_cell_and_total_caps_with_original_lengths() {
         provenance(DriverKind::MySql),
         ResultRetentionPolicy::mysql(500),
     );
-    let Cell::Text(preview) = &snapshot.rows[0][0] else {
+    let Cell::TextPreview {
+        preview,
+        original_len: retained_original_len,
+    } = &snapshot.rows[0][0]
+    else {
         panic!("expected retained text preview");
     };
     assert_eq!(preview.len(), MAX_RESULT_CELL_BYTES);
+    assert_eq!(*retained_original_len, original_len);
     assert_eq!(snapshot.cell_truncations.len(), 1);
     assert_eq!(
         snapshot.cell_truncations[0].original_len,
@@ -376,10 +381,15 @@ fn result_snapshot_applies_stricter_redis_cell_depth_and_static_notice_contract(
         provenance(DriverKind::Redis),
         ResultRetentionPolicy::redis(10_000),
     );
-    let Cell::Text(preview) = &snapshot.rows[0][0] else {
+    let Cell::TextPreview {
+        preview,
+        original_len,
+    } = &snapshot.rows[0][0]
+    else {
         panic!("expected Redis text preview");
     };
     assert_eq!(preview.len(), MAX_REDIS_CELL_BYTES);
+    assert_eq!(*original_len, MAX_REDIS_CELL_BYTES + 1);
     assert!(
         snapshot
             .notices
