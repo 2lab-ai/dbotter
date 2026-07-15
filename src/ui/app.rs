@@ -14,14 +14,17 @@ use crate::model::{
     RedisScanRequest, RequestIdentity,
 };
 
+use super::accessibility::named_author_id;
 use super::adapter::{SubmitError, UiCommand, UiPort};
 use super::editor::{EditorIntent, EditorSurface};
+use super::layout::NativeLayout;
 use super::model::{ConnectionState, ProfileSnapshot, UiEvent, UiModel};
 use super::mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 use super::profile_form::{
     DraftTestAttempt, FormAction, ProfileEditor, ProfileEventResult, SaveAttempt,
 };
 use super::redis_explorer::{RedisExplorer, RedisExplorerIntent};
+use super::theme::OpenAiTheme;
 
 const EVENT_DRAIN_LIMIT: usize = 128;
 pub const DEFAULT_EXECUTE_ROW_LIMIT: u32 = 500;
@@ -34,6 +37,7 @@ pub struct DbotterApp {
     profile_editor: Option<ProfileEditor>,
     editor_surface: EditorSurface,
     redis_explorer: RedisExplorer,
+    first_run_driver: DriverKind,
     next_draft_id: u64,
     pending_connect_after_refresh: Option<(ProfileId, OperationId)>,
 }
@@ -47,6 +51,7 @@ impl DbotterApp {
             profile_editor: None,
             editor_surface: EditorSurface::default(),
             redis_explorer: RedisExplorer::default(),
+            first_run_driver: DriverKind::MySql,
             next_draft_id: 1,
             pending_connect_after_refresh: None,
         };
@@ -497,48 +502,183 @@ impl DbotterApp {
         self.profile_editor = Some(editor);
     }
 
+    fn show_native(&mut self, ui: &mut egui::Ui) {
+        OpenAiTheme::apply(ui.ctx());
+        if self.model.profile_load_succeeded()
+            && self.model.profiles.is_empty()
+            && self.profile_editor.is_none()
+        {
+            egui::CentralPanel::default().show(ui, |ui| self.show_first_run(ui));
+            return;
+        }
+
+        if NativeLayout::columns_for_width(ui.available_width()) == 3 {
+            self.connections(ui);
+            self.explorer(ui);
+        } else {
+            self.narrow_navigation(ui);
+        }
+        self.editor_and_results(ui);
+    }
+
+    fn show_first_run(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(520.0);
+            ui.add_space(64.0);
+            ui.heading("Connect your first database");
+            ui.label("Create a local profile. Credentials stay outside the saved profile.");
+            ui.add_space(24.0);
+            ui.label("Database");
+
+            let mysql = ui.add_sized(
+                [280.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                egui::RadioButton::new(self.first_run_driver == DriverKind::MySql, "MySQL"),
+            );
+            if named_author_id(mysql, "connection.new.mysql", "New MySQL connection").clicked() {
+                self.first_run_driver = DriverKind::MySql;
+            }
+            let redis = ui.add_sized(
+                [280.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                egui::RadioButton::new(self.first_run_driver == DriverKind::Redis, "Redis"),
+            );
+            if named_author_id(redis, "connection.new.redis", "New Redis connection").clicked() {
+                self.first_run_driver = DriverKind::Redis;
+            }
+            let mongodb = ui.add_enabled(false, egui::RadioButton::new(false, "MongoDB · Planned"));
+            named_author_id(
+                mongodb,
+                "connection.mongodb.planned",
+                "MongoDB planned and unavailable",
+            );
+
+            ui.add_space(24.0);
+            let primary = ui.add(
+                egui::Button::new(
+                    egui::RichText::new("New connection").color(egui::Color32::WHITE),
+                )
+                .fill(egui::Color32::BLACK)
+                .min_size(egui::vec2(280.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            if named_author_id(primary, "connection.new", "New connection").clicked() {
+                let draft_id = self.allocate_draft_id();
+                self.profile_editor = Some(ProfileEditor::new(draft_id, self.first_run_driver));
+            }
+            ui.add_space(24.0);
+            ui.label("Credential sources: None · This app session · Environment variable");
+        });
+    }
+
+    fn narrow_navigation(&mut self, root_ui: &mut egui::Ui) {
+        egui::Panel::top("narrow-navigation").show(root_ui, |ui| {
+            egui::CollapsingHeader::new("Connections")
+                .default_open(false)
+                .show(ui, |ui| self.connections_contents(ui));
+            egui::CollapsingHeader::new("Explorer")
+                .default_open(false)
+                .show(ui, |ui| self.explorer_contents(ui));
+        });
+    }
+
     fn connections(&mut self, root_ui: &mut egui::Ui) {
         egui::Panel::left("connections")
-            .resizable(true)
-            .default_size(360.0)
+            .resizable(false)
+            .exact_size(NativeLayout::CONNECTIONS_WIDTH)
+            .show(root_ui, |ui| self.connections_contents(ui));
+    }
+
+    fn connections_contents(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Connections");
+        let actions_enabled = !self.model.is_config_uncertain();
+        let mysql = ui.add_enabled(
+            actions_enabled,
+            egui::Button::new("+ MySQL")
+                .min_size(egui::vec2(104.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+        );
+        if named_author_id(mysql, "connection.new.mysql", "New MySQL connection").clicked() {
+            let draft_id = self.allocate_draft_id();
+            self.profile_editor = Some(ProfileEditor::new(draft_id, DriverKind::MySql));
+        }
+        let redis = ui.add_enabled(
+            actions_enabled,
+            egui::Button::new("+ Redis")
+                .min_size(egui::vec2(104.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+        );
+        if named_author_id(redis, "connection.new.redis", "New Redis connection").clicked() {
+            let draft_id = self.allocate_draft_id();
+            self.profile_editor = Some(ProfileEditor::new(draft_id, DriverKind::Redis));
+        }
+        let mongodb = ui.add_enabled(
+            false,
+            egui::Button::new("MongoDB · Planned")
+                .min_size(egui::vec2(160.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+        );
+        named_author_id(
+            mongodb,
+            "connection.mongodb.planned",
+            "MongoDB planned and unavailable",
+        );
+        if ui
+            .add_sized(
+                [104.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                egui::Button::new("Reload"),
+            )
+            .clicked()
+        {
+            self.submit_refresh();
+        }
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for profile in self.model.profiles.clone() {
+                self.profile_card(ui, &profile);
+                ui.add_space(8.0);
+            }
+        });
+    }
+
+    fn explorer(&mut self, root_ui: &mut egui::Ui) {
+        egui::Panel::right("explorer")
+            .resizable(false)
+            .exact_size(NativeLayout::EXPLORER_WIDTH)
             .show(root_ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.heading("Connections");
-                    let actions_enabled = !self.model.is_config_uncertain();
-                    if ui
-                        .add_enabled(actions_enabled, egui::Button::new("+ MySQL").small())
-                        .clicked()
-                    {
-                        let draft_id = self.allocate_draft_id();
-                        self.profile_editor = Some(ProfileEditor::new(draft_id, DriverKind::MySql));
-                    }
-                    if ui
-                        .add_enabled(actions_enabled, egui::Button::new("+ Redis").small())
-                        .clicked()
-                    {
-                        let draft_id = self.allocate_draft_id();
-                        self.profile_editor = Some(ProfileEditor::new(draft_id, DriverKind::Redis));
-                    }
-                    if ui
-                        .add_enabled(actions_enabled, egui::Button::new("+ MongoDB").small())
-                        .clicked()
-                    {
-                        let draft_id = self.allocate_draft_id();
-                        self.profile_editor =
-                            Some(ProfileEditor::new(draft_id, DriverKind::MongoDb));
-                    }
-                    if ui.small_button("Reload").clicked() {
-                        self.submit_refresh();
-                    }
-                });
+                ui.heading("Explorer");
                 ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for profile in self.model.profiles.clone() {
-                        self.profile_card(ui, &profile);
-                        ui.add_space(8.0);
-                    }
-                });
+                self.explorer_contents(ui);
             });
+    }
+
+    fn explorer_contents(&mut self, ui: &mut egui::Ui) {
+        let selected = self.model.selected_profile_snapshot().cloned();
+        match selected {
+            Some(profile) if profile.driver == DriverKind::MySql && profile.is_ready() => {
+                self.redis_explorer.set_profile(None);
+                let intents = self
+                    .mysql_explorers
+                    .entry((profile.id.clone(), profile.generation))
+                    .or_default()
+                    .show(ui);
+                for intent in intents {
+                    self.submit_mysql_explorer_intent(&profile, intent);
+                }
+            }
+            Some(profile) if profile.driver == DriverKind::Redis && profile.is_ready() => {
+                self.redis_explorer
+                    .set_profile(Some((profile.id.clone(), profile.generation)));
+                if let Some(intent) = self
+                    .redis_explorer
+                    .show(ui, !self.model.is_config_uncertain())
+                {
+                    self.submit_redis_intent(intent);
+                }
+            }
+            Some(profile) => {
+                self.redis_explorer.set_profile(None);
+                ui.weak(format!("{} explorer is unavailable", profile.driver));
+            }
+            None => {
+                self.redis_explorer.set_profile(None);
+                ui.weak("Select a connection to browse resources.");
+            }
+        }
     }
 
     fn profile_card(&mut self, ui: &mut egui::Ui, profile: &ProfileSnapshot) {
@@ -585,20 +725,8 @@ impl DbotterApp {
                 profile.planned_reason.as_deref().unwrap_or("not available")
             ));
         }
-        if selected && profile.driver == DriverKind::MySql && profile.is_ready() {
-            ui.add_space(12.0);
-            let intents = self
-                .mysql_explorers
-                .entry((profile.id.clone(), profile.generation))
-                .or_default()
-                .show(ui);
-            for intent in intents {
-                self.submit_mysql_explorer_intent(profile, intent);
-            }
-        } else if profile.driver == DriverKind::Redis && profile.is_ready() {
-            ui.weak("Keyspace browser ready · SCAN semantics");
-        } else {
-            ui.weak("Resource browser availability follows driver capabilities");
+        if selected {
+            ui.weak("Open in Explorer");
         }
     }
 
@@ -680,21 +808,8 @@ impl DbotterApp {
             }
             return;
         }
-        let mut redis_intent = None;
         let mut editor_intent = None;
         egui::CentralPanel::default().show(root_ui, |ui| {
-            let selected_redis = self
-                .model
-                .selected_profile_snapshot()
-                .filter(|profile| profile.driver == DriverKind::Redis)
-                .map(|profile| (profile.id.clone(), profile.generation));
-            self.redis_explorer.set_profile(selected_redis.clone());
-            if selected_redis.is_some() {
-                redis_intent = self
-                    .redis_explorer
-                    .show(ui, !self.model.is_config_uncertain());
-                ui.add_space(16.0);
-            }
             let selected_workspace_key = self.model.selected_workspace_key();
             if let Some(profile) = self.model.selected_profile_snapshot().cloned() {
                 let editor_enabled = !self.model.is_config_uncertain();
@@ -724,9 +839,6 @@ impl DbotterApp {
                 ui.weak("No result yet");
             }
         });
-        if let Some(intent) = redis_intent {
-            self.submit_redis_intent(intent);
-        }
         if let Some(intent) = editor_intent {
             self.submit_editor_intent(intent);
         }
@@ -740,8 +852,7 @@ impl eframe::App for DbotterApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.connections(ui);
-        self.editor_and_results(ui);
+        self.show_native(ui);
     }
 }
 
@@ -1061,10 +1172,7 @@ mod tests {
 
         let context = Context::default();
         context.enable_accesskit();
-        let output = context.run_ui(RawInput::default(), |ui| {
-            app.connections(ui);
-            app.editor_and_results(ui);
-        });
+        let output = context.run_ui(RawInput::default(), |ui| app.show_native(ui));
         let update = output
             .platform_output
             .accesskit_update

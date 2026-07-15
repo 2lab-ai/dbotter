@@ -273,6 +273,7 @@ pub struct UiModel {
     pub workspaces: HashMap<WorkspaceKey, ProfileWorkspace>,
     pub status: String,
     config_uncertain: bool,
+    profile_load_succeeded: bool,
     last_profiles_operation: Option<OperationId>,
     pending_retags: HashMap<ProfileId, (ProfileGeneration, ProfileGeneration)>,
     next_operation_id: u64,
@@ -289,6 +290,7 @@ impl Default for UiModel {
             workspaces: HashMap::new(),
             status: "Loading profiles…".to_owned(),
             config_uncertain: false,
+            profile_load_succeeded: false,
             last_profiles_operation: None,
             pending_retags: HashMap::new(),
             next_operation_id: 1,
@@ -363,6 +365,10 @@ impl UiModel {
         self.config_uncertain
     }
 
+    pub(crate) fn profile_load_succeeded(&self) -> bool {
+        self.profile_load_succeeded
+    }
+
     pub(crate) fn profiles_operation_is_newer(&self, operation_id: OperationId) -> bool {
         self.last_profiles_operation
             .is_none_or(|latest| operation_id.0 > latest.0)
@@ -377,6 +383,7 @@ impl UiModel {
                 if !self.accept_profiles_operation(operation_id) {
                     return;
                 }
+                self.profile_load_succeeded = true;
                 self.fold_profiles(profiles);
             }
             UiEvent::ProfilesFailed {
