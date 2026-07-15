@@ -10,8 +10,9 @@ fn openai_palette_and_focus_geometry_meet_the_frozen_numerical_contract() {
     assert_eq!(OpenAiTheme::DISABLED_INK, [145, 145, 145, 255]);
     assert!(OpenAiTheme::contrast(OpenAiTheme::INK, OpenAiTheme::CANVAS) >= 4.5);
     assert!(OpenAiTheme::contrast(OpenAiTheme::SECONDARY_INK, OpenAiTheme::CANVAS) >= 4.5);
-    assert!(OpenAiTheme::FOCUS_STROKE_WIDTH >= 2.0);
-    assert!(OpenAiTheme::MIN_CONTROL_HEIGHT >= 44.0);
+    assert!(OpenAiTheme::contrast(OpenAiTheme::BOUNDARY, OpenAiTheme::CANVAS) >= 3.0);
+    assert!(std::hint::black_box(OpenAiTheme::FOCUS_STROKE_WIDTH) >= 2.0);
+    assert!(std::hint::black_box(OpenAiTheme::MIN_CONTROL_HEIGHT) >= 44.0);
     assert_eq!(OpenAiTheme::CORNER_RADIUS, 0.0);
 }
 

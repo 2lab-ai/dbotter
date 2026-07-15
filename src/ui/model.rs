@@ -11,6 +11,31 @@ use crate::model::{
 use crate::public_error::PublicOperationError;
 use crate::service::SessionDisposition;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WorkspaceKey {
+    pub profile_id: ProfileId,
+    pub profile_generation: ProfileGeneration,
+}
+
+impl WorkspaceKey {
+    pub fn new(profile_id: ProfileId, profile_generation: ProfileGeneration) -> Self {
+        Self {
+            profile_id,
+            profile_generation,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ProfileWorkspace {
+    pub editor_text: String,
+    pub row_limit: String,
+    pub timeout_seconds: String,
+    pub pending_execute: Option<OperationId>,
+    pub result: Option<ResultSnapshot>,
+    pub error: Option<PublicOperationError>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PostCloseState {
     Disconnected,
@@ -214,6 +239,7 @@ pub struct UiModel {
     pub active_generations: HashMap<ProfileId, ProfileGeneration>,
     pub tombstones: HashMap<ProfileId, ProfileGeneration>,
     pub connection_states: HashMap<ProfileId, ConnectionState>,
+    pub workspaces: HashMap<WorkspaceKey, ProfileWorkspace>,
     pub editor_text: String,
     pub pending_execute: Option<(OperationId, ProfileId, ProfileGeneration)>,
     pub result: Option<ResultSnapshot>,
@@ -240,6 +266,7 @@ impl Default for UiModel {
             active_generations: HashMap::new(),
             tombstones: HashMap::new(),
             connection_states: HashMap::new(),
+            workspaces: HashMap::new(),
             editor_text: String::new(),
             pending_execute: None,
             result: None,
@@ -261,6 +288,25 @@ impl Default for UiModel {
 }
 
 impl UiModel {
+    pub fn workspace(&self, key: &WorkspaceKey) -> Option<&ProfileWorkspace> {
+        self.workspaces.get(key)
+    }
+
+    pub fn workspace_mut(&mut self, key: WorkspaceKey) -> &mut ProfileWorkspace {
+        self.workspaces
+            .entry(key)
+            .or_insert_with(|| ProfileWorkspace {
+                row_limit: "500".to_owned(),
+                timeout_seconds: "30".to_owned(),
+                ..ProfileWorkspace::default()
+            })
+    }
+
+    pub fn selected_workspace_key(&self) -> Option<WorkspaceKey> {
+        let profile = self.selected_profile_snapshot()?;
+        Some(WorkspaceKey::new(profile.id.clone(), profile.generation))
+    }
+
     pub fn next_operation(&mut self) -> OperationId {
         let operation_id = OperationId(self.next_operation_id);
         self.next_operation_id = self.next_operation_id.saturating_add(1);

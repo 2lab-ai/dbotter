@@ -4,8 +4,8 @@ use dbotter::ui::{NativeLayout, OpenAiTheme};
 
 #[test]
 fn openai_surface_forbids_decorative_effects() {
-    assert!(!OpenAiTheme::USES_GRADIENTS);
-    assert!(!OpenAiTheme::USES_SHADOWS);
+    assert!(!std::hint::black_box(OpenAiTheme::USES_GRADIENTS));
+    assert!(!std::hint::black_box(OpenAiTheme::USES_SHADOWS));
     assert_eq!(OpenAiTheme::CORNER_RADIUS, 0.0);
 }
 

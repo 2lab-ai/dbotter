@@ -26,7 +26,9 @@ fn profile_workspaces_are_isolated_by_profile_and_generation() {
     model.workspace_mut(replacement.clone()).editor_text = "SELECT 'replacement'".to_owned();
 
     assert_eq!(
-        model.workspace(&first).map(|workspace| workspace.editor_text.as_str()),
+        model
+            .workspace(&first)
+            .map(|workspace| workspace.editor_text.as_str()),
         Some("SELECT 'first'")
     );
     assert_eq!(

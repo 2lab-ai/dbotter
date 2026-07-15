@@ -1,22 +1,30 @@
+mod accessibility;
 mod adapter;
 mod app;
+mod layout;
 mod model;
 mod mysql_explorer;
+mod native_harness;
 mod profile_form;
 mod redis_explorer;
 mod runtime;
 #[cfg(test)]
 mod runtime_contract_tests;
+mod theme;
 
 pub use adapter::{
     CONTROL_CAPACITY, EVENT_CAPACITY, MUTATION_CAPACITY, ServicePort, SubmitError, UiCommand,
     UiPort, WORK_CAPACITY, bounded_ports, controller_ports,
 };
+pub use layout::NativeLayout;
 pub use model::{
-    ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot, UiEvent, UiModel,
+    ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot, ProfileWorkspace,
+    UiEvent, UiModel, WorkspaceKey,
 };
 pub use mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
+pub use native_harness::NativeUiHarness;
 pub use runtime::{RegisteredTask, RuntimeHandle, TaskScope, spawn_with_service};
+pub use theme::OpenAiTheme;
 
 use crate::error::AppError;
 
