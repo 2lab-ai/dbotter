@@ -103,10 +103,14 @@ fn clipboard_scalar_and_tsv_field_cover_every_cell_and_control_character() {
 }
 
 #[test]
-fn mysql_naive_datetime_and_rfc3339_offsets_share_normalized_iso_wire_text() {
+fn mysql_naive_date_time_datetime_and_rfc3339_offsets_share_normalized_iso_wire_text() {
+    let date = Cell::DateTime("2016-11-15".to_owned());
+    let time = Cell::DateTime("07:39:24.123456".to_owned());
     let naive = Cell::DateTime("2016-11-15 07:39:24.123456".to_owned());
     let offset = Cell::DateTime("2016-11-15T07:39:24.123456+02:00".to_owned());
 
+    assert_eq!(clipboard_scalar(&date), "2016-11-15");
+    assert_eq!(clipboard_scalar(&time), "07:39:24.123456");
     assert_eq!(clipboard_scalar(&offset), "2016-11-15T05:39:24.123456Z");
     assert_eq!(clipboard_scalar(&naive), "2016-11-15T07:39:24.123456");
 
