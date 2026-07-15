@@ -103,6 +103,27 @@ fn clipboard_scalar_and_tsv_field_cover_every_cell_and_control_character() {
 }
 
 #[test]
+fn mysql_naive_datetime_and_rfc3339_offsets_share_normalized_iso_wire_text() {
+    let naive = Cell::DateTime("2016-11-15 07:39:24.123456".to_owned());
+    let offset = Cell::DateTime("2016-11-15T07:39:24.123456+02:00".to_owned());
+
+    assert_eq!(clipboard_scalar(&offset), "2016-11-15T05:39:24.123456Z");
+    assert_eq!(clipboard_scalar(&naive), "2016-11-15T07:39:24.123456");
+
+    let result = snapshot(
+        vec![column("naive", "DATETIME"), column("offset", "TIMESTAMP")],
+        vec![vec![naive, offset]],
+    );
+    assert_eq!(
+        encode(&result, ExportFormat::Csv),
+        b"naive,offset\r\n2016-11-15T07:39:24.123456,2016-11-15T05:39:24.123456Z\r\n"
+    );
+    let json = String::from_utf8(encode(&result, ExportFormat::Json)).expect("UTF-8 JSON export");
+    assert!(json.contains("{\"type\":\"datetime\",\"value\":\"2016-11-15T07:39:24.123456\"}"));
+    assert!(json.contains("{\"type\":\"datetime\",\"value\":\"2016-11-15T05:39:24.123456Z\"}"));
+}
+
+#[test]
 fn csv_and_tsv_are_exact_for_duplicate_headers_null_unicode_controls_and_zero_rows() {
     let columns = vec![
         column("dup", "NULL"),

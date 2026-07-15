@@ -485,23 +485,82 @@ mod tests {
         for _ in 0..=MAX_REDIS_DEPTH {
             nested = ::redis::Value::Array(vec![nested]);
         }
-        let (_, depth_truncated) = value_rows(
-            ::redis::Value::Map(vec![(
-                ::redis::Value::SimpleString("key".to_owned()),
-                nested,
-            )]),
+        let (depth_rows, depth_truncated) = value_rows(
+            ::redis::Value::Array(vec![
+                ::redis::Value::Int(7),
+                ::redis::Value::Map(vec![(
+                    ::redis::Value::SimpleString("key".to_owned()),
+                    nested,
+                )]),
+            ]),
             100,
         );
         assert!(depth_truncated);
+        assert_eq!(depth_rows, vec![vec![Cell::Int(7)]]);
 
-        let (_, nodes_truncated) = value_rows(
-            ::redis::Value::Set(
-                (0..=MAX_REDIS_CELLS)
-                    .map(|value| ::redis::Value::Int(value as i64))
-                    .collect(),
-            ),
+        let (node_rows, nodes_truncated) = value_rows(
+            ::redis::Value::Array(vec![
+                ::redis::Value::Int(8),
+                ::redis::Value::Set(
+                    (0..=MAX_REDIS_CELLS)
+                        .map(|value| ::redis::Value::Int(value as i64))
+                        .collect(),
+                ),
+            ]),
             100,
         );
         assert!(nodes_truncated);
+        assert_eq!(node_rows, vec![vec![Cell::Int(8)]]);
+    }
+
+    #[test]
+    fn oversized_nested_text_and_binary_drop_before_derived_json_allocation() {
+        for oversized in [
+            ::redis::Value::BulkString(vec![b'x'; crate::model::MAX_REDIS_CELL_BYTES + 1]),
+            ::redis::Value::BulkString(vec![0xff; crate::model::MAX_REDIS_CELL_BYTES + 1]),
+        ] {
+            let (rows, truncated) = value_rows(
+                ::redis::Value::Array(vec![
+                    ::redis::Value::Int(9),
+                    ::redis::Value::Map(vec![(
+                        ::redis::Value::SimpleString("payload".to_owned()),
+                        oversized,
+                    )]),
+                    ::redis::Value::Int(10),
+                ]),
+                3,
+            );
+
+            assert!(truncated);
+            assert_eq!(rows, vec![vec![Cell::Int(9)]]);
+        }
+    }
+
+    #[test]
+    fn complete_nested_composites_and_top_level_bytes_keep_exact_identity() {
+        let (rows, truncated) = value_rows(
+            ::redis::Value::Array(vec![
+                ::redis::Value::Map(vec![(
+                    ::redis::Value::SimpleString("key".to_owned()),
+                    ::redis::Value::Array(vec![::redis::Value::Int(1), ::redis::Value::Nil]),
+                )]),
+                ::redis::Value::BulkString(vec![0, 0xff]),
+            ]),
+            2,
+        );
+
+        assert!(!truncated);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Cell::Json(serde_json::json!([
+                    {"key": "key", "value": [1, null]}
+                ]))],
+                vec![Cell::Bytes {
+                    retained: vec![0, 0xff],
+                    original_len: 2,
+                }],
+            ]
+        );
     }
 }

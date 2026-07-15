@@ -148,3 +148,52 @@ fn metadata_retention_stops_at_an_oversized_entry_and_preserves_row_width() {
     );
     assert_eq!(snapshot.rows[0], vec![Cell::Text("first".to_owned())]);
 }
+
+#[test]
+fn unpreviewable_oversized_scalars_drop_the_crossing_row_without_false_complete_wire_truth() {
+    let cases = [
+        Cell::Decimal("9".repeat(dbotter::model::MAX_RESULT_CELL_BYTES + 1)),
+        Cell::DateTime("2".repeat(dbotter::model::MAX_RESULT_CELL_BYTES + 1)),
+    ];
+
+    for oversized in cases {
+        let snapshot = ResultSnapshot::retain(
+            QueryResult {
+                columns: vec![Column {
+                    name: "value".to_owned(),
+                    type_name: "VALUE".to_owned(),
+                }],
+                rows: vec![
+                    vec![Cell::Text("complete-before-crossing".to_owned())],
+                    vec![oversized],
+                    vec![Cell::Text("must-not-pass-crossing".to_owned())],
+                ],
+                affected_rows: 0,
+                last_insert_id: None,
+                elapsed_ms: 19,
+                truncated: false,
+                backend_notices_present: false,
+            },
+            provenance(DriverKind::MySql),
+            ResultRetentionPolicy::mysql(3),
+        );
+
+        assert_eq!(
+            snapshot.rows,
+            vec![vec![Cell::Text("complete-before-crossing".to_owned())]]
+        );
+        assert!(snapshot.truncated);
+        assert!(
+            snapshot
+                .notices
+                .contains(&ResultNotice::SnapshotByteLimitReached)
+        );
+        assert!(snapshot.notices.contains(&ResultNotice::RowLimitReached));
+        assert!(
+            !snapshot
+                .notices
+                .contains(&ResultNotice::CellPreviewTruncated)
+        );
+        assert!(snapshot.cell_truncations.is_empty());
+    }
+}
