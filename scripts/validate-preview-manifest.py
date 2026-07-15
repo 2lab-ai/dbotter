@@ -144,6 +144,16 @@ def validate_manifest(
     version_components = tuple(
         version_match[name] for name in ("year", "month", "day", "time", "run", "attempt")
     )
+    tag_created_at = (
+        f'{tag_match["year"]}-{tag_match["month"]}-{tag_match["day"]}T'
+        f'{tag_match["time"][0:2]}:{tag_match["time"][2:4]}:{tag_match["time"][4:6]}Z'
+    )
+    try:
+        dt.datetime.strptime(tag_created_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise ContractError("tag/version stamp is not a real UTC timestamp") from error
+    if created_at != tag_created_at:
+        raise ContractError("created_at must exactly equal the tag/version UTC stamp")
     if tag_components != version_components:
         raise ContractError("tag and Homebrew version do not describe the same run")
     if int(tag_match["run"]) != run_id or int(tag_match["attempt"]) != run_attempt:
