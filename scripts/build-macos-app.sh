@@ -160,6 +160,14 @@ work_app="$temporary/$app_name"
 mkdir -p "$work_app/Contents/MacOS" "$work_app/Contents/Resources"
 cp "$binary" "$work_app/Contents/MacOS/dbotter"
 chmod 0755 "$work_app/Contents/MacOS/dbotter"
+embedded="$work_app/Contents/MacOS/dbotter"
+if codesign -dv "$embedded" >/dev/null 2>&1; then
+  codesign --remove-signature "$embedded"
+fi
+if codesign --verify "$embedded" >/dev/null 2>&1; then
+  fail "pre-sign embedded executable still carries a valid code signature"
+fi
+unsigned_executable_sha256="$(sha256_file "$embedded")"
 cp "$ROOT/packaging/macos/Info.plist" "$work_app/Contents/Info.plist"
 plutil -replace CFBundleShortVersionString -string "$package_version" "$work_app/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$bundle_build_version" "$work_app/Contents/Info.plist"
@@ -186,7 +194,6 @@ codesign_identity="${DBOTTER_CODESIGN_IDENTITY:--}"
 codesign --force --deep --sign "$codesign_identity" --timestamp=none "$work_app"
 codesign --verify --deep --strict "$work_app"
 
-embedded="$work_app/Contents/MacOS/dbotter"
 embedded_identity="$("$embedded" version --format json)"
 embedded_config="$("$embedded" config-contract --format json)"
 [[ "$(jq -S -c . <<<"$embedded_identity")" == "$(jq -S -c . <<<"$identity_json")" ]] \
@@ -202,8 +209,9 @@ embedded_config="$("$embedded" config-contract --format json)"
 [[ "$package_version" != "$version" && "$bundle_build_version" != "$version" ]] \
   || fail "bundle version fields must not contain the Homebrew version"
 
-unsigned_executable_sha256="$(sha256_file "$binary")"
 embedded_executable_sha256="$(sha256_file "$embedded")"
+[[ "$unsigned_executable_sha256" != "$embedded_executable_sha256" ]] \
+  || fail "signing must transform the canonical embedded executable identity"
 COPYFILE_DISABLE=1 tar -C "$temporary" -czf "$temporary/$archive_name" "$app_name"
 archive_sha256="$(sha256_file "$temporary/$archive_name")"
 archive_bytes="$(stat -f '%z' "$temporary/$archive_name")"
