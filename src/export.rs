@@ -101,8 +101,7 @@ where
         ExportFormat::Csv => write_csv(snapshot, &mut writer),
         ExportFormat::Tsv => write_tsv(snapshot, &mut writer),
         ExportFormat::Json => write_json(snapshot, &mut writer),
-    }
-    .and_then(|()| writer.flush().map_err(ExportEncodeError::from));
+    };
 
     if writer.cancelled {
         Err(ExportEncodeError::Cancelled)

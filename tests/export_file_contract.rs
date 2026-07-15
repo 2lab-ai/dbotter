@@ -298,7 +298,7 @@ fn cancellation_and_precommit_failpoints_clean_temp_without_claiming_commit() {
         let fault = Recorder::failing(stage);
         assert!(matches!(
             export_result_to_file_with_faults(&request, None, || false, &fault),
-            Err(ExportFileError::NotCommitted)
+            Err(ExportFileError::NotCommitted { .. })
         ));
         assert!(!request.destination.exists(), "stage {stage:?}");
         assert!(temp_entries(directory.path()).is_empty(), "stage {stage:?}");
@@ -327,7 +327,7 @@ fn postcommit_failures_preserve_file_and_report_committed_durability_unknown() {
         let fault = Recorder::failing(stage);
         assert!(matches!(
             export_result_to_file_with_faults(&request, None, || false, &fault),
-            Err(ExportFileError::CommittedDurabilityUnknown)
+            Err(ExportFileError::CommittedDurabilityUnknown { .. })
         ));
         assert_eq!(
             fs::read(&request.destination).expect("committed destination"),
