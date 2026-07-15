@@ -65,6 +65,7 @@ for executable in \
   scripts/validate-macos-package.py \
   scripts/assemble-preview-manifest.py \
   scripts/assemble-installed-receipt.py \
+  scripts/assemble-live-contract-receipt.py \
   scripts/verify-hermetic.sh \
   scripts/verify-live-contracts.sh \
   scripts/verify-installed.sh \

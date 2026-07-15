@@ -64,6 +64,7 @@ required_inputs=(
   scripts/test-workflow-contract.sh
   scripts/check-workflow-graph.rb
   scripts/test-live-evidence-contract.sh
+  scripts/assemble-live-contract-receipt.py
   scripts/test-installed-verifier-contract.sh
   scripts/test-installed-receipt-assembler-contract.sh
   scripts/assemble-installed-receipt.py
