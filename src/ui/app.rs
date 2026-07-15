@@ -15,6 +15,7 @@ use crate::model::{
 };
 
 use super::adapter::{SubmitError, UiCommand, UiPort};
+use super::editor::{EditorIntent, EditorSurface};
 use super::model::{ConnectionState, ProfileSnapshot, UiEvent, UiModel};
 use super::mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 use super::profile_form::{FormAction, ProfileEditor, ProfileEventResult, SaveAttempt};
@@ -29,6 +30,7 @@ pub struct DbotterApp {
     model: UiModel,
     mysql_explorers: HashMap<(ProfileId, ProfileGeneration), MySqlExplorerState>,
     profile_editor: Option<ProfileEditor>,
+    editor_surface: EditorSurface,
     redis_explorer: RedisExplorer,
     next_draft_id: u64,
 }
@@ -40,6 +42,7 @@ impl DbotterApp {
             model: UiModel::default(),
             mysql_explorers: HashMap::new(),
             profile_editor: None,
+            editor_surface: EditorSurface::default(),
             redis_explorer: RedisExplorer::default(),
             next_draft_id: 1,
         };
@@ -184,54 +187,60 @@ impl DbotterApp {
         }
     }
 
-    fn submit_execute(&mut self) {
+    fn submit_editor_intent(&mut self, intent: EditorIntent) {
         if self.model.is_config_uncertain() {
             self.model.status = "Reload profiles before executing.".to_owned();
             return;
         }
-        let Some(profile) = self.model.selected_profile_snapshot().cloned() else {
-            self.model.status = "Select a connection profile".to_owned();
-            return;
-        };
-        let workspace_key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
-        if self
-            .model
-            .workspace(&workspace_key)
-            .is_some_and(|workspace| workspace.pending_execute.is_some())
-        {
-            self.model.status = "Execute is already pending".to_owned();
-            return;
-        }
-        if !profile.is_ready() {
-            self.model.status = "MongoDB is planned; execute is disabled".to_owned();
-            return;
-        }
-        let text = self
-            .model
-            .workspace(&workspace_key)
-            .map_or("", |workspace| workspace.editor_text.trim())
-            .to_owned();
-        if text.is_empty() {
-            self.model.status = "Enter a statement or command".to_owned();
-            return;
-        }
-        let operation_id = self.model.next_operation();
-        let profile_id = profile.id;
-        let profile_generation = profile.generation;
-        match self.port.try_submit(UiCommand::Execute {
-            operation_id,
-            profile_id: profile_id.clone(),
-            profile_generation,
-            language: profile.driver.language(),
-            text,
-            row_limit: DEFAULT_EXECUTE_ROW_LIMIT,
-            timeout_ms: DEFAULT_TIMEOUT_MS,
-        }) {
-            Ok(()) => {
-                self.model.workspace_mut(workspace_key).pending_execute = Some(operation_id);
-                self.model.status = "Executing…".to_owned();
+        match intent {
+            EditorIntent::Execute(intent) => {
+                let workspace_key = super::model::WorkspaceKey::new(
+                    intent.profile_id().clone(),
+                    intent.profile_generation(),
+                );
+                if self.model.active_generation(intent.profile_id())
+                    != Some(intent.profile_generation())
+                {
+                    self.model.status = "The selected profile generation is stale.".to_owned();
+                    return;
+                }
+                if self
+                    .model
+                    .workspace(&workspace_key)
+                    .is_some_and(|workspace| workspace.pending_execute.is_some())
+                {
+                    self.model.status = "Execute is already pending".to_owned();
+                    return;
+                }
+                let operation_id = self.model.next_operation();
+                match self.port.try_submit(intent.into_ui_command(operation_id)) {
+                    Ok(()) => {
+                        self.model.workspace_mut(workspace_key).pending_execute =
+                            Some(operation_id);
+                        self.model.status = "Executing…".to_owned();
+                    }
+                    Err(error) => self.report_submit_error(error),
+                }
             }
-            Err(error) => self.report_submit_error(error),
+            EditorIntent::Cancel { operation_id } => {
+                if !self
+                    .model
+                    .selected_workspace()
+                    .is_some_and(|workspace| workspace.pending_execute == Some(operation_id))
+                {
+                    self.model.status = "The pending execution is no longer current.".to_owned();
+                    return;
+                }
+                match self
+                    .port
+                    .try_submit(UiCommand::CancelOperation { operation_id })
+                {
+                    Ok(()) => {
+                        self.model.status = format!("Cancelling operation {}…", operation_id.0);
+                    }
+                    Err(error) => self.report_submit_error(error),
+                }
+            }
         }
     }
 
@@ -591,7 +600,7 @@ impl DbotterApp {
             return;
         }
         let mut redis_intent = None;
-        let mut execute_requested = false;
+        let mut editor_intent = None;
         egui::CentralPanel::default().show(root_ui, |ui| {
             let selected_redis = self
                 .model
@@ -605,57 +614,21 @@ impl DbotterApp {
                     .show(ui, !self.model.is_config_uncertain());
                 ui.add_space(16.0);
             }
-            ui.horizontal(|ui| {
-                ui.heading("Editor");
-                if let Some(profile) = self.model.selected_profile_snapshot() {
-                    ui.label(format!(
-                        "{} · {:?}",
-                        profile.name,
-                        profile.driver.language()
-                    ));
-                }
-            });
             let selected_workspace_key = self.model.selected_workspace_key();
-            if let Some(key) = selected_workspace_key.clone() {
+            if let Some(profile) = self.model.selected_profile_snapshot().cloned() {
                 let editor_enabled = !self.model.is_config_uncertain();
+                let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
                 let workspace = self.model.workspace_mut(key);
-                ui.add_enabled(
-                    editor_enabled,
-                    egui::TextEdit::multiline(&mut workspace.editor_text)
-                        .code_editor()
-                        .desired_rows(10)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("SELECT 1  or  PING"),
+                editor_intent = self.editor_surface.show(
+                    ui,
+                    &profile,
+                    workspace,
+                    editor_enabled && profile.is_ready(),
                 );
             } else {
                 ui.weak("Select a connection to edit a statement or command.");
             }
-            let execute_enabled = self
-                .model
-                .selected_profile_snapshot()
-                .is_some_and(ProfileSnapshot::is_ready)
-                && selected_workspace_key.as_ref().is_none_or(|key| {
-                    self.model
-                        .workspace(key)
-                        .is_none_or(|workspace| workspace.pending_execute.is_none())
-                })
-                && !self.model.is_config_uncertain();
             ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(execute_enabled, egui::Button::new("Execute"))
-                    .clicked()
-                {
-                    execute_requested = true;
-                }
-                if let Some(operation_id) = selected_workspace_key
-                    .as_ref()
-                    .and_then(|key| self.model.workspace(key))
-                    .and_then(|workspace| workspace.pending_execute)
-                {
-                    ui.spinner();
-                    ui.label(format!("operation {}", operation_id.0));
-                }
-                ui.separator();
                 ui.label(&self.model.status);
             });
             ui.separator();
@@ -673,8 +646,8 @@ impl DbotterApp {
         if let Some(intent) = redis_intent {
             self.submit_redis_intent(intent);
         }
-        if execute_requested {
-            self.submit_execute();
+        if let Some(intent) = editor_intent {
+            self.submit_editor_intent(intent);
         }
     }
 }
@@ -864,6 +837,7 @@ mod tests {
         TlsMode,
     };
     use crate::ui::adapter::{UiCommand, bounded_ports};
+    use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
     use crate::ui::model::{ProfileSnapshot, WorkspaceKey};
     use crate::ui::redis_explorer::RedisExplorerIntent;
     use eframe::egui::{Context, Event, Key, Modifiers, RawInput};
@@ -912,6 +886,9 @@ mod tests {
         let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
         app.model.profiles = vec![profile];
         app.model.selected_profile = Some(ProfileId("profile".to_owned()));
+        app.model
+            .active_generations
+            .insert(ProfileId("profile".to_owned()), ProfileGeneration(1));
         app.model.workspace_mut(key.clone()).editor_text = "SELECT 1".to_owned();
 
         #[cfg(target_os = "macos")]
@@ -988,6 +965,76 @@ mod tests {
     }
 
     #[test]
+    fn editor_submission_sets_pending_only_after_success_and_cancel_is_exact() {
+        let (ui_port, mut service) = bounded_ports(1);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.model.workspace_mut(key.clone()).editor_text = "SELECT 1".to_owned();
+        let intent = build_execute_intent(
+            &profile,
+            app.model.workspace(&key).expect("workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("execute intent");
+
+        app.port
+            .try_submit(UiCommand::TestConnection {
+                operation_id: OperationId(99),
+                profile_id: profile.id.clone(),
+                profile_generation: profile.generation,
+                timeout_ms: 1_000,
+            })
+            .expect("fill work lane");
+        app.submit_editor_intent(EditorIntent::Execute(intent.clone()));
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(|workspace| workspace.pending_execute.is_none()),
+            "a Busy submit must not fabricate pending state"
+        );
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::TestConnection {
+                operation_id: OperationId(99),
+                ..
+            })
+        ));
+
+        app.submit_editor_intent(EditorIntent::Execute(intent));
+        let Some(UiCommand::Execute { operation_id, .. }) = service.try_next_command() else {
+            panic!("expected exact Execute after capacity became available");
+        };
+        assert_eq!(
+            app.model
+                .workspace(&key)
+                .and_then(|workspace| workspace.pending_execute),
+            Some(operation_id)
+        );
+
+        app.submit_editor_intent(EditorIntent::Cancel { operation_id });
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::CancelOperation {
+                operation_id: cancelled,
+            }) if cancelled == operation_id
+        ));
+        assert_eq!(
+            app.model
+                .workspace(&key)
+                .and_then(|workspace| workspace.pending_execute),
+            Some(operation_id),
+            "Cancel submission waits for the correlated terminal event"
+        );
+    }
+
+    #[test]
     fn double_execute_while_pending_submits_only_once() {
         let (ui, mut service) = bounded_ports(4);
         let mut app = DbotterApp::new(ui);
@@ -998,14 +1045,30 @@ mod tests {
         app.model.profiles = vec![profile(DriverKind::MySql, DriverAvailability::Ready)];
         app.model.selected_profile = Some(ProfileId("profile".to_owned()));
         app.model
+            .active_generations
+            .insert(ProfileId("profile".to_owned()), ProfileGeneration(1));
+        app.model
             .workspace_mut(WorkspaceKey::new(
                 ProfileId("profile".to_owned()),
                 ProfileGeneration(1),
             ))
             .editor_text = "SELECT 1".to_owned();
 
-        app.submit_execute();
-        app.submit_execute();
+        let profile = app
+            .model
+            .selected_profile_snapshot()
+            .cloned()
+            .expect("selected profile");
+        let intent = build_execute_intent(
+            &profile,
+            app.model
+                .workspace(&WorkspaceKey::new(profile.id.clone(), profile.generation))
+                .expect("workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("execute intent");
+        app.submit_editor_intent(EditorIntent::Execute(intent.clone()));
+        app.submit_editor_intent(EditorIntent::Execute(intent));
 
         assert!(matches!(
             service.try_next_command(),
@@ -1028,7 +1091,21 @@ mod tests {
             ))
             .editor_text = "{}".to_owned();
 
-        app.submit_execute();
+        let profile = app
+            .model
+            .selected_profile_snapshot()
+            .cloned()
+            .expect("selected profile");
+        assert!(
+            build_execute_intent(
+                &profile,
+                app.model
+                    .workspace(&WorkspaceKey::new(profile.id.clone(), profile.generation,))
+                    .expect("workspace"),
+                EditorCursor::caret(0),
+            )
+            .is_err()
+        );
 
         assert!(service.try_next_command().is_none());
     }
@@ -1041,17 +1118,33 @@ mod tests {
         app.model.profiles = vec![profile(DriverKind::MySql, DriverAvailability::Ready)];
         app.model.selected_profile = Some(ProfileId("profile".to_owned()));
         app.model
+            .active_generations
+            .insert(ProfileId("profile".to_owned()), ProfileGeneration(1));
+        app.model
             .workspace_mut(WorkspaceKey::new(
                 ProfileId("profile".to_owned()),
                 ProfileGeneration(1),
             ))
             .editor_text = "SELECT 1".to_owned();
+        let profile = app
+            .model
+            .selected_profile_snapshot()
+            .cloned()
+            .expect("selected profile");
+        let intent = build_execute_intent(
+            &profile,
+            app.model
+                .workspace(&WorkspaceKey::new(profile.id.clone(), profile.generation))
+                .expect("workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("execute intent");
         app.model.fold(crate::ui::UiEvent::ConfigUncertain {
             operation_id: crate::model::OperationId(10),
         });
 
         app.submit_test(ProfileId("profile".to_owned()));
-        app.submit_execute();
+        app.submit_editor_intent(EditorIntent::Execute(intent));
 
         assert!(
             service.try_next_command().is_none(),
