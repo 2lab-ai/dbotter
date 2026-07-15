@@ -13,10 +13,11 @@ use dbotter::drivers::{
 };
 use dbotter::model::{
     CatalogLevel, CatalogPage, CatalogRequest, CatalogRetainedCounts, ConnectionDraft,
-    CredentialMode, DraftId, DriverKind, MySqlPublicErrorCode, OperationId, PreparedMySqlRequest,
-    ProfileGeneration, ProfileId, QueryResult, RedisExecuteRequest, RedisKeyFilter, RedisKeyId,
-    RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, RequestIdentity,
-    ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration,
+    CredentialMode, DraftId, DriverKind, ExportFormat, ExportResult, MySqlPublicErrorCode,
+    OperationId, OverwritePolicy, PreparedMySqlRequest, ProfileGeneration, ProfileId, QueryResult,
+    RedisExecuteRequest, RedisKeyFilter, RedisKeyId, RedisKeyInspectRequest, RedisKeyPage,
+    RedisScanRequest, RedisValuePreview, RequestIdentity, ResultId, ResultProvenance,
+    ResultRetentionPolicy, ResultSnapshot, SessionGeneration,
 };
 use dbotter::secrets::{
     EnvironmentAvailability, SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate,
@@ -78,6 +79,61 @@ fn controller_capacities_and_task_scope_shape_are_exact() {
     assert!(matches!(draft, TaskScope::Draft { .. }));
     assert!(matches!(export, TaskScope::Export { .. }));
     assert!(matches!(global, TaskScope::Global));
+}
+
+#[tokio::test]
+async fn export_runtime_correlates_the_immutable_result_and_emits_a_path_free_terminal() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = directory.path().join("config.toml");
+    let destination = directory.path().join("result.json");
+    let service = test_service(&config, Arc::new(CountingConnector::default()));
+    let (mut ui, service_port) = controller_ports();
+    let runtime = spawn_with_service(service_port, service);
+    let snapshot = Arc::new(empty_query_result());
+    let operation_id = OperationId(18_001);
+    let result_id = snapshot.provenance.result_id;
+
+    let command = UiCommand::ExportResult {
+        request: ExportResult {
+            result_id,
+            operation_id,
+            snapshot,
+            format: ExportFormat::Json,
+            destination: destination.clone(),
+            overwrite_policy: OverwritePolicy::DenyOverwrite,
+        },
+        confirmation: None,
+    };
+    let debug = format!("{command:?}");
+    assert!(!debug.contains(destination.to_string_lossy().as_ref()));
+    ui.try_submit(command).expect("export command");
+
+    let event = wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::ResultExported {
+                operation_id: actual_operation,
+                result_id: actual_result,
+                ..
+            } if *actual_operation == operation_id && *actual_result == result_id
+        )
+    })
+    .await;
+    assert!(matches!(
+        event,
+        UiEvent::ResultExported {
+            operation_id: actual_operation,
+            result_id: actual_result,
+            format: ExportFormat::Json,
+            overwrite_policy: OverwritePolicy::DenyOverwrite,
+            row_count: 0,
+            bytes_written,
+        } if actual_operation == operation_id
+            && actual_result == result_id
+            && bytes_written > 0
+    ));
+    assert!(destination.is_file());
+    shutdown(&ui, runtime, OperationId(18_002)).await;
 }
 
 #[tokio::test]
