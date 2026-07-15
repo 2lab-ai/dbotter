@@ -11,7 +11,7 @@ use crate::config::MigrationConsent;
 use crate::model::{
     CatalogRequest, Cell, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
     DEFAULT_REDIS_SCAN_COUNT, DraftId, DriverAvailability, DriverCapabilities, DriverKind,
-    OperationId, OperationKind, ProfileFieldId, ProfileGeneration, ProfileId,
+    OperationId, OperationKind, ProfileFieldId, ProfileGeneration, ProfileId, PublicSummary,
     RedisKeyInspectRequest, RedisScanRequest, RequestIdentity, SessionCredentialIntent,
 };
 use crate::service::DeleteProfileRequest;
@@ -35,7 +35,26 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveOperation {
     operation_id: OperationId,
+    profile_generation: ProfileGeneration,
     kind: OperationKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingDelete {
+    operation_id: OperationId,
+    profile_generation: ProfileGeneration,
+    prior_active: Option<ActiveOperation>,
+    prior_finished: bool,
+}
+
+const fn delete_failure_is_known_non_committed(summary: PublicSummary) -> bool {
+    matches!(
+        summary,
+        PublicSummary::InvalidInput
+            | PublicSummary::ResourceBusy
+            | PublicSummary::ResourceStale
+            | PublicSummary::ConfigWriteNotCommitted
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +81,7 @@ pub struct DbotterApp {
     redis_explorer: RedisExplorer,
     first_run_driver: DriverKind,
     active_operations: HashMap<ProfileId, ActiveOperation>,
+    pending_deletes: HashMap<ProfileId, PendingDelete>,
     delete_confirmation: Option<DeleteConfirmation>,
     next_draft_id: u64,
     pending_connect_after_refresh: Option<(ProfileId, OperationId)>,
@@ -78,6 +98,7 @@ impl DbotterApp {
             redis_explorer: RedisExplorer::default(),
             first_run_driver: DriverKind::MySql,
             active_operations: HashMap::new(),
+            pending_deletes: HashMap::new(),
             delete_confirmation: None,
             next_draft_id: 1,
             pending_connect_after_refresh: None,
@@ -186,12 +207,21 @@ impl DbotterApp {
         self.mysql_explorers.retain(|(profile_id, generation), _| {
             self.model.active_generation(profile_id) == Some(*generation)
         });
+        self.prune_active_operations();
         if let Some(editor) = self.profile_editor.as_mut() {
             editor.set_config_uncertain(self.model.is_config_uncertain());
         }
     }
 
     fn finish_active_operation(&mut self, event: &UiEvent) {
+        if matches!(
+            event,
+            UiEvent::ConfigUncertain { .. } | UiEvent::RuntimeShutdown { .. }
+        ) {
+            self.active_operations.clear();
+            self.pending_deletes.clear();
+            return;
+        }
         let terminal = match event {
             UiEvent::ConnectionReady {
                 operation_id,
@@ -243,14 +273,59 @@ impl DbotterApp {
             }
             _ => None,
         };
-        if let Some((profile_id, operation_id)) = terminal
-            && self
+        if let Some((profile_id, operation_id)) = terminal {
+            if let Some(pending) = self.pending_deletes.get_mut(profile_id)
+                && pending
+                    .prior_active
+                    .is_some_and(|prior| prior.operation_id == operation_id)
+            {
+                pending.prior_finished = true;
+            }
+            if let UiEvent::OperationFailed {
+                kind: OperationKind::DeleteProfile,
+                summary,
+                ..
+            } = event
+                && let Some(pending) = self.pending_deletes.get(profile_id).copied()
+                && pending.operation_id == operation_id
+            {
+                self.pending_deletes.remove(profile_id);
+                if self
+                    .active_operations
+                    .get(profile_id)
+                    .is_some_and(|active| active.operation_id == operation_id)
+                {
+                    self.active_operations.remove(profile_id);
+                }
+                if delete_failure_is_known_non_committed(*summary)
+                    && !pending.prior_finished
+                    && self.model.active_generation(profile_id) == Some(pending.profile_generation)
+                    && let Some(prior) = pending.prior_active
+                {
+                    self.active_operations.insert(profile_id.clone(), prior);
+                }
+                return;
+            }
+            if matches!(event, UiEvent::ProfileDeleted { .. }) {
+                self.pending_deletes.remove(profile_id);
+            }
+            if self
                 .active_operations
                 .get(profile_id)
                 .is_some_and(|active| active.operation_id == operation_id)
-        {
-            self.active_operations.remove(profile_id);
+            {
+                self.active_operations.remove(profile_id);
+            }
         }
+    }
+
+    fn prune_active_operations(&mut self) {
+        self.active_operations.retain(|profile_id, active| {
+            self.model.active_generation(profile_id) == Some(active.profile_generation)
+        });
+        self.pending_deletes.retain(|profile_id, pending| {
+            self.model.active_generation(profile_id) == Some(pending.profile_generation)
+        });
     }
 
     fn fold_mysql_explorer_event(&mut self, event: &UiEvent) {
@@ -352,6 +427,7 @@ impl DbotterApp {
                     profile_id,
                     ActiveOperation {
                         operation_id,
+                        profile_generation,
                         kind: OperationKind::ConnectProfile,
                     },
                 );
@@ -415,6 +491,7 @@ impl DbotterApp {
                     profile_id,
                     ActiveOperation {
                         operation_id,
+                        profile_generation,
                         kind: OperationKind::DisconnectProfile,
                     },
                 );
@@ -448,6 +525,7 @@ impl DbotterApp {
                     profile_id,
                     ActiveOperation {
                         operation_id,
+                        profile_generation,
                         kind: OperationKind::ReconnectProfile,
                     },
                 );
@@ -465,11 +543,10 @@ impl DbotterApp {
         match intent {
             EditorIntent::Execute(intent) => {
                 let profile_id = intent.profile_id().clone();
+                let profile_generation = intent.profile_generation();
                 let operation_kind = intent.operation_kind();
-                let workspace_key = super::model::WorkspaceKey::new(
-                    profile_id.clone(),
-                    intent.profile_generation(),
-                );
+                let workspace_key =
+                    super::model::WorkspaceKey::new(profile_id.clone(), profile_generation);
                 if self.model.active_generation(intent.profile_id())
                     != Some(intent.profile_generation())
                 {
@@ -498,6 +575,7 @@ impl DbotterApp {
                             profile_id,
                             ActiveOperation {
                                 operation_id,
+                                profile_generation,
                                 kind: operation_kind,
                             },
                         );
@@ -609,6 +687,7 @@ impl DbotterApp {
                     profile.id.clone(),
                     ActiveOperation {
                         operation_id,
+                        profile_generation: profile.generation,
                         kind: OperationKind::BrowseMySql,
                     },
                 );
@@ -694,6 +773,7 @@ impl DbotterApp {
                             profile.id.clone(),
                             ActiveOperation {
                                 operation_id,
+                                profile_generation: profile.generation,
                                 kind: OperationKind::BrowseRedis,
                             },
                         );
@@ -719,6 +799,7 @@ impl DbotterApp {
                             profile.id.clone(),
                             ActiveOperation {
                                 operation_id,
+                                profile_generation: profile.generation,
                                 kind: OperationKind::InspectRedis,
                             },
                         );
@@ -811,11 +892,21 @@ impl DbotterApp {
                 self.model
                     .connection_states
                     .insert(profile_id.clone(), ConnectionState::Closing);
-                self.active_operations.insert(
-                    profile_id,
+                let prior_active = self.active_operations.insert(
+                    profile_id.clone(),
                     ActiveOperation {
                         operation_id,
+                        profile_generation,
                         kind: OperationKind::DeleteProfile,
+                    },
+                );
+                self.pending_deletes.insert(
+                    profile_id,
+                    PendingDelete {
+                        operation_id,
+                        profile_generation,
+                        prior_active,
+                        prior_finished: false,
                     },
                 );
                 self.model.status = "Deleting profile…".to_owned();
@@ -1472,7 +1563,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ActiveOperation, ConnectionState, DbotterApp, ProfileEditor, SessionCredentialIntent,
+        ActiveOperation, ConnectionState, DbotterApp, PendingDelete, ProfileEditor,
+        SessionCredentialIntent,
     };
     use crate::model::{
         ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
@@ -1737,6 +1829,7 @@ mod tests {
             app.active_operations.get(&profile.id),
             Some(&ActiveOperation {
                 operation_id: connect_operation,
+                profile_generation: profile.generation,
                 kind: OperationKind::ConnectProfile,
             })
         );
@@ -2041,6 +2134,7 @@ mod tests {
             app.active_operations.get(&profile.id),
             Some(&ActiveOperation {
                 operation_id: active_operation,
+                profile_generation: profile.generation,
                 kind: OperationKind::ExecuteMutation,
             })
         );
@@ -2072,6 +2166,7 @@ mod tests {
             app.active_operations.get(&profile.id),
             Some(&ActiveOperation {
                 operation_id: active_operation,
+                profile_generation: profile.generation,
                 kind: OperationKind::ExecuteMutation,
             })
         );
@@ -2126,6 +2221,7 @@ mod tests {
             .insert(profile.id.clone(), profile.generation);
         let prior = ActiveOperation {
             operation_id: OperationId(77),
+            profile_generation: profile.generation,
             kind: OperationKind::ExecuteMutation,
         };
         app.active_operations.insert(profile.id.clone(), prior);
@@ -2163,6 +2259,115 @@ mod tests {
                 .and_then(|confirmation| confirmation.active_kind),
             Some(OperationKind::ExecuteMutation)
         );
+    }
+
+    #[test]
+    fn durability_unknown_delete_failure_does_not_restore_prior_active_operation() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        app.model.profiles = vec![profile.clone()];
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        let prior = ActiveOperation {
+            operation_id: OperationId(78),
+            profile_generation: profile.generation,
+            kind: OperationKind::ExecuteMutation,
+        };
+        app.active_operations.insert(profile.id.clone(), prior);
+
+        app.open_delete_confirmation(&profile);
+        app.confirm_delete_confirmation();
+        let delete_operation = match service.try_next_command() {
+            Some(UiCommand::DeleteProfile(request)) => request.operation_id,
+            _ => panic!("confirmed delete command"),
+        };
+        let error = PublicOperationError::new_or_internal(
+            OperationKind::DeleteProfile,
+            PublicSummary::CommittedDurabilityUnknown,
+            PublicCode::None,
+            &SafeContext::profile(profile.id.clone(), delete_operation),
+        );
+        assert!(service.try_emit(crate::ui::UiEvent::OperationFailed {
+            operation_id: delete_operation,
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            session_generation: None,
+            kind: OperationKind::DeleteProfile,
+            summary: error.summary,
+            error,
+            session_disposition: None,
+            connection_outcome: crate::ui::ConnectionFailureOutcome::Preserve,
+        }));
+        app.poll_events();
+
+        assert!(!app.active_operations.contains_key(&profile.id));
+        assert!(!app.pending_deletes.contains_key(&profile.id));
+        app.open_delete_confirmation(&profile);
+        assert_eq!(
+            app.delete_confirmation
+                .as_ref()
+                .and_then(|confirmation| confirmation.active_kind),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_active_tracking_clears_on_generation_change_uncertainty_and_shutdown() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile_id = ProfileId("lifecycle-prune".to_owned());
+        let active = ActiveOperation {
+            operation_id: OperationId(90),
+            profile_generation: ProfileGeneration(1),
+            kind: OperationKind::ExecuteRead,
+        };
+        app.model
+            .active_generations
+            .insert(profile_id.clone(), ProfileGeneration(2));
+        app.active_operations.insert(profile_id.clone(), active);
+        app.pending_deletes.insert(
+            profile_id.clone(),
+            PendingDelete {
+                operation_id: OperationId(91),
+                profile_generation: ProfileGeneration(1),
+                prior_active: Some(active),
+                prior_finished: false,
+            },
+        );
+        app.prune_active_operations();
+        assert!(app.active_operations.is_empty());
+        assert!(app.pending_deletes.is_empty());
+
+        let current = ActiveOperation {
+            operation_id: OperationId(92),
+            profile_generation: ProfileGeneration(2),
+            kind: OperationKind::BrowseMySql,
+        };
+        app.active_operations.insert(profile_id.clone(), current);
+        app.pending_deletes.insert(
+            profile_id.clone(),
+            PendingDelete {
+                operation_id: OperationId(93),
+                profile_generation: ProfileGeneration(2),
+                prior_active: Some(current),
+                prior_finished: false,
+            },
+        );
+        app.finish_active_operation(&crate::ui::UiEvent::ConfigUncertain {
+            operation_id: OperationId(94),
+        });
+        assert!(app.active_operations.is_empty());
+        assert!(app.pending_deletes.is_empty());
+
+        app.active_operations.insert(profile_id, current);
+        app.finish_active_operation(&crate::ui::UiEvent::RuntimeShutdown {
+            operation_id: OperationId(95),
+        });
+        assert!(app.active_operations.is_empty());
     }
 
     #[test]
