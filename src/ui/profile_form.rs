@@ -855,21 +855,151 @@ fn render_error(ui: &mut egui::Ui, error: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProfileDraft, ProfileEditor, ProfileEventResult, SaveAttempt};
+    use super::{
+        DraftTestAttempt, ProfileDraft, ProfileEditor, ProfileEventResult, SaveAttempt,
+        environment_availability_label,
+    };
     use crate::config::MigrationConsent;
     use crate::model::{
         ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileGeneration,
-        ProfileId, RedisTlsConfig, TlsMode,
+        ProfileId, RedisTlsConfig, SessionCredentialIntent, TlsMode,
     };
-    use crate::secrets::SessionSecretUpdate;
-    use crate::ui::adapter::{UiCommand, bounded_ports};
+    use crate::secrets::{EnvironmentAvailability, SessionSecretUpdate};
+    use crate::ui::adapter::{DraftTestIntent, UiCommand, bounded_ports};
     use crate::ui::model::UiEvent;
 
     fn valid_editor(driver: DriverKind) -> ProfileEditor {
         let mut editor = ProfileEditor::new(DraftId(101), driver);
+        editor.set_auto_id(false);
         editor.draft.id = "local-profile".to_owned();
         editor.draft.name = "Local profile".to_owned();
         editor
+    }
+
+    #[test]
+    fn add_profile_uses_name_slug_preview_auto_id_and_migration_confirmation() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut editor = ProfileEditor::new(DraftId(201), DriverKind::MySql);
+        editor.draft.name = "Local Primary DB".to_owned();
+        assert_eq!(
+            editor.auto_id_preview().as_deref(),
+            Some("local-primary-db")
+        );
+        editor.set_migration_confirmed(true);
+
+        assert_eq!(
+            editor.try_save(&ui, OperationId(201)),
+            SaveAttempt::Submitted(OperationId(201))
+        );
+        let Some(UiCommand::CreateProfile(request)) = service.try_next_command() else {
+            panic!("expected create command");
+        };
+        assert_eq!(request.explicit_id, None);
+        assert_eq!(request.migration_consent, MigrationConsent::Confirmed);
+    }
+
+    #[test]
+    fn session_keep_replace_forget_and_save_connect_map_exactly() {
+        let (create_ui, mut create_service) = bounded_ports(4);
+        let mut create = ProfileEditor::new(DraftId(202), DriverKind::Redis);
+        create.draft.name = "Session Redis".to_owned();
+        create.select_credential_mode(CredentialMode::Session);
+        create.set_replacement_secret("replace-secret".to_owned());
+        assert_eq!(
+            create.try_save_with_connect(&create_ui, OperationId(202), true),
+            SaveAttempt::Submitted(OperationId(202))
+        );
+        let Some(UiCommand::CreateProfile(create_request)) = create_service.try_next_command()
+        else {
+            panic!("expected create command");
+        };
+        assert!(matches!(
+            create_request.secret_update,
+            SessionSecretUpdate::Replace(_)
+        ));
+        assert!(!create.replacement_is_set());
+
+        let profile =
+            ConnectionProfile::from_draft("session-redis".to_owned(), create_request.draft);
+        let (keep_ui, mut keep_service) = bounded_ports(4);
+        let mut keep = ProfileEditor::edit(DraftId(203), &profile, ProfileGeneration(7), true);
+        assert_eq!(
+            keep.session_intent(),
+            Some(SessionCredentialIntent::KeepCurrent)
+        );
+        assert_eq!(
+            keep.try_save(&keep_ui, OperationId(203)),
+            SaveAttempt::Submitted(OperationId(203))
+        );
+        assert!(matches!(
+            keep_service.try_next_command(),
+            Some(UiCommand::UpdateProfile(
+                crate::service::UpdateProfileRequest {
+                    secret_update: SessionSecretUpdate::Keep,
+                    ..
+                }
+            ))
+        ));
+
+        let (forget_ui, mut forget_service) = bounded_ports(4);
+        let mut forget = ProfileEditor::edit(DraftId(204), &profile, ProfileGeneration(8), true);
+        forget.set_replacement_secret("must-be-zeroized".to_owned());
+        forget.select_session_intent(SessionCredentialIntent::Forget);
+        assert!(!forget.replacement_is_set());
+        assert_eq!(
+            forget.try_save(&forget_ui, OperationId(204)),
+            SaveAttempt::Submitted(OperationId(204))
+        );
+        assert!(matches!(
+            forget_service.try_next_command(),
+            Some(UiCommand::UpdateProfile(
+                crate::service::UpdateProfileRequest {
+                    secret_update: SessionSecretUpdate::Clear,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn draft_test_intent_and_environment_states_are_explicit_and_mongodb_is_disabled() {
+        assert_eq!(
+            environment_availability_label(EnvironmentAvailability::Available),
+            "Available"
+        );
+        assert_eq!(
+            environment_availability_label(EnvironmentAvailability::Missing),
+            "Missing"
+        );
+        assert_eq!(
+            environment_availability_label(EnvironmentAvailability::Empty),
+            "Empty"
+        );
+
+        let (ui, mut service) = bounded_ports(4);
+        let mut editor = ProfileEditor::new(DraftId(205), DriverKind::MySql);
+        editor.draft.name = "Draft MySQL".to_owned();
+        assert_eq!(
+            editor.try_test_draft(&ui, OperationId(205)),
+            DraftTestAttempt::Submitted(OperationId(205))
+        );
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::PrepareDraftConnectionTest(
+                DraftTestIntent::Secretless {
+                    draft_id: DraftId(205),
+                    operation_id: OperationId(205),
+                    ..
+                }
+            ))
+        ));
+
+        let mut mongodb = ProfileEditor::new(DraftId(206), DriverKind::MongoDb);
+        mongodb.draft.name = "Planned Mongo".to_owned();
+        assert_eq!(
+            mongodb.try_test_draft(&ui, OperationId(206)),
+            DraftTestAttempt::Unavailable
+        );
     }
 
     #[test]
