@@ -1496,8 +1496,19 @@ pub enum Cell {
     Float(f64),
     Decimal(String),
     Text(String),
-    Bytes { preview: String, len: usize },
+    TextPreview {
+        preview: String,
+        original_len: usize,
+    },
+    Bytes {
+        retained: Vec<u8>,
+        original_len: usize,
+    },
     Json(serde_json::Value),
+    JsonPreview {
+        preview: String,
+        original_len: usize,
+    },
     DateTime(String),
 }
 
@@ -1511,8 +1522,10 @@ impl fmt::Debug for Cell {
             Self::Float(_) => "Cell::Float(<redacted>)",
             Self::Decimal(_) => "Cell::Decimal(<redacted>)",
             Self::Text(_) => "Cell::Text(<redacted>)",
+            Self::TextPreview { .. } => "Cell::TextPreview(<redacted>)",
             Self::Bytes { .. } => "Cell::Bytes(<redacted>)",
             Self::Json(_) => "Cell::Json(<redacted>)",
+            Self::JsonPreview { .. } => "Cell::JsonPreview(<redacted>)",
             Self::DateTime(_) => "Cell::DateTime(<redacted>)",
         })
     }
@@ -1839,6 +1852,10 @@ impl ResultSnapshot {
         let mut retained_bytes = 0_usize;
         for column in source_columns.into_iter().take(MAX_RESULT_COLUMNS) {
             let column_bytes = column.name.len().saturating_add(column.type_name.len());
+            if column_bytes > MAX_RESULT_CELL_BYTES {
+                push_result_notice(&mut notices, ResultNotice::SnapshotByteLimitReached);
+                break;
+            }
             if retained_bytes.saturating_add(column_bytes) > MAX_RESULT_BYTES {
                 push_result_notice(&mut notices, ResultNotice::SnapshotByteLimitReached);
                 break;
@@ -1877,7 +1894,9 @@ impl ResultSnapshot {
             let mut retained_row = Vec::with_capacity(allowed_cells);
             let row_start_bytes = retained_bytes;
             let truncation_start = cell_truncations.len();
+            let notice_start = notices.len();
             let mut row_complete = true;
+            let mut drop_row = false;
 
             for (column_index, cell) in source_row.into_iter().take(allowed_cells).enumerate() {
                 let remaining = MAX_RESULT_BYTES.saturating_sub(retained_bytes);
@@ -1886,8 +1905,13 @@ impl ResultSnapshot {
                     break;
                 }
                 let cell_cap = policy.cell_bytes().min(remaining);
-                let retained =
-                    retain_cell(cell, cell_cap, policy.max_depth(), row_index, column_index);
+                let Some(retained) =
+                    retain_cell(cell, cell_cap, policy.max_depth(), row_index, column_index)
+                else {
+                    row_complete = false;
+                    drop_row = true;
+                    break;
+                };
                 if retained.retained_bytes > remaining {
                     row_complete = false;
                     break;
@@ -1911,10 +1935,11 @@ impl ResultSnapshot {
             if !row_complete {
                 truncated = true;
             }
-            if retained_row.len() != columns.len() && !columns.is_empty() {
+            if drop_row || (retained_row.len() != columns.len() && !columns.is_empty()) {
                 retained_bytes = row_start_bytes;
                 retained_cells = retained_cells.saturating_sub(retained_row.len());
                 cell_truncations.truncate(truncation_start);
+                notices.truncate(notice_start);
                 push_result_notice(&mut notices, ResultNotice::SnapshotByteLimitReached);
                 break;
             }
@@ -1960,53 +1985,45 @@ fn retain_cell(
     max_depth: Option<usize>,
     row_index: usize,
     column_index: usize,
-) -> RetainedCell {
+) -> Option<RetainedCell> {
     match cell {
-        Cell::Text(value) => retain_string_cell(
-            value,
+        Cell::Text(value) => Some(retain_text_cell(value, None, cap, row_index, column_index)),
+        Cell::TextPreview {
+            preview,
+            original_len,
+        } => Some(retain_text_cell(
+            preview,
+            Some(original_len),
             cap,
             row_index,
             column_index,
-            CellTruncationKind::Text,
-            Cell::Text,
-        ),
-        Cell::Decimal(value) => retain_string_cell(
-            value,
-            cap,
-            row_index,
-            column_index,
-            CellTruncationKind::Decimal,
-            Cell::Decimal,
-        ),
-        Cell::DateTime(value) => retain_string_cell(
-            value,
-            cap,
-            row_index,
-            column_index,
-            CellTruncationKind::DateTime,
-            Cell::DateTime,
-        ),
-        Cell::Bytes { mut preview, len } => {
-            let original_preview_len = preview.len();
-            truncate_utf8(&mut preview, cap);
-            let truncated = preview.len() < original_preview_len
-                || original_preview_len < len
-                || len > 32
-                || preview.ends_with('…');
-            let retained_bytes = preview.len();
-            RetainedCell {
-                cell: Cell::Bytes { preview, len },
+        )),
+        Cell::Decimal(value) => retain_complete_string_cell(value, cap, Cell::Decimal),
+        Cell::DateTime(value) => retain_complete_string_cell(value, cap, Cell::DateTime),
+        Cell::Bytes {
+            mut retained,
+            original_len,
+        } => {
+            let original_len = original_len.max(retained.len());
+            retained.truncate(cap);
+            let retained_bytes = retained.len();
+            let truncated = retained_bytes < original_len;
+            Some(RetainedCell {
+                cell: Cell::Bytes {
+                    retained,
+                    original_len,
+                },
                 retained_bytes,
                 truncation: truncated.then_some(CellTruncation {
                     row_index,
                     column_index,
                     kind: CellTruncationKind::Bytes,
                     retained_bytes,
-                    original_len: Some(len),
+                    original_len: Some(original_len),
                     truncated: true,
                 }),
                 depth_truncated: false,
-            }
+            })
         }
         Cell::Json(mut value) => {
             let original_len = serde_json::to_vec(&value).map_or(0, |encoded| encoded.len());
@@ -2021,13 +2038,15 @@ fn retain_cell(
             let byte_truncated = retained.len() < encoded_len;
             let truncated = depth_truncated || byte_truncated;
             let retained_bytes = retained.len();
-            let retained_value = if byte_truncated {
-                serde_json::Value::String(retained)
-            } else {
-                value
-            };
-            RetainedCell {
-                cell: Cell::Json(retained_value),
+            Some(RetainedCell {
+                cell: if truncated {
+                    Cell::JsonPreview {
+                        preview: retained,
+                        original_len,
+                    }
+                } else {
+                    Cell::Json(value)
+                },
                 retained_bytes,
                 truncation: truncated.then_some(CellTruncation {
                     row_index,
@@ -2038,45 +2057,94 @@ fn retain_cell(
                     truncated: true,
                 }),
                 depth_truncated,
-            }
+            })
+        }
+        Cell::JsonPreview {
+            mut preview,
+            original_len,
+        } => {
+            let original_len = original_len.max(preview.len());
+            truncate_utf8(&mut preview, cap);
+            let retained_bytes = preview.len();
+            Some(RetainedCell {
+                cell: Cell::JsonPreview {
+                    preview,
+                    original_len,
+                },
+                retained_bytes,
+                truncation: Some(CellTruncation {
+                    row_index,
+                    column_index,
+                    kind: CellTruncationKind::Json,
+                    retained_bytes,
+                    original_len: Some(original_len),
+                    truncated: true,
+                }),
+                depth_truncated: false,
+            })
         }
         scalar => {
             let retained_bytes = scalar_retained_bytes(&scalar);
-            RetainedCell {
+            Some(RetainedCell {
                 cell: scalar,
                 retained_bytes,
                 truncation: None,
                 depth_truncated: false,
-            }
+            })
         }
     }
 }
 
-fn retain_string_cell(
-    mut value: String,
+fn retain_text_cell(
+    mut preview: String,
+    declared_original_len: Option<usize>,
     cap: usize,
     row_index: usize,
     column_index: usize,
-    kind: CellTruncationKind,
-    wrap: impl FnOnce(String) -> Cell,
 ) -> RetainedCell {
-    let original_len = value.len();
-    truncate_utf8(&mut value, cap);
-    let retained_bytes = value.len();
-    let truncation = (retained_bytes < original_len).then_some(CellTruncation {
-        row_index,
-        column_index,
-        kind,
-        retained_bytes,
-        original_len: Some(original_len),
-        truncated: true,
-    });
+    let original_len = declared_original_len
+        .unwrap_or(preview.len())
+        .max(preview.len());
+    truncate_utf8(&mut preview, cap);
+    let retained_bytes = preview.len();
+    let truncated = declared_original_len.is_some() || retained_bytes < original_len;
     RetainedCell {
-        cell: wrap(value),
+        cell: if truncated {
+            Cell::TextPreview {
+                preview,
+                original_len,
+            }
+        } else {
+            Cell::Text(preview)
+        },
         retained_bytes,
-        truncation,
+        truncation: truncated.then_some(CellTruncation {
+            row_index,
+            column_index,
+            kind: CellTruncationKind::Text,
+            retained_bytes,
+            original_len: Some(original_len),
+            truncated: true,
+        }),
         depth_truncated: false,
     }
+}
+
+fn retain_complete_string_cell(
+    value: String,
+    cap: usize,
+    wrap: impl FnOnce(String) -> Cell,
+) -> Option<RetainedCell> {
+    let retained_bytes = value.len();
+    if retained_bytes > cap {
+        return None;
+    }
+    Some(RetainedCell {
+        cell: wrap(value),
+        retained_bytes,
+        truncation: None,
+        depth_truncated: false,
+    })
 }
 
 fn truncate_utf8(value: &mut String, cap: usize) {
@@ -2133,7 +2201,8 @@ fn scalar_retained_bytes(cell: &Cell) -> usize {
         Cell::UInt(value) => value.to_string().len(),
         Cell::Float(value) => value.to_string().len(),
         Cell::Decimal(value) | Cell::Text(value) | Cell::DateTime(value) => value.len(),
-        Cell::Bytes { preview, .. } => preview.len(),
+        Cell::TextPreview { preview, .. } | Cell::JsonPreview { preview, .. } => preview.len(),
+        Cell::Bytes { retained, .. } => retained.len(),
         Cell::Json(value) => serde_json::to_vec(value).map_or(0, |encoded| encoded.len()),
     }
 }

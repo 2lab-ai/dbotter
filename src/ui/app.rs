@@ -3026,15 +3026,10 @@ fn render_result(ui: &mut egui::Ui, result: &crate::model::ResultSnapshot) {
 }
 
 fn display_cell(cell: &Cell) -> String {
-    match cell {
-        Cell::Null => "NULL".to_owned(),
-        Cell::Bool(value) => value.to_string(),
-        Cell::Int(value) => value.to_string(),
-        Cell::UInt(value) => value.to_string(),
-        Cell::Float(value) => value.to_string(),
-        Cell::Decimal(value) | Cell::Text(value) | Cell::DateTime(value) => value.clone(),
-        Cell::Bytes { preview, len } => format!("{preview} ({len} bytes)"),
-        Cell::Json(value) => value.to_string(),
+    if matches!(cell, Cell::Null) {
+        "NULL".to_owned()
+    } else {
+        crate::export::clipboard_scalar(cell)
     }
 }
 

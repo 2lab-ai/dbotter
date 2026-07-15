@@ -454,26 +454,33 @@ impl PreviewRetention {
         let cell = match std::str::from_utf8(&bytes) {
             Ok(value) => {
                 let end = utf8_prefix_len(value, MAX_REDIS_CELL_BYTES);
-                Cell::Text(value[..end].to_owned())
+                if end < original_len {
+                    Cell::TextPreview {
+                        preview: value[..end].to_owned(),
+                        original_len,
+                    }
+                } else {
+                    Cell::Text(value.to_owned())
+                }
             }
             Err(_) => {
-                // Base64 expands by 4/3. Restrict the raw slice so the public
-                // preview itself, not merely its decoded form, stays bounded.
-                let binary_limit = (MAX_REDIS_CELL_BYTES / 4) * 3;
-                let retained = &bytes[..original_len.min(binary_limit)];
+                let retained = bytes[..original_len.min(MAX_REDIS_CELL_BYTES)].to_vec();
                 Cell::Bytes {
-                    preview: base64::engine::general_purpose::STANDARD.encode(retained),
-                    len: original_len,
+                    retained,
+                    original_len,
                 }
             }
         };
-        let cell_truncated = original_len
-            > match &cell {
-                Cell::Text(value) => value.len(),
-                Cell::Bytes { preview, .. } => (preview.len() / 4) * 3,
-                _ => 0,
-            };
-        self.push(cell, original_len.min(MAX_REDIS_CELL_BYTES), cell_truncated);
+        let cell_truncated = match &cell {
+            Cell::Text(_) => false,
+            Cell::TextPreview { .. } => true,
+            Cell::Bytes {
+                retained,
+                original_len,
+            } => retained.len() < *original_len,
+            _ => false,
+        };
+        self.push(cell, original_len, cell_truncated);
     }
 
     fn mark_more(&mut self, more: bool) {
@@ -494,7 +501,7 @@ impl PreviewRetention {
         fields.insert(left_name.to_owned(), binary_json(&left, allowance));
         fields.insert(right_name.to_owned(), binary_json(&right, allowance));
         let cell = Cell::Json(fields.into());
-        self.push(cell, raw_len.min(MAX_REDIS_CELL_BYTES), cell_truncated);
+        self.push(cell, raw_len, cell_truncated);
     }
 
     fn push_scored(&mut self, member: Vec<u8>, score: f64) {
@@ -504,7 +511,7 @@ impl PreviewRetention {
             "member": binary_json(&member, MAX_REDIS_CELL_BYTES.saturating_sub(512)),
             "score": score.to_string(),
         }));
-        self.push(cell, raw_len.min(MAX_REDIS_CELL_BYTES), cell_truncated);
+        self.push(cell, raw_len, cell_truncated);
     }
 
     fn push_resp_sequence(&mut self, value: redis::Value) {
@@ -531,13 +538,17 @@ impl PreviewRetention {
         self.push(Cell::Text("[unsupported-redis-type]".to_owned()), 24, false);
     }
 
-    fn push(&mut self, mut cell: Cell, _source_retained_bytes: usize, mut cell_truncated: bool) {
-        let mut materialized_bytes = cell_materialized_bytes(&cell);
-        if materialized_bytes > MAX_REDIS_CELL_BYTES {
-            cell = Cell::Text("[dbotter-cell-preview-truncated]".to_owned());
-            materialized_bytes = cell_materialized_bytes(&cell);
-            cell_truncated = true;
-        }
+    fn push(&mut self, cell: Cell, source_original_len: usize, cell_truncated: bool) {
+        let cell = bounded_preview_cell(cell, source_original_len, cell_truncated);
+        let materialized_bytes = cell_materialized_bytes(&cell);
+        let retained_cell_is_truncated = match &cell {
+            Cell::TextPreview { .. } | Cell::JsonPreview { .. } => true,
+            Cell::Bytes {
+                retained,
+                original_len,
+            } => retained.len() < *original_len,
+            _ => false,
+        };
         if self.items.len() >= MAX_REDIS_PREVIEW_ITEMS
             || self.retained_bytes.saturating_add(materialized_bytes) > MAX_REDIS_PREVIEW_BYTES
         {
@@ -545,7 +556,7 @@ impl PreviewRetention {
             return;
         }
         self.retained_bytes = self.retained_bytes.saturating_add(materialized_bytes);
-        self.truncated |= cell_truncated;
+        self.truncated |= cell_truncated || retained_cell_is_truncated;
         self.items.push(cell);
     }
 
@@ -558,6 +569,74 @@ impl PreviewRetention {
             notices.push(ResultNotice::RedisDepthLimitReached);
         }
         notices
+    }
+}
+
+fn bounded_preview_cell(cell: Cell, source_original_len: usize, already_truncated: bool) -> Cell {
+    match cell {
+        Cell::Text(mut value) => {
+            let original_len = source_original_len.max(value.len());
+            let end = utf8_prefix_len(&value, MAX_REDIS_CELL_BYTES);
+            value.truncate(end);
+            if already_truncated || end < original_len {
+                Cell::TextPreview {
+                    preview: value,
+                    original_len,
+                }
+            } else {
+                Cell::Text(value)
+            }
+        }
+        Cell::TextPreview {
+            mut preview,
+            original_len,
+        } => {
+            let original_len = source_original_len.max(original_len).max(preview.len());
+            let end = utf8_prefix_len(&preview, MAX_REDIS_CELL_BYTES);
+            preview.truncate(end);
+            Cell::TextPreview {
+                preview,
+                original_len,
+            }
+        }
+        Cell::Bytes {
+            mut retained,
+            original_len,
+        } => {
+            let original_len = source_original_len.max(original_len).max(retained.len());
+            retained.truncate(MAX_REDIS_CELL_BYTES);
+            Cell::Bytes {
+                retained,
+                original_len,
+            }
+        }
+        Cell::Json(value) => {
+            let mut preview = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_owned());
+            let original_len = source_original_len.max(preview.len());
+            let end = utf8_prefix_len(&preview, MAX_REDIS_CELL_BYTES);
+            if already_truncated || end < preview.len() {
+                preview.truncate(end);
+                Cell::JsonPreview {
+                    preview,
+                    original_len,
+                }
+            } else {
+                Cell::Json(value)
+            }
+        }
+        Cell::JsonPreview {
+            mut preview,
+            original_len,
+        } => {
+            let original_len = source_original_len.max(original_len).max(preview.len());
+            let end = utf8_prefix_len(&preview, MAX_REDIS_CELL_BYTES);
+            preview.truncate(end);
+            Cell::JsonPreview {
+                preview,
+                original_len,
+            }
+        }
+        scalar => scalar,
     }
 }
 
@@ -682,7 +761,8 @@ fn utf8_prefix_len(value: &str, maximum: usize) -> usize {
 fn cell_materialized_bytes(cell: &Cell) -> usize {
     match cell {
         Cell::Text(value) | Cell::Decimal(value) => value.len(),
-        Cell::Bytes { preview, .. } => preview.len(),
+        Cell::TextPreview { preview, .. } | Cell::JsonPreview { preview, .. } => preview.len(),
+        Cell::Bytes { retained, .. } => retained.len(),
         Cell::Json(value) => {
             serde_json::to_vec(value).map_or(MAX_REDIS_CELL_BYTES + 1, |v| v.len())
         }
