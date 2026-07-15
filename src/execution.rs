@@ -1,6 +1,8 @@
 use std::fmt;
 use std::ops::Range;
 
+use crate::model::OperationKind;
+
 pub const MAX_EXECUTE_ROW_LIMIT: u32 = 10_000;
 pub const MAX_EXECUTE_TIMEOUT_SECONDS: u32 = 300;
 pub const MAX_REDIS_TARGET_BYTES: usize = 65_536;
@@ -32,6 +34,108 @@ impl fmt::Debug for ExecutionTarget {
                 .finish(),
         }
     }
+}
+
+/// Classifies only a closed, clearly read-only set as `ExecuteRead`.
+/// Language/target mismatches and unknown or side-effecting forms fail closed.
+#[must_use]
+pub fn classify_execution_kind(
+    language: ExecutionLanguage,
+    target: &ExecutionTarget,
+) -> OperationKind {
+    let is_read = match (language, target) {
+        (ExecutionLanguage::MySql, ExecutionTarget::MySqlText(text)) => {
+            mysql_is_clearly_read_only(text)
+        }
+        (ExecutionLanguage::Redis, ExecutionTarget::RedisArgv(arguments)) => {
+            redis_is_clearly_read_only(arguments)
+        }
+        _ => false,
+    };
+    if is_read {
+        OperationKind::ExecuteRead
+    } else {
+        OperationKind::ExecuteMutation
+    }
+}
+
+fn mysql_is_clearly_read_only(text: &str) -> bool {
+    let uppercase = text.to_ascii_uppercase();
+    let keyword = uppercase
+        .trim_start()
+        .chars()
+        .take_while(|character| character.is_ascii_alphabetic())
+        .collect::<String>();
+    if !matches!(
+        keyword.as_str(),
+        "SELECT" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
+    ) {
+        return false;
+    }
+    ![
+        " INTO OUTFILE",
+        " INTO DUMPFILE",
+        " FOR UPDATE",
+        " LOCK IN SHARE MODE",
+        "GET_LOCK(",
+        "RELEASE_LOCK(",
+        "SLEEP(",
+    ]
+    .iter()
+    .any(|side_effect| uppercase.contains(side_effect))
+}
+
+fn redis_is_clearly_read_only(arguments: &[String]) -> bool {
+    let Some(command) = arguments.first() else {
+        return false;
+    };
+    matches!(
+        command.to_ascii_uppercase().as_str(),
+        "PING"
+            | "ECHO"
+            | "GET"
+            | "MGET"
+            | "EXISTS"
+            | "TYPE"
+            | "TTL"
+            | "PTTL"
+            | "STRLEN"
+            | "GETRANGE"
+            | "BITCOUNT"
+            | "HGET"
+            | "HMGET"
+            | "HGETALL"
+            | "HEXISTS"
+            | "HLEN"
+            | "HKEYS"
+            | "HVALS"
+            | "LLEN"
+            | "LINDEX"
+            | "LRANGE"
+            | "SCARD"
+            | "SISMEMBER"
+            | "SMISMEMBER"
+            | "SMEMBERS"
+            | "ZCARD"
+            | "ZCOUNT"
+            | "ZSCORE"
+            | "ZMSCORE"
+            | "ZRANGE"
+            | "ZRANGEBYSCORE"
+            | "ZREVRANGE"
+            | "ZRANK"
+            | "ZREVRANK"
+            | "XLEN"
+            | "XRANGE"
+            | "XREVRANGE"
+            | "SCAN"
+            | "SSCAN"
+            | "HSCAN"
+            | "ZSCAN"
+            | "DBSIZE"
+            | "INFO"
+            | "TIME"
+    )
 }
 
 #[derive(Clone, PartialEq, Eq)]

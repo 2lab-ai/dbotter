@@ -6,8 +6,8 @@ use std::ops::Range;
 use eframe::egui;
 
 use crate::execution::{
-    ExecutionLanguage, ExecutionTargetError, MAX_EXECUTE_ROW_LIMIT, MAX_EXECUTE_TIMEOUT_SECONDS,
-    extract_and_validate_target,
+    ExecutionLanguage, ExecutionTarget, ExecutionTargetError, MAX_EXECUTE_ROW_LIMIT,
+    MAX_EXECUTE_TIMEOUT_SECONDS, classify_execution_kind, extract_and_validate_target,
 };
 use crate::model::{
     DriverKind, OperationId, OperationKind, ProfileGeneration, ProfileId, QueryLanguage, TlsMode,
@@ -186,8 +186,8 @@ pub fn build_execute_intent(
         timeout_seconds,
     )
     .map_err(EditorValidationError::Target)?;
+    let operation_kind = classify_execution_kind(execution_language, validated.target());
     let text = validated.into_source_text();
-    let operation_kind = classify_execute_operation(query_language, &text);
     Ok(EditorExecuteIntent {
         profile_id: profile.id.clone(),
         profile_generation: profile.generation,
@@ -220,98 +220,23 @@ fn parse_timeout(value: &str) -> Result<u32, EditorValidationError> {
 /// Classifies only a closed, clearly read-only set as `ExecuteRead`.
 /// Unknown or side-effecting forms fail closed to `ExecuteMutation`.
 pub fn classify_execute_operation(language: QueryLanguage, text: &str) -> OperationKind {
-    let is_read = match language {
-        QueryLanguage::Sql => mysql_is_clearly_read_only(text),
-        QueryLanguage::RedisCommand => redis_is_clearly_read_only(text),
-        QueryLanguage::MongoDocument => false,
+    let (execution_language, target) = match language {
+        QueryLanguage::Sql => (
+            ExecutionLanguage::MySql,
+            ExecutionTarget::MySqlText(text.to_owned()),
+        ),
+        QueryLanguage::RedisCommand => {
+            let Ok(arguments) = shell_words::split(text) else {
+                return OperationKind::ExecuteMutation;
+            };
+            (
+                ExecutionLanguage::Redis,
+                ExecutionTarget::RedisArgv(arguments),
+            )
+        }
+        QueryLanguage::MongoDocument => return OperationKind::ExecuteMutation,
     };
-    if is_read {
-        OperationKind::ExecuteRead
-    } else {
-        OperationKind::ExecuteMutation
-    }
-}
-
-fn mysql_is_clearly_read_only(text: &str) -> bool {
-    let uppercase = text.to_ascii_uppercase();
-    let keyword = uppercase
-        .trim_start()
-        .chars()
-        .take_while(|character| character.is_ascii_alphabetic())
-        .collect::<String>();
-    if !matches!(
-        keyword.as_str(),
-        "SELECT" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
-    ) {
-        return false;
-    }
-    ![
-        " INTO OUTFILE",
-        " INTO DUMPFILE",
-        " FOR UPDATE",
-        " LOCK IN SHARE MODE",
-        "GET_LOCK(",
-        "RELEASE_LOCK(",
-        "SLEEP(",
-    ]
-    .iter()
-    .any(|side_effect| uppercase.contains(side_effect))
-}
-
-fn redis_is_clearly_read_only(text: &str) -> bool {
-    let Ok(arguments) = shell_words::split(text) else {
-        return false;
-    };
-    let Some(command) = arguments.first() else {
-        return false;
-    };
-    matches!(
-        command.to_ascii_uppercase().as_str(),
-        "PING"
-            | "ECHO"
-            | "GET"
-            | "MGET"
-            | "EXISTS"
-            | "TYPE"
-            | "TTL"
-            | "PTTL"
-            | "STRLEN"
-            | "GETRANGE"
-            | "BITCOUNT"
-            | "HGET"
-            | "HMGET"
-            | "HGETALL"
-            | "HEXISTS"
-            | "HLEN"
-            | "HKEYS"
-            | "HVALS"
-            | "LLEN"
-            | "LINDEX"
-            | "LRANGE"
-            | "SCARD"
-            | "SISMEMBER"
-            | "SMISMEMBER"
-            | "SMEMBERS"
-            | "ZCARD"
-            | "ZCOUNT"
-            | "ZSCORE"
-            | "ZMSCORE"
-            | "ZRANGE"
-            | "ZRANGEBYSCORE"
-            | "ZREVRANGE"
-            | "ZRANK"
-            | "ZREVRANK"
-            | "XLEN"
-            | "XRANGE"
-            | "XREVRANGE"
-            | "SCAN"
-            | "SSCAN"
-            | "HSCAN"
-            | "ZSCAN"
-            | "DBSIZE"
-            | "INFO"
-            | "TIME"
-    )
+    classify_execution_kind(execution_language, &target)
 }
 
 pub fn editor_target_label(profile: &ProfileSnapshot) -> String {
