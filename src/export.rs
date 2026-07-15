@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use base64::Engine as _;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, Utc};
 use rust_decimal::Decimal;
 
 use crate::model::{Cell, ExportFormat, MAX_RESULT_CELL_BYTES, ResultSnapshot};
@@ -438,14 +438,23 @@ fn canonical_decimal(value: &str) -> String {
 }
 
 fn normalize_datetime(value: &str) -> String {
-    DateTime::parse_from_rfc3339(value).map_or_else(
-        |_| value.to_owned(),
-        |datetime| {
-            datetime
-                .with_timezone(&Utc)
-                .to_rfc3339_opts(SecondsFormat::AutoSi, true)
-        },
-    )
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
+        return datetime
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::AutoSi, true);
+    }
+    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(datetime) = NaiveDateTime::parse_from_str(value, format) {
+            return format!("{}T{}", datetime.date(), datetime.time());
+        }
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return date.to_string();
+    }
+    if let Ok(time) = NaiveTime::parse_from_str(value, "%H:%M:%S%.f") {
+        return time.to_string();
+    }
+    value.to_owned()
 }
 
 fn canonical_json(value: &serde_json::Value) -> String {
