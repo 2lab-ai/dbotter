@@ -598,7 +598,11 @@ fn value_cell_complete(value: ::redis::Value) -> Cell {
             Cell::Json(serde_json::json!({ "data": data, "attributes": attributes }))
         }
         ::redis::Value::VerbatimString { text, .. } => Cell::Text(text),
-        ::redis::Value::BigNumber(value) => Cell::Decimal(value.to_string()),
+        ::redis::Value::BigNumber(value) => {
+            #[cfg(test)]
+            BIG_NUMBER_STRINGIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Cell::Decimal(value.to_string())
+        }
         ::redis::Value::Push { data, .. } => Cell::Json(serde_json::json!({
             "type": "push",
             "data": values_json_complete(data)
@@ -667,8 +671,14 @@ fn bytes_cell(bytes: Vec<u8>) -> Cell {
 }
 
 #[cfg(test)]
+static BIG_NUMBER_STRINGIFICATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    static BIG_NUMBER_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn retain_decoded(rows: Vec<Vec<Cell>>, truncated: bool) -> crate::model::ResultSnapshot {
         use crate::model::{
@@ -832,6 +842,102 @@ mod tests {
         assert!(truncated);
         assert!(derived_bytes <= crate::model::MAX_RESULT_BYTES);
         assert!(rows.len() < 200);
+    }
+
+    #[test]
+    fn nested_big_numbers_count_json_quotes_before_the_per_cell_cap() {
+        let _serial = BIG_NUMBER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        BIG_NUMBER_STRINGIFICATIONS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let negative_hundred = ::redis::Value::BigNumber(
+            "-100"
+                .parse()
+                .expect("parse the nested BigNumber counterexample"),
+        );
+        let values = (0..9_363).map(|_| negative_hundred.clone()).collect();
+
+        let (rows, truncated) = value_rows(::redis::Value::Set(values), 1);
+        let actual_bytes = rows.first().map_or(0, |row| match &row[0] {
+            Cell::Json(value) => serde_json::to_vec(value)
+                .expect("serialize nested BigNumber counterexample")
+                .len(),
+            _ => 0,
+        });
+        let stringifications =
+            BIG_NUMBER_STRINGIFICATIONS.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            truncated
+                && rows.is_empty()
+                && actual_bytes <= MAX_REDIS_CELL_BYTES
+                && stringifications == 0,
+            "nested BigNumbers crossed the cell cap: bytes={actual_bytes}, stringifications={stringifications}, rows={}, truncated={truncated}",
+            rows.len()
+        );
+    }
+
+    #[test]
+    fn cumulative_nested_big_numbers_count_sign_and_quotes_before_the_total_cap() {
+        let _serial = BIG_NUMBER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        BIG_NUMBER_STRINGIFICATIONS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let decimal = format!("-{}", "9".repeat(1_674));
+        let big_number = ::redis::Value::BigNumber(
+            decimal
+                .parse()
+                .expect("parse the cumulative BigNumber counterexample"),
+        );
+        let values = (0..4_999)
+            .map(|_| ::redis::Value::Array(vec![big_number.clone()]))
+            .collect();
+
+        let (rows, truncated) = value_rows(::redis::Value::Array(values), 4_999);
+        let actual_bytes = rows
+            .iter()
+            .map(|row| match &row[0] {
+                Cell::Json(value) => serde_json::to_vec(value)
+                    .expect("serialize cumulative BigNumber counterexample")
+                    .len(),
+                _ => 0,
+            })
+            .fold(0_usize, usize::saturating_add);
+        let stringifications =
+            BIG_NUMBER_STRINGIFICATIONS.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            truncated
+                && rows.len() < 4_999
+                && actual_bytes <= MAX_RESULT_BYTES
+                && stringifications == rows.len(),
+            "nested BigNumbers crossed the total cap: bytes={actual_bytes}, stringifications={stringifications}, rows={}, truncated={truncated}",
+            rows.len()
+        );
+    }
+
+    #[test]
+    fn enormous_top_level_big_number_is_rejected_before_decimal_string_allocation() {
+        let _serial = BIG_NUMBER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        BIG_NUMBER_STRINGIFICATIONS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let decimal = format!("-{}", "9".repeat(MAX_REDIS_CELL_BYTES + 1));
+        let value = ::redis::Value::BigNumber(
+            decimal
+                .parse()
+                .expect("parse the top-level BigNumber counterexample"),
+        );
+
+        let (rows, truncated) = value_rows(value, 1);
+
+        assert!(truncated);
+        assert!(rows.is_empty());
+        assert_eq!(
+            BIG_NUMBER_STRINGIFICATIONS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "top-level preflight must reject before BigNumber::to_string"
+        );
     }
 
     #[test]
