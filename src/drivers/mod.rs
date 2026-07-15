@@ -139,7 +139,11 @@ pub trait RedisExecution: Send + Sync {
 
 #[async_trait]
 pub trait CatalogBrowser: Send + Sync {
-    async fn load_page(&self, request: &CatalogRequest) -> Result<CatalogPage, DriverError>;
+    async fn load_page(
+        &self,
+        request: &CatalogRequest,
+        token_key: &mysql_catalog::CatalogTokenKey,
+    ) -> Result<CatalogPage, DriverError>;
 }
 
 #[async_trait]
@@ -245,9 +249,13 @@ impl RedisExecution for Session {
 
 #[async_trait]
 impl CatalogBrowser for Session {
-    async fn load_page(&self, request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
+    async fn load_page(
+        &self,
+        request: &CatalogRequest,
+        token_key: &mysql_catalog::CatalogTokenKey,
+    ) -> Result<CatalogPage, DriverError> {
         match self {
-            Self::MySql(session) => session.load_page(request).await,
+            Self::MySql(session) => session.load_page(request, token_key).await,
             Self::Redis(_) => Err(DriverError::Unsupported {
                 driver: DriverKind::Redis,
                 operation: "mysql catalog browsing".to_owned(),

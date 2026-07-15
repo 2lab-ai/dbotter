@@ -1642,7 +1642,7 @@ async fn run_profile_work(
             run_execute(service, request, kind, cancel, messages).await
         }
         ProfileWork::BrowseCatalog { request } => {
-            run_catalog_browse(service, request, cancel).await
+            run_catalog_browse(service, request, cancel, messages).await
         }
         ProfileWork::ScanRedisKeys { request } => run_redis_scan(service, request, cancel).await,
         ProfileWork::InspectRedisKey { request } => {
@@ -1939,19 +1939,139 @@ async fn run_catalog_browse(
     service: &ApplicationService,
     request: crate::model::CatalogRequest,
     cancel: &CancellationToken,
+    messages: &mpsc::UnboundedSender<ControllerMessage>,
 ) -> UiEvent {
+    let operation_id = request.operation_id();
+    let profile_id = request.profile_id().clone();
+    let profile_generation = request.profile_generation();
+    let timeout = request.timeout();
     let deadline = tokio::time::Instant::now() + request.timeout();
-    let operation = service.load_catalog_page(request.clone());
-    tokio::pin!(operation);
-    let result = tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(PublicSummary::OperationCancelled),
-        () = tokio::time::sleep_until(deadline) => Err(PublicSummary::OperationTimedOut),
-        result = &mut operation => result.map_err(|error| error.public_summary()),
+    let prepared = {
+        let prepare = service.prepare_catalog_request(&request);
+        tokio::pin!(prepare);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(PublicSummary::OperationCancelled),
+            () = tokio::time::sleep_until(deadline) => Err(PublicSummary::OperationTimedOut),
+            result = &mut prepare => result.map_err(|error| error.public_summary()),
+        }
     };
-    match result {
-        Ok(page) => UiEvent::CatalogPageLoaded { page },
-        Err(summary) => UiEvent::CatalogPageFailed { request, summary },
+    if let Err(summary) = prepared {
+        return catalog_failed_event(request, summary, None, None);
+    }
+
+    let acquire = service.acquire_session_at(operation_id, profile_id, profile_generation, timeout);
+    tokio::pin!(acquire);
+    let lease = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return catalog_failed_event(
+                request,
+                PublicSummary::OperationCancelled,
+                None,
+                None,
+            );
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            return catalog_failed_event(
+                request,
+                PublicSummary::OperationTimedOut,
+                None,
+                None,
+            );
+        }
+        result = &mut acquire => match result {
+            Ok(lease) => lease,
+            Err(error) => {
+                return catalog_failed_event(request, error.public_summary(), None, None);
+            }
+        }
+    };
+    let session_generation = lease.identity().session_generation;
+    let _ = messages.send(ControllerMessage::SessionAcquired {
+        operation_id,
+        session_generation,
+    });
+    tokio::task::yield_now().await;
+
+    enum CatalogAttempt {
+        Driver(Box<Result<crate::model::CatalogPage, crate::drivers::DriverError>>),
+        Cancelled,
+        TimedOut,
+    }
+    let attempt = {
+        let browse = lease.load_catalog_page(&request, service.catalog_token_key());
+        tokio::pin!(browse);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => CatalogAttempt::Cancelled,
+            () = tokio::time::sleep_until(deadline) => CatalogAttempt::TimedOut,
+            result = &mut browse => CatalogAttempt::Driver(Box::new(result)),
+        }
+    };
+    let observation = service.observe_session(&lease, operation_id).await;
+    match attempt {
+        CatalogAttempt::Driver(result) => match (*result, observation) {
+            (Ok(page), Ok(())) => UiEvent::CatalogPageLoaded {
+                page,
+                session_generation,
+                session_disposition: SessionDisposition::Keep,
+            },
+            (Err(error), Ok(())) => {
+                let disposition = SessionDisposition::for_driver_error(&error);
+                let summary = ServiceError::from(error).public_summary();
+                if disposition == SessionDisposition::Evict {
+                    service.evict_session_lease(&lease).await;
+                }
+                catalog_failed_event(
+                    request,
+                    summary,
+                    Some(session_generation),
+                    Some(disposition),
+                )
+            }
+            (_, Err(error)) => {
+                service.evict_session_lease(&lease).await;
+                catalog_failed_event(
+                    request,
+                    error.public_summary(),
+                    Some(session_generation),
+                    Some(SessionDisposition::Evict),
+                )
+            }
+        },
+        CatalogAttempt::Cancelled => {
+            service.evict_session_lease(&lease).await;
+            catalog_failed_event(
+                request,
+                PublicSummary::OperationCancelled,
+                Some(session_generation),
+                Some(SessionDisposition::Evict),
+            )
+        }
+        CatalogAttempt::TimedOut => {
+            service.evict_session_lease(&lease).await;
+            catalog_failed_event(
+                request,
+                PublicSummary::OperationTimedOut,
+                Some(session_generation),
+                Some(SessionDisposition::Evict),
+            )
+        }
+    }
+}
+
+fn catalog_failed_event(
+    request: crate::model::CatalogRequest,
+    summary: PublicSummary,
+    session_generation: Option<SessionGeneration>,
+    session_disposition: Option<SessionDisposition>,
+) -> UiEvent {
+    UiEvent::CatalogPageFailed {
+        request,
+        summary,
+        session_generation,
+        session_disposition,
     }
 }
 
@@ -2887,7 +3007,7 @@ fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEven
             operation_id,
             summary,
         },
-        UiCommand::BrowseCatalog(request) => UiEvent::CatalogPageFailed { request, summary },
+        UiCommand::BrowseCatalog(request) => catalog_failed_event(request, summary, None, None),
         UiCommand::ScanRedisKeys(request) => UiEvent::RedisKeysFailed { request, summary },
         UiCommand::InspectRedisKey(request) => UiEvent::RedisKeyInspectFailed { request, summary },
         UiCommand::CreateProfile(request) => UiEvent::ProfileSaveFailed {

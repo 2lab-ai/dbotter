@@ -11,11 +11,11 @@ use dbotter::drivers::{
     CatalogBrowser, ConnectedResources, ConnectionPing, DriverError, MySqlPreparedExecution,
 };
 use dbotter::model::{
-    CatalogPage, CatalogRequest, ConnectionDraft, CredentialMode, DraftId, DriverKind,
-    MySqlPublicErrorCode, OperationId, PreparedMySqlRequest, ProfileGeneration, ProfileId,
-    QueryResult, RedisKeyFilter, RedisKeyId, RedisKeyInspectRequest, RedisScanRequest,
-    RequestIdentity, ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
-    SessionGeneration,
+    CatalogLevel, CatalogPage, CatalogRequest, CatalogRetainedCounts, ConnectionDraft,
+    CredentialMode, DraftId, DriverKind, MySqlPublicErrorCode, OperationId, PreparedMySqlRequest,
+    ProfileGeneration, ProfileId, QueryResult, RedisKeyFilter, RedisKeyId, RedisKeyInspectRequest,
+    RedisScanRequest, RequestIdentity, ResultId, ResultProvenance, ResultRetentionPolicy,
+    ResultSnapshot, SessionGeneration,
 };
 use dbotter::secrets::{SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate};
 use dbotter::service::{
@@ -23,9 +23,9 @@ use dbotter::service::{
     SessionConnector, SessionDisposition, SessionHandle, UpdateProfileRequest,
 };
 use dbotter::ui::{
-    CONTROL_CAPACITY, ConnectionFailureOutcome, EVENT_CAPACITY, MUTATION_CAPACITY, PostCloseState,
-    ProfileSnapshot, SubmitError, TaskScope, UiCommand, UiEvent, UiModel, UiPort, WORK_CAPACITY,
-    bounded_ports, controller_ports, spawn_with_service,
+    CONTROL_CAPACITY, ConnectionFailureOutcome, ConnectionState, EVENT_CAPACITY, MUTATION_CAPACITY,
+    PostCloseState, ProfileSnapshot, SubmitError, TaskScope, UiCommand, UiEvent, UiModel, UiPort,
+    WORK_CAPACITY, bounded_ports, controller_ports, spawn_with_service,
 };
 
 #[test]
@@ -974,6 +974,10 @@ async fn p4_catalog_cancel_and_outer_timeout_drop_driver_future_before_exact_ses
         ui.try_submit(UiCommand::BrowseCatalog(request.clone()))
             .expect("catalog submits");
         session.resources.wait_until_started().await;
+        let acquired = service
+            .cached_session_identity(&profile.profile_id)
+            .await
+            .expect("catalog acquired exact session");
         if cancel_explicitly {
             ui.try_submit(UiCommand::CancelOperation { operation_id })
                 .expect("cancel submits");
@@ -983,7 +987,7 @@ async fn p4_catalog_cancel_and_outer_timeout_drop_driver_future_before_exact_ses
         } else {
             dbotter::model::PublicSummary::OperationTimedOut
         };
-        wait_for_event(&mut ui, |event| {
+        let terminal = wait_for_event(&mut ui, |event| {
             matches!(
                 event,
                 UiEvent::CatalogPageFailed {
@@ -995,6 +999,17 @@ async fn p4_catalog_cancel_and_outer_timeout_drop_driver_future_before_exact_ses
         })
         .await;
 
+        let UiEvent::CatalogPageFailed {
+            session_generation,
+            session_disposition,
+            ..
+        } = &terminal
+        else {
+            panic!("catalog terminal expected");
+        };
+        assert_eq!(*session_generation, Some(acquired.session_generation));
+        assert_eq!(*session_disposition, Some(SessionDisposition::Evict));
+
         assert!(session.resources.catalog_dropped.load(Ordering::SeqCst));
         assert!(
             !session.close_before_catalog_drop.load(Ordering::SeqCst),
@@ -1002,8 +1017,157 @@ async fn p4_catalog_cancel_and_outer_timeout_drop_driver_future_before_exact_ses
         );
         assert_eq!(session.closes.load(Ordering::SeqCst), 1);
         assert_eq!(service.cached_session_count().await, 0);
+
+        let prior_page = CatalogPage {
+            identity: RequestIdentity::new(
+                profile.profile_id.clone(),
+                profile.profile_generation,
+                OperationId(operation_id.0.saturating_sub(1)),
+            ),
+            level: CatalogLevel::Schemas,
+            parent: None,
+            nodes: Vec::new(),
+            next_token: None,
+            retained_counts: CatalogRetainedCounts::default(),
+            retained_utf8_bytes: 0,
+            truncated: false,
+            stale: false,
+            loaded_at: "2026-07-15T00:00:00Z".to_owned(),
+        };
+        let mut model = UiModel::default();
+        model.active_generations =
+            [(profile.profile_id.clone(), profile.profile_generation)].into();
+        model.connection_states = [(
+            profile.profile_id.clone(),
+            ConnectionState::Connected {
+                session_generation: acquired.session_generation,
+                elapsed_ms: 0,
+            },
+        )]
+        .into();
+        model.catalog_pages = [(profile.profile_id.clone(), prior_page)].into();
+        model.fold(terminal);
+        assert_eq!(
+            model.connection_state(&profile.profile_id),
+            &ConnectionState::Disconnected
+        );
+        assert!(model.catalog_pages[&profile.profile_id].stale);
+        assert_eq!(model.catalog_retry[&profile.profile_id], request);
         shutdown(&ui, runtime, OperationId(218 + index as u64)).await;
     }
+}
+
+#[tokio::test]
+async fn p4_catalog_stale_cancel_cannot_evict_or_hide_a_replacement_session() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let old_session = Arc::new(CatalogLifecycleSession::default());
+    let connector = Arc::new(CatalogReplacementConnector {
+        old_session: old_session.clone(),
+        calls: AtomicUsize::new(0),
+    });
+    let service = test_service_with_connector(&path, connector);
+    let profile = service
+        .create_profile(create_request("mysql-p4-replacement", OperationId(260)))
+        .await
+        .expect("mysql profile");
+    let request = CatalogRequest::Schemas {
+        identity: RequestIdentity::new(
+            profile.profile_id.clone(),
+            profile.profile_generation,
+            OperationId(261),
+        ),
+        prefix: None,
+        page_token: None,
+        page_size: 50,
+        timeout: Duration::from_secs(5),
+    };
+    let (mut ui, service_port) = controller_ports();
+    let runtime = spawn_with_service(service_port, service.clone());
+    ui.try_submit(UiCommand::BrowseCatalog(request))
+        .expect("catalog submits");
+    old_session.resources.wait_until_started().await;
+    let old_identity = service
+        .cached_session_identity(&profile.profile_id)
+        .await
+        .expect("old catalog identity");
+
+    assert!(
+        service
+            .evict_cached_session_exact(
+                &profile.profile_id,
+                profile.profile_generation,
+                old_identity.session_generation,
+            )
+            .await
+    );
+    let replacement = service
+        .check_at(
+            OperationId(262),
+            profile.profile_id.clone(),
+            profile.profile_generation,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("replacement session");
+    assert_ne!(
+        replacement.session_generation,
+        old_identity.session_generation
+    );
+
+    ui.try_submit(UiCommand::CancelOperation {
+        operation_id: OperationId(261),
+    })
+    .expect("cancel old catalog");
+    let terminal = wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::CatalogPageFailed {
+                request,
+                summary: dbotter::model::PublicSummary::OperationCancelled,
+                ..
+            } if request.operation_id() == OperationId(261)
+        )
+    })
+    .await;
+    let UiEvent::CatalogPageFailed {
+        session_generation,
+        session_disposition,
+        ..
+    } = &terminal
+    else {
+        panic!("old catalog terminal expected");
+    };
+    assert_eq!(*session_generation, Some(old_identity.session_generation));
+    assert_eq!(*session_disposition, Some(SessionDisposition::Evict));
+    assert_eq!(
+        service
+            .cached_session_identity(&profile.profile_id)
+            .await
+            .map(|identity| identity.session_generation),
+        Some(replacement.session_generation)
+    );
+    assert_eq!(old_session.closes.load(Ordering::SeqCst), 1);
+
+    let mut model = UiModel::default();
+    model.active_generations = [(profile.profile_id.clone(), profile.profile_generation)].into();
+    model.connection_states = [(
+        profile.profile_id.clone(),
+        ConnectionState::Connected {
+            session_generation: replacement.session_generation,
+            elapsed_ms: 0,
+        },
+    )]
+    .into();
+    model.fold(terminal);
+    assert_eq!(
+        model.connection_state(&profile.profile_id),
+        &ConnectionState::Connected {
+            session_generation: replacement.session_generation,
+            elapsed_ms: 0,
+        }
+    );
+    shutdown(&ui, runtime, OperationId(269)).await;
 }
 
 #[tokio::test]
@@ -1110,7 +1274,7 @@ async fn p4_catalog_reaches_its_typed_resource_while_mismatches_and_keyspace_sta
         .await
         .expect("redis profile");
     let (mut ui, service_port) = controller_ports();
-    let runtime = spawn_with_service(service_port, service);
+    let runtime = spawn_with_service(service_port, service.clone());
 
     let catalog = CatalogRequest::Schemas {
         identity: RequestIdentity::new(
@@ -1125,16 +1289,41 @@ async fn p4_catalog_reaches_its_typed_resource_while_mismatches_and_keyspace_sta
     };
     ui.try_submit(UiCommand::BrowseCatalog(catalog))
         .expect("catalog submits");
-    wait_for_event(&mut ui, |event| {
+    let permission_terminal = wait_for_event(&mut ui, |event| {
         matches!(
             event,
             UiEvent::CatalogPageFailed {
                 request,
                 summary: dbotter::model::PublicSummary::PermissionDenied,
+                ..
             } if request.operation_id() == OperationId(202)
         )
     })
     .await;
+    let cached = service
+        .cached_session_identity(&mysql.profile_id)
+        .await
+        .expect("permission rejection keeps healthy catalog session");
+    let UiEvent::CatalogPageFailed {
+        session_generation,
+        session_disposition,
+        ..
+    } = &permission_terminal
+    else {
+        panic!("catalog permission terminal expected");
+    };
+    assert_eq!(*session_generation, Some(cached.session_generation));
+    assert_eq!(*session_disposition, Some(SessionDisposition::Keep));
+    let mut model = UiModel::default();
+    model.active_generations = [(mysql.profile_id.clone(), mysql.profile_generation)].into();
+    model.fold(permission_terminal);
+    assert_eq!(
+        model.connection_state(&mysql.profile_id),
+        &ConnectionState::Connected {
+            session_generation: cached.session_generation,
+            elapsed_ms: 0,
+        }
+    );
 
     let mismatched_catalog = CatalogRequest::Schemas {
         identity: RequestIdentity::new(
@@ -1149,16 +1338,27 @@ async fn p4_catalog_reaches_its_typed_resource_while_mismatches_and_keyspace_sta
     };
     ui.try_submit(UiCommand::BrowseCatalog(mismatched_catalog))
         .expect("mismatched catalog submits");
-    wait_for_event(&mut ui, |event| {
+    let mismatched_terminal = wait_for_event(&mut ui, |event| {
         matches!(
             event,
             UiEvent::CatalogPageFailed {
                 request,
                 summary: dbotter::model::PublicSummary::InvalidInput,
+                ..
             } if request.operation_id() == OperationId(205)
         )
     })
     .await;
+    let UiEvent::CatalogPageFailed {
+        session_generation,
+        session_disposition,
+        ..
+    } = mismatched_terminal
+    else {
+        panic!("mismatched catalog terminal expected");
+    };
+    assert_eq!(session_generation, None);
+    assert_eq!(session_disposition, None);
 
     let scan = RedisScanRequest {
         identity: RequestIdentity::new(
@@ -3133,7 +3333,11 @@ impl MySqlPreparedExecution for CountingMySqlResources {
 
 #[async_trait]
 impl CatalogBrowser for CountingMySqlResources {
-    async fn load_page(&self, _request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
+    async fn load_page(
+        &self,
+        _request: &CatalogRequest,
+        _token_key: &dbotter::drivers::mysql_catalog::CatalogTokenKey,
+    ) -> Result<CatalogPage, DriverError> {
         Err(DriverError::MySqlServer {
             code: MySqlPublicErrorCode::new(1142, "42000").expect("valid injected permission code"),
         })
@@ -3247,7 +3451,11 @@ impl MySqlPreparedExecution for ExecuteTestResources {
 
 #[async_trait]
 impl CatalogBrowser for ExecuteTestResources {
-    async fn load_page(&self, _request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
+    async fn load_page(
+        &self,
+        _request: &CatalogRequest,
+        _token_key: &dbotter::drivers::mysql_catalog::CatalogTokenKey,
+    ) -> Result<CatalogPage, DriverError> {
         Err(DriverError::Unsupported {
             driver: DriverKind::MySql,
             operation: "test catalog".to_owned(),
@@ -3354,7 +3562,11 @@ impl MySqlPreparedExecution for CatalogLifecycleResources {
 
 #[async_trait]
 impl CatalogBrowser for CatalogLifecycleResources {
-    async fn load_page(&self, _request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
+    async fn load_page(
+        &self,
+        _request: &CatalogRequest,
+        _token_key: &dbotter::drivers::mysql_catalog::CatalogTokenKey,
+    ) -> Result<CatalogPage, DriverError> {
         let _guard = CatalogDropGuard(self.catalog_dropped.clone());
         self.started.store(true, Ordering::SeqCst);
         self.started_notify.notify_waiters();
@@ -3394,6 +3606,27 @@ impl SessionHandle for CatalogLifecycleSession {
 
 struct CatalogLifecycleConnector {
     session: Arc<CatalogLifecycleSession>,
+}
+
+struct CatalogReplacementConnector {
+    old_session: Arc<CatalogLifecycleSession>,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl SessionConnector for CatalogReplacementConnector {
+    async fn connect(
+        &self,
+        _profile: &dbotter::model::ConnectionProfile,
+        _secret: Option<&SessionSecret>,
+        _timeout: Duration,
+    ) -> Result<Arc<dyn SessionHandle>, DriverError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(self.old_session.clone())
+        } else {
+            Ok(Arc::new(CountingSession::default()))
+        }
+    }
 }
 
 #[async_trait]

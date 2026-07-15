@@ -197,6 +197,20 @@ async fn p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli() {
     let live_stale_seed = first.clone();
     assert_eq!(first.nodes.len(), 17);
     assert_binary_order(&first.nodes);
+    let other_service = ApplicationService::load_path(&config_path).expect("second live service");
+    let cross_service = relations(
+        &other_service,
+        "catalog-scoped",
+        "dbotter_allowed",
+        Some("bulk_"),
+        first.next_token.clone(),
+        17,
+        3_001,
+    )
+    .await
+    .expect_err("catalog token is scoped to one ApplicationService key");
+    assert_eq!(cross_service.public_summary(), PublicSummary::InvalidInput);
+    assert_eq!(cross_service.public_code(), PublicCode::Catalog);
     let second = relations(
         &service,
         "catalog-scoped",

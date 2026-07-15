@@ -144,10 +144,14 @@ pub enum UiEvent {
     },
     CatalogPageLoaded {
         page: CatalogPage,
+        session_generation: SessionGeneration,
+        session_disposition: SessionDisposition,
     },
     CatalogPageFailed {
         request: CatalogRequest,
         summary: PublicSummary,
+        session_generation: Option<SessionGeneration>,
+        session_disposition: Option<SessionDisposition>,
     },
     RedisKeysLoaded {
         page: RedisKeyPage,
@@ -409,17 +413,32 @@ impl UiModel {
                     );
                 }
             }
-            UiEvent::CatalogPageLoaded { page } => {
+            UiEvent::CatalogPageLoaded {
+                page,
+                session_generation,
+                session_disposition,
+            } => {
                 let profile_id = page.identity.profile_id.clone();
                 if self.event_is_current(&profile_id, page.identity.profile_generation) {
+                    self.fold_catalog_session(
+                        &profile_id,
+                        Some(session_generation),
+                        Some(session_disposition),
+                    );
                     self.catalog_retry.remove(&profile_id);
                     self.catalog_pages.insert(profile_id, page);
                     self.status = "Catalog page loaded".to_owned();
                 }
             }
-            UiEvent::CatalogPageFailed { request, summary } => {
+            UiEvent::CatalogPageFailed {
+                request,
+                summary,
+                session_generation,
+                session_disposition,
+            } => {
                 let profile_id = request.profile_id().clone();
                 if self.event_is_current(&profile_id, request.profile_generation()) {
+                    self.fold_catalog_session(&profile_id, session_generation, session_disposition);
                     if let Some(page) = self.catalog_pages.get_mut(&profile_id) {
                         page.stale = true;
                     }
@@ -581,6 +600,40 @@ impl UiModel {
                 .is_none_or(|tombstone| generation.0 > tombstone.0)
     }
 
+    fn fold_catalog_session(
+        &mut self,
+        profile_id: &ProfileId,
+        session_generation: Option<SessionGeneration>,
+        disposition: Option<SessionDisposition>,
+    ) {
+        let (Some(session_generation), Some(disposition)) = (session_generation, disposition)
+        else {
+            return;
+        };
+        let current = self.connection_states.get(profile_id);
+        let protected = matches!(
+            current,
+            Some(ConnectionState::Pending(_) | ConnectionState::Closing)
+        ) || matches!(
+            current,
+            Some(ConnectionState::Connected {
+                session_generation: visible,
+                ..
+            }) if *visible != session_generation
+        );
+        if protected {
+            return;
+        }
+        let next = match disposition {
+            SessionDisposition::Keep => ConnectionState::Connected {
+                session_generation,
+                elapsed_ms: 0,
+            },
+            SessionDisposition::Evict => ConnectionState::Disconnected,
+        };
+        self.connection_states.insert(profile_id.clone(), next);
+    }
+
     fn fold_deleted(
         &mut self,
         profile_id: ProfileId,
@@ -724,6 +777,7 @@ mod tests {
         RedisScanConsistency, RedisScanRequest, RedisTlsConfig, RequestIdentity, ResultId,
         ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
     };
+    use crate::service::SessionDisposition;
 
     fn result(elapsed_ms: u128) -> ResultSnapshot {
         let raw = QueryResult {
@@ -809,6 +863,8 @@ mod tests {
         model.fold(UiEvent::CatalogPageFailed {
             request: catalog_request.clone(),
             summary: PublicSummary::PermissionDenied,
+            session_generation: Some(SessionGeneration(31)),
+            session_disposition: Some(SessionDisposition::Keep),
         });
         model.fold(UiEvent::RedisKeysFailed {
             request: redis_request.clone(),
@@ -820,7 +876,11 @@ mod tests {
         assert!(model.redis_key_pages[&profile_id].stale);
         assert_eq!(model.redis_scan_retry[&profile_id], redis_request);
 
-        model.fold(UiEvent::CatalogPageLoaded { page: catalog_page });
+        model.fold(UiEvent::CatalogPageLoaded {
+            page: catalog_page,
+            session_generation: SessionGeneration(31),
+            session_disposition: SessionDisposition::Keep,
+        });
         model.fold(UiEvent::RedisKeysLoaded { page: redis_page });
 
         assert!(!model.catalog_pages[&profile_id].stale);

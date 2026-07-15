@@ -13,7 +13,6 @@ use crate::model::{
 const OPENAI_CANVAS: egui::Color32 = egui::Color32::WHITE;
 const OPENAI_INK: egui::Color32 = egui::Color32::BLACK;
 const OPENAI_INK_60: egui::Color32 = egui::Color32::from_gray(102);
-const OPENAI_INK_44: egui::Color32 = egui::Color32::from_gray(145);
 const OPENAI_HAIRLINE: egui::Color32 = egui::Color32::from_gray(224);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -41,7 +40,7 @@ impl BranchKey {
 #[derive(Debug, Clone, Default)]
 struct CatalogBranch {
     nodes: Vec<CatalogNode>,
-    next_token: Option<CatalogPageToken>,
+    continuation: Option<CatalogRequest>,
     truncated: bool,
     stale: bool,
 }
@@ -57,10 +56,7 @@ pub enum MySqlExplorerIntent {
     RefreshSchemas {
         prefix: Option<String>,
     },
-    LoadMoreSchemas {
-        prefix: Option<String>,
-        token: CatalogPageToken,
-    },
+    LoadMore(CatalogRequest),
     LoadRelations {
         schema: String,
         prefix: Option<String>,
@@ -112,6 +108,11 @@ impl MySqlExplorerState {
             return;
         };
         let append = pending.as_ref().is_some_and(|pending| pending.append);
+        let continuation = pending.as_ref().and_then(|pending| {
+            page.next_token
+                .clone()
+                .map(|token| request_with_page_token(&pending.request, token))
+        });
         if !append && let Some(previous) = self.branches.get(&key) {
             self.retention.remove(&previous.nodes);
         }
@@ -122,11 +123,7 @@ impl MySqlExplorerState {
         }
         branch.nodes.extend(outcome.nodes);
         branch.truncated = page.truncated || outcome.truncated;
-        branch.next_token = if branch.truncated {
-            None
-        } else {
-            page.next_token
-        };
+        branch.continuation = if branch.truncated { None } else { continuation };
         branch.stale = false;
         self.retry = None;
         self.last_error = None;
@@ -217,7 +214,7 @@ impl MySqlExplorerState {
                     if prefix_response.has_focus() {
                         ui.label(
                             egui::RichText::new(
-                                "Prefix is applied to the next refresh or expansion.",
+                                "Prefix applies to the next refresh or expansion. Existing Load more keeps its page prefix.",
                             )
                             .color(OPENAI_INK_60),
                         );
@@ -288,7 +285,7 @@ impl MySqlExplorerState {
         let Some(schemas) = self.branches.get(&BranchKey::Schemas).cloned() else {
             ui.label(
                 egui::RichText::new("No catalog page loaded. Refresh schemas to begin.")
-                    .color(OPENAI_INK_44),
+                    .color(OPENAI_INK_60),
             );
             return;
         };
@@ -354,13 +351,10 @@ impl MySqlExplorerState {
                 self.show_relations(ui, &schema, intents);
             }
         }
-        if let Some(token) = schemas.next_token {
+        if let Some(request) = schemas.continuation {
             ui.add_space(8.0);
             if secondary_button(ui, "Load more schemas", !self.is_pending()).clicked() {
-                intents.push(MySqlExplorerIntent::LoadMoreSchemas {
-                    prefix: normalized_prefix(&self.prefix),
-                    token,
-                });
+                intents.push(MySqlExplorerIntent::LoadMore(request));
             }
         }
         if schemas.truncated {
@@ -377,7 +371,7 @@ impl MySqlExplorerState {
         let key = BranchKey::Relations(schema.to_owned());
         let Some(relations) = self.branches.get(&key).cloned() else {
             ui.indent("mysql.catalog.relations.loading", |ui| {
-                ui.label(egui::RichText::new("Relations not loaded yet.").color(OPENAI_INK_44));
+                ui.label(egui::RichText::new("Relations not loaded yet.").color(OPENAI_INK_60));
             });
             return;
         };
@@ -454,14 +448,10 @@ impl MySqlExplorerState {
                     self.show_columns(ui, schema, &relation, intents);
                 }
             }
-            if let Some(token) = relations.next_token
+            if let Some(request) = relations.continuation
                 && secondary_button(ui, "Load more relations", !self.is_pending()).clicked()
             {
-                intents.push(MySqlExplorerIntent::LoadRelations {
-                    schema: schema.to_owned(),
-                    prefix: normalized_prefix(&self.prefix),
-                    token: Some(token),
-                });
+                intents.push(MySqlExplorerIntent::LoadMore(request));
             }
             if relations.truncated {
                 cap_recovery(ui);
@@ -505,18 +495,13 @@ impl MySqlExplorerState {
                             .color(OPENAI_INK_60)
                             .monospace(),
                     );
-                    ui.label(egui::RichText::new(nullability).color(OPENAI_INK_44));
+                    ui.label(egui::RichText::new(nullability).color(OPENAI_INK_60));
                 });
             }
-            if let Some(token) = columns.next_token
+            if let Some(request) = columns.continuation
                 && secondary_button(ui, "Load more columns", !self.is_pending()).clicked()
             {
-                intents.push(MySqlExplorerIntent::LoadColumns {
-                    schema: schema.to_owned(),
-                    relation: relation.to_owned(),
-                    prefix: normalized_prefix(&self.prefix),
-                    token: Some(token),
-                });
+                intents.push(MySqlExplorerIntent::LoadMore(request));
             }
             if columns.truncated {
                 cap_recovery(ui);
@@ -532,6 +517,59 @@ fn branch_for_request(request: &CatalogRequest) -> BranchKey {
         CatalogRequest::Columns {
             schema, relation, ..
         } => BranchKey::Columns(schema.clone(), relation.clone()),
+    }
+}
+
+fn request_with_page_token(
+    request: &CatalogRequest,
+    page_token: CatalogPageToken,
+) -> CatalogRequest {
+    match request {
+        CatalogRequest::Schemas {
+            identity,
+            prefix,
+            page_size,
+            timeout,
+            ..
+        } => CatalogRequest::Schemas {
+            identity: identity.clone(),
+            prefix: prefix.clone(),
+            page_token: Some(page_token),
+            page_size: *page_size,
+            timeout: *timeout,
+        },
+        CatalogRequest::Relations {
+            identity,
+            schema,
+            prefix,
+            page_size,
+            timeout,
+            ..
+        } => CatalogRequest::Relations {
+            identity: identity.clone(),
+            schema: schema.clone(),
+            prefix: prefix.clone(),
+            page_token: Some(page_token),
+            page_size: *page_size,
+            timeout: *timeout,
+        },
+        CatalogRequest::Columns {
+            identity,
+            schema,
+            relation,
+            prefix,
+            page_size,
+            timeout,
+            ..
+        } => CatalogRequest::Columns {
+            identity: identity.clone(),
+            schema: schema.clone(),
+            relation: relation.clone(),
+            prefix: prefix.clone(),
+            page_token: Some(page_token),
+            page_size: *page_size,
+            timeout: *timeout,
+        },
     }
 }
 
@@ -686,6 +724,42 @@ mod tests {
     }
 
     #[test]
+    fn changing_filter_does_not_rewrite_existing_load_more_context() {
+        let mut state = MySqlExplorerState::default();
+        let initial = CatalogRequest::Schemas {
+            identity: RequestIdentity::new(
+                ProfileId("mysql-ui".to_owned()),
+                ProfileGeneration(1),
+                OperationId(10),
+            ),
+            prefix: Some("original_".to_owned()),
+            page_token: None,
+            page_size: 2,
+            timeout: Duration::from_secs(5),
+        };
+        state.mark_submitted(initial);
+        let mut loaded = page(10, vec![node("original_a"), node("original_b")]);
+        loaded.next_token = Some(CatalogPageToken("opaque-service-token".to_owned()));
+        state.handle_loaded(loaded);
+
+        state.prefix = "changed_".to_owned();
+        let continuation = state.branches[&BranchKey::Schemas]
+            .continuation
+            .as_ref()
+            .expect("captured continuation");
+        assert_eq!(continuation.prefix(), Some("original_"));
+        assert_eq!(continuation.page_size(), 2);
+        assert_eq!(
+            continuation.page_token(),
+            Some(&CatalogPageToken("opaque-service-token".to_owned()))
+        );
+        assert_eq!(
+            normalized_prefix(&state.prefix),
+            Some("changed_".to_owned())
+        );
+    }
+
+    #[test]
     fn ordinary_explorer_text_meets_wcag_aa_contrast_on_white() {
         fn relative_luminance(channel: u8) -> f64 {
             let channel = f64::from(channel) / 255.0;
@@ -712,7 +786,7 @@ mod tests {
         }
 
         assert!(
-            contrast(OPENAI_INK_44, OPENAI_CANVAS) >= 4.5,
+            contrast(OPENAI_INK_60, OPENAI_CANVAS) >= 4.5,
             "ordinary informational text must be at least 4.5:1 on the white canvas"
         );
     }

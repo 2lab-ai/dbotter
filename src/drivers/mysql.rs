@@ -110,8 +110,18 @@ impl MySqlSession {
         })
     }
 
-    pub async fn load_page(&self, request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
-        mysql_catalog::load_page(&self.pool, self.configured_database.as_deref(), request).await
+    pub async fn load_page(
+        &self,
+        request: &CatalogRequest,
+        token_key: &mysql_catalog::CatalogTokenKey,
+    ) -> Result<CatalogPage, DriverError> {
+        mysql_catalog::load_page(
+            &self.pool,
+            self.configured_database.as_deref(),
+            request,
+            token_key,
+        )
+        .await
     }
 
     async fn execute_one(&self, text: &str, row_limit: u32) -> Result<QueryResult, DriverError> {

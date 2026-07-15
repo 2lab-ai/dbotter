@@ -17,6 +17,7 @@ use crate::config::{
     LoadedConfig, MigrationConsent, MutationOutcome, PostCommitObservation,
     PostCommitObservationError,
 };
+use crate::drivers::mysql_catalog::CatalogTokenKey;
 use crate::drivers::{ConnectedResources, DriverError, Session};
 use crate::execution::{
     ExecutionLanguage, ExecutionTarget, ExecutionTargetError, ValidatedExecutionTarget,
@@ -552,6 +553,7 @@ pub struct ApplicationService {
     connector: Arc<dyn SessionConnector>,
     environment: Arc<dyn SecretResolver>,
     session_secrets: Arc<SessionSecretStore>,
+    catalog_token_key: Arc<CatalogTokenKey>,
     next_generation: Arc<AtomicU64>,
     next_session_generation: Arc<AtomicU64>,
     next_result_id: Arc<AtomicU64>,
@@ -834,6 +836,22 @@ impl SessionLease {
             }),
         }
     }
+
+    pub(crate) async fn load_catalog_page(
+        &self,
+        request: &CatalogRequest,
+        token_key: &CatalogTokenKey,
+    ) -> Result<CatalogPage, DriverError> {
+        match self.connected_resources()? {
+            ConnectedResources::MySql { catalog, .. } => {
+                catalog.load_page(request, token_key).await
+            }
+            ConnectedResources::Redis { .. } => Err(DriverError::Unsupported {
+                driver: self.profile.driver,
+                operation: "mismatched catalog resource".to_owned(),
+            }),
+        }
+    }
 }
 
 struct ObservedMutationOutcome {
@@ -864,14 +882,14 @@ impl ApplicationService {
         let path = path.into();
         let loaded = crate::config::load_path(&path)?;
         validate_config_identity(&loaded.config)?;
-        Ok(Self::from_validated_loaded(
+        Self::from_validated_loaded(
             path,
             loaded,
             connector,
             environment,
             session_secrets,
             writer,
-        ))
+        )
     }
 
     fn from_validated_loaded(
@@ -881,14 +899,21 @@ impl ApplicationService {
         environment: Arc<dyn SecretResolver>,
         session_secrets: Arc<SessionSecretStore>,
         writer: ConfigWriter,
-    ) -> Self {
+    ) -> Result<Self, ServiceError> {
         let mut generations = HashMap::new();
         let mut next = 1_u64;
         for profile in &loaded.config.profiles {
             generations.insert(ProfileId(profile.id.clone()), ProfileGeneration(next));
             next = next.saturating_add(1);
         }
-        Self {
+        let catalog_token_key =
+            Arc::new(
+                CatalogTokenKey::generate().map_err(|_| DriverError::Unavailable {
+                    driver: DriverKind::MySql,
+                    reason: "catalog token entropy unavailable",
+                })?,
+            );
+        Ok(Self {
             config_path: Arc::new(path),
             state: Arc::new(RwLock::new(ServiceState {
                 observed: ObservedState {
@@ -902,13 +927,14 @@ impl ApplicationService {
             connector,
             environment,
             session_secrets,
+            catalog_token_key,
             next_generation: Arc::new(AtomicU64::new(next)),
             next_session_generation: Arc::new(AtomicU64::new(1)),
             next_result_id: Arc::new(AtomicU64::new(1)),
             writer,
             mutation_lane: Arc::new(Semaphore::new(1)),
             config_uncertain: Arc::new(AtomicBool::new(false)),
-        }
+        })
     }
 
     pub fn config_path(&self) -> &Path {
@@ -1906,14 +1932,7 @@ impl ApplicationService {
         &self,
         request: CatalogRequest,
     ) -> Result<CatalogPage, ServiceError> {
-        request.validate().map_err(service_request_error)?;
-        self.ensure_typed_resource_request(
-            request.identity(),
-            DriverKind::MySql,
-            DriverCapabilities::CATALOG,
-            "mysql catalog browsing",
-        )
-        .await?;
+        self.prepare_catalog_request(&request).await?;
         let lease = self
             .acquire_session_at(
                 request.operation_id(),
@@ -1922,16 +1941,29 @@ impl ApplicationService {
                 request.timeout(),
             )
             .await?;
-        let result = match lease.connected_resources() {
-            Ok(ConnectedResources::MySql { catalog, .. }) => catalog.load_page(&request).await,
-            Ok(_) => Err(DriverError::Unsupported {
-                driver: lease.profile.driver,
-                operation: "mismatched catalog resource".to_owned(),
-            }),
-            Err(error) => Err(error),
-        };
+        let result = lease
+            .load_catalog_page(&request, self.catalog_token_key())
+            .await;
         self.finish_resource_operation(&lease, request.operation_id(), result)
             .await
+    }
+
+    pub(crate) async fn prepare_catalog_request(
+        &self,
+        request: &CatalogRequest,
+    ) -> Result<(), ServiceError> {
+        request.validate().map_err(service_request_error)?;
+        self.ensure_typed_resource_request(
+            request.identity(),
+            DriverKind::MySql,
+            DriverCapabilities::CATALOG,
+            "mysql catalog browsing",
+        )
+        .await
+    }
+
+    pub(crate) fn catalog_token_key(&self) -> &CatalogTokenKey {
+        self.catalog_token_key.as_ref()
     }
 
     pub async fn scan_redis_keys(

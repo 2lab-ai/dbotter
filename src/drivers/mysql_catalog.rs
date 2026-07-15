@@ -1,13 +1,16 @@
 //! Prepared, level-specific MySQL catalog browsing and pure retained-state bounds.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use base64::Engine as _;
 use chrono::{SecondsFormat, Utc};
 use futures_util::TryStreamExt as _;
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use sqlx::{Either, Executor as _, Row as _, SqlSafeStr as _, Statement as _};
+use zeroize::Zeroizing;
 
 use crate::drivers::DriverError;
 use crate::model::{
@@ -18,7 +21,59 @@ use crate::model::{
 
 const TOKEN_VERSION: u8 = 1;
 const TOKEN_PREFIX: &str = "v1";
-const TOKEN_DIGEST_DOMAIN: &[u8] = b"dbotter:mysql-catalog-token:v1\0";
+const TOKEN_AUTHENTICATION_DOMAIN: &[u8] = b"dbotter:mysql-catalog-token:v1\0";
+const TOKEN_KEY_BYTES: usize = 32;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Process-local capability used only to authenticate catalog continuations.
+///
+/// The key is generated once per [`crate::service::ApplicationService`], shared
+/// only by clones of that service, zeroized on final drop, and never serialized.
+///
+/// ```compile_fail
+/// use dbotter::drivers::mysql_catalog::CatalogTokenKey;
+///
+/// fn requires_serialize<T: serde::Serialize>() {}
+/// requires_serialize::<CatalogTokenKey>();
+/// ```
+pub struct CatalogTokenKey(Zeroizing<[u8; TOKEN_KEY_BYTES]>);
+
+impl CatalogTokenKey {
+    pub(crate) fn generate() -> Result<Self, getrandom::Error> {
+        let mut key = Zeroizing::new([0_u8; TOKEN_KEY_BYTES]);
+        getrandom::fill(key.as_mut())?;
+        Ok(Self(key))
+    }
+
+    fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, DriverError> {
+        let mut mac = HmacSha256::new_from_slice(self.0.as_ref())
+            .map_err(|_| DriverError::InvalidCatalogRequest)?;
+        mac.update(TOKEN_AUTHENTICATION_DOMAIN);
+        mac.update(payload);
+        Ok(mac.finalize().into_bytes().to_vec())
+    }
+
+    fn verify(&self, payload: &[u8], supplied: &[u8]) -> Result<(), DriverError> {
+        let mut mac = HmacSha256::new_from_slice(self.0.as_ref())
+            .map_err(|_| DriverError::InvalidCatalogRequest)?;
+        mac.update(TOKEN_AUTHENTICATION_DOMAIN);
+        mac.update(payload);
+        mac.verify_slice(supplied)
+            .map_err(|_| DriverError::InvalidCatalogRequest)
+    }
+
+    #[cfg(test)]
+    fn for_test(value: u8) -> Self {
+        Self(Zeroizing::new([value; TOKEN_KEY_BYTES]))
+    }
+}
+
+impl fmt::Debug for CatalogTokenKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CatalogTokenKey(<redacted>)")
+    }
+}
 
 const SCHEMA_QUERY: &str = r#"
 SELECT SCHEMA_NAME
@@ -284,6 +339,7 @@ struct TokenPayload {
     level: u8,
     parent_fingerprint: String,
     prefix_fingerprint: String,
+    page_size: u16,
     last_name: String,
     last_ordinal: Option<u32>,
     schemas: u64,
@@ -304,12 +360,13 @@ pub async fn load_page(
     pool: &sqlx::MySqlPool,
     configured_database: Option<&str>,
     request: &CatalogRequest,
+    token_key: &CatalogTokenKey,
 ) -> Result<CatalogPage, DriverError> {
     request
         .validate()
         .map_err(|_error: RequestValidationError| DriverError::InvalidCatalogRequest)?;
     let decoded = match request.page_token() {
-        Some(token) => decode_page_token(request, token)?,
+        Some(token) => decode_page_token(request, token, token_key)?,
         None => DecodedToken {
             last_name: String::new(),
             last_ordinal: None,
@@ -322,7 +379,14 @@ pub async fn load_page(
     let timeout = request.timeout();
     tokio::time::timeout(
         timeout,
-        load_page_inner(pool, configured_database, request, decoded, server_limit),
+        load_page_inner(
+            pool,
+            configured_database,
+            request,
+            decoded,
+            server_limit,
+            token_key,
+        ),
     )
     .await
     .map_err(|_| DriverError::Timeout {
@@ -337,6 +401,7 @@ async fn load_page_inner(
     request: &CatalogRequest,
     decoded: DecodedToken,
     server_limit: u32,
+    token_key: &CatalogTokenKey,
 ) -> Result<CatalogPage, DriverError> {
     let prefix = request.prefix().unwrap_or_default().to_owned();
     let nodes = match request {
@@ -368,7 +433,7 @@ async fn load_page_inner(
             .await?
         }
     };
-    finish_page(request, decoded, nodes)
+    finish_page(request, decoded, nodes, token_key)
 }
 
 async fn load_schemas(
@@ -520,6 +585,7 @@ fn finish_page(
     request: &CatalogRequest,
     decoded: DecodedToken,
     mut fetched: Vec<CatalogNode>,
+    token_key: &CatalogTokenKey,
 ) -> Result<CatalogPage, DriverError> {
     let page_size = usize::from(request.page_size());
     let has_extra = fetched.len() > page_size;
@@ -545,7 +611,7 @@ fn finish_page(
             outcome
                 .nodes
                 .last()
-                .map(|last| encode_page_token(request, last, &outcome))
+                .map(|last| encode_page_token(request, last, &outcome, token_key))
                 .transpose()?
         } else {
             None
@@ -580,6 +646,7 @@ fn encode_page_token(
     request: &CatalogRequest,
     last: &CatalogNode,
     outcome: &CatalogRetentionOutcome,
+    token_key: &CatalogTokenKey,
 ) -> Result<CatalogPageToken, DriverError> {
     let (last_name, last_ordinal) = match last {
         CatalogNode {
@@ -596,6 +663,7 @@ fn encode_page_token(
         level: level_tag(request.level()),
         parent_fingerprint: parent_fingerprint(request),
         prefix_fingerprint: prefix_fingerprint(request.prefix()),
+        page_size: request.page_size(),
         last_name,
         last_ordinal,
         schemas: usize_to_u64(outcome.retained_counts.schemas)?,
@@ -606,34 +674,34 @@ fn encode_page_token(
     };
     let payload_bytes =
         serde_json::to_vec(&payload).map_err(|_| DriverError::InvalidCatalogRequest)?;
-    let digest = token_digest(&payload_bytes);
+    let authenticator = token_key.sign(&payload_bytes)?;
     let payload_encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_bytes);
-    let digest_encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    let authenticator_encoded =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(authenticator);
     Ok(CatalogPageToken(format!(
-        "{TOKEN_PREFIX}.{payload_encoded}.{digest_encoded}"
+        "{TOKEN_PREFIX}.{payload_encoded}.{authenticator_encoded}"
     )))
 }
 
 fn decode_page_token(
     request: &CatalogRequest,
     token: &CatalogPageToken,
+    token_key: &CatalogTokenKey,
 ) -> Result<DecodedToken, DriverError> {
     let mut parts = token.0.split('.');
     let prefix = parts.next().ok_or(DriverError::InvalidCatalogRequest)?;
     let payload_encoded = parts.next().ok_or(DriverError::InvalidCatalogRequest)?;
-    let digest_encoded = parts.next().ok_or(DriverError::InvalidCatalogRequest)?;
+    let authenticator_encoded = parts.next().ok_or(DriverError::InvalidCatalogRequest)?;
     if prefix != TOKEN_PREFIX || parts.next().is_some() {
         return Err(DriverError::InvalidCatalogRequest);
     }
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_encoded)
         .map_err(|_| DriverError::InvalidCatalogRequest)?;
-    let supplied_digest = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(digest_encoded)
+    let supplied_authenticator = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(authenticator_encoded)
         .map_err(|_| DriverError::InvalidCatalogRequest)?;
-    if supplied_digest.as_slice() != token_digest(&payload_bytes) {
-        return Err(DriverError::InvalidCatalogRequest);
-    }
+    token_key.verify(&payload_bytes, &supplied_authenticator)?;
     let payload: TokenPayload =
         serde_json::from_slice(&payload_bytes).map_err(|_| DriverError::InvalidCatalogRequest)?;
     if payload.version != TOKEN_VERSION
@@ -642,6 +710,7 @@ fn decode_page_token(
         || payload.level != level_tag(request.level())
         || payload.parent_fingerprint != parent_fingerprint(request)
         || payload.prefix_fingerprint != prefix_fingerprint(request.prefix())
+        || payload.page_size != request.page_size()
         || (request.level() == CatalogLevel::Columns) != payload.last_ordinal.is_some()
     {
         return Err(DriverError::InvalidCatalogRequest);
@@ -669,13 +738,6 @@ fn decode_page_token(
         counts,
         retained_utf8_bytes,
     })
-}
-
-fn token_digest(payload: &[u8]) -> Vec<u8> {
-    let mut digest = Sha256::new();
-    digest.update(TOKEN_DIGEST_DOMAIN);
-    digest.update(payload);
-    digest.finalize().to_vec()
 }
 
 fn parent_fingerprint(request: &CatalogRequest) -> String {
@@ -754,6 +816,10 @@ mod tests {
         )
     }
 
+    fn token_key() -> CatalogTokenKey {
+        CatalogTokenKey::for_test(7)
+    }
+
     fn schema_request(generation: u64, token: Option<CatalogPageToken>) -> CatalogRequest {
         CatalogRequest::Schemas {
             identity: identity(generation),
@@ -780,6 +846,7 @@ mod tests {
     #[test]
     fn page_size_plus_one_proves_more_and_token_uses_last_retained_key() {
         let request = schema_request(4, None);
+        let token_key = token_key();
         let page = finish_page(
             &request,
             DecodedToken {
@@ -789,19 +856,25 @@ mod tests {
                 retained_utf8_bytes: 0,
             },
             vec![schema("app_a"), schema("app_b"), schema("app_c")],
+            &token_key,
         )
         .expect("valid synthetic catalog page");
         assert_eq!(page.nodes.len(), 2);
         assert!(page.next_token.is_some());
         let token = page.next_token.as_ref().expect("next page token");
-        let decoded = decode_page_token(&request, token).expect("decode generated token");
+        let decoded =
+            decode_page_token(&request, token, &token_key).expect("decode generated token");
         assert_eq!(decoded.last_name, "app_b");
         assert_eq!(decoded.counts.schemas, 2);
     }
 
     #[test]
-    fn token_tampering_generation_parent_and_prefix_mismatch_fail_closed() {
+    fn token_key_debug_is_static_and_cross_service_authentication_fails_closed() {
         let request = schema_request(4, None);
+        let service_a = CatalogTokenKey::for_test(17);
+        let service_b = CatalogTokenKey::for_test(18);
+        assert_eq!(format!("{service_a:?}"), "CatalogTokenKey(<redacted>)");
+
         let outcome = CatalogRetentionOutcome {
             nodes: vec![schema("app_b")],
             retained_counts: CatalogRetainedCounts {
@@ -811,14 +884,33 @@ mod tests {
             retained_utf8_bytes: 5,
             truncated: false,
         };
-        let mut token =
-            encode_page_token(&request, &outcome.nodes[0], &outcome).expect("encode valid token");
-        token.0.push('x');
-        assert!(decode_page_token(&request, &token).is_err());
+        let token = encode_page_token(&request, &outcome.nodes[0], &outcome, &service_a)
+            .expect("service A token");
+        assert!(decode_page_token(&request, &token, &service_a).is_ok());
+        assert!(decode_page_token(&request, &token, &service_b).is_err());
+    }
 
-        let valid =
-            encode_page_token(&request, &outcome.nodes[0], &outcome).expect("encode valid token");
-        assert!(decode_page_token(&schema_request(5, None), &valid).is_err());
+    #[test]
+    fn token_tampering_generation_parent_and_prefix_mismatch_fail_closed() {
+        let request = schema_request(4, None);
+        let token_key = token_key();
+        let outcome = CatalogRetentionOutcome {
+            nodes: vec![schema("app_b")],
+            retained_counts: CatalogRetainedCounts {
+                schemas: 1,
+                ..CatalogRetainedCounts::default()
+            },
+            retained_utf8_bytes: 5,
+            truncated: false,
+        };
+        let mut token = encode_page_token(&request, &outcome.nodes[0], &outcome, &token_key)
+            .expect("encode valid token");
+        token.0.push('x');
+        assert!(decode_page_token(&request, &token, &token_key).is_err());
+
+        let valid = encode_page_token(&request, &outcome.nodes[0], &outcome, &token_key)
+            .expect("encode valid token");
+        assert!(decode_page_token(&schema_request(5, None), &valid, &token_key).is_err());
         let different_profile = CatalogRequest::Schemas {
             identity: RequestIdentity::new(
                 ProfileId("other-mysql".to_owned()),
@@ -830,7 +922,7 @@ mod tests {
             page_size: 2,
             timeout: Duration::from_secs(5),
         };
-        assert!(decode_page_token(&different_profile, &valid).is_err());
+        assert!(decode_page_token(&different_profile, &valid, &token_key).is_err());
         let different_prefix = CatalogRequest::Schemas {
             identity: identity(4),
             prefix: Some("other_".to_owned()),
@@ -838,12 +930,25 @@ mod tests {
             page_size: 2,
             timeout: Duration::from_secs(5),
         };
-        assert!(decode_page_token(&different_prefix, &valid).is_err());
+        assert!(decode_page_token(&different_prefix, &valid, &token_key).is_err());
+
+        let different_page_size = CatalogRequest::Schemas {
+            identity: identity(4),
+            prefix: Some("app_".to_owned()),
+            page_token: None,
+            page_size: 3,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(decode_page_token(&different_page_size, &valid, &token_key).is_err());
+
+        let other_service_key = CatalogTokenKey::for_test(8);
+        assert!(decode_page_token(&request, &valid, &other_service_key).is_err());
     }
 
     #[test]
     fn attacker_cannot_rewrite_payload_and_resign_with_public_sha256() {
         let request = schema_request(4, None);
+        let token_key = token_key();
         let outcome = CatalogRetentionOutcome {
             nodes: vec![schema("app_b")],
             retained_counts: CatalogRetainedCounts {
@@ -853,8 +958,8 @@ mod tests {
             retained_utf8_bytes: 5,
             truncated: false,
         };
-        let valid =
-            encode_page_token(&request, &outcome.nodes[0], &outcome).expect("encode valid token");
+        let valid = encode_page_token(&request, &outcome.nodes[0], &outcome, &token_key)
+            .expect("encode valid token");
         let mut parts = valid.0.split('.');
         let prefix = parts.next().expect("token prefix");
         let payload = parts.next().expect("token payload");
@@ -871,7 +976,7 @@ mod tests {
         let rewritten_bytes = serde_json::to_vec(&rewritten).expect("serialize rewritten payload");
 
         let mut attacker_digest = Sha256::new();
-        attacker_digest.update(TOKEN_DIGEST_DOMAIN);
+        attacker_digest.update(TOKEN_AUTHENTICATION_DOMAIN);
         attacker_digest.update(&rewritten_bytes);
         let forged = CatalogPageToken(format!(
             "{prefix}.{}.{}",
@@ -880,7 +985,7 @@ mod tests {
         ));
 
         assert!(
-            decode_page_token(&request, &forged).is_err(),
+            decode_page_token(&request, &forged, &token_key).is_err(),
             "a public checksum cannot authenticate attacker-controlled continuation state"
         );
     }
@@ -906,6 +1011,7 @@ mod tests {
                 retained_utf8_bytes: 0,
             },
             nodes,
+            &token_key(),
         )
         .expect("valid exact-cap page");
         assert!(!page.truncated);

@@ -97,7 +97,7 @@ impl DbotterApp {
 
     fn fold_mysql_explorer_event(&mut self, event: &UiEvent) {
         match event {
-            UiEvent::CatalogPageLoaded { page } => {
+            UiEvent::CatalogPageLoaded { page, .. } => {
                 let key = (
                     page.identity.profile_id.clone(),
                     page.identity.profile_generation,
@@ -107,7 +107,9 @@ impl DbotterApp {
                     .or_default()
                     .handle_loaded(page.clone());
             }
-            UiEvent::CatalogPageFailed { request, summary } => {
+            UiEvent::CatalogPageFailed {
+                request, summary, ..
+            } => {
                 let key = (request.profile_id().clone(), request.profile_generation());
                 self.mysql_explorers
                     .entry(key)
@@ -250,13 +252,9 @@ impl DbotterApp {
                 page_size: DEFAULT_CATALOG_PAGE_SIZE,
                 timeout: DEFAULT_CATALOG_TIMEOUT,
             },
-            MySqlExplorerIntent::LoadMoreSchemas { prefix, token } => CatalogRequest::Schemas {
-                identity,
-                prefix,
-                page_token: Some(token),
-                page_size: DEFAULT_CATALOG_PAGE_SIZE,
-                timeout: DEFAULT_CATALOG_TIMEOUT,
-            },
+            MySqlExplorerIntent::LoadMore(request) => {
+                catalog_request_with_identity(request, identity)
+            }
             MySqlExplorerIntent::LoadRelations {
                 schema,
                 prefix,

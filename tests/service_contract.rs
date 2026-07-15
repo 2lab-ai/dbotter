@@ -120,7 +120,11 @@ impl MySqlPreparedExecution for FakeMySqlResources {
 
 #[async_trait]
 impl CatalogBrowser for FakeMySqlResources {
-    async fn load_page(&self, _request: &CatalogRequest) -> Result<CatalogPage, DriverError> {
+    async fn load_page(
+        &self,
+        _request: &CatalogRequest,
+        _token_key: &dbotter::drivers::mysql_catalog::CatalogTokenKey,
+    ) -> Result<CatalogPage, DriverError> {
         Err(DriverError::Unsupported {
             driver: DriverKind::MySql,
             operation: "test catalog".to_owned(),
