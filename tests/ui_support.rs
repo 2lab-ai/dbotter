@@ -30,3 +30,14 @@ fn actual_app_owns_the_openai_theme_first_run_and_responsive_layout() {
     assert!(source.contains("show_first_run"));
     assert!(source.contains("connection.mongodb.planned"));
 }
+
+#[test]
+fn actual_app_owns_confirmed_delete_and_exact_active_operation_warning() {
+    let source = include_str!("../src/ui/app.rs");
+
+    assert!(source.contains("DeleteProfileRequest"));
+    assert!(source.contains("profile.delete.active_warning"));
+    assert!(source.contains("profile.delete.confirm"));
+    assert!(source.contains("profile.delete.cancel"));
+    assert!(source.contains("OperationKind::DeleteProfile"));
+}

@@ -1022,11 +1022,11 @@ fn display_cell(cell: &Cell) -> String {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{DbotterApp, ProfileEditor};
+    use super::{ConnectionState, DbotterApp, ProfileEditor};
     use crate::model::{
         ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind, OperationId,
         OperationKind, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
-        RedisKeyFilter, RedisKeyId, RedisTlsConfig, TlsMode,
+        RedisKeyFilter, RedisKeyId, RedisTlsConfig, SessionGeneration, TlsMode,
     };
     use crate::public_error::{PublicOperationError, SafeContext};
     use crate::ui::adapter::{UiCommand, bounded_ports};
@@ -1197,6 +1197,58 @@ mod tests {
         let mongodb = node("connection.mongodb.planned");
         assert_eq!(mongodb.role(), accesskit::Role::RadioButton);
         assert!(mongodb.is_disabled());
+    }
+
+    #[test]
+    fn actual_profile_cards_expose_exact_lifecycle_delete_and_credential_actions() {
+        let render_ids = |state: ConnectionState, session_profile: bool| {
+            let (ui_port, mut service) = bounded_ports(4);
+            let mut app = DbotterApp::new(ui_port);
+            assert!(service.try_next_command().is_some());
+            let mut profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+            if session_profile {
+                profile.persisted.credential_mode = CredentialMode::Session;
+            }
+            app.model.selected_profile = Some(profile.id.clone());
+            app.model
+                .active_generations
+                .insert(profile.id.clone(), profile.generation);
+            app.model
+                .connection_states
+                .insert(profile.id.clone(), state);
+            app.model.profiles = vec![profile];
+
+            let context = Context::default();
+            context.enable_accesskit();
+            context
+                .run_ui(RawInput::default(), |ui| app.connections(ui))
+                .platform_output
+                .accesskit_update
+                .expect("actual lifecycle frame must emit AccessKit")
+                .nodes
+                .into_iter()
+                .filter_map(|(_, node)| node.author_id().map(str::to_owned))
+                .collect::<BTreeSet<_>>()
+        };
+
+        let disconnected = render_ids(ConnectionState::Disconnected, false);
+        assert!(disconnected.contains("connection.connect"));
+        assert!(disconnected.contains("profile.delete"));
+
+        let connected = render_ids(
+            ConnectionState::Connected {
+                session_generation: SessionGeneration(8),
+                elapsed_ms: 3,
+            },
+            false,
+        );
+        assert!(connected.contains("connection.disconnect"));
+        assert!(connected.contains("connection.reconnect"));
+        assert!(connected.contains("profile.delete"));
+
+        let needs_credential = render_ids(ConnectionState::NeedsCredential, true);
+        assert!(needs_credential.contains("connection.credential.open"));
+        assert!(needs_credential.contains("profile.delete"));
     }
 
     #[test]
