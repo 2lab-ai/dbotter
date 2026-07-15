@@ -43,7 +43,7 @@ TOP_LEVEL_KEYS = {
     "artifacts",
 }
 CONFIG_KEYS = {"read_versions", "write_version", "migration_backup_suffix"}
-ARTIFACT_KEYS = {
+MACOS_ARTIFACT_KEYS = {
     "target",
     "arch",
     "kind",
@@ -55,9 +55,28 @@ ARTIFACT_KEYS = {
     "bundle_short_version",
     "bundle_build_version",
 }
-TARGET_ARCH = {
-    "aarch64-apple-darwin": "aarch64",
-    "x86_64-apple-darwin": "x86_64",
+LINUX_ARTIFACT_KEYS = {
+    "target",
+    "arch",
+    "kind",
+    "url",
+    "bytes",
+    "sha256",
+    "executable_mode",
+}
+TARGET_SPECS = {
+    "aarch64-apple-darwin": ("aarch64", "macos-app-tar-gz", "dbotter-preview-aarch64.tar.gz"),
+    "x86_64-apple-darwin": ("x86_64", "macos-app-tar-gz", "dbotter-preview-x86_64.tar.gz"),
+    "aarch64-unknown-linux-gnu": (
+        "aarch64",
+        "linux-native-executable",
+        "dbotter-preview-linux-aarch64",
+    ),
+    "x86_64-unknown-linux-gnu": (
+        "x86_64",
+        "linux-native-executable",
+        "dbotter-preview-linux-x86_64",
+    ),
 }
 
 
@@ -213,29 +232,36 @@ def validate_manifest(
         raise ContractError("config_contract is not the exact approved three-field object")
 
     artifacts = manifest["artifacts"]
-    if not isinstance(artifacts, list) or len(artifacts) != 2:
-        raise ContractError("artifacts must contain exactly the two macOS target records")
+    if not isinstance(artifacts, list) or len(artifacts) != 4:
+        raise ContractError("artifacts must contain exactly the four approved native target records")
     seen_targets: set[str] = set()
     seen_urls: set[str] = set()
     for index, raw_artifact in enumerate(artifacts):
         location = f"artifacts[{index}]"
-        artifact = require_exact_object(raw_artifact, ARTIFACT_KEYS, location)
-        target = artifact["target"]
-        if target not in TARGET_ARCH:
-            raise ContractError(f"{location}.target is not an approved macOS target")
+        if not isinstance(raw_artifact, dict):
+            raise ContractError(f"{location} must be an object")
+        target = raw_artifact.get("target")
+        if target not in TARGET_SPECS:
+            raise ContractError(f"{location}.target is not an approved native target")
+        expected_arch, expected_kind, expected_name = TARGET_SPECS[target]
+        expected_keys = (
+            MACOS_ARTIFACT_KEYS
+            if expected_kind == "macos-app-tar-gz"
+            else LINUX_ARTIFACT_KEYS
+        )
+        artifact = require_exact_object(raw_artifact, expected_keys, location)
         arch = artifact["arch"]
-        if arch != TARGET_ARCH[target]:
+        if arch != expected_arch:
             raise ContractError(f"{location} swaps target and architecture identity")
         if target in seen_targets:
             raise ContractError("artifact targets must be unique")
         seen_targets.add(target)
-        if artifact["kind"] != "macos-app-tar-gz":
-            raise ContractError(f"{location}.kind is not macos-app-tar-gz")
+        if artifact["kind"] != expected_kind:
+            raise ContractError(f"{location}.kind disagrees with its target")
         url = artifact["url"]
         if not isinstance(url, str):
             raise ContractError(f"{location}.url must be a string")
         parsed = urllib.parse.urlsplit(url)
-        expected_name = f"dbotter-preview-{arch}.tar.gz"
         expected_path = f"/2lab-ai/dbotter/releases/download/{tag}/{expected_name}"
         if (
             parsed.scheme != "https"
@@ -251,28 +277,37 @@ def validate_manifest(
             raise ContractError("artifact URLs must be unique")
         seen_urls.add(url)
         require_positive_integer(artifact["bytes"], f"{location}.bytes")
-        archive_hash = require_string(artifact["sha256"], SHA256_RE, f"{location}.sha256")
-        executable_hash = require_string(
-            artifact["embedded_executable_sha256"],
-            SHA256_RE,
-            f"{location}.embedded_executable_sha256",
-        )
-        if archive_hash == executable_hash:
-            raise ContractError(f"{location} falsely equates transformed archive/executable bytes")
-        if artifact["bundle_id"] != "ai.2lab.dbotter.preview":
-            raise ContractError(f"{location}.bundle_id is not the preview bundle id")
-        if artifact["bundle_short_version"] != package_version:
-            raise ContractError(f"{location}.bundle_short_version must equal package_version")
-        expected_build_version = f"{run_id}.{run_attempt}"
-        if artifact["bundle_build_version"] != expected_build_version:
-            raise ContractError(f"{location}.bundle_build_version must equal the numeric run tuple")
-        if (
-            artifact["bundle_short_version"] == version
-            or artifact["bundle_build_version"] == version
-        ):
-            raise ContractError(f"{location} conflates bundle and Homebrew versions")
-    if seen_targets != set(TARGET_ARCH):
-        raise ContractError("manifest is missing an approved macOS target")
+        asset_hash = require_string(artifact["sha256"], SHA256_RE, f"{location}.sha256")
+        if expected_kind == "macos-app-tar-gz":
+            executable_hash = require_string(
+                artifact["embedded_executable_sha256"],
+                SHA256_RE,
+                f"{location}.embedded_executable_sha256",
+            )
+            if asset_hash == executable_hash:
+                raise ContractError(
+                    f"{location} falsely equates transformed archive/executable bytes"
+                )
+            if artifact["bundle_id"] != "ai.2lab.dbotter.preview":
+                raise ContractError(f"{location}.bundle_id is not the preview bundle id")
+            if artifact["bundle_short_version"] != package_version:
+                raise ContractError(
+                    f"{location}.bundle_short_version must equal package_version"
+                )
+            expected_build_version = f"{run_id}.{run_attempt}"
+            if artifact["bundle_build_version"] != expected_build_version:
+                raise ContractError(
+                    f"{location}.bundle_build_version must equal the numeric run tuple"
+                )
+            if (
+                artifact["bundle_short_version"] == version
+                or artifact["bundle_build_version"] == version
+            ):
+                raise ContractError(f"{location} conflates bundle and Homebrew versions")
+        elif artifact["executable_mode"] != "0755":
+            raise ContractError(f"{location}.executable_mode is not 0755")
+    if seen_targets != set(TARGET_SPECS):
+        raise ContractError("manifest is missing an approved native target")
 
 
 def main() -> int:

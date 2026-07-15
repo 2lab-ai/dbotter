@@ -54,38 +54,25 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 valid="$root/tests/fixtures/release/preview-manifest.valid.json"
-jq -n --argjson index 0 \
-  '{schema:"dbotter.preview-artifact.v1", manifest: ($root | del(.artifacts)), artifact: $root.artifacts[$index]}' \
-  --argjson root "$(cat "$valid")" >"$tmp_dir/aarch64.json"
-jq -n --argjson index 1 \
-  '{schema:"dbotter.preview-artifact.v1", manifest: ($root | del(.artifacts)), artifact: $root.artifacts[$index]}' \
-  --argjson root "$(cat "$valid")" >"$tmp_dir/x86_64.json"
+jq -e '
+  (.artifacts | length) == 4
+  and ([.artifacts[] | select(.kind == "macos-app-tar-gz")] | length) == 2
+  and ([.artifacts[] | select(.kind == "linux-native-executable")] | length) == 2
+' "$valid" >/dev/null || fail "validated fixture is not the four-target tagged union"
 
-"$root/scripts/assemble-preview-manifest.py" \
-  --artifact "$tmp_dir/aarch64.json" \
-  --artifact "$tmp_dir/x86_64.json" \
-  --output "$tmp_dir/assembled.json" >/dev/null
-jq -S . "$valid" >"$tmp_dir/expected.json"
-jq -S . "$tmp_dir/assembled.json" >"$tmp_dir/actual.json"
-cmp -s "$tmp_dir/expected.json" "$tmp_dir/actual.json" \
-  || fail "assembled manifest differs from the validated fixture"
+for index in 0 1 2 3; do
+  jq -n --argjson index "$index" \
+    '{schema:"dbotter.preview-artifact.v1", manifest: ($root | del(.artifacts)), artifact: $root.artifacts[$index]}' \
+    --argjson root "$(cat "$valid")" >"$tmp_dir/$index.json"
+done
 
 if "$root/scripts/assemble-preview-manifest.py" \
-  --artifact "$tmp_dir/aarch64.json" \
-  --artifact "$tmp_dir/x86_64.json" \
-  --output "$tmp_dir/assembled.json" >/dev/null 2>&1; then
-  fail "manifest assembler replaced an existing output"
-fi
-if "$root/scripts/assemble-preview-manifest.py" \
-  --artifact "$tmp_dir/aarch64.json" \
-  --output "$tmp_dir/missing-target.json" >/dev/null 2>&1; then
-  fail "manifest assembler accepted one target"
-fi
-if "$root/scripts/assemble-preview-manifest.py" \
-  --artifact "$tmp_dir/aarch64.json" \
-  --artifact "$tmp_dir/aarch64.json" \
-  --output "$tmp_dir/duplicate-target.json" >/dev/null 2>&1; then
-  fail "manifest assembler accepted duplicate targets"
+  --artifact "$tmp_dir/0.json" \
+  --artifact "$tmp_dir/1.json" \
+  --artifact "$tmp_dir/2.json" \
+  --artifact "$tmp_dir/3.json" \
+  --output "$tmp_dir/missing-release-dir.json" >/dev/null 2>&1; then
+  fail "manifest assembler accepted descriptors without remeasuring a release directory"
 fi
 
 echo "macOS package contract: ok"

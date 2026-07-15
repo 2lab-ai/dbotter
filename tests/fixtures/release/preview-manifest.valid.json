@@ -35,6 +35,24 @@
       "bundle_id": "ai.2lab.dbotter.preview",
       "bundle_short_version": "0.1.0",
       "bundle_build_version": "123456789.2"
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "arch": "aarch64",
+      "kind": "linux-native-executable",
+      "url": "https://github.com/2lab-ai/dbotter/releases/download/preview-2026-07-15-123456-123456789-2-0123456789ab/dbotter-preview-linux-aarch64",
+      "bytes": 34567,
+      "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "executable_mode": "0755"
+    },
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "arch": "x86_64",
+      "kind": "linux-native-executable",
+      "url": "https://github.com/2lab-ai/dbotter/releases/download/preview-2026-07-15-123456-123456789-2-0123456789ab/dbotter-preview-linux-x86_64",
+      "bytes": 45678,
+      "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "executable_mode": "0755"
     }
   ]
 }
