@@ -1,59 +1,76 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$ROOT"
 
 fail() {
   echo "workflow contract: $*" >&2
   exit 1
 }
 
-for required in \
-  .github/workflows/verify.yml \
-  .github/workflows/ci.yml \
-  .github/workflows/preview.yml \
-  .github/workflows/release.yml \
-  scripts/verify-hermetic.sh \
-  scripts/verify-live-contracts.sh; do
-  [ -s "$root/$required" ] || fail "$required is missing or empty"
-done
+checker="$ROOT/scripts/check-workflow-graph.rb"
+"$checker" --workflow-dir "$ROOT/.github/workflows" >/dev/null
 
-grep -Fq 'workflow_call:' "$root/.github/workflows/verify.yml" \
-  || fail "verify.yml is not reusable"
-for workflow in ci.yml preview.yml release.yml; do
-  grep -Fq 'uses: ./.github/workflows/verify.yml' "$root/.github/workflows/$workflow" \
-    || fail "$workflow does not call the reusable verify gate"
-done
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/dbotter-workflow-mutations.XXXXXX")"
+cleanup() {
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT HUP INT TERM
 
-preview="$root/.github/workflows/preview.yml"
-for immutable_input in \
-  'stamp="$(date -u +%Y-%m-%d-%H%M%S)"' \
-  'GITHUB_RUN_ID' \
-  'GITHUB_RUN_ATTEMPT' \
-  'tag=preview-$build_id' \
-  'DBOTTER_SOURCE_SHA' \
-  'scripts/build-macos-app.sh' \
-  'scripts/assemble-preview-manifest.py' \
-  'release/preview-manifest.json' \
-  'tag=${{ needs.plan.outputs.tag }}' \
-  'source_sha=${{ needs.plan.outputs.commit }}' \
-  'version=${{ needs.plan.outputs.version }}' \
-  'manifest_url=${{ needs.plan.outputs.manifest_url }}' \
-  'manifest_sha256=${{ needs.publish.outputs.manifest_sha256 }}'; do
-  grep -Fq -- "$immutable_input" "$preview" \
-    || fail "preview workflow is missing immutable input: $immutable_input"
-done
+mutation_case() {
+  local name="$1"
+  local old="$2"
+  local new="$3"
+  local case_dir="$tmp_dir/$name"
+  mkdir -p "$case_dir"
+  cp .github/workflows/*.yml "$case_dir/"
+  python3 - "$case_dir/preview.yml" "$old" "$new" <<'PY'
+import pathlib
+import sys
 
-for forbidden in \
-  'previews[15:]' \
-  '--cleanup-tag' \
-  'gh release delete' \
-  'Prune old preview' \
-  'delete-release' \
-  'delete-ref'; do
-  if grep -Fq -- "$forbidden" "$preview"; then
-    fail "preview workflow contains forbidden immutable-release pruning: $forbidden"
+path = pathlib.Path(sys.argv[1])
+old = sys.argv[2]
+new = sys.argv[3]
+text = path.read_text(encoding="utf-8")
+if text.count(old) != 1:
+    raise SystemExit(f"mutation anchor count is {text.count(old)}, expected one: {old!r}")
+path.write_text(text.replace(old, new), encoding="utf-8")
+PY
+  if "$checker" --workflow-dir "$case_dir" >/dev/null 2>&1; then
+    fail "negative workflow mutation was accepted: $name"
   fi
-done
+}
+
+mutation_case \
+  queue_only \
+  './scripts/dispatch-and-verify-tap.sh' \
+  'gh workflow run bump.yml'
+mutation_case \
+  missing_verify_need \
+  'needs: [verify, plan, publish]' \
+  'needs: [plan, publish]'
+mutation_case \
+  no_release_remeasure \
+  '--release-dir release' \
+  '--release-dir descriptors-only'
+mutation_case \
+  missing_linux_descriptor \
+  '          --artifact artifacts/package-linux-x86_64/preview-artifact-linux-x86_64.json \\\n+' \
+  ''
+
+duplicate_dir="$tmp_dir/duplicate-key"
+mkdir -p "$duplicate_dir"
+cp .github/workflows/*.yml "$duplicate_dir/"
+python3 - "$duplicate_dir/preview.yml" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.write_text("name: Duplicate\n" + path.read_text(encoding="utf-8"), encoding="utf-8")
+PY
+if "$checker" --workflow-dir "$duplicate_dir" >/dev/null 2>&1; then
+  fail "duplicate YAML key mutation was accepted"
+fi
 
 echo "workflow contract: ok"

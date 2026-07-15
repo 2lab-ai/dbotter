@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || fail "--expected-sha must be one full Git SHA"
 
-for dependency in git jq cargo rustc python3; do
+for dependency in git jq cargo rustc python3 ruby; do
   command -v "$dependency" >/dev/null 2>&1 || fail "$dependency is required"
 done
 
@@ -58,6 +58,7 @@ required_inputs=(
   scripts/test-installed-receipt-contract.sh
   scripts/test-macos-package-contract.sh
   scripts/test-workflow-contract.sh
+  scripts/check-workflow-graph.rb
   scripts/test-installed-verifier-contract.sh
   scripts/test-installed-receipt-assembler-contract.sh
   scripts/assemble-installed-receipt.py
