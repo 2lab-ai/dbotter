@@ -106,8 +106,6 @@ jobs:
       DBOTTER_BUILD_CHANNEL: preview
       DBOTTER_BUILD_ID: ${{ needs.plan.outputs.build_id }}
       DBOTTER_SOURCE_SHA: ${{ needs.plan.outputs.commit }}
-      DBOTTER_EXPECTED_SOURCE_SHA: ${{ needs.plan.outputs.commit }}
-      DBOTTER_EXPECTED_TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - name: Checkout verified candidate
         uses: actions/checkout@v4
@@ -174,7 +172,9 @@ jobs:
           ./scripts/build-macos-app.sh \
             --channel preview \
             --binary "target/${{ matrix.target }}/release/dbotter" \
-            --output out
+            --output out \
+            --expected-source-sha "${{ needs.plan.outputs.commit }}" \
+            --expected-tag "${{ needs.plan.outputs.tag }}"
 
       - name: Package Linux native executable
         if: matrix.kind == 'linux'

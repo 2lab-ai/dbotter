@@ -161,6 +161,17 @@ begin
   ]
   fail_contract("preview.yml: build matrix is not the exact four native targets") unless matrix == expected_matrix
 
+  macos_build = unique_named_step(build, "Package signed macOS app", "preview.yml.build")
+  require_substrings(
+    macos_build["run"],
+    [
+      "./scripts/build-macos-app.sh",
+      '--expected-source-sha "${{ needs.plan.outputs.commit }}"',
+      '--expected-tag "${{ needs.plan.outputs.tag }}"'
+    ],
+    "preview.yml.build macOS package run"
+  )
+
   linux_package = unique_named_step(build, "Package Linux native executable", "preview.yml.build")
   require_substrings(
     linux_package["run"],

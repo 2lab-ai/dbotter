@@ -69,6 +69,7 @@ required_inputs=(
   scripts/verify-installed.sh
   scripts/verify-installed-gui.sh
   packaging/macos/Info.plist
+  packaging/macos/stable-ax-identifiers.json
   packaging/release/preview-manifest.schema.json
   packaging/release/installed-receipt.schema.json
 )

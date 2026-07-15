@@ -87,6 +87,18 @@ if "$ROOT/scripts/validate-macos-package.py" \
   fail "validator accepted a mutated archive digest"
 fi
 
+mutated_ax_receipt="$tmp_dir/mutated-ax-receipt.json"
+jq '.ax_identifiers += ["unreviewed.control"]' "$receipt" >"$mutated_ax_receipt"
+if "$ROOT/scripts/validate-macos-package.py" \
+  --app "$app" \
+  --archive "$archive" \
+  --descriptor "$descriptor" \
+  --receipt "$mutated_ax_receipt" \
+  --expected-source-sha "$expected_source_sha" \
+  --expected-tag "$expected_tag" >/dev/null 2>&1; then
+  fail "validator accepted an unreviewed AX identifier"
+fi
+
 mutated_archive="$tmp_dir/dbotter-preview-$arch.tar.gz"
 cp "$archive" "$mutated_archive"
 printf 'tamper\n' >>"$mutated_archive"

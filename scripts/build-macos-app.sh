@@ -5,7 +5,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/build-macos-app.sh --channel preview --binary PATH --output DIR
+Usage: scripts/build-macos-app.sh --channel preview --binary PATH --output DIR \
+  --expected-source-sha SHA --expected-tag TAG
 
 Packages one already-built, preview-identified macOS binary into a signed
 Dbotter Preview.app, a tar.gz release artifact, an artifact descriptor, and a
@@ -32,6 +33,8 @@ sha256_file() {
 channel=""
 binary=""
 output=""
+expected_source_sha=""
+expected_tag=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h)
@@ -53,6 +56,16 @@ while [[ $# -gt 0 ]]; do
       output="$2"
       shift 2
       ;;
+    --expected-source-sha)
+      [[ $# -ge 2 ]] || fail "--expected-source-sha requires a value"
+      expected_source_sha="$2"
+      shift 2
+      ;;
+    --expected-tag)
+      [[ $# -ge 2 ]] || fail "--expected-tag requires a value"
+      expected_tag="$2"
+      shift 2
+      ;;
     *)
       fail "unknown argument: $1"
       ;;
@@ -62,9 +75,12 @@ done
 [[ "$channel" == "preview" ]] || fail "only the preview channel may be packaged"
 [[ -n "$binary" ]] || fail "--binary is required"
 [[ -n "$output" ]] || fail "--output is required"
+[[ "$expected_source_sha" =~ ^[0-9a-f]{40}$ ]] || fail "--expected-source-sha is required"
+[[ "$expected_tag" =~ ^preview-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}-[1-9][0-9]*-[1-9][0-9]*-[0-9a-f]{12}$ ]] \
+  || fail "--expected-tag is required"
 [[ "$(uname -s)" == "Darwin" ]] || fail "macOS packaging requires a Darwin runner"
 
-for command_name in jq plutil sips iconutil codesign lipo tar stat python3; do
+for command_name in jq plutil sips iconutil codesign lipo tar stat python3 rustc cargo; do
   command -v "$command_name" >/dev/null 2>&1 || fail "$command_name is required"
 done
 
@@ -110,8 +126,8 @@ run_id="${BASH_REMATCH[5]}"
 run_attempt="${BASH_REMATCH[6]}"
 short_sha="${BASH_REMATCH[7]}"
 [[ "$short_sha" == "${source_sha:0:12}" ]] || fail "build_id sha12 disagrees with source_sha"
-[[ -z "${DBOTTER_EXPECTED_SOURCE_SHA:-}" || "$source_sha" == "$DBOTTER_EXPECTED_SOURCE_SHA" ]] \
-  || fail "binary source_sha disagrees with DBOTTER_EXPECTED_SOURCE_SHA"
+[[ "$source_sha" == "$expected_source_sha" ]] \
+  || fail "binary source_sha disagrees with --expected-source-sha"
 
 case "$target:$arch" in
   aarch64-apple-darwin:aarch64) mach_arch="arm64" ;;
@@ -131,8 +147,7 @@ import sys
 
 dt.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ")
 PY
-[[ -z "${DBOTTER_EXPECTED_TAG:-}" || "$tag" == "$DBOTTER_EXPECTED_TAG" ]] \
-  || fail "derived tag disagrees with DBOTTER_EXPECTED_TAG"
+[[ "$tag" == "$expected_tag" ]] || fail "derived tag disagrees with --expected-tag"
 
 icon_source="$ROOT/assets/dbotter-icon.png"
 [[ -f "$icon_source" && ! -L "$icon_source" ]] || fail "approved icon source is missing"
@@ -188,7 +203,16 @@ for specification in \
   read -r size filename <<<"$specification"
   sips -z "$size" "$size" "$icon_source" --out "$iconset/$filename" >/dev/null
 done
-iconutil -c icns "$iconset" -o "$work_app/Contents/Resources/dbotter.icns"
+icns="$work_app/Contents/Resources/dbotter.icns"
+"$ROOT/scripts/build-icns.py" --iconset "$iconset" --output "$icns" >/dev/null
+reproducible_icns="$temporary/dbotter-reproducible.icns"
+"$ROOT/scripts/build-icns.py" --iconset "$iconset" --output "$reproducible_icns" >/dev/null
+cmp -s "$icns" "$reproducible_icns" || fail "ICNS construction is not reproducible"
+decoded_iconset="$temporary/decoded.iconset"
+iconutil -c iconset "$icns" -o "$decoded_iconset"
+[[ "$(find "$decoded_iconset" -maxdepth 1 -type f | wc -l | tr -d ' ')" == "10" ]] \
+  || fail "generated ICNS does not decode to the exact ten-member iconset"
+icns_sha256="$(sha256_file "$icns")"
 
 codesign_identity="${DBOTTER_CODESIGN_IDENTITY:--}"
 codesign --force --deep --sign "$codesign_identity" --timestamp=none "$work_app"
@@ -219,6 +243,7 @@ archive_bytes="$(stat -f '%z' "$temporary/$archive_name")"
   || fail "archive and embedded executable transformations must have distinct identities"
 
 artifact_url="https://github.com/2lab-ai/dbotter/releases/download/$tag/$archive_name"
+manifest_url="https://github.com/2lab-ai/dbotter/releases/download/$tag/preview-manifest.json"
 jq -n \
   --arg tag "$tag" \
   --arg source_sha "$source_sha" \
@@ -274,7 +299,14 @@ jq -n \
   --arg bundle_short "$package_version" \
   --arg bundle_build "$bundle_build_version" \
   --arg icon_sha256 "$icon_source_sha256" \
+  --arg icns_sha256 "$icns_sha256" \
   --arg codesign_identity "$codesign_identity" \
+  --arg rustc_version "$(rustc --version)" \
+  --arg cargo_version "$(cargo --version)" \
+  --arg cargo_lock_sha256 "$(sha256_file "$ROOT/Cargo.lock")" \
+  --arg manifest_url "$manifest_url" \
+  --arg artifact_url "$artifact_url" \
+  --argjson ax_identifiers "$(cat "$ROOT/packaging/macos/stable-ax-identifiers.json")" \
   --argjson identity "$identity_json" \
   --argjson config_contract "$config_json" \
   '{
@@ -290,11 +322,37 @@ jq -n \
     bundle_id: "ai.2lab.dbotter.preview",
     bundle_short_version: $bundle_short,
     bundle_build_version: $bundle_build,
-    icon: {source: "assets/dbotter-icon.png", sha256: $icon_sha256},
+    icon: {
+      source: "assets/dbotter-icon.png",
+      source_sha256: $icon_sha256,
+      icns_sha256: $icns_sha256
+    },
     signing: {identity: $codesign_identity, verified: true},
     identity: $identity,
-    config_contract: $config_contract
+    config_contract: $config_contract,
+    build: {
+      profile: "release",
+      features: ["all"],
+      locked: true,
+      rustc_version: $rustc_version,
+      cargo_version: $cargo_version,
+      cargo_lock_sha256: $cargo_lock_sha256
+    },
+    ax_identifiers: $ax_identifiers,
+    manifest: {
+      url: $manifest_url,
+      artifact_target: $target,
+      artifact_url: $artifact_url
+    }
   }' >"$temporary/$receipt_name"
+
+"$ROOT/scripts/validate-macos-package.py" \
+  --app "$work_app" \
+  --archive "$temporary/$archive_name" \
+  --descriptor "$temporary/$descriptor_name" \
+  --receipt "$temporary/$receipt_name" \
+  --expected-source-sha "$expected_source_sha" \
+  --expected-tag "$expected_tag" >/dev/null
 
 mv "$work_app" "$output/$app_name"
 mv "$temporary/$archive_name" "$output/$archive_name"

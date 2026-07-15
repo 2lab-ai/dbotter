@@ -61,6 +61,8 @@ for executable in \
   scripts/build-linux-artifact.sh \
   scripts/check-installed-receipt-contract.sh \
   scripts/build-macos-app.sh \
+  scripts/build-icns.py \
+  scripts/validate-macos-package.py \
   scripts/assemble-preview-manifest.py \
   scripts/assemble-installed-receipt.py \
   scripts/verify-hermetic.sh \
@@ -73,7 +75,8 @@ done
 for schema in \
   packaging/release/preview-manifest.schema.json \
   packaging/release/installed-receipt.schema.json \
-  packaging/macos/Info.plist; do
+  packaging/macos/Info.plist \
+  packaging/macos/stable-ax-identifiers.json; do
   test -s "$schema" || fail "$schema is missing or empty"
 done
 

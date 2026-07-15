@@ -11,7 +11,10 @@ fail() {
 
 for required in \
   packaging/macos/Info.plist \
+  packaging/macos/stable-ax-identifiers.json \
   scripts/build-macos-app.sh \
+  scripts/build-icns.py \
+  scripts/validate-macos-package.py \
   scripts/assemble-preview-manifest.py; do
   [ -f "$root/$required" ] || fail "$required is missing"
 done
@@ -20,9 +23,23 @@ done
   || fail "scripts/build-macos-app.sh is not executable"
 [ -x "$root/scripts/assemble-preview-manifest.py" ] \
   || fail "scripts/assemble-preview-manifest.py is not executable"
+for executable in scripts/build-icns.py scripts/validate-macos-package.py; do
+  [ -x "$root/$executable" ] || fail "$executable is not executable"
+done
 
 "$root/scripts/build-macos-app.sh" --help >/dev/null
 "$root/scripts/assemble-preview-manifest.py" --help >/dev/null
+"$root/scripts/build-icns.py" --help >/dev/null
+"$root/scripts/validate-macos-package.py" --help >/dev/null
+
+jq -e '
+  type == "array"
+  and length == 25
+  and length == (unique | length)
+  and .[0] == "connection.new"
+  and .[-1] == "result.export.json"
+' "$root/packaging/macos/stable-ax-identifiers.json" >/dev/null \
+  || fail "stable AX identifier inventory is not exact"
 
 if "$root/scripts/build-macos-app.sh" \
   --channel stable --binary /missing --output /missing >/dev/null 2>&1; then
