@@ -49,6 +49,7 @@ fn profile(
         availability: DriverAvailability::Ready,
         planned_reason: None,
         has_current_session_secret: false,
+        environment_availability: None,
         persisted,
     }
 }

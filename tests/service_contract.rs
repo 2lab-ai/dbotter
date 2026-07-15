@@ -20,7 +20,8 @@ use dbotter::model::{
 };
 use dbotter::public_error::{RecoveryAction, SafeContext, recovery_for};
 use dbotter::secrets::{
-    ReplacementSecretBuffer, SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate,
+    EnvironmentAvailability, ReplacementSecretBuffer, SecretError, SessionSecret,
+    SessionSecretStore, SessionSecretUpdate,
 };
 use dbotter::service::{
     ApplicationService, CheckOutcome, CreateProfileRequest, DeleteProfileRequest, ExecuteOutcome,
@@ -412,6 +413,10 @@ impl SecretResolver for MissingEnvironment {
     fn resolve_environment(&self, name: &str) -> Result<Arc<SessionSecret>, SecretError> {
         Err(SecretError::MissingEnv(name.to_owned()))
     }
+
+    fn probe_environment(&self, _name: &str) -> EnvironmentAvailability {
+        EnvironmentAvailability::Missing
+    }
 }
 
 #[derive(Default)]
@@ -428,6 +433,14 @@ impl SecretResolver for FixedEnvironment {
         Ok(Arc::new(SessionSecret::new(
             "resolved-environment-secret".to_owned(),
         )))
+    }
+
+    fn probe_environment(&self, name: &str) -> EnvironmentAvailability {
+        if name == "EXACT_ENV_NAME" {
+            EnvironmentAvailability::Available
+        } else {
+            EnvironmentAvailability::Missing
+        }
     }
 }
 

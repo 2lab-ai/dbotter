@@ -294,9 +294,20 @@ impl EditorSurface {
     ) -> Option<EditorIntent> {
         OpenAiTheme::apply(ui.ctx());
         let workspace_key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        let editor_id = egui::Id::new(EDITOR_INPUT_ID).with(&workspace_key);
         if self.active_workspace.as_ref() != Some(&workspace_key) {
             self.active_workspace = Some(workspace_key);
-            self.cursor = Some(EditorCursor::caret(workspace.editor_text.chars().count()));
+            let cursor = workspace_cursor(workspace);
+            workspace.caret_character_index = cursor.caret_character_index;
+            workspace.selection_character_range = cursor.selection_character_range.clone();
+            let mut state =
+                egui::text_edit::TextEditState::load(ui.ctx(), editor_id).unwrap_or_default();
+            state.cursor.set_char_range(Some(egui_cursor_range(
+                &cursor,
+                workspace.editor_text.chars().count(),
+            )));
+            state.store(ui.ctx(), editor_id);
+            self.cursor = Some(cursor);
             self.validation_error = None;
         }
 
@@ -318,7 +329,7 @@ impl EditorSurface {
         let execute_enabled = enabled && workspace.pending_execute.is_none();
         let shortcut_pressed = execute_enabled && consume_execute_shortcut(ui);
         let editor_output = egui::TextEdit::multiline(&mut workspace.editor_text)
-            .id_salt(EDITOR_INPUT_ID)
+            .id(editor_id)
             .code_editor()
             .lock_focus(false)
             .desired_rows(12)
@@ -332,10 +343,12 @@ impl EditorSurface {
                 let range = cursor_range.as_sorted_char_range();
                 range.start.0..range.end.0
             });
-            self.cursor = Some(match selection {
-                Some(selection) => EditorCursor::with_selection(caret, selection),
+            self.cursor = Some(match selection.as_ref() {
+                Some(selection) => EditorCursor::with_selection(caret, selection.clone()),
                 None => EditorCursor::caret(caret),
             });
+            workspace.caret_character_index = caret;
+            workspace.selection_character_range = selection;
         }
         let editor_response = named_author_id(
             editor_output.response.response,
@@ -486,6 +499,36 @@ impl EditorSurface {
         }
 
         intent
+    }
+}
+
+fn workspace_cursor(workspace: &ProfileWorkspace) -> EditorCursor {
+    let character_count = workspace.editor_text.chars().count();
+    let caret = workspace.caret_character_index.min(character_count);
+    let selection = workspace
+        .selection_character_range
+        .as_ref()
+        .map(|selection| selection.start.min(character_count)..selection.end.min(character_count))
+        .filter(|selection| selection.start < selection.end);
+    match selection {
+        Some(selection) => EditorCursor::with_selection(caret, selection),
+        None => EditorCursor::caret(caret),
+    }
+}
+
+fn egui_cursor_range(cursor: &EditorCursor, character_count: usize) -> egui::text::CCursorRange {
+    let caret = cursor.caret_character_index.min(character_count);
+    let primary = egui::text::CCursor::new(caret);
+    let Some(selection) = cursor.selection_character_range.as_ref() else {
+        return egui::text::CCursorRange::one(primary);
+    };
+    let start = selection.start.min(character_count);
+    let end = selection.end.min(character_count);
+    let secondary = if caret == start { end } else { start };
+    egui::text::CCursorRange {
+        primary,
+        secondary: egui::text::CCursor::new(secondary),
+        h_pos: None,
     }
 }
 

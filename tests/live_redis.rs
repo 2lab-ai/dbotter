@@ -23,7 +23,9 @@ use dbotter::model::{
     RedisKeyId, RedisKeyInspectRequest, RedisScanRequest, RedisTlsConfig, RedisTtl, RedisValueType,
     RequestIdentity, TlsMode,
 };
-use dbotter::secrets::{SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate};
+use dbotter::secrets::{
+    EnvironmentAvailability, SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate,
+};
 use dbotter::service::{ApplicationService, DriverConnector, SecretResolver, ServiceError};
 use secrecy::SecretString;
 
@@ -345,6 +347,15 @@ impl SecretResolver for FixtureResolver {
             ResolverState::Available(value) => Ok(Arc::new(SessionSecret::new(value.clone()))),
             ResolverState::Missing => Err(SecretError::MissingEnv(name.to_owned())),
             ResolverState::Empty => Err(SecretError::EmptyEnv(name.to_owned())),
+        }
+    }
+
+    fn probe_environment(&self, name: &str) -> EnvironmentAvailability {
+        assert_eq!(name, ENV_NAME);
+        match self.0 {
+            ResolverState::Available(_) => EnvironmentAvailability::Available,
+            ResolverState::Missing => EnvironmentAvailability::Missing,
+            ResolverState::Empty => EnvironmentAvailability::Empty,
         }
     }
 }

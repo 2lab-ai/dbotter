@@ -1,9 +1,12 @@
 //! Pure UI snapshots and event folding. No driver or network client belongs here.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::config::{ConfigSourceVersion, migration_backup_path};
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionProfile, CredentialMode, DraftId, DriverAvailability,
     DriverKind, OperationId, OperationKind, ProfileGeneration, ProfileId, PublicSummary,
@@ -11,7 +14,59 @@ use crate::model::{
     SessionGeneration,
 };
 use crate::public_error::PublicOperationError;
+use crate::secrets::EnvironmentAvailability;
 use crate::service::SessionDisposition;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConfigPresentation {
+    source_version: ConfigSourceVersion,
+    migration_backup: Option<PathBuf>,
+}
+
+impl ConfigPresentation {
+    pub fn for_source(source_version: ConfigSourceVersion, config_path: &Path) -> Self {
+        Self {
+            source_version,
+            migration_backup: (source_version == ConfigSourceVersion::V1)
+                .then(|| migration_backup_path(config_path)),
+        }
+    }
+
+    pub const fn source_version(&self) -> ConfigSourceVersion {
+        self.source_version
+    }
+
+    pub const fn migration_required(&self) -> bool {
+        matches!(self.source_version, ConfigSourceVersion::V1)
+    }
+
+    pub fn migration_backup(&self) -> Option<&Path> {
+        self.migration_backup.as_deref()
+    }
+}
+
+impl Default for ConfigPresentation {
+    fn default() -> Self {
+        Self {
+            source_version: ConfigSourceVersion::Missing,
+            migration_backup: None,
+        }
+    }
+}
+
+impl fmt::Debug for ConfigPresentation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigPresentation")
+            .field("source_version", &self.source_version)
+            .field("migration_required", &self.migration_required())
+            .field(
+                "migration_backup",
+                &self.migration_backup.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WorkspaceKey {
@@ -80,6 +135,7 @@ pub struct ProfileSnapshot {
     pub availability: DriverAvailability,
     pub planned_reason: Option<String>,
     pub has_current_session_secret: bool,
+    pub environment_availability: Option<EnvironmentAvailability>,
     pub persisted: ConnectionProfile,
 }
 
@@ -88,6 +144,7 @@ impl ProfileSnapshot {
         profile: &ConnectionProfile,
         generation: ProfileGeneration,
         has_current_session_secret: bool,
+        environment_availability: Option<EnvironmentAvailability>,
     ) -> Self {
         let descriptor = crate::drivers::descriptors()
             .into_iter()
@@ -104,12 +161,19 @@ impl ProfileSnapshot {
             availability,
             planned_reason: descriptor.and_then(|value| value.reason).map(str::to_owned),
             has_current_session_secret,
+            environment_availability,
             persisted: profile.clone(),
         }
     }
 
     pub fn is_ready(&self) -> bool {
         self.availability == DriverAvailability::Ready
+    }
+
+    pub fn can_connect(&self) -> bool {
+        self.is_ready()
+            && (self.persisted.credential_mode != CredentialMode::Environment
+                || self.environment_availability == Some(EnvironmentAvailability::Available))
     }
 }
 
@@ -156,6 +220,7 @@ pub enum UiEvent {
     ProfilesLoaded {
         operation_id: OperationId,
         profiles: Vec<ProfileSnapshot>,
+        config: ConfigPresentation,
     },
     ProfilesFailed {
         operation_id: OperationId,
@@ -301,6 +366,7 @@ pub struct UiModel {
     pub connection_states: HashMap<ProfileId, ConnectionState>,
     pub workspaces: HashMap<WorkspaceKey, ProfileWorkspace>,
     pub status: String,
+    pub config: ConfigPresentation,
     config_uncertain: bool,
     profile_load_succeeded: bool,
     last_profiles_operation: Option<OperationId>,
@@ -318,6 +384,7 @@ impl Default for UiModel {
             connection_states: HashMap::new(),
             workspaces: HashMap::new(),
             status: "Loading profiles…".to_owned(),
+            config: ConfigPresentation::default(),
             config_uncertain: false,
             profile_load_succeeded: false,
             last_profiles_operation: None,
@@ -408,11 +475,13 @@ impl UiModel {
             UiEvent::ProfilesLoaded {
                 operation_id,
                 profiles,
+                config,
             } => {
                 if !self.accept_profiles_operation(operation_id) {
                     return;
                 }
                 self.profile_load_succeeded = true;
+                self.config = config;
                 self.fold_profiles(profiles);
             }
             UiEvent::ProfilesFailed {
@@ -1549,6 +1618,7 @@ mod tests {
         model.fold(UiEvent::ProfilesLoaded {
             operation_id: OperationId(1),
             profiles: vec![profile(3307)],
+            config: Default::default(),
         });
 
         assert_eq!(
@@ -1581,6 +1651,7 @@ mod tests {
             availability: DriverAvailability::Ready,
             planned_reason: None,
             has_current_session_secret: false,
+            environment_availability: None,
             persisted,
         }
     }

@@ -26,8 +26,8 @@ pub use editor::{
 };
 pub use layout::NativeLayout;
 pub use model::{
-    ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot, ProfileWorkspace,
-    UiEvent, UiModel, WorkspaceKey,
+    ConfigPresentation, ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot,
+    ProfileWorkspace, UiEvent, UiModel, WorkspaceKey,
 };
 pub use mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 pub use native_harness::NativeUiHarness;

@@ -1,20 +1,83 @@
+use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{
-    DraftId, OperationId, ProfileGeneration, ProfileId, PublicSummary, ResultId, SessionGeneration,
+use crate::config::{
+    CURRENT_CONFIG_VERSION, Config, ConfigSourceVersion, ConfigWriter, migration_backup_path,
 };
+use crate::model::{
+    ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileGeneration,
+    ProfileId, PublicSummary, RedisTlsConfig, ResultId, SessionGeneration, TlsMode,
+};
+use crate::secrets::{EnvironmentAvailability, SecretError, SessionSecret, SessionSecretStore};
+use crate::service::{ApplicationService, DriverConnector, SecretResolver};
 
 use super::runtime::{
     DraftPermitRegistry, ProfilePermitRegistry, RegisteredTask, TaskClass, TaskRegistry, TaskScope,
-    await_pre_session_blocking, join_registered_for_shutdown_with_grace,
+    await_pre_session_blocking, join_registered_for_shutdown_with_grace, snapshots,
 };
 
 struct DropFlag(Arc<AtomicBool>);
+
+#[cfg(test)]
+struct MutableEnvironment {
+    availability: Mutex<EnvironmentAvailability>,
+    probes: AtomicUsize,
+    resolves: AtomicUsize,
+}
+
+#[cfg(test)]
+impl MutableEnvironment {
+    fn new(availability: EnvironmentAvailability) -> Self {
+        Self {
+            availability: Mutex::new(availability),
+            probes: AtomicUsize::new(0),
+            resolves: AtomicUsize::new(0),
+        }
+    }
+
+    fn set(&self, availability: EnvironmentAvailability) {
+        *self.availability.lock().expect("environment state") = availability;
+    }
+}
+
+#[cfg(test)]
+impl SecretResolver for MutableEnvironment {
+    fn resolve_environment(&self, name: &str) -> Result<Arc<SessionSecret>, SecretError> {
+        self.resolves.fetch_add(1, Ordering::SeqCst);
+        match *self.availability.lock().expect("environment state") {
+            EnvironmentAvailability::Available => Ok(Arc::new(SessionSecret::new(
+                "ENVIRONMENT_VALUE_MUST_NOT_REACH_A_SNAPSHOT".to_owned(),
+            ))),
+            EnvironmentAvailability::Missing => Err(SecretError::MissingEnv(name.to_owned())),
+            EnvironmentAvailability::Empty => Err(SecretError::EmptyEnv(name.to_owned())),
+        }
+    }
+
+    fn probe_environment(&self, _name: &str) -> EnvironmentAvailability {
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        *self.availability.lock().expect("environment state")
+    }
+}
+
+#[cfg(test)]
+fn environment_service(
+    path: &std::path::Path,
+    environment: Arc<MutableEnvironment>,
+) -> ApplicationService {
+    ApplicationService::with_dependencies(
+        path,
+        Arc::new(DriverConnector),
+        environment,
+        Arc::new(SessionSecretStore::default()),
+        ConfigWriter::default(),
+    )
+    .expect("environment service")
+}
 
 impl Drop for DropFlag {
     fn drop(&mut self) {
@@ -273,4 +336,85 @@ fn duplicate_operation_id_is_rejected_by_reservation_before_spawn() {
     assert_eq!(spawned, 0, "duplicate must not reach its spawn factory");
     registry.release_reservation(reservation);
     assert!(registry.reserve(operation_id).is_ok());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn saved_environment_availability_refreshes_on_reload_and_restart_without_resolving_value() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let profile = ConnectionProfile {
+        id: "saved-environment".to_owned(),
+        name: "Saved Environment".to_owned(),
+        driver: DriverKind::MySql,
+        host: "127.0.0.1".to_owned(),
+        port: 3306,
+        database: None,
+        username: None,
+        tls: TlsMode::Disabled,
+        credential_mode: CredentialMode::Environment,
+        secret_env: Some("DBOTTER_SAVED_ENV".to_owned()),
+        redis_tls: RedisTlsConfig::default(),
+    };
+    let config = Config {
+        version: CURRENT_CONFIG_VERSION,
+        profiles: vec![profile],
+    };
+    fs::write(&path, toml::to_string(&config).expect("serialize config")).expect("write config");
+
+    let environment = Arc::new(MutableEnvironment::new(EnvironmentAvailability::Missing));
+    let process_a = environment_service(&path, environment.clone());
+    let (missing, config) = snapshots(&process_a).await.expect("missing snapshot");
+    assert_eq!(config.source_version(), ConfigSourceVersion::V2);
+    assert_eq!(
+        missing[0].environment_availability,
+        Some(EnvironmentAvailability::Missing)
+    );
+
+    environment.set(EnvironmentAvailability::Available);
+    process_a
+        .reload_configuration()
+        .await
+        .expect("reload process A");
+    let (available, _) = snapshots(&process_a).await.expect("available snapshot");
+    assert_eq!(
+        available[0].environment_availability,
+        Some(EnvironmentAvailability::Available)
+    );
+
+    environment.set(EnvironmentAvailability::Empty);
+    let process_b = environment_service(&path, environment.clone());
+    let (empty, _) = snapshots(&process_b).await.expect("restart snapshot");
+    assert_eq!(
+        empty[0].environment_availability,
+        Some(EnvironmentAvailability::Empty)
+    );
+    assert_eq!(environment.probes.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        environment.resolves.load(Ordering::SeqCst),
+        0,
+        "profile snapshots probe availability without resolving an environment value"
+    );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn empty_v1_snapshot_reports_the_exact_fixed_backup_without_debug_disclosure() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("v1-config.toml");
+    fs::write(&path, "version = 1\n").expect("write v1 config");
+    let environment = Arc::new(MutableEnvironment::new(EnvironmentAvailability::Missing));
+    let service = environment_service(&path, environment);
+
+    let (profiles, config) = snapshots(&service).await.expect("v1 snapshot");
+    assert!(profiles.is_empty());
+    assert_eq!(config.source_version(), ConfigSourceVersion::V1);
+    assert!(config.migration_required());
+    assert_eq!(
+        config.migration_backup(),
+        Some(migration_backup_path(&path).as_path())
+    );
+    let debug = format!("{config:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains(path.to_string_lossy().as_ref()));
 }

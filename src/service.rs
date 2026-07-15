@@ -34,7 +34,8 @@ use crate::model::{
     ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
 };
 use crate::secrets::{
-    ReplacementSecretBuffer, SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate,
+    EnvironmentAvailability, ReplacementSecretBuffer, SecretError, SessionSecret,
+    SessionSecretStore, SessionSecretUpdate,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -587,6 +588,7 @@ impl SessionConnector for DriverConnector {
 
 pub trait SecretResolver: Send + Sync {
     fn resolve_environment(&self, name: &str) -> Result<Arc<SessionSecret>, SecretError>;
+    fn probe_environment(&self, name: &str) -> EnvironmentAvailability;
 }
 
 #[derive(Default)]
@@ -595,6 +597,10 @@ pub struct EnvironmentSecrets;
 impl SecretResolver for EnvironmentSecrets {
     fn resolve_environment(&self, name: &str) -> Result<Arc<SessionSecret>, SecretError> {
         crate::secrets::resolve_environment(name)
+    }
+
+    fn probe_environment(&self, name: &str) -> EnvironmentAvailability {
+        crate::secrets::probe_environment(name)
     }
 }
 
@@ -1033,6 +1039,10 @@ impl ApplicationService {
 
     pub async fn source_version(&self) -> ConfigSourceVersion {
         self.state.read().await.observed.source_version
+    }
+
+    pub fn environment_availability(&self, name: &str) -> EnvironmentAvailability {
+        self.environment.probe_environment(name)
     }
 
     pub async fn profiles_snapshot(&self) -> Vec<ConnectionProfile> {

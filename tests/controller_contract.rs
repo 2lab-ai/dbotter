@@ -18,7 +18,9 @@ use dbotter::model::{
     RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, RequestIdentity,
     ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration,
 };
-use dbotter::secrets::{SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate};
+use dbotter::secrets::{
+    EnvironmentAvailability, SecretError, SessionSecret, SessionSecretStore, SessionSecretUpdate,
+};
 use dbotter::service::{
     ApplicationService, CreateProfileRequest, DeleteProfileRequest, SecretResolver,
     SessionConnector, SessionDisposition, SessionHandle, UpdateProfileRequest,
@@ -375,6 +377,7 @@ fn ui_fold_rejects_late_profile_events_after_tombstone_and_recreation() {
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(19),
         profiles: vec![snapshot(profile_id.clone(), ProfileGeneration(5))],
+        config: Default::default(),
     });
     model.fold(UiEvent::ProfileDeleted {
         operation_id: OperationId(20),
@@ -385,6 +388,7 @@ fn ui_fold_rejects_late_profile_events_after_tombstone_and_recreation() {
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(22),
         profiles: vec![snapshot(profile_id.clone(), ProfileGeneration(7))],
+        config: Default::default(),
     });
     model.fold(UiEvent::ConnectionReady {
         operation_id: OperationId(21),
@@ -415,10 +419,12 @@ fn reload_removal_tombstones_late_create_and_ignores_stale_profiles_loaded() {
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(70),
         profiles: vec![snapshot(profile_id.clone(), ProfileGeneration(5))],
+        config: Default::default(),
     });
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(72),
         profiles: Vec::new(),
+        config: Default::default(),
     });
     assert_eq!(
         model.tombstone_generation(&profile_id),
@@ -437,18 +443,21 @@ fn reload_removal_tombstones_late_create_and_ignores_stale_profiles_loaded() {
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(71),
         profiles: vec![snapshot(profile_id.clone(), ProfileGeneration(9))],
+        config: Default::default(),
     });
     assert_eq!(model.active_generation(&profile_id), None);
 
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(73),
         profiles: vec![snapshot(profile_id.clone(), ProfileGeneration(5))],
+        config: Default::default(),
     });
     assert_eq!(model.active_generation(&profile_id), None);
 
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(74),
         profiles: vec![snapshot(profile_id.clone(), ProfileGeneration(6))],
+        config: Default::default(),
     });
     assert_eq!(
         model.active_generation(&profile_id),
@@ -464,6 +473,7 @@ fn ui_fold_preserves_runtime_neutral_retag_and_uncertain_state_rejects_late_even
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(30),
         profiles: vec![snapshot(profile_id.clone(), ProfileGeneration(1))],
+        config: Default::default(),
     });
     model.connection_states.insert(
         profile_id.clone(),
@@ -483,6 +493,7 @@ fn ui_fold_preserves_runtime_neutral_retag_and_uncertain_state_rejects_late_even
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(32),
         profiles: vec![snapshot(profile_id.clone(), ProfileGeneration(2))],
+        config: Default::default(),
     });
     assert!(matches!(
         model.connection_state(&profile_id),
@@ -524,6 +535,7 @@ fn ui_connection_state_table_covers_credentials_cache_disposition_and_shutdown()
             session_snapshot(profile_id.clone(), generation, false),
             snapshot(other_id.clone(), generation),
         ],
+        config: Default::default(),
     });
     assert!(matches!(
         model.connection_state(&profile_id),
@@ -692,6 +704,7 @@ fn connect_auth_tls_network_and_timeout_failures_remain_visibly_failed() {
     model.fold(UiEvent::ProfilesLoaded {
         operation_id: OperationId(60),
         profiles: vec![snapshot(profile_id.clone(), generation)],
+        config: Default::default(),
     });
 
     let cases = [
@@ -778,6 +791,7 @@ fn changed_removed_and_stale_save_fences_clear_only_the_exact_profile_workspace(
             snapshot(target.clone(), ProfileGeneration(1)),
             snapshot(survivor.clone(), ProfileGeneration(2)),
         ],
+        config: Default::default(),
     });
     model.selected_profile = Some(target.clone());
     let original_key = WorkspaceKey::new(target.clone(), ProfileGeneration(1));
@@ -793,6 +807,7 @@ fn changed_removed_and_stale_save_fences_clear_only_the_exact_profile_workspace(
             snapshot(target.clone(), ProfileGeneration(3)),
             snapshot(survivor.clone(), ProfileGeneration(2)),
         ],
+        config: Default::default(),
     });
     assert!(model.workspace(&original_key).is_none());
     let replacement_key = WorkspaceKey::new(target.clone(), ProfileGeneration(3));
@@ -819,6 +834,7 @@ fn changed_removed_and_stale_save_fences_clear_only_the_exact_profile_workspace(
             snapshot(target.clone(), ProfileGeneration(5)),
             snapshot(survivor, ProfileGeneration(2)),
         ],
+        config: Default::default(),
     });
     model.connection_states.insert(
         target.clone(),
@@ -4489,6 +4505,10 @@ impl SecretResolver for MissingEnvironment {
     fn resolve_environment(&self, name: &str) -> Result<Arc<SessionSecret>, SecretError> {
         Err(SecretError::MissingEnv(name.to_owned()))
     }
+
+    fn probe_environment(&self, _name: &str) -> EnvironmentAvailability {
+        EnvironmentAvailability::Missing
+    }
 }
 
 fn test_service(path: &std::path::Path, connector: Arc<CountingConnector>) -> ApplicationService {
@@ -4527,6 +4547,7 @@ async fn seed_profiles(service: &ApplicationService, count: usize) -> Vec<Profil
             &profile,
             created.profile_generation,
             false,
+            None,
         ));
     }
     snapshots
@@ -4649,7 +4670,7 @@ fn snapshot(profile_id: ProfileId, generation: ProfileGeneration) -> ProfileSnap
     let mut draft = ConnectionDraft::for_driver(DriverKind::MySql);
     draft.name = "Folded".to_owned();
     let profile = dbotter::model::ConnectionProfile::from_draft(profile_id.0.clone(), draft);
-    ProfileSnapshot::from_profile(&profile, generation, false)
+    ProfileSnapshot::from_profile(&profile, generation, false, None)
 }
 
 fn session_snapshot(
@@ -4661,5 +4682,5 @@ fn session_snapshot(
     draft.name = "Session profile".to_owned();
     draft.credential_mode = CredentialMode::Session;
     let profile = dbotter::model::ConnectionProfile::from_draft(profile_id.0.clone(), draft);
-    ProfileSnapshot::from_profile(&profile, generation, has_current_session_secret)
+    ProfileSnapshot::from_profile(&profile, generation, has_current_session_secret, None)
 }

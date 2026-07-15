@@ -1,6 +1,6 @@
 //! Pure profile draft validation plus egui rendering and save correlation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eframe::egui;
@@ -16,7 +16,7 @@ use crate::secrets::{
 };
 use crate::service::{CreateProfileRequest, UpdateProfileRequest, slugify_profile_id};
 
-use super::accessibility::named_author_id;
+use super::accessibility::{named_author_id, named_dynamic_value_author_id};
 use super::adapter::{DraftTestIntent, SubmitError, UiCommand, UiPort};
 use super::model::UiEvent;
 use super::theme::OpenAiTheme;
@@ -33,6 +33,7 @@ const PROFILE_SESSION_REPLACEMENT_ID: &str = "profile.credential.session.value";
 const PROFILE_ENVIRONMENT_ID: &str = "profile.credential.environment_name";
 const PROFILE_ENVIRONMENT_CHECK_ID: &str = "profile.environment.check";
 const PROFILE_MIGRATION_ID: &str = "profile.migration.confirm";
+const PROFILE_MIGRATION_BACKUP_ID: &str = "profile.migration.backup";
 const PROFILE_TEST_ID: &str = "profile.test_draft";
 const PROFILE_SAVE_ID: &str = "profile.save";
 const PROFILE_SAVE_CONNECT_ID: &str = "profile.save_connect";
@@ -355,6 +356,8 @@ pub(super) struct ProfileEditor {
     replacement_secret: ReplacementSecretBuffer,
     environment_availability: Option<EnvironmentAvailability>,
     environment_probe_name: Option<String>,
+    migration_required: bool,
+    migration_backup: Option<PathBuf>,
     migration_confirmed: bool,
     pub draft: ProfileDraft,
     pub errors: ValidationErrors,
@@ -376,6 +379,8 @@ impl ProfileEditor {
             replacement_secret: ReplacementSecretBuffer::default(),
             environment_availability: None,
             environment_probe_name: None,
+            migration_required: false,
+            migration_backup: None,
             migration_confirmed: false,
             draft: ProfileDraft::new(driver),
             errors: ValidationErrors::default(),
@@ -410,6 +415,8 @@ impl ProfileEditor {
             replacement_secret: ReplacementSecretBuffer::default(),
             environment_availability: None,
             environment_probe_name: None,
+            migration_required: false,
+            migration_backup: None,
             migration_confirmed: false,
             draft: ProfileDraft::from_profile(profile),
             errors: ValidationErrors::default(),
@@ -423,6 +430,20 @@ impl ProfileEditor {
 
     pub fn request_focus(&mut self, field: ProfileFieldId) {
         self.focus_field = Some(field);
+    }
+
+    pub fn set_migration_presentation(
+        &mut self,
+        migration_required: bool,
+        migration_backup: Option<&Path>,
+    ) {
+        self.migration_required = migration_required;
+        self.migration_backup = migration_required
+            .then(|| migration_backup.map(Path::to_path_buf))
+            .flatten();
+        if !migration_required {
+            self.migration_confirmed = false;
+        }
     }
 
     pub(super) const fn draft_id(&self) -> DraftId {
@@ -608,7 +629,9 @@ impl ProfileEditor {
         let destination_mode = profile.credential_mode;
         let credential_context = self.credential_context();
         let session_intent = self.session_intent;
-        let migration_consent = MigrationConsent::from_confirmation(self.migration_confirmed);
+        let migration_consent = MigrationConsent::from_confirmation(
+            self.migration_required && self.migration_confirmed,
+        );
         let pending_save = match &mode {
             EditorMode::Add => PendingSave::Create {
                 operation_id,
@@ -1220,15 +1243,27 @@ impl ProfileEditor {
                     "MongoDB is planned. Profile creation and network actions are disabled.",
                 );
             }
-            let migration = ui.checkbox(
-                &mut self.migration_confirmed,
-                "Allow a version-1 configuration migration with backup if required",
-            );
-            named_author_id(
-                migration,
-                PROFILE_MIGRATION_ID,
-                "Confirm configuration migration backup",
-            );
+            if self.migration_required {
+                let migration = ui.checkbox(
+                    &mut self.migration_confirmed,
+                    "Allow the version-1 configuration migration",
+                );
+                named_author_id(
+                    migration,
+                    PROFILE_MIGRATION_ID,
+                    "Confirm configuration migration backup",
+                );
+                if let Some(backup) = self.migration_backup.as_deref() {
+                    let backup = backup.to_string_lossy().into_owned();
+                    let response = ui.label(format!("Backup: {backup}"));
+                    named_dynamic_value_author_id(
+                        response,
+                        PROFILE_MIGRATION_BACKUP_ID.to_owned(),
+                        "Migration backup path".to_owned(),
+                        backup,
+                    );
+                }
+            }
         });
         ui.separator();
         let footer_action = ui
@@ -1415,6 +1450,8 @@ fn render_error(ui: &mut egui::Ui, error: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use std::collections::HashMap;
 
     use super::{
@@ -1655,6 +1692,8 @@ mod tests {
             editor.auto_id_preview().as_deref(),
             Some("local-primary-db")
         );
+        editor
+            .set_migration_presentation(true, Some(Path::new("/tmp/dbotter-profile-form.v1.bak")));
         editor.set_migration_confirmed(true);
 
         assert_eq!(

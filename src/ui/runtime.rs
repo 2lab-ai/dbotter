@@ -26,7 +26,9 @@ use crate::service::{
 
 use super::adapter::{ControlKey, DraftTestIntent, ServicePort, UiCommand};
 use super::editor::classify_execute_operation;
-use super::model::{ConnectionFailureOutcome, PostCloseState, ProfileSnapshot, UiEvent};
+use super::model::{
+    ConfigPresentation, ConnectionFailureOutcome, PostCloseState, ProfileSnapshot, UiEvent,
+};
 
 const GLOBAL_NETWORK_LIMIT: usize = 4;
 const SHUTDOWN_ASYNC_GRACE: Duration = Duration::from_secs(2);
@@ -546,11 +548,17 @@ enum ControllerMessage {
     },
 }
 
+struct ReloadPresentation {
+    outcome: RuntimeReloadOutcome,
+    profiles: Vec<ProfileSnapshot>,
+    config: ConfigPresentation,
+}
+
 enum TaskOutput {
     Event(Box<UiEvent>),
     Reload {
         operation_id: OperationId,
-        result: Box<Result<(RuntimeReloadOutcome, Vec<ProfileSnapshot>), ServiceError>>,
+        result: Box<Result<ReloadPresentation, ServiceError>>,
     },
     Create {
         operation_id: OperationId,
@@ -2777,9 +2785,19 @@ async fn run_mutation(service: &ApplicationService, command: UiCommand) -> TaskO
         UiCommand::RefreshProfiles { operation_id } => {
             let result = match service.reload_configuration_for_runtime().await {
                 Ok(outcome) if !outcome.config_uncertain => {
-                    snapshots(service).await.map(|profiles| (outcome, profiles))
+                    snapshots(service)
+                        .await
+                        .map(|(profiles, config)| ReloadPresentation {
+                            outcome,
+                            profiles,
+                            config,
+                        })
                 }
-                Ok(outcome) => Ok((outcome, Vec::new())),
+                Ok(outcome) => Ok(ReloadPresentation {
+                    outcome,
+                    profiles: Vec::new(),
+                    config: ConfigPresentation::default(),
+                }),
                 Err(error) => Err(error),
             };
             TaskOutput::Reload {
@@ -3099,7 +3117,7 @@ fn mutation_completion_waiters(
 
     let targets = match output {
         TaskOutput::Reload { result, .. } => match result.as_ref() {
-            Ok((outcome, _)) => outcome.cleanup.targets().collect::<Vec<_>>(),
+            Ok(reload) => reload.outcome.cleanup.targets().collect::<Vec<_>>(),
             Err(_) => Vec::new(),
         },
         TaskOutput::Create { result, .. } => match result.as_ref() {
@@ -3146,16 +3164,20 @@ async fn finish_task_output(
             operation_id,
             result,
         } => match *result {
-            Ok((outcome, profiles)) => {
-                if let Err(error) = application.apply_deferred_cleanup(outcome.cleanup).await {
+            Ok(reload) => {
+                if let Err(error) = application
+                    .apply_deferred_cleanup(reload.outcome.cleanup)
+                    .await
+                {
                     let (summary, code) = error.public_error_parts();
                     profiles_failed_event(operation_id, summary, code)
-                } else if outcome.config_uncertain {
+                } else if reload.outcome.config_uncertain {
                     UiEvent::ConfigUncertain { operation_id }
                 } else {
                     UiEvent::ProfilesLoaded {
                         operation_id,
-                        profiles,
+                        profiles: reload.profiles,
+                        config: reload.config,
                     }
                 }
             }
@@ -3495,18 +3517,32 @@ fn internal_failure_event(operation_id: OperationId, failure: FailureContext) ->
     }
 }
 
-async fn snapshots(application: &ApplicationService) -> Result<Vec<ProfileSnapshot>, ServiceError> {
+pub(super) async fn snapshots(
+    application: &ApplicationService,
+) -> Result<(Vec<ProfileSnapshot>, ConfigPresentation), ServiceError> {
     let mut snapshots = Vec::new();
     for (profile, generation) in application.profiles_with_generations_snapshot().await {
         let profile_id = ProfileId(profile.id.clone());
         let has_current_session_secret = application.has_current_session_secret(&profile_id)?;
+        let environment_availability = (profile.credential_mode
+            == crate::model::CredentialMode::Environment)
+            .then(|| {
+                profile
+                    .secret_env
+                    .as_deref()
+                    .map(|name| application.environment_availability(name))
+            })
+            .flatten();
         snapshots.push(ProfileSnapshot::from_profile(
             &profile,
             generation,
             has_current_session_secret,
+            environment_availability,
         ));
     }
-    Ok(snapshots)
+    let source_version = application.source_version().await;
+    let config = ConfigPresentation::for_source(source_version, application.config_path());
+    Ok((snapshots, config))
 }
 
 enum RedisResourceRequest {

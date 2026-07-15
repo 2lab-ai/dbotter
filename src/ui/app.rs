@@ -10,7 +10,7 @@ use egui_extras::{Column as TableColumn, TableBuilder};
 
 use crate::config::MigrationConsent;
 use crate::model::{
-    CatalogRequest, Cell, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
+    CatalogRequest, Cell, CredentialMode, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
     DEFAULT_REDIS_SCAN_COUNT, DraftId, DriverAvailability, DriverCapabilities, DriverKind,
     OperationId, OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration, ProfileId,
     PublicCode, PublicSummary, RedisKeyInspectRequest, RedisScanRequest, RequestIdentity,
@@ -20,7 +20,7 @@ use crate::public_error::{
     PublicOperationError, RecoveryAction, RecoveryCommand, RecoveryCommandDispatcher,
     dispatch_recovery,
 };
-use crate::secrets::ReplacementSecretBuffer;
+use crate::secrets::{EnvironmentAvailability, ReplacementSecretBuffer};
 use crate::service::DeleteProfileRequest;
 
 use super::accessibility::{
@@ -208,13 +208,31 @@ const fn delete_failure_is_known_non_committed(summary: PublicSummary) -> bool {
     )
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct DeleteConfirmation {
     profile_id: ProfileId,
     profile_generation: ProfileGeneration,
     profile_name: String,
     active_kind: Option<OperationKind>,
+    migration_backup: Option<PathBuf>,
     migration_confirmed: bool,
+}
+
+impl std::fmt::Debug for DeleteConfirmation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeleteConfirmation")
+            .field("profile_id", &"<redacted>")
+            .field("profile_generation", &self.profile_generation)
+            .field("profile_name", &"<redacted>")
+            .field("active_kind", &self.active_kind)
+            .field(
+                "migration_backup",
+                &self.migration_backup.as_ref().map(|_| "<redacted>"),
+            )
+            .field("migration_confirmed", &self.migration_confirmed)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +293,14 @@ impl DbotterApp {
         let draft_id = DraftId(self.next_draft_id);
         self.next_draft_id = self.next_draft_id.saturating_add(1);
         draft_id
+    }
+
+    fn configured_profile_editor(&self, mut editor: ProfileEditor) -> ProfileEditor {
+        editor.set_migration_presentation(
+            self.model.config.migration_required(),
+            self.model.config.migration_backup(),
+        );
+        editor
     }
 
     fn redis_explorer_mut(&mut self, key: &WorkspaceKey) -> &mut RedisExplorer {
@@ -578,8 +604,17 @@ impl DbotterApp {
         });
         self.prune_redis_explorers();
         self.prune_active_operations();
+        let migration_required = self.model.config.migration_required();
+        let migration_backup = self.model.config.migration_backup().map(PathBuf::from);
         if let Some(editor) = self.profile_editor.as_mut() {
             editor.set_config_uncertain(self.model.is_config_uncertain());
+            editor.set_migration_presentation(migration_required, migration_backup.as_deref());
+        }
+        if let Some(confirmation) = self.delete_confirmation.as_mut() {
+            confirmation.migration_backup = migration_backup;
+            if confirmation.migration_backup.is_none() {
+                confirmation.migration_confirmed = false;
+            }
         }
     }
 
@@ -971,6 +1006,10 @@ impl DbotterApp {
         };
         if !profile.is_ready() {
             self.model.status = "Driver is planned and unavailable".to_owned();
+            return;
+        }
+        if !profile.can_connect() {
+            self.model.status = "Environment credential is not available".to_owned();
             return;
         }
         if self.model.active_generation(&profile_id) != Some(profile.generation) {
@@ -2017,12 +2056,12 @@ impl DbotterApp {
             return;
         };
         let draft_id = self.allocate_draft_id();
-        let mut editor = ProfileEditor::edit(
+        let mut editor = self.configured_profile_editor(ProfileEditor::edit(
             draft_id,
             &profile.persisted,
             profile.generation,
             profile.has_current_session_secret,
-        );
+        ));
         editor.request_focus(field);
         self.profile_editor = Some(editor);
     }
@@ -2044,6 +2083,7 @@ impl DbotterApp {
                 .active_operations
                 .get(&profile.id)
                 .map(|active| active.kind),
+            migration_backup: self.model.config.migration_backup().map(PathBuf::from),
             migration_confirmed: false,
         });
     }
@@ -2065,8 +2105,9 @@ impl DbotterApp {
         }
         let profile_id = confirmation.profile_id.clone();
         let profile_generation = confirmation.profile_generation;
-        let migration_consent =
-            MigrationConsent::from_confirmation(confirmation.migration_confirmed);
+        let migration_consent = MigrationConsent::from_confirmation(
+            confirmation.migration_backup.is_some() && confirmation.migration_confirmed,
+        );
         let operation_id = self.model.next_operation();
         let request = DeleteProfileRequest {
             profile_id: profile_id.clone(),
@@ -2125,15 +2166,25 @@ impl DbotterApp {
                     );
                     ui.strong("After confirmed deletion, server state will be reported as Unknown.");
                 }
-                let migration = ui.checkbox(
-                    &mut confirmation.migration_confirmed,
-                    "Allow a version-1 configuration migration with backup if required",
-                );
-                named_author_id(
-                    migration,
-                    "profile.delete.migration_confirm",
-                    "Confirm delete configuration migration backup",
-                );
+                if let Some(backup) = confirmation.migration_backup.as_deref() {
+                    let migration = ui.checkbox(
+                        &mut confirmation.migration_confirmed,
+                        "Allow the version-1 configuration migration",
+                    );
+                    named_author_id(
+                        migration,
+                        "profile.delete.migration_confirm",
+                        "Confirm delete configuration migration backup",
+                    );
+                    let backup = backup.to_string_lossy().into_owned();
+                    let response = ui.label(format!("Backup: {backup}"));
+                    named_dynamic_value_author_id(
+                        response,
+                        "profile.delete.migration_backup".to_owned(),
+                        "Delete migration backup path".to_owned(),
+                        backup,
+                    );
+                }
                 ui.horizontal(|ui| {
                     let cancel = ui.add_sized(
                         [104.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
@@ -2298,7 +2349,8 @@ impl DbotterApp {
             );
             if named_author_id(primary, "connection.new", "New connection").clicked() {
                 let draft_id = self.allocate_draft_id();
-                self.profile_editor = Some(ProfileEditor::new(draft_id, self.first_run_driver));
+                let editor = ProfileEditor::new(draft_id, self.first_run_driver);
+                self.profile_editor = Some(self.configured_profile_editor(editor));
             }
             ui.add_space(24.0);
             ui.label("Credential sources: None · This app session · Environment variable");
@@ -2333,7 +2385,8 @@ impl DbotterApp {
         );
         if named_author_id(mysql, "connection.new.mysql", "New MySQL connection").clicked() {
             let draft_id = self.allocate_draft_id();
-            self.profile_editor = Some(ProfileEditor::new(draft_id, DriverKind::MySql));
+            let editor = ProfileEditor::new(draft_id, DriverKind::MySql);
+            self.profile_editor = Some(self.configured_profile_editor(editor));
         }
         let redis = ui.add_enabled(
             actions_enabled,
@@ -2342,7 +2395,8 @@ impl DbotterApp {
         );
         if named_author_id(redis, "connection.new.redis", "New Redis connection").clicked() {
             let draft_id = self.allocate_draft_id();
-            self.profile_editor = Some(ProfileEditor::new(draft_id, DriverKind::Redis));
+            let editor = ProfileEditor::new(draft_id, DriverKind::Redis);
+            self.profile_editor = Some(self.configured_profile_editor(editor));
         }
         let mongodb = ui.add_enabled(
             false,
@@ -2472,6 +2526,19 @@ impl DbotterApp {
         if let Some(database) = &profile.database {
             ui.small(format!("database: {database}"));
         }
+        if profile.persisted.credential_mode == CredentialMode::Environment {
+            let availability = profile
+                .environment_availability
+                .unwrap_or(EnvironmentAvailability::Missing);
+            let availability = environment_availability_label(availability).to_owned();
+            let response = ui.small(format!("Environment credential: {availability}"));
+            named_dynamic_value_author_id(
+                response,
+                "profile.environment.availability".to_owned(),
+                "Environment credential".to_owned(),
+                availability,
+            );
+        }
         let state = self.model.connection_state(&profile.id).clone();
         let actions_enabled = !self.model.is_config_uncertain();
         ui.horizontal_wrapped(|ui| {
@@ -2479,7 +2546,7 @@ impl DbotterApp {
             match state {
                 ConnectionState::Disconnected | ConnectionState::Failed { .. } => {
                     let connect = ui.add_enabled(
-                        actions_enabled && profile.is_ready(),
+                        actions_enabled && profile.can_connect(),
                         egui::Button::new("Connect")
                             .min_size(egui::vec2(104.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
                     );
@@ -2538,12 +2605,13 @@ impl DbotterApp {
             );
             if named_author_id(edit, "profile.edit", "Edit profile").clicked() {
                 let draft_id = self.allocate_draft_id();
-                self.profile_editor = Some(ProfileEditor::edit(
+                let editor = ProfileEditor::edit(
                     draft_id,
                     &profile.persisted,
                     profile.generation,
                     profile.has_current_session_secret,
-                ));
+                );
+                self.profile_editor = Some(self.configured_profile_editor(editor));
             }
             let delete = ui.add_enabled(
                 actions_enabled,
@@ -2777,6 +2845,14 @@ fn connection_label(state: &ConnectionState) -> String {
     }
 }
 
+const fn environment_availability_label(availability: EnvironmentAvailability) -> &'static str {
+    match availability {
+        EnvironmentAvailability::Available => "Available",
+        EnvironmentAvailability::Missing => "Missing",
+        EnvironmentAvailability::Empty => "Empty",
+    }
+}
+
 fn render_recovery_error(
     ui: &mut egui::Ui,
     surface: &'static str,
@@ -2965,6 +3041,7 @@ fn display_cell(cell: &Cell) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2972,6 +3049,7 @@ mod tests {
         ActiveOperation, ConnectionState, DbotterApp, MySqlExplorerIntent, PendingDelete,
         ProfileEditor,
     };
+    use crate::config::ConfigSourceVersion;
     use crate::model::{
         Cell, Column, ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind,
         OperationId, OperationKind, OperationRecipeId, ProfileFieldId, ProfileGeneration,
@@ -2981,11 +3059,12 @@ mod tests {
         SessionGeneration, TlsMode,
     };
     use crate::public_error::{PublicOperationError, RecoveryAction, SafeContext};
+    use crate::secrets::EnvironmentAvailability;
     use crate::service::SessionDisposition;
     use crate::ui::accessibility::{accesskit_author_node, assert_accesskit_value_confined};
     use crate::ui::adapter::{ServicePort, UiCommand, bounded_ports};
     use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
-    use crate::ui::model::{ProfileSnapshot, WorkspaceKey};
+    use crate::ui::model::{ConfigPresentation, ProfileSnapshot, WorkspaceKey};
     use crate::ui::redis_explorer::RedisExplorerIntent;
     use eframe::egui::{Context, Event, Key, Modifiers, RawInput, accesskit};
 
@@ -3017,6 +3096,7 @@ mod tests {
             availability,
             planned_reason: None,
             has_current_session_secret: false,
+            environment_availability: None,
             persisted,
         }
     }
@@ -3253,6 +3333,7 @@ mod tests {
         assert!(service.try_emit(crate::ui::UiEvent::ProfilesLoaded {
             operation_id,
             profiles: Vec::new(),
+            config: Default::default(),
         }));
         app.poll_events();
 
@@ -4100,6 +4181,10 @@ mod tests {
             })
         );
 
+        app.model.config = ConfigPresentation::for_source(
+            ConfigSourceVersion::V1,
+            std::path::Path::new("/tmp/dbotter-delete-config.toml"),
+        );
         app.open_delete_confirmation(&profile);
         let context = Context::default();
         context.enable_accesskit();
@@ -4348,6 +4433,7 @@ mod tests {
         assert!(service.try_emit(crate::ui::UiEvent::ProfilesLoaded {
             operation_id: OperationId(refresh_operation.0 + 1),
             profiles: vec![profile(DriverKind::MySql, DriverAvailability::Ready)],
+            config: Default::default(),
         }));
         app.poll_events();
 
@@ -4397,6 +4483,7 @@ mod tests {
         assert!(service.try_emit(crate::ui::UiEvent::ProfilesLoaded {
             operation_id: OperationId(1_000),
             profiles: vec![profile(DriverKind::MySql, DriverAvailability::Ready)],
+            config: Default::default(),
         }));
         app.poll_events();
         assert!(
@@ -5320,6 +5407,7 @@ mod tests {
         assert!(service.try_emit(crate::ui::UiEvent::ProfilesLoaded {
             operation_id: OperationId(900),
             profiles: vec![refreshed_alpha.clone(), beta],
+            config: Default::default(),
         }));
         reload_app.poll_events();
         render_redis_explorer(&mut reload_app);
@@ -5355,7 +5443,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_environment_profile_reports_missing_without_exposing_a_value_and_gates_connect() {
+    fn saved_environment_profile_reports_availability_without_exposing_a_value_and_gates_connect() {
         let (ui, mut service) = bounded_ports(4);
         let mut app = DbotterApp::new(ui);
         assert!(service.try_next_command().is_some());
@@ -5363,23 +5451,32 @@ mod tests {
         profile.persisted.credential_mode = CredentialMode::Environment;
         profile.persisted.secret_env = Some("DBOTTER_G_DEFINITELY_MISSING".to_owned());
 
-        let context = Context::default();
-        context.enable_accesskit();
-        let output = context.run_ui(RawInput::default(), |ui| app.profile_card(ui, &profile));
-        let update = output
-            .platform_output
-            .accesskit_update
-            .as_ref()
-            .expect("saved environment profile AccessKit");
-        let (_, availability) = accesskit_author_node(update, "profile.environment.availability");
-        assert_eq!(availability.label(), Some("Environment credential"));
-        assert_eq!(availability.value(), Some("Missing"));
-        assert!(
-            accesskit_author_node(update, "connection.connect")
-                .1
-                .is_disabled(),
-            "a saved Environment profile may connect only when its name is Available"
-        );
+        for (availability, label, connect_disabled) in [
+            (EnvironmentAvailability::Available, "Available", false),
+            (EnvironmentAvailability::Missing, "Missing", true),
+            (EnvironmentAvailability::Empty, "Empty", true),
+        ] {
+            profile.environment_availability = Some(availability);
+            let context = Context::default();
+            context.enable_accesskit();
+            let output = context.run_ui(RawInput::default(), |ui| app.profile_card(ui, &profile));
+            let update = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("saved environment profile AccessKit");
+            let (_, availability) =
+                accesskit_author_node(update, "profile.environment.availability");
+            assert_eq!(availability.label(), Some("Environment credential"));
+            assert_eq!(availability.value(), Some(label));
+            assert_eq!(
+                accesskit_author_node(update, "connection.connect")
+                    .1
+                    .is_disabled(),
+                connect_disabled,
+                "a saved Environment profile may connect only when its name is Available"
+            );
+        }
     }
 
     #[test]
@@ -5413,6 +5510,7 @@ mod tests {
         app.open_delete_confirmation(&profile);
         let delete_context = Context::default();
         delete_context.enable_accesskit();
+        let _ = delete_context.run_ui(RawInput::default(), |ui| app.show_delete_confirmation(ui));
         let delete_output =
             delete_context.run_ui(RawInput::default(), |ui| app.show_delete_confirmation(ui));
         let delete_update = delete_output
@@ -5443,5 +5541,114 @@ mod tests {
         assert!(form_source.contains("\"profile.migration.backup\""));
         assert!(app_source.contains("\"profile.delete.migration_backup\""));
         assert!(form_source.contains("migration_required"));
+    }
+
+    #[test]
+    fn v1_profile_and_delete_surfaces_expose_the_exact_confined_backup_path() {
+        let config_path = PathBuf::from("/tmp/dbotter-g-v1-config.toml");
+        let config = ConfigPresentation::for_source(ConfigSourceVersion::V1, &config_path);
+        let backup = config
+            .migration_backup()
+            .expect("v1 fixed backup")
+            .to_string_lossy()
+            .into_owned();
+
+        let mut editor = ProfileEditor::new(DraftId(991), DriverKind::MySql);
+        editor.set_migration_presentation(config.migration_required(), config.migration_backup());
+        let editor_context = Context::default();
+        editor_context.enable_accesskit();
+        let editor_output = editor_context.run_ui(RawInput::default(), |ui| {
+            let _ = editor.show(ui);
+        });
+        let editor_update = editor_output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("v1 profile editor AccessKit");
+        assert!(
+            !accesskit_author_node(editor_update, "profile.migration.confirm")
+                .1
+                .is_disabled()
+        );
+        assert_accesskit_value_confined(editor_update, "profile.migration.backup", &backup);
+
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        app.model.config = config;
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.open_delete_confirmation(&profile);
+        assert!(
+            !format!("{:?}", app.delete_confirmation).contains(&backup),
+            "delete confirmation Debug must redact the user-owned backup path"
+        );
+        let delete_context = Context::default();
+        delete_context.enable_accesskit();
+        let _ = delete_context.run_ui(RawInput::default(), |ui| app.show_delete_confirmation(ui));
+        let delete_output =
+            delete_context.run_ui(RawInput::default(), |ui| app.show_delete_confirmation(ui));
+        let delete_update = delete_output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("v1 delete confirmation AccessKit");
+        assert!(
+            !accesskit_author_node(delete_update, "profile.delete.migration_confirm")
+                .1
+                .is_disabled()
+        );
+        assert_accesskit_value_confined(delete_update, "profile.delete.migration_backup", &backup);
+    }
+
+    #[test]
+    fn accepted_reload_updates_already_open_migration_surfaces() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        let operation_id = match service.try_next_command() {
+            Some(UiCommand::RefreshProfiles { operation_id }) => operation_id,
+            other => panic!("startup refresh expected, got {other:?}"),
+        };
+        app.profile_editor = Some(ProfileEditor::new(DraftId(992), DriverKind::MySql));
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.open_delete_confirmation(&profile);
+
+        let config_path = PathBuf::from("/tmp/dbotter-g-reloaded-v1.toml");
+        let config = ConfigPresentation::for_source(ConfigSourceVersion::V1, &config_path);
+        let backup = config
+            .migration_backup()
+            .expect("reload backup")
+            .to_string_lossy()
+            .into_owned();
+        assert!(service.try_emit(crate::ui::UiEvent::ProfilesLoaded {
+            operation_id,
+            profiles: vec![profile],
+            config,
+        }));
+        app.poll_events();
+
+        assert_eq!(
+            app.delete_confirmation
+                .as_ref()
+                .and_then(|confirmation| confirmation.migration_backup.as_deref())
+                .map(|path| path.to_string_lossy().into_owned()),
+            Some(backup.clone())
+        );
+        let context = Context::default();
+        context.enable_accesskit();
+        let output = context.run_ui(RawInput::default(), |ui| {
+            let _ = app.profile_editor.as_mut().expect("open editor").show(ui);
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("reloaded v1 editor AccessKit");
+        assert_accesskit_value_confined(update, "profile.migration.backup", &backup);
     }
 }
