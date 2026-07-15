@@ -3223,6 +3223,7 @@ const fn export_format_label(format: ExportFormat) -> &'static str {
     }
 }
 
+#[cfg(target_os = "macos")]
 const fn export_format_extension(format: ExportFormat) -> &'static str {
     match format {
         ExportFormat::Csv => "csv",
