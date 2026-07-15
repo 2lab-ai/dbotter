@@ -34,7 +34,7 @@ end
 
 def load_workflow(path)
   text = File.read(path, encoding: "UTF-8")
-  reject_duplicate_keys(Psych.parse_stream(text, path.to_s), path.to_s)
+  reject_duplicate_keys(Psych.parse_stream(text, filename: path.to_s), path.to_s)
   value = Psych.safe_load(text, permitted_classes: [], permitted_symbols: [], aliases: false, filename: path.to_s)
   fail_contract("#{path}: root is not a mapping") unless value.is_a?(Hash)
 
