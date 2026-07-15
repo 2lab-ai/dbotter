@@ -179,6 +179,13 @@ if "${validate[@]/$proof/$wrong_candidate_config}" >/dev/null 2>&1; then
   fail "proof accepted a candidate config contract that disagrees with the manifest"
 fi
 
+wrong_candidate_config_type="$tmp_dir/wrong-candidate-config-type.json"
+jq '.preflight.candidate.config_contract.read_versions[0] = true' \
+  "$proof" >"$wrong_candidate_config_type"
+if "${validate[@]/$proof/$wrong_candidate_config_type}" >/dev/null 2>&1; then
+  fail "proof accepted a type-confused candidate config contract"
+fi
+
 wrong_commit="$tmp_dir/wrong-commit.json"
 jq '.tap.formula_commit = "2222222222222222222222222222222222222222"' "$proof" >"$wrong_commit"
 if "${validate[@]/$proof/$wrong_commit}" >/dev/null 2>&1; then

@@ -22,10 +22,15 @@ TAG_RE = re.compile(
 VERSION_RE = re.compile(
     r"^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{6}\.[1-9][0-9]*\.[1-9][0-9]*$"
 )
-PROOF_KEYS = {"schema", "dispatch", "tap", "workflow"}
+PROOF_KEYS = {"schema", "dispatch", "tap", "workflow", "preflight"}
 DISPATCH_KEYS = {"tag", "source_sha", "version", "manifest_url", "manifest_sha256"}
 TAP_KEYS = {"repository", "formula_commit", "formula_blob", "formula_sha256"}
 WORKFLOW_KEYS = {"run_id", "run_attempt"}
+PREFLIGHT_KEYS = {"schema", "artifacts", "candidate"}
+PREFLIGHT_ARTIFACT_KEYS = {"target", "url", "bytes", "sha256"}
+PREFLIGHT_CANDIDATE_KEYS = {"target", "identity", "config_contract"}
+IDENTITY_KEYS = {"package_version", "channel", "build_id", "source_sha", "target", "arch"}
+CONFIG_KEYS = {"read_versions", "write_version", "migration_backup_suffix"}
 TARGETS = {
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -172,6 +177,9 @@ def validate(args: argparse.Namespace) -> None:
     dispatch = exact_object(proof["dispatch"], DISPATCH_KEYS, "proof.dispatch")
     tap = exact_object(proof["tap"], TAP_KEYS, "proof.tap")
     workflow = exact_object(proof["workflow"], WORKFLOW_KEYS, "proof.workflow")
+    preflight = exact_object(proof["preflight"], PREFLIGHT_KEYS, "proof.preflight")
+    if preflight["schema"] != "dbotter.tap-preflight.v1":
+        raise ContractError("proof preflight schema is not dbotter.tap-preflight.v1")
     if dispatch != {
         "tag": expected_tag,
         "source_sha": expected_source_sha,
@@ -231,6 +239,71 @@ def validate(args: argparse.Namespace) -> None:
     }
     if set(by_target) != TARGETS:
         raise ContractError("manifest target inventory is not exact")
+
+    measured_artifacts = preflight["artifacts"]
+    if not isinstance(measured_artifacts, list) or len(measured_artifacts) != len(TARGETS):
+        raise ContractError("proof preflight must measure exactly four artifacts")
+    for index, measurement in enumerate(measured_artifacts):
+        measurement = exact_object(
+            measurement,
+            PREFLIGHT_ARTIFACT_KEYS,
+            f"proof.preflight.artifacts[{index}]",
+        )
+        if type(measurement["bytes"]) is not int or measurement["bytes"] < 1:
+            raise ContractError(f"proof preflight artifact {index} has invalid bytes")
+        exact_string(
+            measurement["sha256"],
+            SHA256_RE,
+            f"proof.preflight.artifacts[{index}].sha256",
+        )
+    expected_measurements = [
+        {
+            "target": target,
+            "url": by_target[target]["url"],
+            "bytes": by_target[target]["bytes"],
+            "sha256": by_target[target]["sha256"],
+        }
+        for target in sorted(TARGETS)
+    ]
+    if measured_artifacts != expected_measurements:
+        raise ContractError("proof preflight artifact measurements disagree with manifest")
+
+    candidate = exact_object(
+        preflight["candidate"], PREFLIGHT_CANDIDATE_KEYS, "proof.preflight.candidate"
+    )
+    identity = exact_object(
+        candidate["identity"], IDENTITY_KEYS, "proof.preflight.candidate.identity"
+    )
+    config_contract = exact_object(
+        candidate["config_contract"],
+        CONFIG_KEYS,
+        "proof.preflight.candidate.config_contract",
+    )
+    read_versions = config_contract["read_versions"]
+    if (
+        not isinstance(read_versions, list)
+        or len(read_versions) != 2
+        or any(type(version) is not int for version in read_versions)
+        or read_versions != [1, 2]
+        or type(config_contract["write_version"]) is not int
+        or config_contract["write_version"] != 2
+        or config_contract["migration_backup_suffix"] != ".v1.bak"
+    ):
+        raise ContractError("proof preflight candidate config contract is not exact")
+    expected_candidate_target = "x86_64-unknown-linux-gnu"
+    if candidate["target"] != expected_candidate_target:
+        raise ContractError("proof preflight executed the wrong candidate target")
+    if identity != {
+        "package_version": manifest["package_version"],
+        "channel": "preview",
+        "build_id": expected_tag.removeprefix("preview-"),
+        "source_sha": expected_source_sha,
+        "target": expected_candidate_target,
+        "arch": "x86_64",
+    }:
+        raise ContractError("proof preflight candidate identity disagrees with manifest")
+    if config_contract != manifest["config_contract"]:
+        raise ContractError("proof preflight candidate config contract disagrees with manifest")
 
     if args.formula.is_symlink() or not args.formula.is_file():
         raise ContractError("formula must be a regular file, not a link")
