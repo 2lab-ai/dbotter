@@ -40,6 +40,7 @@ pub struct ProfileWorkspace {
     pub error: Option<PublicOperationError>,
     pub catalog_page: Option<CatalogPage>,
     pub catalog_retry: Option<CatalogRequest>,
+    pub catalog_error: Option<PublicOperationError>,
     pub redis_key_page: Option<RedisKeyPage>,
     pub redis_scan_retry: Option<RedisScanRequest>,
     pub redis_scan_error: Option<PublicOperationError>,
@@ -142,6 +143,7 @@ pub enum UiEvent {
     ProfilesFailed {
         operation_id: OperationId,
         summary: PublicSummary,
+        error: PublicOperationError,
     },
     ProfileSaved {
         operation_id: OperationId,
@@ -151,10 +153,18 @@ pub enum UiEvent {
         session_retained: bool,
         warning: Option<PublicSummary>,
     },
-    ProfileSaveFailed {
+    ProfileCreateFailed {
+        operation_id: OperationId,
+        draft_id: DraftId,
+        summary: PublicSummary,
+        error: PublicOperationError,
+    },
+    ProfileUpdateFailed {
         operation_id: OperationId,
         profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
         summary: PublicSummary,
+        error: PublicOperationError,
     },
     ConnectionReady {
         operation_id: OperationId,
@@ -178,6 +188,7 @@ pub enum UiEvent {
         operation_id: OperationId,
         draft_id: DraftId,
         summary: PublicSummary,
+        error: PublicOperationError,
     },
     QueryFinished {
         operation_id: OperationId,
@@ -194,6 +205,7 @@ pub enum UiEvent {
     CatalogPageFailed {
         request: CatalogRequest,
         summary: PublicSummary,
+        error: PublicOperationError,
         session_generation: Option<SessionGeneration>,
         session_disposition: Option<SessionDisposition>,
     },
@@ -228,6 +240,7 @@ pub enum UiEvent {
         session_generation: Option<SessionGeneration>,
         kind: OperationKind,
         summary: PublicSummary,
+        error: PublicOperationError,
         session_disposition: Option<SessionDisposition>,
         connection_outcome: ConnectionFailureOutcome,
     },
@@ -363,12 +376,13 @@ impl UiModel {
             }
             UiEvent::ProfilesFailed {
                 operation_id,
-                summary,
+                error,
+                ..
             } => {
                 if !self.accept_profiles_operation(operation_id) {
                     return;
                 }
-                self.status = summary.message().to_owned();
+                self.status = error.summary.message().to_owned();
             }
             UiEvent::ProfileSaved {
                 profile_id,
@@ -413,8 +427,9 @@ impl UiModel {
                     self.status = summary.message().to_owned();
                 }
             }
-            UiEvent::ProfileSaveFailed { summary, .. } => {
-                self.status = summary.message().to_owned();
+            UiEvent::ProfileCreateFailed { error, .. }
+            | UiEvent::ProfileUpdateFailed { error, .. } => {
+                self.status = error.summary.message().to_owned();
             }
             UiEvent::ConnectionReady {
                 operation_id,
@@ -460,8 +475,8 @@ impl UiModel {
             UiEvent::DraftConnectionReady { elapsed_ms, .. } => {
                 self.status = format!("Draft connection ready in {elapsed_ms} ms");
             }
-            UiEvent::DraftOperationFailed { summary, .. } => {
-                self.status = summary.message().to_owned();
+            UiEvent::DraftOperationFailed { error, .. } => {
+                self.status = error.summary.message().to_owned();
             }
             UiEvent::ExecuteUnavailable {
                 operation_id,
@@ -520,18 +535,21 @@ impl UiModel {
                     let workspace =
                         self.exact_workspace_mut(&profile_id, page.identity.profile_generation);
                     workspace.catalog_retry = None;
+                    workspace.catalog_error = None;
                     workspace.catalog_page = Some(page);
                     self.status = "Catalog page loaded".to_owned();
                 }
             }
             UiEvent::CatalogPageFailed {
                 request,
-                summary,
+                error,
                 session_generation,
                 session_disposition,
+                ..
             } => {
                 let profile_id = request.profile_id().clone();
                 if self.event_is_current(&profile_id, request.profile_generation()) {
+                    let status = error.summary.message().to_owned();
                     self.fold_catalog_session(&profile_id, session_generation, session_disposition);
                     let workspace =
                         self.exact_workspace_mut(&profile_id, request.profile_generation());
@@ -539,7 +557,8 @@ impl UiModel {
                         page.stale = true;
                     }
                     workspace.catalog_retry = Some(request);
-                    self.status = summary.message().to_owned();
+                    workspace.catalog_error = Some(error);
+                    self.status = status;
                 }
             }
             UiEvent::RedisKeysLoaded {
@@ -641,7 +660,7 @@ impl UiModel {
                 profile_id,
                 profile_generation,
                 kind,
-                summary,
+                error,
                 connection_outcome,
                 ..
             } => {
@@ -656,6 +675,7 @@ impl UiModel {
                     self.connection_states.get(&profile_id),
                     Some(ConnectionState::Pending(pending)) if *pending != operation_id
                 );
+                let summary = error.summary;
                 match kind {
                     OperationKind::ConnectProfile | OperationKind::ReconnectProfile => {
                         if self.connection_states.get(&profile_id)
@@ -686,6 +706,7 @@ impl UiModel {
                         let workspace = self.exact_workspace_mut(&profile_id, profile_generation);
                         if workspace.pending_execute == Some(operation_id) {
                             workspace.pending_execute = None;
+                            workspace.error = Some(error);
                             self.status = summary.message().to_owned();
                         }
                     }
@@ -1037,6 +1058,12 @@ mod tests {
         model.fold(UiEvent::CatalogPageFailed {
             request: catalog_request.clone(),
             summary: PublicSummary::PermissionDenied,
+            error: PublicOperationError::new_or_internal(
+                OperationKind::BrowseMySql,
+                PublicSummary::PermissionDenied,
+                PublicCode::None,
+                &SafeContext::profile(profile_id.clone(), OperationId(10)),
+            ),
             session_generation: Some(SessionGeneration(31)),
             session_disposition: Some(SessionDisposition::Keep),
         });
@@ -1279,6 +1306,12 @@ mod tests {
                 session_generation: None,
                 kind: OperationKind::DisconnectProfile,
                 summary: PublicSummary::OperationCancelled,
+                error: PublicOperationError::new_or_internal(
+                    OperationKind::DisconnectProfile,
+                    PublicSummary::OperationCancelled,
+                    PublicCode::None,
+                    &SafeContext::profile(profile_id.clone(), predecessor),
+                ),
                 session_disposition: None,
                 connection_outcome: outcome,
             });
@@ -1306,6 +1339,12 @@ mod tests {
                 session_generation: None,
                 kind: OperationKind::ExecuteRead,
                 summary: PublicSummary::OperationCancelled,
+                error: PublicOperationError::new_or_internal(
+                    OperationKind::ExecuteRead,
+                    PublicSummary::OperationCancelled,
+                    PublicCode::None,
+                    &SafeContext::profile(profile_id.clone(), execute),
+                ),
                 session_disposition: None,
                 connection_outcome: outcome,
             });
@@ -1337,6 +1376,12 @@ mod tests {
                 session_generation: None,
                 kind: OperationKind::DisconnectProfile,
                 summary: PublicSummary::OperationCancelled,
+                error: PublicOperationError::new_or_internal(
+                    OperationKind::DisconnectProfile,
+                    PublicSummary::OperationCancelled,
+                    PublicCode::None,
+                    &SafeContext::profile(profile_id.clone(), reconnect),
+                ),
                 session_disposition: None,
                 connection_outcome: outcome,
             });

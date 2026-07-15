@@ -277,6 +277,27 @@ pub(super) enum ProfileEventResult {
     Failed,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingSave {
+    Create {
+        operation_id: OperationId,
+        draft_id: DraftId,
+    },
+    Update {
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+    },
+}
+
+impl PendingSave {
+    fn operation_id(&self) -> OperationId {
+        match self {
+            Self::Create { operation_id, .. } | Self::Update { operation_id, .. } => *operation_id,
+        }
+    }
+}
+
 pub(super) struct ProfileEditor {
     pub mode: EditorMode,
     draft_id: DraftId,
@@ -284,7 +305,7 @@ pub(super) struct ProfileEditor {
     pub draft: ProfileDraft,
     pub errors: ValidationErrors,
     status: String,
-    pending_save: Option<(OperationId, ProfileId)>,
+    pending_save: Option<PendingSave>,
     config_uncertain: bool,
     focus_field: Option<ProfileFieldId>,
 }
@@ -355,9 +376,7 @@ impl ProfileEditor {
     }
 
     pub fn pending_operation(&self) -> Option<OperationId> {
-        self.pending_save
-            .as_ref()
-            .map(|(operation_id, _)| *operation_id)
+        self.pending_save.as_ref().map(PendingSave::operation_id)
     }
 
     pub fn actions_enabled(&self) -> bool {
@@ -382,7 +401,7 @@ impl ProfileEditor {
             self.status = "Reload profiles before saving.".to_owned();
             return SaveAttempt::ConfigUncertain;
         }
-        if let Some((pending, _)) = self.pending_save {
+        if let Some(pending) = self.pending_save.as_ref().map(PendingSave::operation_id) {
             self.status = "Save is already pending".to_owned();
             return SaveAttempt::AlreadyPending(pending);
         }
@@ -407,10 +426,23 @@ impl ProfileEditor {
         }
         let profile_id = ProfileId(profile.id.clone());
         let draft = profile.as_draft();
-        let pending_profile_id = profile_id.clone();
         let mode = self.mode.clone();
         let draft_id = self.draft_id;
         let destination_mode = profile.credential_mode;
+        let pending_save = match &mode {
+            EditorMode::Add => PendingSave::Create {
+                operation_id,
+                draft_id,
+            },
+            EditorMode::Edit {
+                original_id,
+                expected_generation,
+            } => PendingSave::Update {
+                operation_id,
+                profile_id: original_id.clone(),
+                profile_generation: *expected_generation,
+            },
+        };
         match port.try_submit_with(move || match mode {
             EditorMode::Add => UiCommand::CreateProfile(CreateProfileRequest {
                 draft_id,
@@ -438,7 +470,7 @@ impl ProfileEditor {
         }) {
             Ok(()) => {
                 self.errors = ValidationErrors::default();
-                self.pending_save = Some((operation_id, pending_profile_id));
+                self.pending_save = Some(pending_save);
                 self.status = "Saving profile…".to_owned();
                 SaveAttempt::Submitted(operation_id)
             }
@@ -467,7 +499,18 @@ impl ProfileEditor {
                 profile_id,
                 warning,
                 ..
-            } if self.pending_save.as_ref() == Some(&(*operation_id, profile_id.clone())) => {
+            } if matches!(
+                self.pending_save.as_ref(),
+                Some(PendingSave::Create { operation_id: pending, .. }) if pending == operation_id
+            ) || matches!(
+                self.pending_save.as_ref(),
+                Some(PendingSave::Update {
+                    operation_id: pending,
+                    profile_id: pending_profile,
+                    ..
+                }) if pending == operation_id && pending_profile == profile_id
+            ) =>
+            {
                 self.pending_save = None;
                 self.status = warning.map_or_else(
                     || "Profile saved".to_owned(),
@@ -475,13 +518,42 @@ impl ProfileEditor {
                 );
                 ProfileEventResult::Saved(profile_id.clone(), *warning)
             }
-            UiEvent::ProfileSaveFailed {
+            UiEvent::ProfileCreateFailed {
+                operation_id,
+                draft_id,
+                error,
+                ..
+            } if matches!(
+                self.pending_save.as_ref(),
+                Some(PendingSave::Create {
+                    operation_id: pending,
+                    draft_id: pending_draft,
+                }) if pending == operation_id && pending_draft == draft_id
+            ) =>
+            {
+                self.pending_save = None;
+                self.status = error.summary.message().to_owned();
+                ProfileEventResult::Failed
+            }
+            UiEvent::ProfileUpdateFailed {
                 operation_id,
                 profile_id,
-                summary,
-            } if self.pending_save.as_ref() == Some(&(*operation_id, profile_id.clone())) => {
+                profile_generation,
+                error,
+                ..
+            } if matches!(
+                self.pending_save.as_ref(),
+                Some(PendingSave::Update {
+                    operation_id: pending,
+                    profile_id: pending_profile,
+                    profile_generation: pending_generation,
+                }) if pending == operation_id
+                    && pending_profile == profile_id
+                    && pending_generation == profile_generation
+            ) =>
+            {
                 self.pending_save = None;
-                self.status = summary.message().to_owned();
+                self.status = error.summary.message().to_owned();
                 ProfileEventResult::Failed
             }
             _ => ProfileEventResult::Ignored,

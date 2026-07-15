@@ -114,14 +114,12 @@ impl DbotterApp {
                     .or_default()
                     .handle_loaded(page.clone());
             }
-            UiEvent::CatalogPageFailed {
-                request, summary, ..
-            } => {
+            UiEvent::CatalogPageFailed { request, error, .. } => {
                 let key = (request.profile_id().clone(), request.profile_generation());
                 self.mysql_explorers
                     .entry(key)
                     .or_default()
-                    .handle_failed(request.clone(), *summary);
+                    .handle_failed(request.clone(), error.summary);
             }
             UiEvent::ProfileDeleted {
                 profile_id,

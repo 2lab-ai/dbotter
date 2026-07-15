@@ -29,6 +29,29 @@ use dbotter::ui::{
     WORK_CAPACITY, WorkspaceKey, bounded_ports, controller_ports, spawn_with_service,
 };
 
+fn typed_profile_error(
+    kind: dbotter::model::OperationKind,
+    profile_id: &ProfileId,
+    operation_id: OperationId,
+    summary: dbotter::model::PublicSummary,
+) -> dbotter::public_error::PublicOperationError {
+    let code = match summary {
+        dbotter::model::PublicSummary::AuthenticationFailed => {
+            dbotter::model::PublicCode::SessionCredential
+        }
+        dbotter::model::PublicSummary::TlsVerificationFailed => {
+            dbotter::model::PublicCode::TlsHostnameMismatch
+        }
+        _ => dbotter::model::PublicCode::None,
+    };
+    dbotter::public_error::PublicOperationError::new_or_internal(
+        kind,
+        summary,
+        code,
+        &dbotter::public_error::SafeContext::profile(profile_id.clone(), operation_id),
+    )
+}
+
 #[test]
 fn controller_capacities_and_task_scope_shape_are_exact() {
     assert_eq!(WORK_CAPACITY, 32);
@@ -483,6 +506,12 @@ fn ui_connection_state_table_covers_credentials_cache_disposition_and_shutdown()
         session_generation: Some(SessionGeneration(7)),
         kind: dbotter::model::OperationKind::ExecuteRead,
         summary: dbotter::model::PublicSummary::ConstraintRejected,
+        error: typed_profile_error(
+            dbotter::model::OperationKind::ExecuteRead,
+            &profile_id,
+            OperationId(44),
+            dbotter::model::PublicSummary::ConstraintRejected,
+        ),
         session_disposition: Some(SessionDisposition::Keep),
         connection_outcome: ConnectionFailureOutcome::Preserve,
     });
@@ -523,6 +552,12 @@ fn ui_connection_state_table_covers_credentials_cache_disposition_and_shutdown()
             session_generation: Some(SessionGeneration(7)),
             kind: dbotter::model::OperationKind::ExecuteRead,
             summary,
+            error: typed_profile_error(
+                dbotter::model::OperationKind::ExecuteRead,
+                &profile_id,
+                operation_id,
+                summary,
+            ),
             session_disposition: Some(SessionDisposition::Evict),
             connection_outcome,
         });
@@ -544,6 +579,12 @@ fn ui_connection_state_table_covers_credentials_cache_disposition_and_shutdown()
         session_generation: None,
         kind: dbotter::model::OperationKind::ConnectProfile,
         summary: dbotter::model::PublicSummary::CredentialRequired,
+        error: typed_profile_error(
+            dbotter::model::OperationKind::ConnectProfile,
+            &profile_id,
+            credential_operation,
+            dbotter::model::PublicSummary::CredentialRequired,
+        ),
         session_disposition: None,
         connection_outcome: ConnectionFailureOutcome::NeedsCredential,
     });
@@ -608,6 +649,12 @@ fn connect_auth_tls_network_and_timeout_failures_remain_visibly_failed() {
             session_generation: Some(SessionGeneration(70 + offset as u64)),
             kind: dbotter::model::OperationKind::ConnectProfile,
             summary,
+            error: typed_profile_error(
+                dbotter::model::OperationKind::ConnectProfile,
+                &profile_id,
+                operation_id,
+                summary,
+            ),
             session_disposition: Some(SessionDisposition::Evict),
             connection_outcome,
         });
@@ -627,6 +674,12 @@ fn connect_auth_tls_network_and_timeout_failures_remain_visibly_failed() {
         session_generation: None,
         kind: dbotter::model::OperationKind::ConnectProfile,
         summary: dbotter::model::PublicSummary::CredentialRequired,
+        error: typed_profile_error(
+            dbotter::model::OperationKind::ConnectProfile,
+            &profile_id,
+            credential_operation,
+            dbotter::model::PublicSummary::CredentialRequired,
+        ),
         session_disposition: None,
         connection_outcome: ConnectionFailureOutcome::NeedsCredential,
     });
@@ -1745,7 +1798,7 @@ async fn duplicate_operation_id_mutation_is_busy_without_spawn_and_drops_queued_
     wait_for_event(&mut ui, |event| {
         matches!(
             event,
-            UiEvent::ProfileSaveFailed {
+            UiEvent::ProfileCreateFailed {
                 operation_id: OperationId(250),
                 summary: dbotter::model::PublicSummary::ResourceBusy,
                 ..
@@ -2078,7 +2131,7 @@ async fn edit_and_delete_cancel_active_work_only_after_observed_commit() {
         wait_for_event(&mut ui, |event| {
             matches!(
                 event,
-                UiEvent::ProfileSaveFailed {
+                UiEvent::ProfileUpdateFailed {
                     operation_id: OperationId(851),
                     ..
                 } | UiEvent::OperationFailed {
@@ -2433,6 +2486,7 @@ async fn draft_work_is_same_draft_and_global_bounded_and_cancel_releases_its_slo
                 draft_id: DraftId(1),
                 operation_id: OperationId(1_001),
                 summary: dbotter::model::PublicSummary::ResourceBusy,
+                ..
             }
         )
     })

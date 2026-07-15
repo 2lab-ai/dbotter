@@ -129,6 +129,7 @@ enum FailureContext {
     },
     Draft {
         draft_id: DraftId,
+        kind: OperationKind,
     },
     Profiles,
 }
@@ -230,6 +231,7 @@ impl TaskRegistry {
             },
             TaskScope::Draft { draft_id } => FailureContext::Draft {
                 draft_id: *draft_id,
+                kind: OperationKind::TestDraftConnection,
             },
             TaskScope::Export { .. } | TaskScope::Global => FailureContext::Profiles,
         };
@@ -550,7 +552,7 @@ enum TaskOutput {
     },
     Create {
         operation_id: OperationId,
-        fallback_profile_id: ProfileId,
+        draft_id: DraftId,
         result: Box<Result<RuntimeCreateOutcome, RuntimeMutationFailure>>,
     },
     Update {
@@ -996,31 +998,37 @@ fn start_draft_work(
     let reservation = match registry.reserve(operation_id) {
         Ok(reservation) => reservation,
         Err(()) => {
-            let _ = port.try_emit(UiEvent::DraftOperationFailed {
+            let _ = port.try_emit(draft_failed_event(
                 operation_id,
                 draft_id,
-                summary: PublicSummary::ResourceBusy,
-            });
+                OperationKind::TestDraftConnection,
+                PublicSummary::ResourceBusy,
+                PublicCode::None,
+            ));
             return;
         }
     };
     let Ok(draft_permit) = draft_permits.try_acquire(draft_id) else {
         registry.release_reservation(reservation);
-        let _ = port.try_emit(UiEvent::DraftOperationFailed {
+        let _ = port.try_emit(draft_failed_event(
             operation_id,
             draft_id,
-            summary: PublicSummary::ResourceBusy,
-        });
+            OperationKind::TestDraftConnection,
+            PublicSummary::ResourceBusy,
+            PublicCode::None,
+        ));
         return;
     };
     let Ok(global_permit) = global_permits.clone().try_acquire_owned() else {
         drop(draft_permit);
         registry.release_reservation(reservation);
-        let _ = port.try_emit(UiEvent::DraftOperationFailed {
+        let _ = port.try_emit(draft_failed_event(
             operation_id,
             draft_id,
-            summary: PublicSummary::ResourceBusy,
-        });
+            OperationKind::TestDraftConnection,
+            PublicSummary::ResourceBusy,
+            PublicCode::None,
+        ));
         return;
     };
 
@@ -1054,7 +1062,10 @@ fn start_draft_work(
         reservation,
         task,
         TaskClass::AsyncNetwork,
-        FailureContext::Draft { draft_id },
+        FailureContext::Draft {
+            draft_id,
+            kind: OperationKind::TestDraftConnection,
+        },
         completion_sent,
     ) {
         Ok(()) => {
@@ -1063,11 +1074,13 @@ fn start_draft_work(
         Err(task) => {
             drop(start_tx);
             task.join.abort();
-            let _ = port.try_emit(UiEvent::DraftOperationFailed {
+            let _ = port.try_emit(draft_failed_event(
                 operation_id,
                 draft_id,
-                summary: PublicSummary::ResourceBusy,
-            });
+                OperationKind::TestDraftConnection,
+                PublicSummary::ResourceBusy,
+                PublicCode::None,
+            ));
         }
     }
 }
@@ -1085,69 +1098,83 @@ async fn run_draft_work(
     let lease = tokio::select! {
         biased;
         () = cancel.cancelled() => {
-            return UiEvent::DraftOperationFailed {
+            return draft_failed_event(
                 operation_id,
                 draft_id,
-                summary: PublicSummary::OperationCancelled,
-            };
+                OperationKind::TestDraftConnection,
+                PublicSummary::OperationCancelled,
+                PublicCode::None,
+            );
         }
         () = tokio::time::sleep_until(deadline) => {
-            return UiEvent::DraftOperationFailed {
+            return draft_failed_event(
                 operation_id,
                 draft_id,
-                summary: PublicSummary::OperationTimedOut,
-            };
+                OperationKind::TestDraftConnection,
+                PublicSummary::OperationTimedOut,
+                PublicCode::None,
+            );
         }
         result = &mut acquire => match result {
             Ok(lease) => lease,
             Err(error) => {
-                return UiEvent::DraftOperationFailed {
+                let (summary, code) = error.public_error_parts();
+                return draft_failed_event(
                     operation_id,
                     draft_id,
-                    summary: error.public_summary(),
-                };
+                    OperationKind::TestDraftConnection,
+                    summary,
+                    code,
+                );
             }
         }
     };
     let ping = AssertUnwindSafe(lease.ping()).catch_unwind();
     tokio::pin!(ping);
     enum DraftAttempt {
-        Summary(Option<PublicSummary>),
+        Error(Option<(PublicSummary, PublicCode)>),
         Panicked(Box<dyn std::any::Any + Send>),
     }
     let attempt = tokio::select! {
         biased;
-        () = cancel.cancelled() => DraftAttempt::Summary(Some(PublicSummary::OperationCancelled)),
+        () = cancel.cancelled() => DraftAttempt::Error(Some((
+            PublicSummary::OperationCancelled,
+            PublicCode::None,
+        ))),
         () = tokio::time::sleep_until(deadline) => {
-            DraftAttempt::Summary(Some(PublicSummary::OperationTimedOut))
+            DraftAttempt::Error(Some((PublicSummary::OperationTimedOut, PublicCode::None)))
         }
         result = &mut ping => match result {
-            Ok(result) => DraftAttempt::Summary(
-                result.err().map(|error| ServiceError::from(error).public_summary())
+            Ok(result) => DraftAttempt::Error(
+                result.err().map(|error| ServiceError::from(error).public_error_parts())
             ),
             Err(payload) => DraftAttempt::Panicked(payload),
         },
     };
-    let close_summary = lease
+    let close_error = lease
         .close()
         .await
         .err()
-        .map(|error| ServiceError::from(error).public_summary());
+        .map(|error| ServiceError::from(error).public_error_parts());
     match attempt {
         DraftAttempt::Panicked(payload) => std::panic::resume_unwind(payload),
-        DraftAttempt::Summary(summary) => {
-            if let Some(summary) = summary.or(close_summary) {
-                UiEvent::DraftOperationFailed {
+        DraftAttempt::Error(error) => {
+            if let Some((summary, code)) = error.or(close_error) {
+                draft_failed_event(
                     operation_id,
                     draft_id,
+                    OperationKind::TestDraftConnection,
                     summary,
-                }
+                    code,
+                )
             } else if service.is_config_uncertain() {
-                UiEvent::DraftOperationFailed {
+                draft_failed_event(
                     operation_id,
                     draft_id,
-                    summary: PublicSummary::ResourceStale,
-                }
+                    OperationKind::TestDraftConnection,
+                    PublicSummary::ResourceStale,
+                    PublicCode::ConfigExternalChange,
+                )
             } else {
                 UiEvent::DraftConnectionReady {
                     operation_id: lease.operation_id(),
@@ -1888,7 +1915,8 @@ async fn run_execute(
         },
         (ExecuteAttempt::Driver(Err(error)), Ok(())) => {
             let disposition = SessionDisposition::for_driver_error(&error);
-            let summary = ServiceError::from(error).public_summary();
+            let service_error = ServiceError::from(error);
+            let (summary, code) = service_error.public_error_parts();
             if disposition == SessionDisposition::Evict {
                 service.evict_session_lease(&lease).await;
             }
@@ -1899,6 +1927,7 @@ async fn run_execute(
                 session_generation,
                 kind,
                 summary,
+                code,
                 disposition,
             )
         }
@@ -2111,9 +2140,33 @@ fn catalog_failed_event(
     session_generation: Option<SessionGeneration>,
     session_disposition: Option<SessionDisposition>,
 ) -> UiEvent {
+    catalog_failed_event_with_code(
+        request,
+        summary,
+        PublicCode::None,
+        session_generation,
+        session_disposition,
+    )
+}
+
+fn catalog_failed_event_with_code(
+    request: crate::model::CatalogRequest,
+    summary: PublicSummary,
+    code: PublicCode,
+    session_generation: Option<SessionGeneration>,
+    session_disposition: Option<SessionDisposition>,
+) -> UiEvent {
+    let error = public_profile_error(
+        OperationKind::BrowseMySql,
+        request.profile_id().clone(),
+        request.operation_id(),
+        summary,
+        code,
+    );
     UiEvent::CatalogPageFailed {
         request,
         summary,
+        error,
         session_generation,
         session_disposition,
     }
@@ -2519,7 +2572,10 @@ fn start_mutation(
             TaskScope::Draft {
                 draft_id: request.draft_id,
             },
-            FailureContext::Profiles,
+            FailureContext::Draft {
+                draft_id: request.draft_id,
+                kind: OperationKind::CreateProfile,
+            },
         ),
         UiCommand::UpdateProfile(request) => (
             request.operation_id,
@@ -2611,13 +2667,10 @@ async fn run_mutation(service: &ApplicationService, command: UiCommand) -> TaskO
         }
         UiCommand::CreateProfile(request) => {
             let operation_id = request.operation_id;
-            let fallback_profile_id = request
-                .explicit_id
-                .clone()
-                .unwrap_or_else(|| ProfileId(format!("draft-{}", request.draft_id.0)));
+            let draft_id = request.draft_id;
             TaskOutput::Create {
                 operation_id,
-                fallback_profile_id,
+                draft_id,
                 result: Box::new(service.create_profile_for_runtime(request).await),
             }
         }
@@ -2943,10 +2996,8 @@ async fn finish_task_output(
         } => match *result {
             Ok((outcome, profiles)) => {
                 if let Err(error) = application.apply_deferred_cleanup(outcome.cleanup).await {
-                    UiEvent::ProfilesFailed {
-                        operation_id,
-                        summary: error.public_summary(),
-                    }
+                    let (summary, code) = error.public_error_parts();
+                    profiles_failed_event(operation_id, summary, code)
                 } else if outcome.config_uncertain {
                     UiEvent::ConfigUncertain { operation_id }
                 } else {
@@ -2959,23 +3010,26 @@ async fn finish_task_output(
             Err(_error) if application.is_config_uncertain() => {
                 UiEvent::ConfigUncertain { operation_id }
             }
-            Err(error) => UiEvent::ProfilesFailed {
-                operation_id,
-                summary: error.public_summary(),
-            },
+            Err(error) => {
+                let (summary, code) = error.public_error_parts();
+                profiles_failed_event(operation_id, summary, code)
+            }
         },
         TaskOutput::Create {
             operation_id,
-            fallback_profile_id,
+            draft_id,
             result,
         } => match *result {
             Ok(outcome) => {
                 if let Err(error) = application.apply_deferred_cleanup(outcome.cleanup).await {
-                    UiEvent::ProfileSaveFailed {
+                    let (summary, code) = error.public_error_parts();
+                    draft_failed_event(
                         operation_id,
-                        profile_id: fallback_profile_id,
-                        summary: error.public_summary(),
-                    }
+                        draft_id,
+                        OperationKind::CreateProfile,
+                        summary,
+                        code,
+                    )
                 } else {
                     UiEvent::ProfileSaved {
                         operation_id,
@@ -2992,11 +3046,14 @@ async fn finish_task_output(
                 if application.is_config_uncertain() {
                     UiEvent::ConfigUncertain { operation_id }
                 } else {
-                    UiEvent::ProfileSaveFailed {
+                    let (summary, code) = error.public_error_parts();
+                    draft_failed_event(
                         operation_id,
-                        profile_id: fallback_profile_id,
-                        summary: error.public_summary(),
-                    }
+                        draft_id,
+                        OperationKind::CreateProfile,
+                        summary,
+                        code,
+                    )
                 }
             }
         },
@@ -3016,11 +3073,14 @@ async fn finish_task_output(
                     None => false,
                 };
                 if let Err(error) = application.apply_deferred_cleanup(outcome.cleanup).await {
-                    return UiEvent::ProfileSaveFailed {
+                    let (summary, code) = error.public_error_parts();
+                    return profile_update_failed_event(
                         operation_id,
                         profile_id,
-                        summary: error.public_summary(),
-                    };
+                        previous_generation,
+                        summary,
+                        code,
+                    );
                 }
                 UiEvent::ProfileSaved {
                     operation_id,
@@ -3036,11 +3096,14 @@ async fn finish_task_output(
                 if application.is_config_uncertain() {
                     UiEvent::ConfigUncertain { operation_id }
                 } else {
-                    UiEvent::ProfileSaveFailed {
+                    let (summary, code) = error.public_error_parts();
+                    profile_update_failed_event(
                         operation_id,
                         profile_id,
-                        summary: error.public_summary(),
-                    }
+                        previous_generation,
+                        summary,
+                        code,
+                    )
                 }
             }
         },
@@ -3265,15 +3328,18 @@ fn internal_failure_event(operation_id: OperationId, failure: FailureContext) ->
             kind,
             PublicSummary::InternalFailure,
         ),
-        FailureContext::Profiles => UiEvent::ProfilesFailed {
+        FailureContext::Profiles => profiles_failed_event(
             operation_id,
-            summary: PublicSummary::InternalFailure,
-        },
-        FailureContext::Draft { draft_id } => UiEvent::DraftOperationFailed {
+            PublicSummary::InternalFailure,
+            PublicCode::None,
+        ),
+        FailureContext::Draft { draft_id, kind } => draft_failed_event(
             operation_id,
             draft_id,
-            summary: PublicSummary::InternalFailure,
-        },
+            kind,
+            PublicSummary::InternalFailure,
+            PublicCode::None,
+        ),
     }
 }
 
@@ -3296,7 +3362,31 @@ enum RedisResourceRequest {
     Inspect(RedisKeyInspectRequest),
 }
 
-fn public_redis_resource_error(
+fn public_global_error(
+    kind: OperationKind,
+    operation_id: OperationId,
+    summary: PublicSummary,
+    code: PublicCode,
+) -> PublicOperationError {
+    PublicOperationError::new_or_internal(kind, summary, code, &SafeContext::global(operation_id))
+}
+
+fn public_draft_error(
+    kind: OperationKind,
+    draft_id: DraftId,
+    operation_id: OperationId,
+    summary: PublicSummary,
+    code: PublicCode,
+) -> PublicOperationError {
+    PublicOperationError::new_or_internal(
+        kind,
+        summary,
+        code,
+        &SafeContext::draft(draft_id, operation_id),
+    )
+}
+
+fn public_profile_error(
     kind: OperationKind,
     profile_id: ProfileId,
     operation_id: OperationId,
@@ -3309,6 +3399,81 @@ fn public_redis_resource_error(
         code,
         &SafeContext::profile(profile_id, operation_id),
     )
+}
+
+fn profiles_failed_event(
+    operation_id: OperationId,
+    summary: PublicSummary,
+    code: PublicCode,
+) -> UiEvent {
+    UiEvent::ProfilesFailed {
+        operation_id,
+        summary,
+        error: public_global_error(
+            OperationKind::ReloadConfiguration,
+            operation_id,
+            summary,
+            code,
+        ),
+    }
+}
+
+fn draft_failed_event(
+    operation_id: OperationId,
+    draft_id: DraftId,
+    kind: OperationKind,
+    summary: PublicSummary,
+    code: PublicCode,
+) -> UiEvent {
+    let error = public_draft_error(kind, draft_id, operation_id, summary, code);
+    if kind == OperationKind::CreateProfile {
+        UiEvent::ProfileCreateFailed {
+            operation_id,
+            draft_id,
+            summary,
+            error,
+        }
+    } else {
+        UiEvent::DraftOperationFailed {
+            operation_id,
+            draft_id,
+            summary,
+            error,
+        }
+    }
+}
+
+fn profile_update_failed_event(
+    operation_id: OperationId,
+    profile_id: ProfileId,
+    profile_generation: ProfileGeneration,
+    summary: PublicSummary,
+    code: PublicCode,
+) -> UiEvent {
+    let error = public_profile_error(
+        OperationKind::UpdateProfile,
+        profile_id.clone(),
+        operation_id,
+        summary,
+        code,
+    );
+    UiEvent::ProfileUpdateFailed {
+        operation_id,
+        profile_id,
+        profile_generation,
+        summary,
+        error,
+    }
+}
+
+fn public_redis_resource_error(
+    kind: OperationKind,
+    profile_id: ProfileId,
+    operation_id: OperationId,
+    summary: PublicSummary,
+    code: PublicCode,
+) -> PublicOperationError {
+    public_profile_error(kind, profile_id, operation_id, summary, code)
 }
 
 fn connection_outcome_for_summary(summary: PublicSummary) -> ConnectionFailureOutcome {
@@ -3364,13 +3529,15 @@ fn failed_from_service(
     kind: OperationKind,
     error: &ServiceError,
 ) -> UiEvent {
-    failed_profile_event(
+    let (summary, code) = error.public_error_parts();
+    failed_profile_event_with_code(
         operation_id,
         profile_id,
         profile_generation,
         session_generation,
         kind,
-        error.public_summary(),
+        summary,
+        code,
     )
 }
 
@@ -3381,6 +3548,27 @@ fn failed_profile_event(
     session_generation: Option<SessionGeneration>,
     kind: OperationKind,
     summary: PublicSummary,
+) -> UiEvent {
+    failed_profile_event_with_code(
+        operation_id,
+        profile_id,
+        profile_generation,
+        session_generation,
+        kind,
+        summary,
+        PublicCode::None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn failed_profile_event_with_code(
+    operation_id: OperationId,
+    profile_id: ProfileId,
+    profile_generation: ProfileGeneration,
+    session_generation: Option<SessionGeneration>,
+    kind: OperationKind,
+    summary: PublicSummary,
+    code: PublicCode,
 ) -> UiEvent {
     let connection_outcome = match summary {
         PublicSummary::CredentialRequired => ConnectionFailureOutcome::NeedsCredential,
@@ -3401,6 +3589,7 @@ fn failed_profile_event(
         | PublicSummary::OperationTimedOut => SessionDisposition::Evict,
         _ => SessionDisposition::Keep,
     });
+    let error = public_profile_error(kind, profile_id.clone(), operation_id, summary, code);
     UiEvent::OperationFailed {
         operation_id,
         profile_id,
@@ -3408,11 +3597,13 @@ fn failed_profile_event(
         session_generation,
         kind,
         summary,
+        error,
         session_disposition,
         connection_outcome,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn failed_profile_event_with_disposition(
     operation_id: OperationId,
     profile_id: ProfileId,
@@ -3420,12 +3611,14 @@ fn failed_profile_event_with_disposition(
     session_generation: SessionGeneration,
     kind: OperationKind,
     summary: PublicSummary,
+    code: PublicCode,
     session_disposition: SessionDisposition,
 ) -> UiEvent {
     let connection_outcome = match session_disposition {
         SessionDisposition::Keep => ConnectionFailureOutcome::Preserve,
         SessionDisposition::Evict => ConnectionFailureOutcome::Disconnected,
     };
+    let error = public_profile_error(kind, profile_id.clone(), operation_id, summary, code);
     UiEvent::OperationFailed {
         operation_id,
         profile_id,
@@ -3433,6 +3626,7 @@ fn failed_profile_event_with_disposition(
         session_generation: Some(session_generation),
         kind,
         summary,
+        error,
         session_disposition: Some(session_disposition),
         connection_outcome,
     }
@@ -3440,10 +3634,9 @@ fn failed_profile_event_with_disposition(
 
 fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEvent {
     match command {
-        UiCommand::RefreshProfiles { operation_id } => UiEvent::ProfilesFailed {
-            operation_id,
-            summary,
-        },
+        UiCommand::RefreshProfiles { operation_id } => {
+            profiles_failed_event(operation_id, summary, PublicCode::None)
+        }
         UiCommand::BrowseCatalog(request) => catalog_failed_event(request, summary, None, None),
         UiCommand::ScanRedisKeys(request) => {
             let error = public_redis_resource_error(
@@ -3477,18 +3670,20 @@ fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEven
                 connection_outcome_for_summary(summary),
             )
         }
-        UiCommand::CreateProfile(request) => UiEvent::ProfileSaveFailed {
-            operation_id: request.operation_id,
-            profile_id: request
-                .explicit_id
-                .unwrap_or_else(|| ProfileId(format!("draft-{}", request.draft_id.0))),
+        UiCommand::CreateProfile(request) => draft_failed_event(
+            request.operation_id,
+            request.draft_id,
+            OperationKind::CreateProfile,
             summary,
-        },
-        UiCommand::UpdateProfile(request) => UiEvent::ProfileSaveFailed {
-            operation_id: request.operation_id,
-            profile_id: request.profile_id,
+            PublicCode::None,
+        ),
+        UiCommand::UpdateProfile(request) => profile_update_failed_event(
+            request.operation_id,
+            request.profile_id,
+            request.expected_generation,
             summary,
-        },
+            PublicCode::None,
+        ),
         UiCommand::DeleteProfile(request) => failed_profile_event(
             request.operation_id,
             request.profile_id,
@@ -3510,11 +3705,13 @@ fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEven
             OperationKind::ConnectProfile,
             summary,
         ),
-        UiCommand::TestDraftConnection(request) => UiEvent::DraftOperationFailed {
-            operation_id: request.operation_id(),
-            draft_id: request.draft_id(),
+        UiCommand::TestDraftConnection(request) => draft_failed_event(
+            request.operation_id(),
+            request.draft_id(),
+            OperationKind::TestDraftConnection,
             summary,
-        },
+            PublicCode::None,
+        ),
         UiCommand::Execute {
             operation_id,
             profile_id,
@@ -3527,10 +3724,9 @@ fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEven
             summary,
         },
         UiCommand::CancelOperation { operation_id }
-        | UiCommand::ShutdownRuntime { operation_id } => UiEvent::ProfilesFailed {
-            operation_id,
-            summary,
-        },
+        | UiCommand::ShutdownRuntime { operation_id } => {
+            profiles_failed_event(operation_id, summary, PublicCode::None)
+        }
         UiCommand::DisconnectProfile {
             operation_id,
             profile_id,

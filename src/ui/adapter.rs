@@ -390,7 +390,8 @@ impl ServicePort {
             UiEvent::ProfilesLoaded { operation_id, .. }
             | UiEvent::ProfilesFailed { operation_id, .. }
             | UiEvent::ProfileSaved { operation_id, .. }
-            | UiEvent::ProfileSaveFailed { operation_id, .. }
+            | UiEvent::ProfileCreateFailed { operation_id, .. }
+            | UiEvent::ProfileUpdateFailed { operation_id, .. }
             | UiEvent::ConnectionReady { operation_id, .. }
             | UiEvent::ConnectionClosed { operation_id, .. }
             | UiEvent::DraftConnectionReady { operation_id, .. }
