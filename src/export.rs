@@ -9,6 +9,11 @@ use crate::model::{Cell, ExportFormat, ResultSnapshot};
 
 const STREAM_CHUNK_BYTES: usize = 4 * 1024;
 
+/// Maximum transient encoder allocation for one already-retained cell or
+/// metadata value. The initial RED contract replaces this placeholder with
+/// the measured, row-count-independent bound.
+pub const MAX_EXPORT_TRANSIENT_BYTES: usize = 0;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExportEncodeError {
     #[error("export was cancelled")]
