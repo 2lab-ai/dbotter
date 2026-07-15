@@ -62,11 +62,27 @@ cases_from_ids() {
 }
 
 mysql_catalog_cases="$(cases_from_ids \
-  mysql.catalog.browse_pages \
-  mysql.catalog.capability_gating \
-  mysql.catalog.cli_round_trip \
-  mysql.catalog.mutation \
-  mysql.catalog.permission_denied)"
+  mysql.catalog.cli.page1 \
+  mysql.catalog.cli.page2 \
+  mysql.catalog.column.ordinal_order \
+  mysql.catalog.column.page1 \
+  mysql.catalog.column.page2 \
+  mysql.catalog.count_cap \
+  mysql.catalog.empty \
+  mysql.catalog.filter.clear_after_metadata_cap \
+  mysql.catalog.filter.narrow_after_count_cap \
+  mysql.catalog.metadata_cap_4mib \
+  mysql.catalog.permission.check_denied \
+  mysql.catalog.permission.execute_denied \
+  mysql.catalog.relation.binary_order \
+  mysql.catalog.relation.page1 \
+  mysql.catalog.relation.page2 \
+  mysql.catalog.relation.table \
+  mysql.catalog.relation.view \
+  mysql.catalog.schema.scope \
+  mysql.catalog.schema.visibility \
+  mysql.catalog.token.integrity_rejected \
+  mysql.catalog.token.stale_generation_rejected)"
 mysql_safety_cases="$(cases_from_ids \
   mysql.auth.environment.available.correct \
   mysql.auth.environment.available.wrong \
@@ -77,10 +93,11 @@ mysql_safety_cases="$(cases_from_ids \
   mysql.auth.session.wrong \
   mysql.execute.mutation \
   mysql.execute.read \
-  mysql.marker.prepared.current_target_rejected \
-  mysql.marker.prepared.explicit_selection_rejected \
-  mysql.marker.rows_absent \
-  mysql.marker.ui_explicit_selection_rejected \
+  mysql.marker.current_target.absent \
+  mysql.marker.current_target.prepare_only_rejected \
+  mysql.marker.explicit_selection.absent \
+  mysql.marker.explicit_selection.prepare_only_rejected \
+  mysql.marker.explicit_selection.ui_rejected \
   mysql.prepared_unsupported.no_raw_fallback \
   mysql.prepared_unsupported.session_retained \
   mysql.prepared_unsupported.static_recovery)"
@@ -99,11 +116,23 @@ redis_cases="$(cases_from_ids \
   redis.auth.tls.recovery \
   redis.auth.tls.session.correct \
   redis.auth.tls.session.wrong \
-  redis.browse.plaintext \
-  redis.browse.tls \
-  redis.cli_round_trip \
-  redis.inspect.plaintext \
-  redis.inspect.tls \
+  redis.classifier.no_command \
+  redis.cli.browse \
+  redis.cli.inspect \
+  redis.inspect.truncation_64kib \
+  redis.inspect.ttl.expiring \
+  redis.inspect.ttl.missing \
+  redis.inspect.ttl.persistent \
+  redis.inspect.type.hash \
+  redis.inspect.type.list \
+  redis.inspect.type.set \
+  redis.inspect.type.stream \
+  redis.inspect.type.string \
+  redis.inspect.type.zset \
+  redis.mutation.readback \
+  redis.scan.multiple_pages \
+  redis.scan.oversize_skipped \
+  redis.scan.raw_binary_identity \
   redis.tls.ca_preserved \
   redis.tls.host_recovery \
   redis.tls.wrong_ca.action \
@@ -117,19 +146,19 @@ make_suite \
   mysql_catalog \
   p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli \
   "$mysql_catalog_cases" \
-  '{"catalog_pages":3,"catalog_rows":7,"denied_operations":2,"mutations_verified":1}' \
+  '{"cli_pages":2,"column_pages":2,"column_rows":100,"denied_operations":2,"metadata_retained_bytes":4190000,"metadata_truncations":1,"relation_pages":2,"relation_rows":34,"retained_relations":2000}' \
   "$tmp_dir/mysql-catalog.json"
 make_suite \
   mysql_safety \
   live_mysql_safety_receipt \
   "$mysql_safety_cases" \
-  '{"auth_failures":4,"marker_rows_after":0,"prepared_attempts":2,"prepared_unsupported_attempts":1,"raw_fallback_attempts":0}' \
+  '{"auth_failures":4,"marker_rows_after":0,"prepared_attempts":2,"prepared_unsupported_attempts":1,"raw_fallback_attempts":0,"statements_executed":2}' \
   "$tmp_dir/mysql-safety.json"
 make_suite \
   redis \
   redis_live_receipt \
   "$redis_cases" \
-  '{"auth_failures":8,"plaintext_fallback_attempts":0,"required_tls_attempts":3,"scan_pages":4,"tls_recovery_attempts":1}' \
+  '{"auth_failures":8,"cli_operations":2,"inspect_types":6,"mutation_readbacks":2,"plaintext_fallback_attempts":0,"required_tls_attempts":3,"scan_pages":4,"tls_recovery_attempts":1}' \
   "$tmp_dir/redis.json"
 
 assemble() {
@@ -170,6 +199,19 @@ jq -e \
     and ([.suites[].cases[].passed] | all(. > 0))
   ' "$tmp_dir/receipt.json" >/dev/null \
   || fail "valid measured suite evidence did not assemble exactly"
+
+cp "$tmp_dir/receipt.json" "$tmp_dir/stale-receipt.json"
+stale_hash="$(python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$tmp_dir/stale-receipt.json")"
+if assemble \
+  "$tmp_dir/mysql-catalog.json" \
+  "$tmp_dir/mysql-safety.json" \
+  "$tmp_dir/redis.json" \
+  "$tmp_dir/stale-receipt.json" \
+  >"$tmp_dir/stale.stdout" 2>"$tmp_dir/stale.stderr"; then
+  fail "existing receipt was silently replaced"
+fi
+new_stale_hash="$(python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$tmp_dir/stale-receipt.json")"
+[[ "$new_stale_hash" == "$stale_hash" ]] || fail "existing receipt bytes changed on rejection"
 
 expect_reject() {
   local label="$1"
