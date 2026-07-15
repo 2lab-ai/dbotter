@@ -93,6 +93,13 @@ if ! receipt_candidate_has_static_leak "$tmp_dir/credential-uri.json"; then
   exit 1
 fi
 
+jq '.probe = "dbotter-redis-local-only"' "$tmp_dir/clean.json" \
+  >"$tmp_dir/redis-fixture-secret.json"
+if ! receipt_candidate_has_static_leak "$tmp_dir/redis-fixture-secret.json"; then
+  echo "error: Redis fixture secret injection was not detected" >&2
+  exit 1
+fi
+
 resolved_secret='runtime-only-contract-secret'
 jq '.probe = "runtime-only-contract-secret"' "$tmp_dir/clean.json" \
   >"$tmp_dir/resolved-secret.json"

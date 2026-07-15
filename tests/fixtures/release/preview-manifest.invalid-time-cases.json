@@ -1,0 +1,17 @@
+[
+  {
+    "name": "impossible-tag-timestamp",
+    "sets": [
+      {"path": ["tag"], "value": "preview-2026-99-99-999999-123456789-2-0123456789ab"},
+      {"path": ["version"], "value": "2026.99.99.999999.123456789.2"},
+      {"path": ["artifacts", 0, "url"], "value": "https://github.com/2lab-ai/dbotter/releases/download/preview-2026-99-99-999999-123456789-2-0123456789ab/dbotter-preview-aarch64.tar.gz"},
+      {"path": ["artifacts", 1, "url"], "value": "https://github.com/2lab-ai/dbotter/releases/download/preview-2026-99-99-999999-123456789-2-0123456789ab/dbotter-preview-x86_64.tar.gz"}
+    ]
+  },
+  {
+    "name": "created-at-stamp-disagreement",
+    "sets": [
+      {"path": ["created_at"], "value": "2026-07-15T12:34:57Z"}
+    ]
+  }
+]

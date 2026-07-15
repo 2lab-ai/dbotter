@@ -5,11 +5,12 @@ use futures_util::TryStreamExt as _;
 use rust_decimal::Decimal;
 use secrecy::{ExposeSecret as _, SecretString};
 use sqlx::mysql::{
-    MySqlConnectOptions, MySqlDatabaseError, MySqlPoolOptions, MySqlRow, MySqlSslMode,
+    MySqlConnectOptions, MySqlConnection, MySqlDatabaseError, MySqlPoolOptions, MySqlRow,
+    MySqlSslMode,
 };
 use sqlx::{
-    Column as _, Either, Executor as _, Row as _, SqlSafeStr as _, Statement as _, TypeInfo as _,
-    ValueRef as _,
+    Column as _, Connection as _, Either, Executor as _, Row as _, SqlSafeStr as _, Statement as _,
+    TypeInfo as _, ValueRef as _,
 };
 
 use crate::drivers::{DriverError, mysql_catalog};
@@ -65,11 +66,21 @@ impl MySqlSession {
             TlsMode::Required => MySqlSslMode::Required,
         });
 
+        let started = Instant::now();
+        let authentication_probe = timed(timeout, MySqlConnection::connect_with(&options)).await?;
+        drop(authentication_probe);
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(DriverError::Timeout {
+                driver: DriverKind::MySql,
+                seconds: timeout.as_secs(),
+            })?;
         let pool = timed(
-            timeout,
+            remaining,
             MySqlPoolOptions::new()
                 .max_connections(4)
-                .acquire_timeout(timeout)
+                .acquire_timeout(remaining)
                 .connect_with(options),
         )
         .await?;
