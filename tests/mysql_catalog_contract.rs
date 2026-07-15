@@ -100,10 +100,23 @@ fn p4_opaque_tokens_are_context_bound_and_integrity_checked() {
             "catalog token key dependency is missing {required}"
         );
     }
+    for required in [
+        "CatalogTokenKeyStore",
+        "catalog_token_keys: Arc<CatalogTokenKeyStore>",
+        "CatalogTokenKeyStore::for_config_path",
+        "load_or_create",
+        "create_new(true)",
+        "mode(0o600)",
+        "sync_all()",
+    ] {
+        assert!(
+            catalog.contains(required) || service.contains(required),
+            "persistent cross-process token integrity is missing {required}"
+        );
+    }
     assert!(
-        service.contains("catalog_token_key: Arc<CatalogTokenKey>")
-            && service.contains("CatalogTokenKey::generate"),
-        "each ApplicationService must own one generated catalog token key"
+        !service.contains("CatalogTokenKey::generate"),
+        "ApplicationService construction must not generate a process-local key"
     );
     assert!(
         catalog.contains("CatalogTokenKey(<redacted>)") && !catalog.contains("fn token_digest("),

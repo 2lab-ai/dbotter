@@ -208,25 +208,31 @@ async fn p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli() {
         3_001,
     )
     .await
-    .expect_err("catalog token is scoped to one ApplicationService key");
-    assert_eq!(cross_service.public_summary(), PublicSummary::InvalidInput);
-    assert_eq!(cross_service.public_code(), PublicCode::Catalog);
-    let second = relations(
-        &service,
-        "catalog-scoped",
-        "dbotter_allowed",
-        Some("bulk_"),
-        first.next_token.clone(),
-        17,
-        4,
-    )
-    .await
-    .expect("second relation page");
+    .expect("same-config ApplicationService must continue the token");
+    let second = cross_service;
     assert_eq!(second.nodes.len(), 17);
     assert!(
         first.nodes.last().expect("first last").name.as_bytes()
             < second.nodes.first().expect("second first").name.as_bytes()
     );
+
+    let different_config_path = directory.path().join("different-config.toml");
+    fs::copy(&config_path, &different_config_path).expect("copy different config fixture");
+    let different_config_service =
+        ApplicationService::load_path(&different_config_path).expect("different config service");
+    let cross_config = relations(
+        &different_config_service,
+        "catalog-scoped",
+        "dbotter_allowed",
+        Some("bulk_"),
+        first.next_token.clone(),
+        17,
+        3_002,
+    )
+    .await
+    .expect_err("different config integrity key must reject the token");
+    assert_eq!(cross_config.public_summary(), PublicSummary::InvalidInput);
+    assert_eq!(cross_config.public_code(), PublicCode::Catalog);
 
     let catalog_relations = relations(
         &service,
@@ -470,4 +476,78 @@ async fn p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli() {
     assert_eq!(cli_page["identity"]["profile_id"], "catalog-scoped");
     assert!(cli_page.get("query_text").is_none());
     assert_eq!(cli_page["nodes"].as_array().expect("CLI nodes").len(), 2);
+
+    let cli_first = Command::new(env!("CARGO_BIN_EXE_dbotter"))
+        .args([
+            "--config",
+            config_path.to_string_lossy().as_ref(),
+            "browse",
+            "mysql",
+            "relations",
+            "--profile",
+            "catalog-scoped",
+            "--schema",
+            "dbotter_allowed",
+            "--prefix",
+            "bulk_",
+            "--page-size",
+            "17",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run first paginated catalog CLI process");
+    assert!(
+        cli_first.status.success(),
+        "first CLI stderr must be static: {:?}",
+        cli_first.stderr
+    );
+    assert!(cli_first.stderr.is_empty());
+    let cli_first_page: serde_json::Value =
+        serde_json::from_slice(&cli_first.stdout).expect("first catalog CLI JSON");
+    let cli_token = cli_first_page["next_token"]
+        .as_str()
+        .expect("first CLI page token");
+    let cli_first_last = cli_first_page["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.last())
+        .and_then(|node| node["name"].as_str())
+        .expect("first CLI last relation");
+
+    let cli_second = Command::new(env!("CARGO_BIN_EXE_dbotter"))
+        .args([
+            "--config",
+            config_path.to_string_lossy().as_ref(),
+            "browse",
+            "mysql",
+            "relations",
+            "--profile",
+            "catalog-scoped",
+            "--schema",
+            "dbotter_allowed",
+            "--prefix",
+            "bulk_",
+            "--page-size",
+            "17",
+            "--page-token",
+            cli_token,
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run second paginated catalog CLI process");
+    assert!(
+        cli_second.status.success(),
+        "second CLI stderr must be static: {:?}",
+        cli_second.stderr
+    );
+    assert!(cli_second.stderr.is_empty());
+    let cli_second_page: serde_json::Value =
+        serde_json::from_slice(&cli_second.stdout).expect("second catalog CLI JSON");
+    let cli_second_first = cli_second_page["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.first())
+        .and_then(|node| node["name"].as_str())
+        .expect("second CLI first relation");
+    assert!(cli_first_last.as_bytes() < cli_second_first.as_bytes());
 }
