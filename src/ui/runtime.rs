@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -13,10 +13,11 @@ use tokio_util::sync::CancellationToken;
 use futures_util::FutureExt as _;
 
 use crate::config::CommitState;
+use crate::export_file::{ConfirmedDestination, ExportFileError, export_result_to_file};
 use crate::model::{
-    DraftId, OperationId, OperationKind, OperationRecipeId, ProfileGeneration, ProfileId,
-    PublicCode, PublicSummary, RedisKeyInspectRequest, RedisScanRequest, ResultId,
-    SessionGeneration,
+    DraftId, ExportFormat, ExportResult, OperationId, OperationKind, OperationRecipeId,
+    OverwritePolicy, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
+    RedisKeyInspectRequest, RedisScanRequest, ResultId, SessionGeneration,
 };
 use crate::public_error::{PublicOperationError, SafeContext};
 use crate::service::{
@@ -31,7 +32,10 @@ use super::model::{
 };
 
 const GLOBAL_NETWORK_LIMIT: usize = 4;
+const PROCESS_EXPORT_LIMIT: usize = 2;
 const SHUTDOWN_ASYNC_GRACE: Duration = Duration::from_secs(2);
+static PROCESS_EXPORT_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(PROCESS_EXPORT_LIMIT)));
 
 #[derive(Default)]
 pub(super) struct ProfilePermitRegistry {
@@ -135,6 +139,11 @@ enum FailureContext {
         draft_id: DraftId,
         kind: OperationKind,
     },
+    Export {
+        result_id: ResultId,
+        format: ExportFormat,
+        overwrite_policy: OverwritePolicy,
+    },
     Profiles,
 }
 
@@ -237,7 +246,12 @@ impl TaskRegistry {
                 draft_id: *draft_id,
                 kind: OperationKind::TestDraftConnection,
             },
-            TaskScope::Export { .. } | TaskScope::Global => FailureContext::Profiles,
+            TaskScope::Export { result_id } => FailureContext::Export {
+                result_id: *result_id,
+                format: ExportFormat::Json,
+                overwrite_policy: OverwritePolicy::DenyOverwrite,
+            },
+            TaskScope::Global => FailureContext::Profiles,
         };
         self.insert_with_metadata(task, class, failure, Arc::new(AtomicBool::new(false)))
     }
@@ -304,6 +318,14 @@ impl TaskRegistry {
         } else {
             false
         }
+    }
+
+    fn active_export(&self, result_id: ResultId) -> Option<OperationId> {
+        self.entries.values().find_map(|entry| {
+            (entry.class == TaskClass::Export
+                && matches!(&entry.task.scope, TaskScope::Export { result_id: active } if *active == result_id))
+            .then_some(entry.task.operation_id)
+        })
     }
 
     fn take(&mut self, operation_id: OperationId) -> Option<RegistryEntry> {
@@ -941,6 +963,16 @@ fn handle_work(
     draft_permits: &mut DraftPermitRegistry,
     registry: &mut TaskRegistry,
 ) {
+    let command = match command {
+        UiCommand::ExportResult {
+            request,
+            confirmation,
+        } => {
+            start_export_work(request, confirmation, port, message_tx, registry);
+            return;
+        }
+        other => other,
+    };
     if application.is_config_uncertain() {
         let _ = port.try_emit(UiEvent::ConfigUncertain {
             operation_id: command.operation_id(),
@@ -1027,6 +1059,209 @@ fn handle_work(
         profile_permits,
         registry,
     );
+}
+
+fn start_export_work(
+    request: ExportResult,
+    confirmation: Option<ConfirmedDestination>,
+    port: &ServicePort,
+    message_tx: &mpsc::UnboundedSender<ControllerMessage>,
+    registry: &mut TaskRegistry,
+) {
+    let operation_id = request.operation_id;
+    let result_id = request.result_id;
+    let format = request.format;
+    let overwrite_policy = request.overwrite_policy;
+    if registry.active_export(result_id).is_some() {
+        let _ = port.try_emit(result_export_failed_event(
+            operation_id,
+            result_id,
+            format,
+            overwrite_policy,
+            PublicSummary::ResourceBusy,
+            PublicCode::None,
+            false,
+        ));
+        return;
+    }
+    let reservation = match registry.reserve(operation_id) {
+        Ok(reservation) => reservation,
+        Err(()) => {
+            let _ = port.try_emit(result_export_failed_event(
+                operation_id,
+                result_id,
+                format,
+                overwrite_policy,
+                PublicSummary::ResourceBusy,
+                PublicCode::None,
+                false,
+            ));
+            return;
+        }
+    };
+    let export_permit = Arc::clone(&PROCESS_EXPORT_PERMITS).try_acquire_owned();
+    let Ok(export_permit) = export_permit else {
+        registry.release_reservation(reservation);
+        let _ = port.try_emit(result_export_failed_event(
+            operation_id,
+            result_id,
+            format,
+            overwrite_policy,
+            PublicSummary::ResourceBusy,
+            PublicCode::None,
+            false,
+        ));
+        return;
+    };
+
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let messages = message_tx.clone();
+    let completion_sent = Arc::new(AtomicBool::new(false));
+    let task_completion_sent = completion_sent.clone();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let join = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            return;
+        }
+        let worker = tokio::task::spawn_blocking(move || {
+            export_result_to_file(&request, confirmation.as_ref(), || {
+                task_cancel.is_cancelled()
+            })
+        });
+        let event = match worker.await {
+            Ok(Ok(outcome)) => UiEvent::ResultExported {
+                operation_id,
+                result_id,
+                format: outcome.format,
+                overwrite_policy: outcome.overwrite_policy,
+                row_count: outcome.row_count,
+                bytes_written: outcome.bytes_written,
+            },
+            Ok(Err(error)) => result_export_file_error_event(
+                operation_id,
+                result_id,
+                format,
+                overwrite_policy,
+                &error,
+            ),
+            Err(_join_error) => result_export_failed_event(
+                operation_id,
+                result_id,
+                format,
+                overwrite_policy,
+                PublicSummary::InternalFailure,
+                PublicCode::None,
+                false,
+            ),
+        };
+        drop(export_permit);
+        task_completion_sent.store(true, Ordering::Release);
+        let _ = messages.send(ControllerMessage::Completed {
+            operation_id,
+            output: Box::new(TaskOutput::Event(Box::new(event))),
+        });
+    });
+    let task = RegisteredTask {
+        operation_id,
+        scope: TaskScope::Export { result_id },
+        cancel,
+        join,
+    };
+    match registry.commit_reservation(
+        reservation,
+        task,
+        TaskClass::Export,
+        FailureContext::Export {
+            result_id,
+            format,
+            overwrite_policy,
+        },
+        completion_sent,
+    ) {
+        Ok(()) => {
+            let _ = start_tx.send(());
+        }
+        Err(task) => {
+            drop(start_tx);
+            task.join.abort();
+            let _ = port.try_emit(result_export_failed_event(
+                operation_id,
+                result_id,
+                format,
+                overwrite_policy,
+                PublicSummary::ResourceBusy,
+                PublicCode::None,
+                false,
+            ));
+        }
+    }
+}
+
+fn result_export_file_error_event(
+    operation_id: OperationId,
+    result_id: ResultId,
+    format: ExportFormat,
+    overwrite_policy: OverwritePolicy,
+    error: &ExportFileError,
+) -> UiEvent {
+    let (summary, code, destination_committed) = match error {
+        ExportFileError::Cancelled => (PublicSummary::OperationCancelled, PublicCode::None, false),
+        ExportFileError::DestinationExists
+        | ExportFileError::InvalidDestinationType
+        | ExportFileError::ConfirmationRequired
+        | ExportFileError::ConfirmationMismatch
+        | ExportFileError::DestinationChanged
+        | ExportFileError::ResultIdentityMismatch => (
+            PublicSummary::InvalidInput,
+            PublicCode::ExportDestination,
+            false,
+        ),
+        ExportFileError::Encode { .. } | ExportFileError::NotCommitted { .. } => {
+            (PublicSummary::ExportFailed, PublicCode::None, false)
+        }
+        ExportFileError::CommittedDurabilityUnknown { .. } => (
+            PublicSummary::CommittedDurabilityUnknown,
+            PublicCode::ExportDestinationCommitted,
+            true,
+        ),
+    };
+    result_export_failed_event(
+        operation_id,
+        result_id,
+        format,
+        overwrite_policy,
+        summary,
+        code,
+        destination_committed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn result_export_failed_event(
+    operation_id: OperationId,
+    result_id: ResultId,
+    format: ExportFormat,
+    overwrite_policy: OverwritePolicy,
+    summary: PublicSummary,
+    code: PublicCode,
+    destination_committed: bool,
+) -> UiEvent {
+    let error = PublicOperationError::new_or_internal(
+        OperationKind::ExportResult,
+        summary,
+        code,
+        &SafeContext::export(result_id, operation_id, destination_committed),
+    );
+    UiEvent::ResultExportFailed {
+        operation_id,
+        result_id,
+        format,
+        overwrite_policy,
+        summary,
+        error,
+        destination_committed,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3335,7 +3570,7 @@ async fn handle_control(
     profile_permits: &mut ProfilePermitRegistry,
     registry: &mut TaskRegistry,
 ) {
-    if application.is_config_uncertain() {
+    if application.is_config_uncertain() && !matches!(&command, UiCommand::CancelOperation { .. }) {
         let key = command.control_key();
         let _ = port.try_emit(UiEvent::ConfigUncertain {
             operation_id: command.operation_id(),
@@ -3513,6 +3748,19 @@ fn internal_failure_event(operation_id: OperationId, failure: FailureContext) ->
             kind,
             PublicSummary::InternalFailure,
             PublicCode::None,
+        ),
+        FailureContext::Export {
+            result_id,
+            format,
+            overwrite_policy,
+        } => result_export_failed_event(
+            operation_id,
+            result_id,
+            format,
+            overwrite_policy,
+            PublicSummary::InternalFailure,
+            PublicCode::None,
+            false,
         ),
     }
 }
@@ -3983,6 +4231,15 @@ fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEven
             profile_generation,
             summary,
         },
+        UiCommand::ExportResult { request, .. } => result_export_failed_event(
+            request.operation_id,
+            request.result_id,
+            request.format,
+            request.overwrite_policy,
+            summary,
+            PublicCode::None,
+            false,
+        ),
         UiCommand::CancelOperation { operation_id }
         | UiCommand::ShutdownRuntime { operation_id } => {
             profiles_failed_event(operation_id, summary, PublicCode::None)

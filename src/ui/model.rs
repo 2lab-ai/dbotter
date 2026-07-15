@@ -9,9 +9,9 @@ use std::sync::Arc;
 use crate::config::{ConfigSourceVersion, migration_backup_path};
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionProfile, CredentialMode, DraftId, DriverAvailability,
-    DriverKind, OperationId, OperationKind, ProfileGeneration, ProfileId, PublicSummary,
-    RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, ResultSnapshot,
-    SessionGeneration,
+    DriverKind, ExportFormat, OperationId, OperationKind, OverwritePolicy, ProfileGeneration,
+    ProfileId, PublicSummary, RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest,
+    RedisValuePreview, ResultId, ResultSnapshot, SessionGeneration,
 };
 use crate::public_error::PublicOperationError;
 use crate::secrets::EnvironmentAvailability;
@@ -293,6 +293,23 @@ pub enum UiEvent {
         profile_generation: ProfileGeneration,
         session_generation: SessionGeneration,
         result: ResultSnapshot,
+    },
+    ResultExported {
+        operation_id: OperationId,
+        result_id: ResultId,
+        format: ExportFormat,
+        overwrite_policy: OverwritePolicy,
+        row_count: usize,
+        bytes_written: u64,
+    },
+    ResultExportFailed {
+        operation_id: OperationId,
+        result_id: ResultId,
+        format: ExportFormat,
+        overwrite_policy: OverwritePolicy,
+        summary: PublicSummary,
+        error: PublicOperationError,
+        destination_committed: bool,
     },
     CatalogPageLoaded {
         page: CatalogPage,
@@ -664,6 +681,16 @@ impl UiModel {
                         },
                     );
                 }
+            }
+            UiEvent::ResultExported {
+                row_count,
+                bytes_written,
+                ..
+            } => {
+                self.status = format!("Exported {row_count} rows ({bytes_written} bytes).");
+            }
+            UiEvent::ResultExportFailed { error, .. } => {
+                self.status = error.summary.message().to_owned();
             }
             UiEvent::CatalogPageLoaded {
                 page,

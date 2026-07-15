@@ -8,9 +8,10 @@ use std::time::Duration;
 use tokio::sync::mpsc::{self, error::TryRecvError, error::TrySendError};
 use tokio::sync::watch;
 
+use crate::export_file::ConfirmedDestination;
 use crate::model::{
-    CatalogRequest, ConnectionDraft, DraftId, OperationId, OperationKind, ProfileGeneration,
-    ProfileId, QueryLanguage, RedisKeyInspectRequest, RedisScanRequest,
+    CatalogRequest, ConnectionDraft, DraftId, ExportResult, OperationId, OperationKind,
+    ProfileGeneration, ProfileId, QueryLanguage, RedisKeyInspectRequest, RedisScanRequest,
 };
 use crate::secrets::SessionSecret;
 use crate::service::{
@@ -135,6 +136,10 @@ pub enum UiCommand {
     BrowseCatalog(CatalogRequest),
     ScanRedisKeys(RedisScanRequest),
     InspectRedisKey(RedisKeyInspectRequest),
+    ExportResult {
+        request: ExportResult,
+        confirmation: Option<ConfirmedDestination>,
+    },
     CancelOperation {
         operation_id: OperationId,
     },
@@ -168,6 +173,7 @@ impl UiCommand {
             Self::BrowseCatalog(request) => request.operation_id(),
             Self::ScanRedisKeys(request) => request.operation_id(),
             Self::InspectRedisKey(request) => request.operation_id(),
+            Self::ExportResult { request, .. } => request.operation_id,
             Self::CreateProfile(request) => request.operation_id,
             Self::UpdateProfile(request) => request.operation_id,
             Self::DeleteProfile(request) => request.operation_id,
@@ -189,7 +195,8 @@ impl UiCommand {
             | Self::Execute { .. }
             | Self::BrowseCatalog(_)
             | Self::ScanRedisKeys(_)
-            | Self::InspectRedisKey(_) => CommandLane::Work,
+            | Self::InspectRedisKey(_)
+            | Self::ExportResult { .. } => CommandLane::Work,
             Self::CancelOperation { .. }
             | Self::DisconnectProfile { .. }
             | Self::ReconnectProfile { .. } => CommandLane::Control,
@@ -280,6 +287,11 @@ impl fmt::Debug for UiCommand {
             Self::InspectRedisKey(request) => formatter
                 .debug_tuple("UiCommand::InspectRedisKey")
                 .field(request)
+                .finish(),
+            Self::ExportResult { request, .. } => formatter
+                .debug_struct("UiCommand::ExportResult")
+                .field("request", request)
+                .field("confirmation", &"<redacted>")
                 .finish(),
             Self::CancelOperation { operation_id } => formatter
                 .debug_struct("UiCommand::CancelOperation")
@@ -520,6 +532,8 @@ impl ServicePort {
             | UiEvent::DraftConnectionReady { operation_id, .. }
             | UiEvent::DraftOperationFailed { operation_id, .. }
             | UiEvent::QueryFinished { operation_id, .. }
+            | UiEvent::ResultExported { operation_id, .. }
+            | UiEvent::ResultExportFailed { operation_id, .. }
             | UiEvent::OperationFailed { operation_id, .. }
             | UiEvent::ExecuteUnavailable { operation_id, .. }
             | UiEvent::ProfileDeleted { operation_id, .. }
