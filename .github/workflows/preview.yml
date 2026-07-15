@@ -176,12 +176,16 @@ jobs:
             --binary "target/${{ matrix.target }}/release/dbotter" \
             --output out
 
-      - name: Stage Linux executable
+      - name: Package Linux native executable
         if: matrix.kind == 'linux'
         run: |
           mkdir -p out
-          cp "target/${{ matrix.target }}/release/dbotter" "out/dbotter-preview-linux-${{ matrix.arch }}"
-          chmod 0755 "out/dbotter-preview-linux-${{ matrix.arch }}"
+          ./scripts/build-linux-artifact.sh \
+            --channel preview \
+            --binary "target/${{ matrix.target }}/release/dbotter" \
+            --output out \
+            --expected-source-sha "${{ needs.plan.outputs.commit }}" \
+            --expected-tag "${{ needs.plan.outputs.tag }}"
 
       - name: Upload macOS package
         if: matrix.kind == 'macos'
@@ -194,12 +198,15 @@ jobs:
             out/package-receipt-${{ matrix.arch }}.json
           if-no-files-found: error
 
-      - name: Upload Linux executable
+      - name: Upload Linux package
         if: matrix.kind == 'linux'
         uses: actions/upload-artifact@v4
         with:
           name: package-linux-${{ matrix.arch }}
-          path: out/dbotter-preview-linux-${{ matrix.arch }}
+          path: |
+            out/dbotter-preview-linux-${{ matrix.arch }}
+            out/preview-artifact-linux-${{ matrix.arch }}.json
+            out/package-receipt-linux-${{ matrix.arch }}.json
           if-no-files-found: error
 
   publish:
@@ -232,9 +239,13 @@ jobs:
           cp artifacts/package-x86_64/dbotter-preview-x86_64.tar.gz release/
           cp artifacts/package-linux-aarch64/dbotter-preview-linux-aarch64 release/
           cp artifacts/package-linux-x86_64/dbotter-preview-linux-x86_64 release/
+          chmod 0755 release/dbotter-preview-linux-*
           ./scripts/assemble-preview-manifest.py \
+            --release-dir release \
             --artifact artifacts/package-aarch64/preview-artifact-aarch64.json \
             --artifact artifacts/package-x86_64/preview-artifact-x86_64.json \
+            --artifact artifacts/package-linux-aarch64/preview-artifact-linux-aarch64.json \
+            --artifact artifacts/package-linux-x86_64/preview-artifact-linux-x86_64.json \
             --output release/preview-manifest.json
           ./scripts/validate-preview-manifest.py \
             release/preview-manifest.json \
@@ -243,7 +254,6 @@ jobs:
             --greater-than "${{ needs.plan.outputs.current_version }}"
           manifest_sha256="$(sha256sum release/preview-manifest.json | awk '{print $1}')"
           echo "manifest_sha256=$manifest_sha256" >>"$GITHUB_OUTPUT"
-          chmod 0755 release/dbotter-preview-linux-*
           (cd release && sha256sum dbotter-preview-* preview-manifest.json >SHA256SUMS)
 
       - name: Reject tag or release replacement
@@ -274,6 +284,21 @@ jobs:
             echo 'Install with `brew install 2lab-ai/tap/dbotter-preview` after the explicit tap dispatch completes.'
           } >PREVIEW_NOTES.md
 
+      - name: Revalidate final release bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          temporary="$(mktemp -d)"
+          trap 'rm -rf "$temporary"' EXIT
+          ./scripts/assemble-preview-manifest.py \
+            --release-dir release \
+            --artifact artifacts/package-aarch64/preview-artifact-aarch64.json \
+            --artifact artifacts/package-x86_64/preview-artifact-x86_64.json \
+            --artifact artifacts/package-linux-aarch64/preview-artifact-linux-aarch64.json \
+            --artifact artifacts/package-linux-x86_64/preview-artifact-linux-x86_64.json \
+            --output "$temporary/preview-manifest.json"
+          cmp release/preview-manifest.json "$temporary/preview-manifest.json"
+
       - name: Create immutable preview prerelease
         uses: softprops/action-gh-release@v2
         with:
@@ -299,17 +324,32 @@ jobs:
     env:
       TAP_DISPATCH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
     steps:
-      - name: Dispatch exact immutable tap inputs
+      - name: Checkout verified candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Dispatch and verify exact immutable tap inputs
         env:
           GH_TOKEN: ${{ env.TAP_DISPATCH_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           test -n "$TAP_DISPATCH_TOKEN"
-          gh workflow run bump.yml \
-            --repo 2lab-ai/homebrew-tap \
-            -f "tag=${{ needs.plan.outputs.tag }}" \
-            -f "source_sha=${{ needs.plan.outputs.commit }}" \
-            -f "version=${{ needs.plan.outputs.version }}" \
-            -f "manifest_url=${{ needs.plan.outputs.manifest_url }}" \
-            -f "manifest_sha256=${{ needs.publish.outputs.manifest_sha256 }}"
+          mkdir -p tap-evidence
+          ./scripts/dispatch-and-verify-tap.sh \
+            --tag "${{ needs.plan.outputs.tag }}" \
+            --source-sha "${{ needs.plan.outputs.commit }}" \
+            --version "${{ needs.plan.outputs.version }}" \
+            --manifest-url "${{ needs.plan.outputs.manifest_url }}" \
+            --manifest-sha256 "${{ needs.publish.outputs.manifest_sha256 }}" \
+            --output tap-evidence/dbotter-tap-dispatch.json
+
+      - name: Upload verified tap proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: tap-proof-${{ needs.plan.outputs.tag }}
+          path: tap-evidence/dbotter-tap-dispatch.json
+          if-no-files-found: error

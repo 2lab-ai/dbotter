@@ -54,6 +54,7 @@ required_inputs=(
   scripts/test-tap-dispatch-contract.sh
   scripts/test-tap-handshake-contract.sh
   scripts/dispatch-and-verify-tap.sh
+  scripts/build-linux-artifact.sh
   scripts/validate-tap-dispatch.py
   scripts/test-installed-receipt-contract.sh
   scripts/test-macos-package-contract.sh

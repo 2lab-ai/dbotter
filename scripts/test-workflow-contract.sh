@@ -33,8 +33,8 @@ path = pathlib.Path(sys.argv[1])
 old = sys.argv[2]
 new = sys.argv[3]
 text = path.read_text(encoding="utf-8")
-if text.count(old) != 1:
-    raise SystemExit(f"mutation anchor count is {text.count(old)}, expected one: {old!r}")
+if text.count(old) < 1:
+    raise SystemExit(f"mutation anchor is missing: {old!r}")
 path.write_text(text.replace(old, new), encoding="utf-8")
 PY
   if "$checker" --workflow-dir "$case_dir" >/dev/null 2>&1; then
@@ -56,8 +56,12 @@ mutation_case \
   '--release-dir descriptors-only'
 mutation_case \
   missing_linux_descriptor \
-  '          --artifact artifacts/package-linux-x86_64/preview-artifact-linux-x86_64.json \\\n+' \
-  ''
+  'artifacts/package-linux-x86_64/preview-artifact-linux-x86_64.json' \
+  'artifacts/package-linux-x86_64/missing-descriptor.json'
+mutation_case \
+  missing_tap_checkout \
+  'ref: ${{ needs.plan.outputs.commit }}' \
+  'ref: ${{ github.sha }}'
 
 duplicate_dir="$tmp_dir/duplicate-key"
 mkdir -p "$duplicate_dir"

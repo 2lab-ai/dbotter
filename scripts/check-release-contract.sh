@@ -58,6 +58,7 @@ for executable in \
   scripts/validate-preview-manifest.py \
   scripts/validate-tap-dispatch.py \
   scripts/dispatch-and-verify-tap.sh \
+  scripts/build-linux-artifact.sh \
   scripts/check-installed-receipt-contract.sh \
   scripts/build-macos-app.sh \
   scripts/assemble-preview-manifest.py \
@@ -89,12 +90,7 @@ require_literal src/build_info.rs 'option_env!("DBOTTER_SOURCE_SHA")'
 require_literal src/build_info.rs 'None => "dev"'
 require_literal src/cli.rs 'version = crate::build_info::version_with_build()'
 
-require_literal .github/workflows/verify.yml 'workflow_call:'
-require_literal .github/workflows/verify.yml 'candidate_sha:'
-require_literal .github/workflows/verify.yml './scripts/verify-hermetic.sh --expected-sha'
-require_literal .github/workflows/verify.yml './scripts/verify-live-contracts.sh --config config/local.example.toml'
-require_literal .github/workflows/verify.yml '--expected-sha "${{ inputs.candidate_sha }}"'
-require_literal .github/workflows/verify.yml 'needs: hermetic'
+./scripts/check-workflow-graph.rb >/dev/null
 require_literal scripts/verify-hermetic.sh 'cargo fmt --check'
 require_literal scripts/verify-hermetic.sh 'cargo clippy --all-targets --all-features --locked -- -D warnings'
 require_literal scripts/verify-hermetic.sh 'cargo test --all-features --locked'
@@ -109,91 +105,6 @@ require_literal scripts/verify-installed-gui.sh 'result.export.json'
 require_literal scripts/verify-installed-gui.sh 'DBOTTER_AX_DRIVER'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.p7-installed-evidence.v1'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.formula-install-evidence.v1'
-
-for workflow in \
-  .github/workflows/ci.yml \
-  .github/workflows/preview.yml \
-  .github/workflows/release.yml; do
-  require_literal "$workflow" 'uses: ./.github/workflows/verify.yml'
-  require_literal "$workflow" 'candidate_sha:'
-done
-
-preview=.github/workflows/preview.yml
-require_literal "$preview" 'needs: verify'
-require_literal "$preview" 'needs: [verify, plan]'
-require_literal "$preview" 'needs: [verify, plan, build]'
-require_literal "$preview" 'needs: [verify, plan, publish]'
-require_literal "$preview" 'stamp="$(date -u +%Y-%m-%d-%H%M%S)"'
-require_literal "$preview" 'GITHUB_RUN_ID'
-require_literal "$preview" 'GITHUB_RUN_ATTEMPT'
-require_literal "$preview" 'tag=preview-$build_id'
-require_literal "$preview" 'check-preview-version.py --candidate'
-require_literal "$preview" 'DBOTTER_BUILD_CHANNEL: preview'
-require_literal "$preview" 'DBOTTER_SOURCE_SHA:'
-require_literal "$preview" 'cargo build --release --all-features --locked --target'
-require_literal "$preview" 'scripts/build-macos-app.sh'
-require_literal "$preview" 'scripts/assemble-preview-manifest.py'
-require_literal "$preview" 'release/preview-manifest.json'
-require_literal "$preview" '--expected-source-sha'
-require_literal "$preview" '--expected-tag'
-require_literal "$preview" 'prerelease: true'
-require_literal "$preview" 'make_latest: false'
-require_literal "$preview" 'Reject tag or release replacement'
-require_literal "$preview" 'test -n "$TAP_DISPATCH_TOKEN"'
-require_literal "$preview" '-f "tag=${{ needs.plan.outputs.tag }}"'
-require_literal "$preview" '-f "source_sha=${{ needs.plan.outputs.commit }}"'
-require_literal "$preview" '-f "version=${{ needs.plan.outputs.version }}"'
-require_literal "$preview" '-f "manifest_url=${{ needs.plan.outputs.manifest_url }}"'
-require_literal "$preview" '-f "manifest_sha256=${{ needs.publish.outputs.manifest_sha256 }}"'
-
-for target in \
-  aarch64-apple-darwin \
-  x86_64-apple-darwin \
-  aarch64-unknown-linux-gnu \
-  x86_64-unknown-linux-gnu; do
-  require_literal "$preview" "$target"
-done
-for asset in \
-  dbotter-preview-aarch64.tar.gz \
-  dbotter-preview-x86_64.tar.gz \
-  dbotter-preview-linux-aarch64 \
-  dbotter-preview-linux-x86_64 \
-  preview-manifest.json \
-  SHA256SUMS; do
-  require_literal "$preview" "$asset"
-done
-
-for forbidden in \
-  'previews[15:]' \
-  '--cleanup-tag' \
-  'gh release delete' \
-  'Prune old preview' \
-  'delete-release' \
-  'delete-ref'; do
-  if grep -Fq -- "$forbidden" "$preview"; then
-    fail "$preview contains forbidden immutable-preview pruning: $forbidden"
-  fi
-done
-
-require_regex .github/workflows/release.yml '^[[:space:]]+- "v\*"$'
-require_literal .github/workflows/release.yml 'cargo_version="$(./scripts/package-version.sh)"'
-require_literal .github/workflows/release.yml '[ "$cargo_version" != "$tag_version" ]'
-require_literal .github/workflows/release.yml 'needs: [verify, preflight]'
-require_literal .github/workflows/release.yml 'needs: [verify, preflight, build]'
-require_literal .github/workflows/release.yml 'DBOTTER_BUILD_CHANNEL: stable'
-require_literal .github/workflows/release.yml 'DBOTTER_SOURCE_SHA:'
-require_literal .github/workflows/release.yml 'prerelease: false'
-require_literal .github/workflows/release.yml 'cargo build --release --all-features --locked'
-
-for asset in \
-  dbotter-macos-aarch64 \
-  dbotter-macos-x86_64 \
-  dbotter-linux-aarch64 \
-  dbotter-linux-x86_64; do
-  require_literal .github/workflows/release.yml "$asset"
-done
-require_literal .github/workflows/release.yml 'sha256sum dbotter-* > SHA256SUMS'
-require_literal .github/workflows/release.yml 'release/SHA256SUMS'
 
 if [ -n "$manifest" ]; then
   validator=(./scripts/validate-preview-manifest.py "$manifest")

@@ -193,7 +193,16 @@ begin
   )
 
   tap = job(preview, "tap", "preview.yml")
+  tap_steps = steps(tap, "preview.yml.tap")
+  tap_checkout = unique_named_step(tap, "Checkout verified candidate", "preview.yml.tap")
+  fail_contract("preview.yml.tap: checkout action is wrong") unless tap_checkout["uses"] == "actions/checkout@v4"
+  fail_contract("preview.yml.tap: checkout is not pinned to the planned commit") unless tap_checkout["with"] == {
+    "ref" => "${{ needs.plan.outputs.commit }}",
+    "fetch-depth" => 0,
+    "persist-credentials" => false
+  }
   dispatch = unique_named_step(tap, "Dispatch and verify exact immutable tap inputs", "preview.yml.tap")
+  fail_contract("preview.yml.tap: exact checkout must precede handshake") unless tap_steps.index(tap_checkout) < tap_steps.index(dispatch)
   require_substrings(
     dispatch["run"],
     [
@@ -212,7 +221,7 @@ begin
   fail_contract("preview.yml.tap: proof upload path is wrong") unless proof_upload.dig("with", "path") == "tap-evidence/dbotter-tap-dispatch.json"
 
   all_run_text = preview_jobs.values.flat_map do |value|
-    value.is_a?(Hash) && value["steps"].is_a?(Array) ? value["steps"].filter_map { |step| step["run"] } : []
+    value.is_a?(Hash) && value["steps"].is_a?(Array) ? value["steps"].map { |step| step["run"] }.compact : []
   end.join("\n")
   fail_contract("preview.yml: legacy queue-only gh workflow run remains") if all_run_text.include?("gh workflow run")
   %w[gh\ release\ delete delete-release delete-ref --cleanup-tag].each do |forbidden|
