@@ -52,6 +52,7 @@ required_inputs=(
   scripts/test-release-contract.sh
   scripts/test-four-target-preview-contract.sh
   scripts/test-tap-dispatch-contract.sh
+  scripts/test-tap-handshake-contract.sh
   scripts/validate-tap-dispatch.py
   scripts/test-installed-receipt-contract.sh
   scripts/test-macos-package-contract.sh
@@ -75,6 +76,7 @@ done
 ./scripts/test-release-contract.sh
 ./scripts/test-four-target-preview-contract.sh
 ./scripts/test-tap-dispatch-contract.sh
+./scripts/test-tap-handshake-contract.sh
 ./scripts/test-installed-receipt-contract.sh
 ./scripts/test-macos-package-contract.sh
 ./scripts/test-workflow-contract.sh
