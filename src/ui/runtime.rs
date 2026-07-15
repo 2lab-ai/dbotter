@@ -2401,7 +2401,8 @@ async fn run_redis_inspect(
     tokio::task::yield_now().await;
 
     enum InspectAttempt {
-        Driver(Result<crate::model::RedisValuePreview, crate::drivers::DriverError>),
+        Succeeded(Box<crate::model::RedisValuePreview>),
+        Failed(crate::drivers::DriverError),
         Cancelled,
         TimedOut,
     }
@@ -2412,17 +2413,20 @@ async fn run_redis_inspect(
             biased;
             () = cancel.cancelled() => InspectAttempt::Cancelled,
             () = tokio::time::sleep_until(deadline) => InspectAttempt::TimedOut,
-            result = &mut inspect => InspectAttempt::Driver(result),
+            result = &mut inspect => match result {
+                Ok(preview) => InspectAttempt::Succeeded(Box::new(preview)),
+                Err(error) => InspectAttempt::Failed(error),
+            },
         }
     };
     let observation = service.observe_session(&lease, operation_id).await;
     match (attempt, observation) {
-        (InspectAttempt::Driver(Ok(preview)), Ok(())) => UiEvent::RedisKeyInspected {
-            preview,
+        (InspectAttempt::Succeeded(preview), Ok(())) => UiEvent::RedisKeyInspected {
+            preview: *preview,
             session_generation,
             session_disposition: SessionDisposition::Keep,
         },
-        (InspectAttempt::Driver(Err(driver_error)), Ok(())) => {
+        (InspectAttempt::Failed(driver_error), Ok(())) => {
             let session_disposition = SessionDisposition::for_driver_error(&driver_error);
             let service_error = ServiceError::from(driver_error);
             let (summary, code) = service_error.public_error_parts();
@@ -2469,7 +2473,7 @@ async fn run_redis_inspect(
                 ConnectionFailureOutcome::Disconnected,
             )
         }
-        (InspectAttempt::Driver(_), Err(error)) => {
+        (InspectAttempt::Succeeded(_) | InspectAttempt::Failed(_), Err(error)) => {
             service.evict_session_lease(&lease).await;
             let (summary, code) = error.public_error_parts();
             failed_redis_resource_event(
