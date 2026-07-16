@@ -3248,6 +3248,132 @@ async fn delete_observation_rejects_deleted_instance_identity_transplant() {
     assert_identity_transplant_fails_closed(MatrixMutation::Delete).await;
 }
 
+#[tokio::test]
+async fn create_reconciliation_rejects_prewrite_identity_transplant() {
+    assert_prewrite_identity_transplant_fails_closed(MatrixMutation::Create).await;
+}
+
+#[tokio::test]
+async fn update_reconciliation_rejects_prewrite_identity_transplant() {
+    assert_prewrite_identity_transplant_fails_closed(MatrixMutation::Update).await;
+}
+
+#[tokio::test]
+async fn delete_reconciliation_rejects_prewrite_identity_transplant() {
+    assert_prewrite_identity_transplant_fails_closed(MatrixMutation::Delete).await;
+}
+
+async fn assert_prewrite_identity_transplant_fails_closed(mutation: MatrixMutation) {
+    const TARGET_ID: &str = "prewrite-transplant-target";
+    const SOURCE_ID: &str = "prewrite-transplant-source";
+    const TRANSPLANTED_ID: &str = "prewrite-transplant-destination";
+
+    let directory = tempfile::tempdir().expect("prewrite identity transplant tempdir");
+    let path = directory.path().join("config.toml");
+    let target = classified_profile(
+        TARGET_ID,
+        named_draft(DriverKind::MySql, "Prewrite transplant target"),
+        31,
+    );
+    let source = classified_profile(
+        SOURCE_ID,
+        named_draft(DriverKind::Redis, "Prewrite transplant source"),
+        32,
+    );
+    let initial_profiles = match mutation {
+        MatrixMutation::Create => vec![source],
+        MatrixMutation::Update | MatrixMutation::Delete => vec![target, source],
+    };
+    let persisted = write_v3_profiles(&path, initial_profiles);
+    let service = service(
+        &path,
+        Arc::new(FakeConnector::new(false)),
+        ConfigWriter::default(),
+    );
+    let before = service.profiles_snapshot().await;
+    let target_id = ProfileId(TARGET_ID.to_owned());
+    let target_generation = match mutation {
+        MatrixMutation::Create => None,
+        MatrixMutation::Update | MatrixMutation::Delete => Some(
+            service
+                .profile_generation(&target_id)
+                .await
+                .expect("prewrite target generation"),
+        ),
+    };
+
+    let mut externally_transplanted = load_path(&path).expect("prewrite source config").config;
+    externally_transplanted
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.id == SOURCE_ID)
+        .expect("prewrite transplant source")
+        .id = TRANSPLANTED_ID.to_owned();
+    fs::write(
+        &path,
+        toml::to_string(&externally_transplanted).expect("prewrite transplant serialization"),
+    )
+    .expect("prewrite transplant write");
+    validate_config_identity(
+        &load_path(&path)
+            .expect("strict-valid prewrite transplant")
+            .config,
+    )
+    .expect("prewrite transplant remains strict-valid");
+
+    let result = match mutation {
+        MatrixMutation::Create => {
+            service
+                .create_profile(create_request(
+                    DraftId(960),
+                    OperationId(960),
+                    Some(TARGET_ID),
+                    named_draft(DriverKind::MySql, "Created after prewrite transplant"),
+                    SessionSecretUpdate::Clear,
+                ))
+                .await
+        }
+        MatrixMutation::Update => {
+            let mut draft = persisted_profile(&persisted, TARGET_ID).as_draft();
+            draft.name = "Updated after prewrite transplant".to_owned();
+            service
+                .update_profile(UpdateProfileRequest {
+                    profile_id: target_id.clone(),
+                    expected_generation: target_generation.expect("update generation"),
+                    operation_id: OperationId(961),
+                    draft,
+                    secret_update: SessionSecretUpdate::Clear,
+                    migration_consent: MigrationConsent::Cancelled,
+                })
+                .await
+        }
+        MatrixMutation::Delete => {
+            service
+                .delete_profile(DeleteProfileRequest {
+                    profile_id: target_id,
+                    expected_generation: target_generation.expect("delete generation"),
+                    operation_id: OperationId(962),
+                    migration_consent: MigrationConsent::Cancelled,
+                })
+                .await
+        }
+    };
+    let error = result.expect_err("prewrite identity transplant must fence reconciliation");
+    assert!(matches!(error, ServiceError::ConfigUncertain));
+    assert!(service.is_config_uncertain());
+    assert_eq!(service.profiles_snapshot().await, before);
+
+    let disk = load_path(&path)
+        .expect("committed prewrite transplant disk")
+        .config;
+    assert!(
+        disk.profiles
+            .iter()
+            .any(|profile| profile.id == TRANSPLANTED_ID)
+    );
+    assert!(disk.profiles.iter().all(|profile| profile.id != SOURCE_ID));
+}
+
 async fn assert_identity_transplant_fails_closed(mutation: MatrixMutation) {
     const TARGET_ID: &str = "identity-transplant-target";
     const SOURCE_ID: &str = "identity-transplant-source";
