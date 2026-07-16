@@ -16,7 +16,7 @@ v1.1 amendment are marked `deferred` rather than deleted.
 |---|---|---|---|---|---|
 | D1 | — | — | — | — | not started |
 | D2 | — | — | — | — | not started |
-| D3 | this commit — `test(d3): freeze server-enforced MySQL read session` | — | RED contract: `cargo test --features desktop --test daily_use_mysql_read_session_contract` must fail until the generic execution port is removed and same-connection read-only proof precedes general SELECT dispatch | — | RED |
+| D3 | `4da8a57` — `test(d3): freeze server-enforced MySQL read session` | — | RED contract: `cargo test --features desktop --test daily_use_mysql_read_session_contract` must fail until the generic execution port is removed and same-connection read-only proof precedes general SELECT dispatch | — | RED |
 | D4 | — | — | — | — | not started |
 | D5 | — | — | — | — | not started |
 | D6 | — | — | — | — | not started |
