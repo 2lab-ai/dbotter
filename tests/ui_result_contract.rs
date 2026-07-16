@@ -10,7 +10,7 @@ use dbotter::ui::{
     NativeUiHarness, OpenAiTheme, RESULT_ACTION_HEIGHT, RESULT_ROW_HEIGHT, copy_all_rows,
     copy_cell, copy_selected_rows,
 };
-use eframe::egui::{Context, RawInput, accesskit};
+use eframe::egui::{Context, Event, Key, Modifiers, RawInput, accesskit};
 
 fn snapshot() -> ResultSnapshot {
     ResultSnapshot::retain(
@@ -112,6 +112,81 @@ fn native_result_inventory_exposes_every_installed_journey_action() {
             "missing result author id {expected}"
         );
     }
+}
+
+#[test]
+fn result_grid_exposes_filter_sort_and_keyboard_record_detail() {
+    let context = Context::default();
+    context.enable_accesskit();
+    let mut harness = NativeUiHarness::p7_result();
+    let initial = context.run_ui(RawInput::default(), |ui| harness.show(ui));
+    let initial_update = initial
+        .platform_output
+        .accesskit_update
+        .expect("the native result harness must emit AccessKit");
+    let author_node = |author_id: &str| {
+        initial_update
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| {
+                (node.author_id() == Some(author_id)).then_some((*node_id, node))
+            })
+            .unwrap_or_else(|| panic!("missing actual result AX id {author_id}"))
+    };
+
+    let (_, grid) = author_node("result.mode.grid");
+    assert_eq!(grid.is_selected(), Some(true));
+    let (record_id, record) = author_node("result.mode.record");
+    assert_eq!(record.is_selected(), Some(false));
+    assert!(record.supports_action(accesskit::Action::Focus));
+    assert!(record.supports_action(accesskit::Action::Click));
+
+    let (_, filter) = author_node("result.filter");
+    assert_eq!(filter.role(), accesskit::Role::TextInput);
+    assert!(filter.supports_action(accesskit::Action::SetTextSelection));
+    let (_, sort) = author_node("result.sort.0");
+    assert!(sort.supports_action(accesskit::Action::Click));
+
+    let mut focus_record = RawInput::default();
+    focus_record
+        .events
+        .push(Event::AccessKitActionRequest(accesskit::ActionRequest {
+            action: accesskit::Action::Focus,
+            target_tree: accesskit::TreeId::ROOT,
+            target_node: record_id,
+            data: None,
+        }));
+    let _ = context.run_ui(focus_record, |ui| harness.show(ui));
+    let record_output = context.run_ui(
+        RawInput {
+            events: vec![Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..RawInput::default()
+        },
+        |ui| harness.show(ui),
+    );
+    let record_update = record_output
+        .platform_output
+        .accesskit_update
+        .expect("record mode must emit AccessKit");
+    let detail = record_update
+        .nodes
+        .iter()
+        .find_map(|(_, node)| (node.author_id() == Some("result.record.field.0")).then_some(node))
+        .expect("record mode must expose the selected row as typed fields");
+    assert_eq!(detail.label(), Some("Record field value"));
+    assert_eq!(detail.value(), Some("sample"));
+    let record_mode = record_update
+        .nodes
+        .iter()
+        .find_map(|(_, node)| (node.author_id() == Some("result.mode.record")).then_some(node))
+        .expect("record mode action must remain visible");
+    assert_eq!(record_mode.is_selected(), Some(true));
 }
 
 #[test]
