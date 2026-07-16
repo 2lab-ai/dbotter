@@ -4052,8 +4052,8 @@ mod tests {
     use crate::model::{
         Cell, Column, ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind,
         ExportFormat, OperationId, OperationKind, OperationRecipeId, OverwritePolicy,
-        ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary, QueryResult,
-        RedisKeyEntry, RedisKeyFilter, RedisKeyId, RedisKeyPage, RedisScanConsistency,
+        ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary, QueryLanguage,
+        QueryResult, RedisKeyEntry, RedisKeyFilter, RedisKeyId, RedisKeyPage, RedisScanConsistency,
         RedisScanRequest, RedisTlsConfig, RequestIdentity, ResultId, ResultProvenance,
         ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
     };
@@ -5123,6 +5123,51 @@ mod tests {
         assert_eq!(retried.cursor, request.cursor);
         assert_eq!(retried.profile_generation(), request.profile_generation());
         assert_ne!(retried.operation_id(), request.operation_id());
+    }
+
+    #[test]
+    fn mysql_data_template_opens_a_new_tab_without_overwriting_the_current_draft() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let mysql = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(mysql.id.clone(), mysql.generation);
+        app.model.profiles = vec![mysql.clone()];
+        app.model.selected_profile = Some(mysql.id.clone());
+        app.model
+            .active_generations
+            .insert(mysql.id.clone(), mysql.generation);
+
+        let original_tab = app
+            .model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Draft", "SELECT draft_value")
+            .expect("original tab");
+        app.submit_mysql_explorer_intent(
+            &mysql,
+            MySqlExplorerIntent::InsertTemplate(
+                "SELECT * FROM `app`.`widgets` LIMIT 200".to_owned(),
+            ),
+        );
+
+        let workspace = app.model.workspace(&key).expect("workspace retained");
+        assert_eq!(workspace.editor_tabs().len(), 2);
+        assert_eq!(
+            workspace
+                .editor_tab(original_tab)
+                .expect("original tab retained")
+                .text(),
+            "SELECT draft_value"
+        );
+        let selected = workspace
+            .selected_editor_tab_id()
+            .expect("data tab selected");
+        assert_ne!(selected, original_tab);
+        assert_eq!(
+            workspace.editor_tab(selected).expect("data tab").text(),
+            "SELECT * FROM `app`.`widgets` LIMIT 200"
+        );
+        assert!(service.try_next_command().is_none());
     }
 
     #[test]

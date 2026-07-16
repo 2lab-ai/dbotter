@@ -921,6 +921,31 @@ fn assert_access_admission_error_is_public_safe(
     }
 }
 
+fn assert_mutation_review_error_is_public_safe(
+    label: &str,
+    error: &ServiceError,
+    forbidden: &[String],
+) {
+    assert!(matches!(error, ServiceError::MutationReviewUnavailable));
+    assert_eq!(
+        error.public_error_parts(),
+        (PublicSummary::UnsupportedFeature, PublicCode::None),
+        "{label}: stable local mutation-review error"
+    );
+    let public_surfaces = format!(
+        "{error:?}\n{error}\n{:?}\n{:?}\n{}",
+        error.public_summary(),
+        error.public_code(),
+        error.public_summary()
+    );
+    for forbidden_value in forbidden {
+        assert!(
+            !public_surfaces.contains(forbidden_value),
+            "{label}: public error leaked forbidden profile, target, endpoint, or credential data"
+        );
+    }
+}
+
 #[tokio::test]
 async fn du01_access_admission_is_effective_read_only_without_blocking_read_paths() {
     for (language, target, expected) in [
@@ -1047,6 +1072,26 @@ async fn du01_access_admission_is_effective_read_only_without_blocking_read_path
         )
         .await,
     ];
+    let review_blocked = vec![
+        observe_classified_access_admission(
+            "classified read-write MySQL mutation without review",
+            OperationId(709),
+            DriverKind::MySql,
+            ProfileAccess::ReadWrite,
+            QueryLanguage::Sql,
+            DU01_MYSQL_MUTATION,
+        )
+        .await,
+        observe_classified_access_admission(
+            "classified read-write Redis mutation without review",
+            OperationId(710),
+            DriverKind::Redis,
+            ProfileAccess::ReadWrite,
+            QueryLanguage::RedisCommand,
+            DU01_REDIS_MUTATION,
+        )
+        .await,
+    ];
     let allowed = vec![
         observe_classified_access_admission(
             "classified read-only MySQL read",
@@ -1084,24 +1129,6 @@ async fn du01_access_admission_is_effective_read_only_without_blocking_read_path
             DU01_REDIS_READ,
         )
         .await,
-        observe_classified_access_admission(
-            "classified read-write MySQL mutation",
-            OperationId(709),
-            DriverKind::MySql,
-            ProfileAccess::ReadWrite,
-            QueryLanguage::Sql,
-            DU01_MYSQL_MUTATION,
-        )
-        .await,
-        observe_classified_access_admission(
-            "classified read-write Redis mutation",
-            OperationId(710),
-            DriverKind::Redis,
-            ProfileAccess::ReadWrite,
-            QueryLanguage::RedisCommand,
-            DU01_REDIS_MUTATION,
-        )
-        .await,
     ];
 
     for observation in blocked {
@@ -1121,6 +1148,32 @@ async fn du01_access_admission_is_effective_read_only_without_blocking_read_path
             .result
             .expect_err("DU-01 mutation posture must reject locally");
         assert_access_admission_error_is_public_safe(
+            observation.label,
+            &error,
+            &observation.forbidden_error_text,
+        );
+    }
+
+    for observation in review_blocked {
+        assert_eq!(
+            observation.non_target_session_io, 0,
+            "{}: mutation-review rejection must happen before session I/O",
+            observation.label
+        );
+        assert_eq!(
+            observation.user_target_dispatches, 0,
+            "{}: mutation reached a typed user-target driver port without review",
+            observation.label
+        );
+        assert!(
+            !observation.saw_secret,
+            "{}: mutation-review rejection resolved a credential",
+            observation.label
+        );
+        let error = observation
+            .result
+            .expect_err("mutation without a completed review flow must reject locally");
+        assert_mutation_review_error_is_public_safe(
             observation.label,
             &error,
             &observation.forbidden_error_text,
