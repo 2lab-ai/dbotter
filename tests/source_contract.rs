@@ -164,7 +164,9 @@ fn p3_user_text_and_resource_boundaries_are_structural() {
     }
     for required in [
         "trait ConnectionPing",
-        "trait MySqlPreparedExecution",
+        "trait MySqlReadExecution",
+        "trait MySqlUnprovenReadLease",
+        "trait MySqlProvenReadLease",
         "trait RedisExecution",
         "trait CatalogBrowser",
         "trait KeyspaceBrowser",
@@ -182,7 +184,7 @@ fn p3_user_text_and_resource_boundaries_are_structural() {
 }
 
 #[test]
-fn p4_production_ast_has_one_static_text_protocol_call_and_only_prepared_fetches() {
+fn p4_production_ast_has_only_closed_static_internal_text_and_prepared_user_fetches() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = vec![root.join("build.rs")];
     collect_rs(&root.join("src"), &mut files);
@@ -202,21 +204,30 @@ fn p4_production_ast_has_one_static_text_protocol_call_and_only_prepared_fetches
 
     assert_eq!(
         production.matches("sqlx::query(").count(),
-        1,
-        "the only text-protocol query is the static PING"
+        5,
+        "PING, the frozen capability row and three closed read-session SET operations are the only static queries"
     );
     assert_eq!(
         production.matches(".execute(").count(),
-        1,
-        "no dynamic text may gain an Executor::execute method call"
+        4,
+        "only the four exact static internal statements may use Executor::execute"
     );
-    assert!(
-        mysql.contains("sqlx::query(\"SELECT1\").execute(&self.pool)"),
-        "the sole text-protocol call must remain the static health check"
-    );
+    for required in [
+        "sqlx::query(\"SELECT1\").execute(&self.pool)",
+        "sqlx::query(\"SELECT@@version,@@version_comment,@@SESSION.character_set_client,@@SESSION.character_set_connection,@@SESSION.character_set_results,@@SESSION.collation_connection,@@SESSION.time_zone,@@SESSION.sql_mode,@@GLOBAL.partial_revokes\").fetch_one(&mut*connection)",
+        "sqlx::query(\"SETNAMESutf8mb4\").execute(&mut*connection)",
+        "sqlx::query(\"SETSESSIONtime_zone='+00:00'\").execute(&mut*connection)",
+        "sqlx::query(\"SETSESSIONTRANSACTIONREADONLY\").execute(&mut*self.connection)",
+    ] {
+        assert!(
+            mysql.contains(required),
+            "missing exact static internal MySQL statement {required}"
+        );
+    }
+    assert_eq!(production.matches("sqlx::query_as(").count(), 2);
+    assert_eq!(production.matches(".fetch_one(").count(), 3);
     for forbidden in [
         "sqlx::raw_sql(",
-        "sqlx::query_as(",
         "sqlx::query_scalar(",
         "sqlx::query_with(",
         "Executor::execute(",
@@ -224,7 +235,6 @@ fn p4_production_ast_has_one_static_text_protocol_call_and_only_prepared_fetches
         "::execute(",
         ".fetch(",
         ".fetch_all(",
-        ".fetch_one(",
         ".fetch_optional(",
     ] {
         assert!(

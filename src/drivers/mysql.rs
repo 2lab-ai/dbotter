@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use futures_util::TryStreamExt as _;
 use rust_decimal::Decimal;
@@ -8,12 +9,17 @@ use sqlx::mysql::{
     MySqlConnectOptions, MySqlConnection, MySqlDatabaseError, MySqlPoolOptions, MySqlRow,
     MySqlSslMode,
 };
+use sqlx::pool::PoolConnection;
 use sqlx::{
     Column as _, Connection as _, Either, Executor as _, Row as _, SqlSafeStr as _, Statement as _,
     TypeInfo as _, ValueRef as _,
 };
 
-use crate::drivers::{DriverError, mysql_catalog};
+use crate::drivers::{
+    DriverError, MySqlCapabilitySnapshot, MySqlProvenReadLease, MySqlReadAdmission,
+    MySqlReadExecution, MySqlUnprovenReadLease, mysql_catalog,
+};
+use crate::execution::classify_mysql_execution_kind_with_sql_mode;
 use crate::model::{
     CatalogPage, CatalogRequest, Cell, Column, ConnectionProfile, DriverAvailability,
     DriverCapabilities, DriverDescriptor, DriverKind, MAX_RESULT_BYTES, MAX_RESULT_CELL_BYTES,
@@ -100,24 +106,68 @@ impl MySqlSession {
         self.pool.close().await;
     }
 
-    pub async fn execute_prepared(
+    pub async fn begin_read_admission(
         &self,
-        request: &PreparedMySqlRequest,
-    ) -> Result<QueryResult, DriverError> {
-        let started = Instant::now();
-        let result = tokio::time::timeout(
-            request.timeout,
-            self.execute_one(&request.statement, request.row_limit),
+        timeout: Duration,
+    ) -> Result<MySqlReadAdmission, DriverError> {
+        let deadline = MySqlOperationDeadline::new(timeout);
+        let mut connection = timed_remaining(&deadline, self.pool.acquire()).await?;
+        connection.close_on_drop();
+
+        timed_remaining(
+            &deadline,
+            sqlx::query("SET NAMES utf8mb4").execute(&mut *connection),
         )
         .await
-        .map_err(|_| DriverError::Timeout {
-            driver: DriverKind::MySql,
-            seconds: request.timeout.as_secs(),
-        })??;
-        Ok(QueryResult {
-            elapsed_ms: started.elapsed().as_millis(),
-            ..result
-        })
+        .map_err(|error| map_capability_failure(error, "session character set"))?;
+        timed_remaining(
+            &deadline,
+            sqlx::query("SET SESSION time_zone = '+00:00'").execute(&mut *connection),
+        )
+        .await
+        .map_err(|error| map_capability_failure(error, "session time zone"))?;
+
+        let capability_row = timed_remaining(
+            &deadline,
+            sqlx::query("SELECT @@version, @@version_comment, @@SESSION.character_set_client, @@SESSION.character_set_connection, @@SESSION.character_set_results, @@SESSION.collation_connection, @@SESSION.time_zone, @@SESSION.sql_mode, @@GLOBAL.partial_revokes")
+                .fetch_one(&mut *connection),
+        )
+        .await
+        .map_err(|error| map_capability_failure(error, "capability query"))?;
+        let partial_revokes = match capability_row.try_get::<i64, _>(8) {
+            Ok(0) => Some(false),
+            Ok(1) => Some(true),
+            _ => None,
+        };
+        let capabilities = MySqlCapabilitySnapshot::new(
+            capability_text(&capability_row, 0, "version")?,
+            capability_text(&capability_row, 1, "version_comment")?,
+            capability_text(&capability_row, 2, "character_set_client")?,
+            capability_text(&capability_row, 3, "character_set_connection")?,
+            capability_text(&capability_row, 4, "character_set_results")?,
+            capability_text(&capability_row, 5, "collation_connection")?,
+            capability_text(&capability_row, 6, "time_zone")?,
+            capability_text(&capability_row, 7, "sql_mode")?,
+            partial_revokes,
+        );
+
+        let (autocommit,): (i64,) = timed_remaining(
+            &deadline,
+            sqlx::query_as("SELECT @@SESSION.autocommit").fetch_one(&mut *connection),
+        )
+        .await
+        .map_err(|error| map_read_only_decode(error, "read-session precheck decode mismatch"))?;
+        verify_clean_read_session(autocommit)?;
+        let sql_mode = capabilities.sql_mode().to_owned();
+
+        Ok(MySqlReadAdmission::new(
+            capabilities,
+            Box::new(UnprovenMySqlReadLease {
+                connection,
+                deadline,
+                sql_mode,
+            }),
+        ))
     }
 
     pub async fn load_page(
@@ -134,9 +184,12 @@ impl MySqlSession {
         .await
     }
 
-    async fn execute_one(&self, text: &str, row_limit: u32) -> Result<QueryResult, DriverError> {
+    async fn execute_one(
+        connection: &mut MySqlConnection,
+        text: &str,
+        row_limit: u32,
+    ) -> Result<QueryResult, DriverError> {
         let limit = row_limit as usize;
-        let mut connection = self.pool.acquire().await.map_err(DriverError::from)?;
 
         // Every caller-supplied statement crosses the wire through the server
         // prepared protocol. Failure to prepare is terminal for this request.
@@ -163,7 +216,7 @@ impl MySqlSession {
         let mut last_insert_id = None;
         let mut truncated = false;
 
-        while let Some(step) = stream.try_next().await.map_err(DriverError::from)? {
+        while let Some(step) = stream.try_next().await.map_err(map_read_execution_error)? {
             match step {
                 Either::Right(row) => {
                     is_result_set = true;
@@ -209,6 +262,109 @@ impl MySqlSession {
             truncated,
             backend_notices_present: false,
         })
+    }
+}
+
+#[async_trait]
+impl MySqlReadExecution for MySqlSession {
+    async fn begin_read_admission(
+        &self,
+        timeout: Duration,
+    ) -> Result<MySqlReadAdmission, DriverError> {
+        Self::begin_read_admission(self, timeout).await
+    }
+}
+
+struct UnprovenMySqlReadLease {
+    connection: PoolConnection<sqlx::MySql>,
+    deadline: MySqlOperationDeadline,
+    sql_mode: String,
+}
+
+#[async_trait]
+impl MySqlUnprovenReadLease for UnprovenMySqlReadLease {
+    async fn prove_read_only(
+        mut self: Box<Self>,
+    ) -> Result<Box<dyn MySqlProvenReadLease>, DriverError> {
+        timed_remaining(
+            &self.deadline,
+            sqlx::query("SET SESSION TRANSACTION READ ONLY").execute(&mut *self.connection),
+        )
+        .await
+        .map_err(|error| map_read_only_failure(error, "read-only SET rejected"))?;
+        let (transaction_read_only,): (i64,) = timed_remaining(
+            &self.deadline,
+            sqlx::query_as("SELECT @@SESSION.transaction_read_only")
+                .fetch_one(&mut *self.connection),
+        )
+        .await
+        .map_err(|error| map_read_only_decode(error, "read-only proof decode mismatch"))?;
+        verify_read_only_session(transaction_read_only)?;
+        Ok(Box::new(ProvenMySqlReadLease {
+            connection: self.connection,
+            deadline: self.deadline,
+            sql_mode: self.sql_mode,
+        }))
+    }
+}
+
+struct ProvenMySqlReadLease {
+    connection: PoolConnection<sqlx::MySql>,
+    deadline: MySqlOperationDeadline,
+    sql_mode: String,
+}
+
+#[async_trait]
+impl MySqlProvenReadLease for ProvenMySqlReadLease {
+    async fn execute_prepared(
+        &mut self,
+        request: &PreparedMySqlRequest,
+    ) -> Result<QueryResult, DriverError> {
+        request
+            .validate()
+            .map_err(|_| DriverError::MySqlReadOnlyNotProven {
+                reason: "invalid read request",
+            })?;
+        if classify_mysql_execution_kind_with_sql_mode(&request.statement, &self.sql_mode)
+            != Some(crate::model::OperationKind::ExecuteRead)
+        {
+            return Err(DriverError::MySqlReadOnlyNotProven {
+                reason: "statement classification denied",
+            });
+        }
+        let result = timed_remaining(
+            &self.deadline,
+            MySqlSession::execute_one(&mut self.connection, &request.statement, request.row_limit),
+        )
+        .await?;
+        Ok(QueryResult {
+            elapsed_ms: self.deadline.started.elapsed().as_millis(),
+            ..result
+        })
+    }
+}
+
+struct MySqlOperationDeadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl MySqlOperationDeadline {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn remaining(&self) -> Result<Duration, DriverError> {
+        self.timeout
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(DriverError::Timeout {
+                driver: DriverKind::MySql,
+                seconds: self.timeout.as_secs(),
+            })
     }
 }
 
@@ -292,12 +448,105 @@ fn json_heap_bytes(value: &serde_json::Value) -> usize {
 }
 
 fn map_prepare_error(error: sqlx::Error) -> DriverError {
-    if mysql_error_number(&error).is_some_and(is_prepare_protocol_unsupported) {
+    if is_mysql_read_only_violation(&error) {
+        DriverError::MySqlReadOnlyDenied
+    } else if mysql_error_number(&error).is_some_and(is_prepare_protocol_unsupported) {
         DriverError::PreparedStatementUnsupported {
             session_healthy: true,
         }
     } else {
         DriverError::MySql(error)
+    }
+}
+
+fn capability_text(
+    row: &MySqlRow,
+    index: usize,
+    field: &'static str,
+) -> Result<String, DriverError> {
+    row.try_get(index)
+        .map_err(|_| DriverError::MySqlCapabilityDecode { field })
+}
+
+fn map_read_only_decode(error: DriverError, reason: &'static str) -> DriverError {
+    if error.mysql_public_code().is_some() {
+        return DriverError::MySqlReadOnlyNotProven { reason };
+    }
+    match error {
+        DriverError::MySql(error) if is_sqlx_decode_error(&error) => {
+            DriverError::MySqlReadOnlyNotProven { reason }
+        }
+        other => other,
+    }
+}
+
+fn map_capability_failure(error: DriverError, field: &'static str) -> DriverError {
+    if error.mysql_public_code().is_some() {
+        DriverError::MySqlCapabilityDecode { field }
+    } else {
+        error
+    }
+}
+
+fn map_read_only_failure(error: DriverError, reason: &'static str) -> DriverError {
+    if error.mysql_public_code().is_some() {
+        DriverError::MySqlReadOnlyNotProven { reason }
+    } else {
+        error
+    }
+}
+
+fn map_read_execution_error(error: sqlx::Error) -> DriverError {
+    if is_mysql_read_only_violation(&error) {
+        DriverError::MySqlReadOnlyDenied
+    } else {
+        DriverError::MySql(error)
+    }
+}
+
+fn is_mysql_read_only_violation(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(database) = error else {
+        return false;
+    };
+    let Some(database) = database.try_downcast_ref::<MySqlDatabaseError>() else {
+        return false;
+    };
+    is_mysql_read_only_violation_parts(database.number(), database.code())
+}
+
+fn is_mysql_read_only_violation_parts(number: u16, sql_state: Option<&str>) -> bool {
+    number == 1792 && sql_state == Some("25006")
+}
+
+fn is_sqlx_decode_error(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::RowNotFound
+            | sqlx::Error::TypeNotFound { .. }
+            | sqlx::Error::ColumnIndexOutOfBounds { .. }
+            | sqlx::Error::ColumnNotFound(_)
+            | sqlx::Error::ColumnDecode { .. }
+            | sqlx::Error::Decode(_)
+    )
+}
+
+fn verify_clean_read_session(autocommit: i64) -> Result<(), DriverError> {
+    if autocommit == 1 {
+        Ok(())
+    } else {
+        Err(DriverError::MySqlReadOnlyNotProven {
+            reason: "unclean read session",
+        })
+    }
+}
+
+fn verify_read_only_session(transaction_read_only: i64) -> Result<(), DriverError> {
+    if transaction_read_only == 1 {
+        Ok(())
+    } else {
+        Err(DriverError::MySqlReadOnlyNotProven {
+            reason: "read-only state mismatch",
+        })
     }
 }
 
@@ -323,6 +572,23 @@ async fn timed<T>(
         .map_err(|_| DriverError::Timeout {
             driver: DriverKind::MySql,
             seconds: timeout.as_secs(),
+        })?
+        .map_err(DriverError::from)
+}
+
+async fn timed_remaining<T, E>(
+    deadline: &MySqlOperationDeadline,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, DriverError>
+where
+    DriverError: From<E>,
+{
+    let remaining = deadline.remaining()?;
+    tokio::time::timeout(remaining, future)
+        .await
+        .map_err(|_| DriverError::Timeout {
+            driver: DriverKind::MySql,
+            seconds: deadline.timeout.as_secs(),
         })?
         .map_err(DriverError::from)
 }
@@ -384,6 +650,81 @@ mod tests {
     fn prepared_protocol_unsupported_code_is_exactly_scoped() {
         assert!(is_prepare_protocol_unsupported(ER_UNSUPPORTED_PS));
         assert!(!is_prepare_protocol_unsupported(1064));
+    }
+
+    #[test]
+    fn production_proof_decode_failures_remain_typed_and_keepable() {
+        for label in ["fixture NULL", "fixture type mismatch"] {
+            let proof = map_read_only_decode(
+                DriverError::MySql(sqlx::Error::ColumnDecode {
+                    index: "transaction_read_only".to_owned(),
+                    source: Box::new(std::io::Error::other(label)),
+                }),
+                "read-only proof decode mismatch",
+            );
+            assert!(matches!(
+                proof,
+                DriverError::MySqlReadOnlyNotProven {
+                    reason: "read-only proof decode mismatch"
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn read_only_proof_requires_exact_one() {
+        assert!(verify_clean_read_session(1).is_ok());
+        assert!(verify_read_only_session(1).is_ok());
+        for autocommit in [0, 2] {
+            assert!(matches!(
+                verify_clean_read_session(autocommit),
+                Err(DriverError::MySqlReadOnlyNotProven { .. })
+            ));
+        }
+        for transaction_read_only in [0, 2] {
+            assert!(matches!(
+                verify_read_only_session(transaction_read_only),
+                Err(DriverError::MySqlReadOnlyNotProven { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn server_read_only_violation_mapping_is_exact() {
+        assert!(is_mysql_read_only_violation_parts(1792, Some("25006")));
+        assert!(!is_mysql_read_only_violation_parts(1792, Some("HY000")));
+        assert!(!is_mysql_read_only_violation_parts(1045, Some("28000")));
+    }
+
+    #[test]
+    fn static_server_rejections_map_to_typed_unsupported_errors() {
+        let capability = map_capability_failure(
+            DriverError::MySqlServer {
+                code: crate::model::MySqlPublicErrorCode::new(1142, "42000")
+                    .expect("valid fixture code"),
+            },
+            "capability query",
+        );
+        assert!(matches!(
+            capability,
+            DriverError::MySqlCapabilityDecode {
+                field: "capability query"
+            }
+        ));
+
+        let proof = map_read_only_failure(
+            DriverError::MySqlServer {
+                code: crate::model::MySqlPublicErrorCode::new(1792, "25006")
+                    .expect("valid fixture code"),
+            },
+            "read-only SET rejected",
+        );
+        assert!(matches!(
+            proof,
+            DriverError::MySqlReadOnlyNotProven {
+                reason: "read-only SET rejected"
+            }
+        ));
     }
 
     #[test]

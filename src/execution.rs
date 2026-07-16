@@ -60,23 +60,219 @@ pub fn classify_execution_kind(
 }
 
 fn mysql_is_clearly_read_only(text: &str) -> bool {
-    // D1 has no mode-aware parser or catalog proof yet. Admit only a closed
-    // literal probe that cannot name a table, view, routine, UDF, or loadable
-    // function. D3 replaces this seam with the full capability-backed parser.
-    if !text.is_ascii() {
+    classify_mysql_execution_kind_with_sql_mode(text, "") == Some(OperationKind::ExecuteRead)
+}
+
+/// Classifies one already-bounded MySQL statement with the exact session mode.
+/// `None` means the server returned an undecodable `sql_mode` capability.
+#[must_use]
+pub fn classify_mysql_execution_kind_with_sql_mode(
+    text: &str,
+    sql_mode: &str,
+) -> Option<OperationKind> {
+    let mode = MysqlClassifierMode::decode(sql_mode)?;
+    Some(if mysql_statement_is_read_only(text, mode) {
+        OperationKind::ExecuteRead
+    } else {
+        OperationKind::ExecuteMutation
+    })
+}
+
+/// Rejects executable-comment marker bytes before any session or mode lookup.
+/// The scan is intentionally quote-agnostic because MySQL/MariaDB can change
+/// lexical interpretation through session modes and version-comment rules.
+#[must_use]
+pub fn mysql_has_forbidden_executable_comment(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.windows(3).any(|window| window == b"/*!")
+        || bytes
+            .windows(4)
+            .any(|window| matches!(window, b"/*M!" | b"/*m!"))
+}
+
+/// Reports whether any relevant exact session mode can classify the target as
+/// a read. This keeps the pre-capability UI/service posture conservative
+/// without mislabeling mode-dependent SELECTs as data changes.
+#[must_use]
+pub fn mysql_may_be_read_with_session_mode(text: &str) -> bool {
+    if mysql_has_forbidden_executable_comment(text) {
         return false;
     }
+    [
+        "",
+        "ANSI_QUOTES",
+        "NO_BACKSLASH_ESCAPES",
+        "ANSI_QUOTES,NO_BACKSLASH_ESCAPES",
+    ]
+    .into_iter()
+    .any(|sql_mode| {
+        classify_mysql_execution_kind_with_sql_mode(text, sql_mode)
+            == Some(OperationKind::ExecuteRead)
+    })
+}
+
+#[derive(Clone, Copy, Default)]
+struct MysqlClassifierMode {
+    ansi_quotes: bool,
+    no_backslash_escapes: bool,
+}
+
+impl MysqlClassifierMode {
+    fn decode(sql_mode: &str) -> Option<Self> {
+        if sql_mode.is_empty() {
+            return Some(Self::default());
+        }
+        let mut decoded = Self::default();
+        for token in sql_mode.split(',') {
+            if token.is_empty()
+                || !token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            {
+                return None;
+            }
+            match token {
+                "ANSI" | "ANSI_QUOTES" => decoded.ansi_quotes = true,
+                "NO_BACKSLASH_ESCAPES" => decoded.no_backslash_escapes = true,
+                "IGNORE_SPACE" => {}
+                _ => {}
+            }
+        }
+        Some(decoded)
+    }
+}
+
+fn mysql_statement_is_read_only(text: &str, mode: MysqlClassifierMode) -> bool {
     let text = text.trim();
     let text = text.strip_suffix(';').unwrap_or(text).trim_end();
-    let bytes = text.as_bytes();
-    if bytes.len() <= b"SELECT".len()
-        || !bytes[..b"SELECT".len()].eq_ignore_ascii_case(b"SELECT")
-        || !bytes[b"SELECT".len()].is_ascii_whitespace()
+    if text.is_empty() {
+        return false;
+    }
+    let Some(words) = mysql_classifier_words(text, mode) else {
+        return false;
+    };
+    let Some(first) = words.first() else {
+        return false;
+    };
+    if !first.eq_ignore_ascii_case("SELECT") && !first.eq_ignore_ascii_case("WITH") {
+        return false;
+    }
+    if first.eq_ignore_ascii_case("WITH")
+        && !words.iter().any(|word| word.eq_ignore_ascii_case("SELECT"))
     {
         return false;
     }
-    let literal = text[b"SELECT".len()..].trim();
-    !literal.is_empty() && literal.bytes().all(|byte| byte.is_ascii_digit())
+
+    !words.iter().any(|word| {
+        [
+            "ALTER",
+            "ANALYZE",
+            "BEGIN",
+            "CALL",
+            "COMMIT",
+            "CREATE",
+            "DELETE",
+            "DESC",
+            "DESCRIBE",
+            "DO",
+            "DROP",
+            "DUMPFILE",
+            "EXPLAIN",
+            "GRANT",
+            "HANDLER",
+            "INSERT",
+            "INSTALL",
+            "INTO",
+            "LOAD",
+            "LOCK",
+            "PROCEDURE",
+            "RELEASE",
+            "RENAME",
+            "REPLACE",
+            "REVOKE",
+            "ROLLBACK",
+            "SAVEPOINT",
+            "SET",
+            "SHARE",
+            "SHOW",
+            "START",
+            "TRUNCATE",
+            "UNINSTALL",
+            "UPDATE",
+            "XA",
+        ]
+        .iter()
+        .any(|forbidden| word.eq_ignore_ascii_case(forbidden))
+    })
+}
+
+fn mysql_classifier_words(text: &str, mode: MysqlClassifierMode) -> Option<Vec<&str>> {
+    let bytes = text.as_bytes();
+    let mut words = Vec::new();
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        if bytes[index] == b'#' || mysql_dash_comment_starts(bytes, index) {
+            index = line_comment_end(bytes, index);
+            continue;
+        }
+        if bytes[index..].starts_with(b"/*") {
+            if bytes[index..].starts_with(b"/*!")
+                || bytes[index..].starts_with(b"/*M!")
+                || bytes[index..].starts_with(b"/*m!")
+            {
+                return None;
+            }
+            index = block_comment_end(bytes, index + 2)?;
+            continue;
+        }
+        let delimiter = bytes[index];
+        if matches!(delimiter, b'\'' | b'"' | b'`') {
+            index = mysql_classifier_quote_end(bytes, index, delimiter, mode)?;
+            continue;
+        }
+        if bytes[index..].starts_with(b":=") || bytes[index] == b';' {
+            return None;
+        }
+        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+            let start = index;
+            index += 1;
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                index += 1;
+            }
+            words.push(&text[start..index]);
+            continue;
+        }
+        index += 1;
+    }
+    Some(words)
+}
+
+fn mysql_classifier_quote_end(
+    bytes: &[u8],
+    start: usize,
+    delimiter: u8,
+    mode: MysqlClassifierMode,
+) -> Option<usize> {
+    let quoted_identifier = delimiter == b'`' || (delimiter == b'"' && mode.ansi_quotes);
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == delimiter {
+            if bytes.get(index + 1) == Some(&delimiter) {
+                index += 2;
+                continue;
+            }
+            return Some(index + 1);
+        }
+        if bytes[index] == b'\\' && !quoted_identifier && !mode.no_backslash_escapes {
+            index = index.saturating_add(2);
+            continue;
+        }
+        index += 1;
+    }
+    None
 }
 
 fn redis_is_clearly_read_only(arguments: &[String]) -> bool {
@@ -202,6 +398,7 @@ pub enum ExecutionTargetError {
     MultipleStatements,
     AmbiguousSqlMode,
     UnterminatedSqlToken,
+    ForbiddenExecutableComment,
     RedisShellParseFailed,
     RedisCommandDenied,
     RedisTargetTooLarge,
@@ -221,6 +418,7 @@ impl ExecutionTargetError {
             Self::MultipleStatements => "MULTIPLE_STATEMENTS",
             Self::AmbiguousSqlMode => "AMBIGUOUS_SQL_MODE",
             Self::UnterminatedSqlToken => "UNTERMINATED_SQL_TOKEN",
+            Self::ForbiddenExecutableComment => "FORBIDDEN_EXECUTABLE_COMMENT",
             Self::RedisShellParseFailed => "REDIS_SHELL_PARSE_FAILED",
             Self::RedisCommandDenied => "REDIS_COMMAND_DENIED",
             Self::RedisTargetTooLarge => "REDIS_TARGET_TOO_LARGE",
@@ -242,6 +440,9 @@ impl ExecutionTargetError {
                 "The SQL boundary depends on SQL mode; select the exact statement."
             }
             Self::UnterminatedSqlToken => "The SQL target contains an unterminated token.",
+            Self::ForbiddenExecutableComment => {
+                "MySQL and MariaDB executable comments are not allowed."
+            }
             Self::RedisShellParseFailed => "The Redis command could not be parsed.",
             Self::RedisCommandDenied => "The Redis command is not allowed for local execution.",
             Self::RedisTargetTooLarge => "The Redis command exceeds the input limit.",
@@ -281,6 +482,9 @@ pub fn extract_and_validate_target(
     }
     if !(1..=MAX_EXECUTE_TIMEOUT_SECONDS).contains(&timeout_seconds) {
         return Err(ExecutionTargetError::InvalidTimeout);
+    }
+    if language == ExecutionLanguage::MySql && mysql_has_forbidden_executable_comment(editor_text) {
+        return Err(ExecutionTargetError::ForbiddenExecutableComment);
     }
 
     let caret_byte = char_to_byte(editor_text, caret_character_index)
@@ -430,14 +634,14 @@ fn scan_mysql(text: &str) -> MysqlScan {
             pending.mark_executable(index, index + 1);
             let preceding_odd_backslash = byte != b'`' && odd_backslash_run_before(bytes, index);
             match quoted_span(text, index, byte) {
-                Some(quoted) => {
+                Ok(quoted) => {
                     pending.mark_executable(index, quoted.end);
                     pending.ambiguous_sql_mode |=
                         preceding_odd_backslash || quoted.ambiguous_sql_mode;
                     index = quoted.end;
                 }
-                None => {
-                    pending.ambiguous_sql_mode |= preceding_odd_backslash;
+                Err(ambiguous_sql_mode) => {
+                    pending.ambiguous_sql_mode |= preceding_odd_backslash || ambiguous_sql_mode;
                     return MysqlScan {
                         statements,
                         issue: Some(MysqlLexIssue {
@@ -501,7 +705,7 @@ fn block_comment_end(bytes: &[u8], search_start: usize) -> Option<usize> {
         .map(|offset| search_start + offset + 2)
 }
 
-fn quoted_span(text: &str, start: usize, delimiter: u8) -> Option<QuotedSpan> {
+fn quoted_span(text: &str, start: usize, delimiter: u8) -> Result<QuotedSpan, bool> {
     let bytes = text.as_bytes();
     let mut index = start + 1;
     let mut ambiguous_sql_mode = false;
@@ -530,7 +734,7 @@ fn quoted_span(text: &str, start: usize, delimiter: u8) -> Option<QuotedSpan> {
                 index += 2;
                 continue;
             }
-            return Some(QuotedSpan {
+            return Ok(QuotedSpan {
                 end: index + 1,
                 ambiguous_sql_mode,
             });
@@ -538,7 +742,7 @@ fn quoted_span(text: &str, start: usize, delimiter: u8) -> Option<QuotedSpan> {
         index = next_char_boundary(text, index);
     }
 
-    None
+    Err(ambiguous_sql_mode)
 }
 
 fn odd_backslash_run_before(bytes: &[u8], index: usize) -> bool {
@@ -563,8 +767,12 @@ fn validate_mysql_selection(selection: &str) -> Result<(), ExecutionTargetError>
         return Err(ExecutionTargetError::NoCurrentStatement);
     }
     let scan = scan_mysql(selection);
-    if scan.issue.is_some() {
-        return Err(ExecutionTargetError::UnterminatedSqlToken);
+    if let Some(issue) = scan.issue {
+        return if issue.ambiguous_sql_mode {
+            Ok(())
+        } else {
+            Err(ExecutionTargetError::UnterminatedSqlToken)
+        };
     }
     match scan.statements.len() {
         0 => Err(ExecutionTargetError::NoCurrentStatement),

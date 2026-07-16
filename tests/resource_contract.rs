@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use dbotter::model::{
     CatalogLevel, CatalogPage, CatalogPageToken, CatalogRequest, CatalogRetainedCounts, Cell,
-    Column, DriverKind, ExportFormat, ExportResult, MAX_CATALOG_PAGE_SIZE, MAX_REDIS_CELL_BYTES,
-    MAX_REDIS_COMMAND_BYTES, MAX_REDIS_DEPTH, MAX_RESULT_BYTES, MAX_RESULT_CELL_BYTES,
-    OverwritePolicy, PreparedMySqlRequest, ProfileGeneration, ProfileId, QueryResult,
-    RedisExecuteRequest, RedisKeyEntry, RedisKeyFilter, RedisKeyId, RedisKeyInspectRequest,
-    RedisKeyPage, RedisScanConsistency, RedisScanRequest, RequestIdentity, ResultId, ResultNotice,
-    ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
+    Column, DriverKind, ExportFormat, ExportResult, MAX_CATALOG_PAGE_SIZE,
+    MAX_MYSQL_STATEMENT_BYTES, MAX_REDIS_CELL_BYTES, MAX_REDIS_COMMAND_BYTES, MAX_REDIS_DEPTH,
+    MAX_RESULT_BYTES, MAX_RESULT_CELL_BYTES, OverwritePolicy, PreparedMySqlRequest,
+    ProfileGeneration, ProfileId, QueryResult, RedisExecuteRequest, RedisKeyEntry, RedisKeyFilter,
+    RedisKeyId, RedisKeyInspectRequest, RedisKeyPage, RedisScanConsistency, RedisScanRequest,
+    RequestIdentity, RequestValidationError, ResultId, ResultNotice, ResultProvenance,
+    ResultRetentionPolicy, ResultSnapshot,
 };
 
 fn source(path: &str) -> String {
@@ -70,7 +71,9 @@ fn p3_driver_boundary_is_split_by_backend_and_resource_kind() {
     let drivers = source("src/drivers/mod.rs");
     for required in [
         "trait ConnectionPing",
-        "trait MySqlPreparedExecution",
+        "trait MySqlReadExecution",
+        "trait MySqlUnprovenReadLease",
+        "trait MySqlProvenReadLease",
         "trait RedisExecution",
         "trait CatalogBrowser",
         "trait KeyspaceBrowser",
@@ -212,6 +215,14 @@ fn typed_requests_validate_bounds_before_network_and_redact_value_data() {
     let mysql_debug = format!("{mysql:?}");
     assert!(!mysql_debug.contains(sentinel));
     assert!(!mysql_debug.contains("sensitive-profile-id"));
+    let mut mysql_at_limit = mysql.clone();
+    mysql_at_limit.statement = "x".repeat(MAX_MYSQL_STATEMENT_BYTES);
+    assert!(mysql_at_limit.validate().is_ok());
+    mysql_at_limit.statement.push('x');
+    assert_eq!(
+        mysql_at_limit.validate(),
+        Err(RequestValidationError::MySqlStatementTooLarge)
+    );
 
     let redis = RedisExecuteRequest::new(
         identity(),

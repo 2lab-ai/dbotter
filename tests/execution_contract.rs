@@ -236,9 +236,15 @@ fn mysql_block_comment_kinds_follow_the_frozen_policy() {
 
     let version = "/*!40101 SET @x=';' */;";
     assert_eq!(
-        mysql_text(&mysql(version, character_index(version, "SET")).unwrap()),
-        version
+        mysql(version, character_index(version, "SET")).unwrap_err(),
+        ExecutionTargetError::ForbiddenExecutableComment
     );
+    for mariadb in ["/*M!100100 SET @x=1 */", "/*m!100100 SET @x=1 */"] {
+        assert_eq!(
+            mysql(mariadb, character_index(mariadb, "SET")).unwrap_err(),
+            ExecutionTargetError::ForbiddenExecutableComment
+        );
+    }
 
     let hint = "SELECT /*+ hint; */ 1;";
     assert_eq!(

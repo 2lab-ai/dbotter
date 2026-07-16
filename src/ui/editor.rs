@@ -8,6 +8,7 @@ use eframe::egui;
 use crate::execution::{
     ExecutionLanguage, ExecutionTarget, ExecutionTargetError, MAX_EXECUTE_ROW_LIMIT,
     MAX_EXECUTE_TIMEOUT_SECONDS, classify_execution_kind, extract_and_validate_target,
+    mysql_may_be_read_with_session_mode,
 };
 use crate::model::{
     DriverKind, OperationId, OperationKind, ProfileGeneration, ProfileId, QueryLanguage, TlsMode,
@@ -191,7 +192,7 @@ pub fn build_execute_intent(
         timeout_seconds,
     )
     .map_err(EditorValidationError::Target)?;
-    let operation_kind = classify_execution_kind(execution_language, validated.target());
+    let operation_kind = classify_validated_operation(execution_language, validated.target());
     let text = validated.into_source_text();
     Ok(EditorExecuteIntent {
         profile_id: profile.id.clone(),
@@ -241,7 +242,19 @@ pub fn classify_execute_operation(language: QueryLanguage, text: &str) -> Operat
         }
         QueryLanguage::MongoDocument => return OperationKind::ExecuteMutation,
     };
-    classify_execution_kind(execution_language, &target)
+    classify_validated_operation(execution_language, &target)
+}
+
+fn classify_validated_operation(
+    language: ExecutionLanguage,
+    target: &ExecutionTarget,
+) -> OperationKind {
+    if let (ExecutionLanguage::MySql, ExecutionTarget::MySqlText(text)) = (language, target)
+        && mysql_may_be_read_with_session_mode(text)
+    {
+        return OperationKind::ExecuteRead;
+    }
+    classify_execution_kind(language, target)
 }
 
 pub fn editor_target_label(profile: &ProfileSnapshot) -> String {

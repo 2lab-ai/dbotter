@@ -2242,7 +2242,8 @@ async fn run_execute(
         TimedOut,
     }
     let attempt = {
-        let execute = lease.execute_typed(&typed_request);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let execute = lease.execute_typed(&typed_request, remaining);
         tokio::pin!(execute);
         tokio::select! {
             biased;

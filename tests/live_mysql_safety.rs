@@ -6,7 +6,7 @@ use std::time::Duration;
 mod live_evidence;
 
 use dbotter::config::{Config, ConfigWriter};
-use dbotter::drivers::{self, DriverError, MySqlPreparedExecution, Session};
+use dbotter::drivers::{self, DriverError, MySqlReadExecution, Session};
 use dbotter::execution::{
     ExecutionLanguage, ExecutionTarget, ExecutionTargetError, extract_and_validate_target,
 };
@@ -25,12 +25,15 @@ use dbotter::service::{
 };
 use live_evidence::LiveEvidence;
 use secrecy::SecretString;
+use sqlx::Connection as _;
+use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlSslMode};
 
 const CORRECT_PASSWORD: &str = "dbotter-local-only";
 const WRONG_PASSWORD: &str = "dbotter-definitely-wrong";
 const ENV_NAME: &str = "DBOTTER_MYSQL_PASSWORD";
 const TIMEOUT: Duration = Duration::from_secs(10);
 const MARKER_TEXT: &str = "INSERT INTO dbotter_live_marker VALUES ('first'); INSERT INTO dbotter_live_marker VALUES ('second')";
+const SIDE_EFFECTING_STORED_FUNCTION: &str = "SELECT dbotter_live_side_effect()";
 
 fn live_port() -> u16 {
     std::env::var("DBOTTER_TEST_MYSQL_PORT")
@@ -316,12 +319,43 @@ async fn mysql_session() -> Session {
     .expect("connect MySQL safety session")
 }
 
+async fn mysql_fixture_connection() -> MySqlConnection {
+    let password = std::env::var(ENV_NAME).expect("MySQL fixture password");
+    assert_eq!(password, CORRECT_PASSWORD);
+    let options = MySqlConnectOptions::new()
+        .host("127.0.0.1")
+        .port(live_port())
+        .username("dbotter")
+        .password(&password)
+        .database("dbotter")
+        .ssl_mode(MySqlSslMode::Disabled);
+    MySqlConnection::connect_with(&options)
+        .await
+        .expect("connect isolated MySQL fixture setup")
+}
+
+async fn fixture_execute(connection: &mut MySqlConnection, statement: &'static str) {
+    sqlx::query(statement)
+        .execute(connection)
+        .await
+        .expect("execute isolated MySQL fixture setup");
+}
+
+async fn fixture_raw_execute(connection: &mut MySqlConnection, statement: &'static str) {
+    sqlx::raw_sql(statement)
+        .execute(connection)
+        .await
+        .expect("execute isolated MySQL raw fixture setup");
+}
+
 async fn execute(
     session: &Session,
     operation: u64,
     statement: &str,
 ) -> Result<dbotter::model::QueryResult, DriverError> {
-    session
+    let admission = session.begin_read_admission(TIMEOUT).await?;
+    let mut proven = admission.prove_read_only().await?;
+    proven
         .execute_prepared(&PreparedMySqlRequest {
             identity: RequestIdentity::new(
                 ProfileId("mysql-live-safety".to_owned()),
@@ -353,23 +387,39 @@ async fn live_mysql_safety_receipt() {
     .expect("initialize MySQL safety evidence");
     let auth_failures = assert_auth_matrix(&mut evidence).await;
     let mut statements_executed = 0_usize;
-    let mut marker_prepared_attempts = 0_usize;
-    let mut prepared_unsupported_attempts = 0_usize;
+    let mut marker_denied_attempts = 0_usize;
+    let mut non_select_denied_attempts = 0_usize;
+    let mut server_side_effect_denied_attempts = 0_usize;
 
-    let session = mysql_session().await;
-    execute(&session, 1, "DROP TABLE IF EXISTS dbotter_live_execute")
-        .await
-        .expect("drop execute fixture");
-    execute(
-        &session,
-        2,
+    let mut fixture = mysql_fixture_connection().await;
+    fixture_raw_execute(
+        &mut fixture,
+        "DROP FUNCTION IF EXISTS dbotter_live_side_effect",
+    )
+    .await;
+    fixture_execute(&mut fixture, "DROP TABLE IF EXISTS dbotter_live_execute").await;
+    fixture_execute(
+        &mut fixture,
         "CREATE TABLE dbotter_live_execute (id INT PRIMARY KEY, marker VARCHAR(32) NOT NULL)",
     )
-    .await
-    .expect("create execute fixture");
+    .await;
+    fixture_execute(&mut fixture, "DROP TABLE IF EXISTS dbotter_live_marker").await;
+    fixture_execute(
+        &mut fixture,
+        "CREATE TABLE dbotter_live_marker (marker VARCHAR(32) PRIMARY KEY)",
+    )
+    .await;
+    fixture_raw_execute(
+        &mut fixture,
+        "CREATE FUNCTION dbotter_live_side_effect() RETURNS INT MODIFIES SQL DATA BEGIN INSERT INTO dbotter_live_marker(marker) VALUES ('udf-side-effect'); RETURN 1; END",
+    )
+    .await;
+    fixture.close().await.expect("close MySQL fixture setup");
+
+    let session = mysql_session().await;
 
     let execute_read = evidence.begin("mysql.execute.read");
-    let read = execute(&session, 3, "SELECT 42 AS value")
+    let read = execute(&session, 1, "SELECT 42 AS value")
         .await
         .expect("prepared read");
     assert_eq!(read.rows, [vec![Cell::Int(42)]]);
@@ -377,38 +427,63 @@ async fn live_mysql_safety_receipt() {
     statements_executed += 1;
     evidence.pass(execute_read);
 
-    let execute_mutation = evidence.begin("mysql.execute.mutation");
-    let mutation = execute(
+    let execute_mutation = evidence.begin("mysql.read_lease.mutation_denied");
+    let mutation_error = execute(
         &session,
-        4,
+        2,
         "INSERT INTO dbotter_live_execute (id, marker) VALUES (1, 'measured')",
     )
     .await
-    .expect("prepared mutation");
-    assert!(mutation.columns.is_empty());
-    assert!(mutation.rows.is_empty());
-    assert_eq!(mutation.affected_rows, 1);
+    .expect_err("read lease must deny mutation before user dispatch");
+    assert!(matches!(
+        mutation_error,
+        DriverError::MySqlReadOnlyNotProven { .. }
+    ));
     let mutation_readback = execute(
         &session,
-        5,
+        3,
         "SELECT marker FROM dbotter_live_execute WHERE id = 1",
     )
     .await
     .expect("mutation readback");
-    assert_eq!(text_cell(&mutation_readback), "measured");
+    assert!(mutation_readback.rows.is_empty());
     statements_executed += 1;
     evidence.pass(execute_mutation);
 
-    execute(&session, 6, "DROP TABLE IF EXISTS dbotter_live_marker")
+    let server_side_effect = evidence.begin("mysql.read_lease.server_side_effect_denied");
+    let server_side_effect_error = execute(&session, 12, SIDE_EFFECTING_STORED_FUNCTION)
         .await
-        .expect("drop marker fixture");
-    execute(
+        .expect_err("the server-enforced read-only session must deny a writing stored function");
+    assert!(matches!(
+        server_side_effect_error,
+        DriverError::MySqlReadOnlyDenied
+    ));
+    let server_side_effect_service_error = ServiceError::from(server_side_effect_error);
+    assert_eq!(
+        server_side_effect_service_error.public_error_parts(),
+        (PublicSummary::UnsupportedFeature, PublicCode::None)
+    );
+    assert_eq!(
+        SessionDisposition::for_driver_error(match &server_side_effect_service_error {
+            ServiceError::Driver(error) => error,
+            other => panic!("expected typed driver denial, got {other:?}"),
+        }),
+        SessionDisposition::Keep
+    );
+    server_side_effect_denied_attempts += 1;
+    evidence.pass(server_side_effect);
+
+    let server_side_effect_absent = evidence.begin("mysql.read_lease.server_side_effect_absent");
+    let after_server_side_effect = execute(
         &session,
-        7,
-        "CREATE TABLE dbotter_live_marker (marker VARCHAR(32) PRIMARY KEY)",
+        13,
+        "SELECT marker FROM dbotter_live_marker WHERE marker = 'udf-side-effect'",
     )
     .await
-    .expect("create marker fixture");
+    .expect("read marker after the server denied the writing stored function");
+    assert!(after_server_side_effect.rows.is_empty());
+    statements_executed += 1;
+    evidence.pass(server_side_effect_absent);
 
     let ui_rejection = evidence.begin("mysql.marker.explicit_selection.ui_rejected");
     let ui_error = extract_and_validate_target(
@@ -423,22 +498,26 @@ async fn live_mysql_safety_receipt() {
     assert_eq!(ui_error, ExecutionTargetError::MultipleStatements);
     evidence.pass(ui_rejection);
 
-    let explicit_prepare = evidence.begin("mysql.marker.explicit_selection.prepare_only_rejected");
-    let explicit_error = execute(&session, 8, MARKER_TEXT)
+    let explicit_prepare = evidence.begin("mysql.marker.explicit_selection.driver_denied");
+    let explicit_error = execute(&session, 4, MARKER_TEXT)
         .await
-        .expect_err("explicit selection adapter must stop at server prepare");
-    assert!(matches!(explicit_error, DriverError::MySql(_)));
-    marker_prepared_attempts += 1;
+        .expect_err("explicit selection adapter must stop before user dispatch");
+    assert!(matches!(
+        explicit_error,
+        DriverError::MySqlReadOnlyNotProven { .. }
+    ));
+    marker_denied_attempts += 1;
     evidence.pass(explicit_prepare);
     let explicit_absent = evidence.begin("mysql.marker.explicit_selection.absent");
     let after_explicit = execute(
         &session,
-        9,
+        5,
         "SELECT marker FROM dbotter_live_marker ORDER BY marker",
     )
     .await
     .expect("read marker after explicit selection rejection");
     assert!(after_explicit.rows.is_empty());
+    statements_executed += 1;
     evidence.pass(explicit_absent);
 
     let current_target = evidence.begin("mysql.marker.current_target.extracted_prepared");
@@ -460,88 +539,87 @@ async fn live_mysql_safety_receipt() {
         panic!("MySQL current target changed language")
     };
     assert_eq!(current_statement, "SELECT 42 AS current");
-    let current_result = execute(&session, 10, &current_statement)
+    let current_result = execute(&session, 6, &current_statement)
         .await
         .expect("execute extracted current target through prepare");
     assert_eq!(current_result.rows, [vec![Cell::Int(42)]]);
+    statements_executed += 1;
     evidence.pass(current_target);
 
-    let current_prepare = evidence.begin("mysql.marker.second_probe.prepare_only_rejected");
-    let current_error = execute(&session, 11, MARKER_TEXT)
+    let current_prepare = evidence.begin("mysql.marker.second_probe.driver_denied");
+    let current_error = execute(&session, 7, MARKER_TEXT)
         .await
-        .expect_err("second exact marker probe must stop at server prepare");
-    assert!(matches!(current_error, DriverError::MySql(_)));
-    marker_prepared_attempts += 1;
+        .expect_err("second exact marker probe must stop before user dispatch");
+    assert!(matches!(
+        current_error,
+        DriverError::MySqlReadOnlyNotProven { .. }
+    ));
+    marker_denied_attempts += 1;
     evidence.pass(current_prepare);
     let current_absent = evidence.begin("mysql.marker.second_probe.absent");
     let after_current = execute(
         &session,
-        12,
+        8,
         "SELECT marker FROM dbotter_live_marker ORDER BY marker",
     )
     .await
     .expect("read marker after current-target rejection");
     assert!(after_current.rows.is_empty());
+    statements_executed += 1;
     evidence.pass(current_absent);
 
-    let unsupported_error_checkpoint = evidence.begin("mysql.prepared_unsupported.error");
-    let unsupported = execute(&session, 13, "USE information_schema")
+    let unsupported_error_checkpoint = evidence.begin("mysql.read_lease.non_select_denied");
+    let unsupported = execute(&session, 9, "USE information_schema")
         .await
-        .expect_err("USE must be unsupported by the prepared protocol");
+        .expect_err("USE must be denied before user dispatch");
     assert!(matches!(
         &unsupported,
-        DriverError::PreparedStatementUnsupported {
-            session_healthy: true
-        }
+        DriverError::MySqlReadOnlyNotProven { .. }
     ));
-    prepared_unsupported_attempts += 1;
+    non_select_denied_attempts += 1;
     evidence.pass(unsupported_error_checkpoint);
 
-    let retained = evidence.begin("mysql.prepared_unsupported.session_retained");
+    let retained = evidence.begin("mysql.read_lease.session_retained");
     assert_eq!(
         SessionDisposition::for_driver_error(&unsupported),
         SessionDisposition::Keep
     );
-    let retained_read = execute(&session, 14, "SELECT 1 AS healthy")
+    let retained_read = execute(&session, 10, "SELECT 1 AS healthy")
         .await
-        .expect("same session remains healthy after prepared unsupported");
+        .expect("same session remains healthy after non-select denial");
     assert_eq!(retained_read.rows, [vec![Cell::Int(1)]]);
+    statements_executed += 1;
     evidence.pass(retained);
 
-    let no_fallback = evidence.begin("mysql.prepared_unsupported.no_raw_fallback");
-    let database = execute(&session, 15, "SELECT DATABASE()")
+    let no_fallback = evidence.begin("mysql.read_lease.no_raw_fallback");
+    let database = execute(&session, 11, "SELECT DATABASE()")
         .await
-        .expect("read current database after unsupported prepare");
+        .expect("read current database after denied non-select");
     let raw_fallback_attempts = usize::from(text_cell(&database) != "dbotter");
     assert_eq!(
         raw_fallback_attempts, 0,
         "raw USE fallback changed database"
     );
+    statements_executed += 1;
     evidence.pass(no_fallback);
 
-    let static_recovery = evidence.begin("mysql.prepared_unsupported.static_recovery");
+    let static_recovery = evidence.begin("mysql.read_lease.static_recovery");
     let service_error = ServiceError::from(unsupported);
     assert_eq!(
         service_error.public_error_parts(),
-        (
-            PublicSummary::UnsupportedFeature,
-            PublicCode::PreparedStatementUnsupported,
-        )
+        (PublicSummary::UnsupportedFeature, PublicCode::None)
     );
     let recovery_profile = ProfileId("mysql-live-safety".to_owned());
     let recovery = recovery_for(
         OperationKind::ExecuteRead,
         service_error.public_summary(),
         service_error.public_code(),
-        &SafeContext::profile(recovery_profile.clone(), OperationId(13)),
+        &SafeContext::profile(recovery_profile, OperationId(9)),
     )
-    .expect("prepared unsupported recovery");
+    .expect("read-lease denial recovery");
     assert_eq!(
         recovery.as_slice(),
-        &[
-            RecoveryAction::FocusEditor(recovery_profile),
-            RecoveryAction::DismissError(OperationId(13)),
-        ]
+        &[RecoveryAction::DismissError(OperationId(9))]
     );
     evidence.pass(static_recovery);
 
@@ -549,20 +627,23 @@ async fn live_mysql_safety_receipt() {
         .measure("auth_failures", auth_failures)
         .expect("auth failure count");
     evidence
-        .measure("marker_prepared_attempts", marker_prepared_attempts)
-        .expect("marker prepare count");
+        .measure("marker_denied_attempts", marker_denied_attempts)
+        .expect("marker denial count");
     evidence
         .measure("marker_rows_after", after_current.rows.len())
         .expect("marker rows after");
     evidence
-        .measure(
-            "prepared_unsupported_attempts",
-            prepared_unsupported_attempts,
-        )
-        .expect("prepared unsupported count");
+        .measure("non_select_denied_attempts", non_select_denied_attempts)
+        .expect("non-select denial count");
     evidence
         .measure("raw_fallback_attempts", raw_fallback_attempts)
         .expect("raw fallback count");
+    evidence
+        .measure(
+            "server_side_effect_denied_attempts",
+            server_side_effect_denied_attempts,
+        )
+        .expect("server side-effect denial count");
     evidence
         .measure("statements_executed", statements_executed)
         .expect("required statement count");

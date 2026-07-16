@@ -7,15 +7,20 @@ fn source(path: &str) -> String {
 }
 
 #[test]
-fn mysql_user_text_has_one_prepared_only_driver_entry() {
+fn mysql_user_text_has_one_proven_prepared_read_entry() {
     let mysql = source("src/drivers/mysql.rs");
     let drivers = source("src/drivers/mod.rs");
     let service = source("src/service.rs");
 
     assert!(mysql.contains("PreparedMySqlRequest"));
     assert!(mysql.contains("execute_prepared"));
-    assert!(drivers.contains("trait MySqlPreparedExecution"));
+    assert!(drivers.contains("trait MySqlReadExecution"));
+    assert!(drivers.contains("trait MySqlUnprovenReadLease"));
+    assert!(drivers.contains("trait MySqlProvenReadLease"));
+    assert!(!drivers.contains("trait MySqlPreparedExecution"));
     assert!(service.contains("PreparedMySqlRequest"));
+    assert!(service.contains("begin_read_admission"));
+    assert!(service.contains("prove_read_only"));
 
     for forbidden in [
         "sqlx::raw_sql",

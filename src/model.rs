@@ -955,6 +955,7 @@ pub const DEFAULT_REDIS_SCAN_COUNT: u32 = 100;
 pub const MAX_REDIS_SCAN_COUNT: u32 = 1_000;
 pub const MAX_REDIS_FILTER_BYTES: usize = 512;
 pub const MAX_REDIS_COMMAND_BYTES: usize = 65_536;
+pub const MAX_MYSQL_STATEMENT_BYTES: usize = 65_536;
 pub const MAX_REDIS_COMMAND_TOKENS: usize = 1_024;
 pub const MAX_REDIS_COMMAND_TOKEN_BYTES: usize = 16 * 1024;
 pub const MAX_REDIS_KEYS: usize = 10_000;
@@ -970,6 +971,8 @@ pub const MAX_REDIS_DEPTH: usize = 8;
 pub enum RequestValidationError {
     #[error("statement target is empty")]
     EmptyStatement,
+    #[error("MySQL statement exceeds 65,536 bytes")]
+    MySqlStatementTooLarge,
     #[error("row limit must be between 1 and 10,000")]
     InvalidRowLimit,
     #[error("execute timeout must be between 1 and 300 seconds")]
@@ -1082,6 +1085,9 @@ impl PreparedMySqlRequest {
     pub fn validate(&self) -> Result<(), RequestValidationError> {
         if self.statement.trim().is_empty() {
             return Err(RequestValidationError::EmptyStatement);
+        }
+        if self.statement.len() > MAX_MYSQL_STATEMENT_BYTES {
+            return Err(RequestValidationError::MySqlStatementTooLarge);
         }
         validate_execute_limits(self.row_limit, self.timeout)
     }

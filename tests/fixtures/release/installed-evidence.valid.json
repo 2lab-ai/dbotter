@@ -315,11 +315,6 @@
             "passed": 1
           },
           {
-            "id": "mysql.execute.mutation",
-            "executed": 1,
-            "passed": 1
-          },
-          {
             "id": "mysql.execute.read",
             "executed": 1,
             "passed": 1
@@ -335,7 +330,7 @@
             "passed": 1
           },
           {
-            "id": "mysql.marker.explicit_selection.prepare_only_rejected",
+            "id": "mysql.marker.explicit_selection.driver_denied",
             "executed": 1,
             "passed": 1
           },
@@ -350,38 +345,54 @@
             "passed": 1
           },
           {
-            "id": "mysql.marker.second_probe.prepare_only_rejected",
+            "id": "mysql.marker.second_probe.driver_denied",
             "executed": 1,
             "passed": 1
           },
           {
-            "id": "mysql.prepared_unsupported.error",
+            "id": "mysql.read_lease.mutation_denied",
             "executed": 1,
             "passed": 1
           },
           {
-            "id": "mysql.prepared_unsupported.no_raw_fallback",
+            "id": "mysql.read_lease.no_raw_fallback",
             "executed": 1,
             "passed": 1
           },
           {
-            "id": "mysql.prepared_unsupported.session_retained",
+            "id": "mysql.read_lease.non_select_denied",
             "executed": 1,
             "passed": 1
           },
           {
-            "id": "mysql.prepared_unsupported.static_recovery",
+            "id": "mysql.read_lease.server_side_effect_absent",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.read_lease.server_side_effect_denied",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.read_lease.session_retained",
+            "executed": 1,
+            "passed": 1
+          },
+          {
+            "id": "mysql.read_lease.static_recovery",
             "executed": 1,
             "passed": 1
           }
         ],
         "measurements": {
           "auth_failures": 4,
-          "marker_prepared_attempts": 2,
+          "marker_denied_attempts": 2,
           "marker_rows_after": 0,
-          "prepared_unsupported_attempts": 1,
+          "non_select_denied_attempts": 1,
           "raw_fallback_attempts": 0,
-          "statements_executed": 2
+          "server_side_effect_denied_attempts": 1,
+          "statements_executed": 8
         }
       },
       "redis": {

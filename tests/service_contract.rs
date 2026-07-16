@@ -12,7 +12,8 @@ use dbotter::config::{
 };
 use dbotter::drivers::{
     CatalogBrowser, ConnectedResources, ConnectionPing, DriverError, KeyspaceBrowser,
-    MySqlPreparedExecution, RedisExecution,
+    MySqlCapabilitySnapshot, MySqlProvenReadLease, MySqlReadAdmission, MySqlReadExecution,
+    MySqlUnprovenReadLease, RedisExecution,
 };
 use dbotter::execution::{ExecutionLanguage, ExecutionTarget, classify_execution_kind};
 use dbotter::model::{
@@ -34,6 +35,24 @@ use dbotter::service::{
     SessionDisposition, SessionHandle, UpdateProfileRequest, validate_config_identity,
     validate_config_mutation,
 };
+
+fn test_mysql_capabilities() -> MySqlCapabilitySnapshot {
+    test_mysql_capabilities_with_sql_mode("STRICT_TRANS_TABLES")
+}
+
+fn test_mysql_capabilities_with_sql_mode(sql_mode: &str) -> MySqlCapabilitySnapshot {
+    MySqlCapabilitySnapshot::new(
+        "8.4.0".to_owned(),
+        "MySQL Community Server - GPL".to_owned(),
+        "utf8mb4".to_owned(),
+        "utf8mb4".to_owned(),
+        "utf8mb4".to_owned(),
+        "utf8mb4_0900_ai_ci".to_owned(),
+        "+00:00".to_owned(),
+        sql_mode.to_owned(),
+        Some(false),
+    )
+}
 
 #[async_trait]
 trait CurrentGenerationTestExt {
@@ -245,9 +264,31 @@ impl ConnectionPing for FakeMySqlResources {
 }
 
 #[async_trait]
-impl MySqlPreparedExecution for FakeMySqlResources {
-    async fn execute_prepared(
+impl MySqlReadExecution for FakeMySqlResources {
+    async fn begin_read_admission(
         &self,
+        _timeout: Duration,
+    ) -> Result<MySqlReadAdmission, DriverError> {
+        Ok(MySqlReadAdmission::new(
+            test_mysql_capabilities(),
+            Box::new(self.clone()),
+        ))
+    }
+}
+
+#[async_trait]
+impl MySqlUnprovenReadLease for FakeMySqlResources {
+    async fn prove_read_only(
+        self: Box<Self>,
+    ) -> Result<Box<dyn MySqlProvenReadLease>, DriverError> {
+        Ok(self)
+    }
+}
+
+#[async_trait]
+impl MySqlProvenReadLease for FakeMySqlResources {
+    async fn execute_prepared(
+        &mut self,
         _request: &PreparedMySqlRequest,
     ) -> Result<QueryResult, DriverError> {
         self.executes.fetch_add(1, Ordering::SeqCst);
@@ -527,12 +568,16 @@ struct AccessAdmissionIo {
 struct AccessAdmissionSession {
     driver: DriverKind,
     io: Arc<AccessAdmissionIo>,
+    proof_failure: Option<&'static str>,
+    sql_mode: &'static str,
 }
 
 #[derive(Clone)]
 struct AccessAdmissionResources {
     driver: DriverKind,
     io: Arc<AccessAdmissionIo>,
+    proof_failure: Option<&'static str>,
+    sql_mode: &'static str,
 }
 
 #[async_trait]
@@ -544,9 +589,35 @@ impl ConnectionPing for AccessAdmissionResources {
 }
 
 #[async_trait]
-impl MySqlPreparedExecution for AccessAdmissionResources {
-    async fn execute_prepared(
+impl MySqlReadExecution for AccessAdmissionResources {
+    async fn begin_read_admission(
         &self,
+        _timeout: Duration,
+    ) -> Result<MySqlReadAdmission, DriverError> {
+        Ok(MySqlReadAdmission::new(
+            test_mysql_capabilities_with_sql_mode(self.sql_mode),
+            Box::new(self.clone()),
+        ))
+    }
+}
+
+#[async_trait]
+impl MySqlUnprovenReadLease for AccessAdmissionResources {
+    async fn prove_read_only(
+        self: Box<Self>,
+    ) -> Result<Box<dyn MySqlProvenReadLease>, DriverError> {
+        if let Some(reason) = self.proof_failure {
+            Err(DriverError::MySqlReadOnlyNotProven { reason })
+        } else {
+            Ok(self)
+        }
+    }
+}
+
+#[async_trait]
+impl MySqlProvenReadLease for AccessAdmissionResources {
+    async fn execute_prepared(
+        &mut self,
         _request: &PreparedMySqlRequest,
     ) -> Result<QueryResult, DriverError> {
         self.io
@@ -614,6 +685,8 @@ impl SessionHandle for AccessAdmissionSession {
         let resources = Arc::new(AccessAdmissionResources {
             driver: self.driver,
             io: self.io.clone(),
+            proof_failure: self.proof_failure,
+            sql_mode: self.sql_mode,
         });
         match self.driver {
             DriverKind::MySql => Some(ConnectedResources::MySql {
@@ -639,6 +712,8 @@ struct AccessAdmissionConnector {
     driver: DriverKind,
     io: Arc<AccessAdmissionIo>,
     saw_secret: AtomicBool,
+    proof_failure: Option<&'static str>,
+    sql_mode: &'static str,
 }
 
 impl AccessAdmissionConnector {
@@ -647,6 +722,28 @@ impl AccessAdmissionConnector {
             driver,
             io: Arc::new(AccessAdmissionIo::default()),
             saw_secret: AtomicBool::new(false),
+            proof_failure: None,
+            sql_mode: "STRICT_TRANS_TABLES",
+        }
+    }
+
+    fn with_mysql_proof_failure(reason: &'static str) -> Self {
+        Self {
+            driver: DriverKind::MySql,
+            io: Arc::new(AccessAdmissionIo::default()),
+            saw_secret: AtomicBool::new(false),
+            proof_failure: Some(reason),
+            sql_mode: "STRICT_TRANS_TABLES",
+        }
+    }
+
+    fn with_mysql_sql_mode(sql_mode: &'static str) -> Self {
+        Self {
+            driver: DriverKind::MySql,
+            io: Arc::new(AccessAdmissionIo::default()),
+            saw_secret: AtomicBool::new(false),
+            proof_failure: None,
+            sql_mode,
         }
     }
 }
@@ -670,6 +767,8 @@ impl SessionConnector for AccessAdmissionConnector {
         Ok(Arc::new(AccessAdmissionSession {
             driver: self.driver,
             io: self.io.clone(),
+            proof_failure: self.proof_failure,
+            sql_mode: self.sql_mode,
         }))
     }
 }
@@ -742,9 +841,29 @@ async fn observe_classified_access_admission(
     language: QueryLanguage,
     source: &'static str,
 ) -> AccessAdmissionObservation {
+    observe_classified_access_admission_with_connector(
+        label,
+        operation_id,
+        driver,
+        access,
+        language,
+        source,
+        Arc::new(AccessAdmissionConnector::new(driver)),
+    )
+    .await
+}
+
+async fn observe_classified_access_admission_with_connector(
+    label: &'static str,
+    operation_id: OperationId,
+    driver: DriverKind,
+    access: ProfileAccess,
+    language: QueryLanguage,
+    source: &'static str,
+    connector: Arc<AccessAdmissionConnector>,
+) -> AccessAdmissionObservation {
     let directory = tempfile::tempdir().expect("classified access-admission tempdir");
     let path = directory.path().join("config.toml");
-    let connector = Arc::new(AccessAdmissionConnector::new(driver));
     let secrets = Arc::new(SessionSecretStore::default());
     let service = ApplicationService::with_dependencies(
         &path,
@@ -962,12 +1081,12 @@ async fn du01_access_admission_is_effective_read_only_without_blocking_read_path
         (
             ExecutionLanguage::MySql,
             ExecutionTarget::MySqlText(DU01_MYSQL_UDF_READ_SHAPE.to_owned()),
-            OperationKind::ExecuteMutation,
+            OperationKind::ExecuteRead,
         ),
         (
             ExecutionLanguage::MySql,
             ExecutionTarget::MySqlText(DU01_MYSQL_VIEW_READ_SHAPE.to_owned()),
-            OperationKind::ExecuteMutation,
+            OperationKind::ExecuteRead,
         ),
         (
             ExecutionLanguage::MySql,
@@ -1024,24 +1143,6 @@ async fn du01_access_admission_is_effective_read_only_without_blocking_read_path
             ProfileAccess::ReadOnly,
             QueryLanguage::RedisCommand,
             DU01_REDIS_MUTATION,
-        )
-        .await,
-        observe_classified_access_admission(
-            "classified read-only MySQL UDF-shaped target",
-            OperationId(711),
-            DriverKind::MySql,
-            ProfileAccess::ReadOnly,
-            QueryLanguage::Sql,
-            DU01_MYSQL_UDF_READ_SHAPE,
-        )
-        .await,
-        observe_classified_access_admission(
-            "classified read-only MySQL view-shaped target",
-            OperationId(712),
-            DriverKind::MySql,
-            ProfileAccess::ReadOnly,
-            QueryLanguage::Sql,
-            DU01_MYSQL_VIEW_READ_SHAPE,
         )
         .await,
         observe_classified_access_admission(
@@ -1109,6 +1210,24 @@ async fn du01_access_admission_is_effective_read_only_without_blocking_read_path
             ProfileAccess::ReadOnly,
             QueryLanguage::RedisCommand,
             DU01_REDIS_READ,
+        )
+        .await,
+        observe_classified_access_admission(
+            "classified read-only MySQL UDF-shaped target",
+            OperationId(711),
+            DriverKind::MySql,
+            ProfileAccess::ReadOnly,
+            QueryLanguage::Sql,
+            DU01_MYSQL_UDF_READ_SHAPE,
+        )
+        .await,
+        observe_classified_access_admission(
+            "classified read-only MySQL view-shaped target",
+            OperationId(712),
+            DriverKind::MySql,
+            ProfileAccess::ReadOnly,
+            QueryLanguage::Sql,
+            DU01_MYSQL_VIEW_READ_SHAPE,
         )
         .await,
         observe_legacy_access_admission(
@@ -1196,6 +1315,99 @@ async fn du01_access_admission_is_effective_read_only_without_blocking_read_path
             .expect("DU-01 effective read-only and classified read-write paths remain available");
         assert_eq!(outcome.operation_id, observation.operation_id);
     }
+}
+
+#[tokio::test]
+async fn typed_mysql_read_only_proof_failure_never_dispatches_a_user_target() {
+    const REASON: &str = "typed proof rejected";
+    let connector = Arc::new(AccessAdmissionConnector::with_mysql_proof_failure(REASON));
+    let observation = observe_classified_access_admission_with_connector(
+        "MySQL typed read-only proof failure",
+        OperationId(730),
+        DriverKind::MySql,
+        ProfileAccess::ReadOnly,
+        QueryLanguage::Sql,
+        DU01_MYSQL_READ,
+        connector,
+    )
+    .await;
+
+    assert_eq!(
+        observation.user_target_dispatches, 0,
+        "typed proof failure reached the prepared user-target port"
+    );
+    let error = observation
+        .result
+        .expect_err("proof failure must reject the read");
+    assert!(matches!(
+        error,
+        ServiceError::Driver(DriverError::MySqlReadOnlyNotProven { reason: REASON })
+    ));
+    assert_eq!(
+        error.public_error_parts(),
+        (PublicSummary::UnsupportedFeature, PublicCode::None)
+    );
+}
+
+#[tokio::test]
+async fn mysql_forbidden_comment_bytes_reject_before_secret_or_session_io() {
+    let connector = Arc::new(AccessAdmissionConnector::new(DriverKind::MySql));
+    let observation = observe_classified_access_admission_with_connector(
+        "MySQL raw executable-comment marker",
+        OperationId(740),
+        DriverKind::MySql,
+        ProfileAccess::ReadOnly,
+        QueryLanguage::Sql,
+        "SELECT '/*!40101 SET @x=1 */'",
+        connector,
+    )
+    .await;
+
+    assert_eq!(observation.non_target_session_io, 0);
+    assert_eq!(observation.user_target_dispatches, 0);
+    assert!(!observation.saw_secret);
+    assert!(matches!(
+        observation.result,
+        Err(ServiceError::InvalidRequest {
+            code: PublicCode::StatementTarget
+        })
+    ));
+}
+
+#[tokio::test]
+async fn mysql_exact_server_sql_mode_admits_a_mode_dependent_read() {
+    const SOURCE: &str = r"SELECT 'a\'";
+    assert_eq!(
+        classify_execution_kind(
+            ExecutionLanguage::MySql,
+            &ExecutionTarget::MySqlText(SOURCE.to_owned())
+        ),
+        OperationKind::ExecuteMutation,
+        "the pre-lease default mode must not be treated as the authority"
+    );
+    let connector = Arc::new(AccessAdmissionConnector::with_mysql_sql_mode(
+        "NO_BACKSLASH_ESCAPES",
+    ));
+    let observation = observe_classified_access_admission_with_connector(
+        "MySQL exact sql_mode read",
+        OperationId(741),
+        DriverKind::MySql,
+        ProfileAccess::ReadOnly,
+        QueryLanguage::Sql,
+        SOURCE,
+        connector,
+    )
+    .await;
+
+    assert!(
+        observation.non_target_session_io > 0,
+        "exact-mode candidate stopped before session I/O: {:?}",
+        observation.result
+    );
+    assert_eq!(observation.user_target_dispatches, 1);
+    observation
+        .result
+        .expect("the exact session mode must admit the prepared read");
 }
 
 #[tokio::test]

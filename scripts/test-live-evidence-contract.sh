@@ -104,18 +104,20 @@ mysql_safety_cases="$(cases_from_ids \
   mysql.auth.session.wrong.action \
   mysql.auth.session.wrong.code \
   mysql.auth.session.wrong.recovery \
-  mysql.execute.mutation \
   mysql.execute.read \
   mysql.marker.current_target.extracted_prepared \
   mysql.marker.explicit_selection.absent \
-  mysql.marker.explicit_selection.prepare_only_rejected \
+  mysql.marker.explicit_selection.driver_denied \
   mysql.marker.explicit_selection.ui_rejected \
   mysql.marker.second_probe.absent \
-  mysql.marker.second_probe.prepare_only_rejected \
-  mysql.prepared_unsupported.error \
-  mysql.prepared_unsupported.no_raw_fallback \
-  mysql.prepared_unsupported.session_retained \
-  mysql.prepared_unsupported.static_recovery)"
+  mysql.marker.second_probe.driver_denied \
+  mysql.read_lease.mutation_denied \
+  mysql.read_lease.no_raw_fallback \
+  mysql.read_lease.non_select_denied \
+  mysql.read_lease.server_side_effect_absent \
+  mysql.read_lease.server_side_effect_denied \
+  mysql.read_lease.session_retained \
+  mysql.read_lease.static_recovery)"
 redis_cases="$(cases_from_ids \
   redis.auth.plaintext.environment.available.correct \
   redis.auth.plaintext.environment.available.wrong \
@@ -189,7 +191,7 @@ make_suite \
   mysql_safety \
   live_mysql_safety_receipt \
   "$mysql_safety_cases" \
-  '{"auth_failures":4,"marker_prepared_attempts":2,"marker_rows_after":0,"prepared_unsupported_attempts":1,"raw_fallback_attempts":0,"statements_executed":2}' \
+  '{"auth_failures":4,"marker_denied_attempts":2,"marker_rows_after":0,"non_select_denied_attempts":1,"raw_fallback_attempts":0,"server_side_effect_denied_attempts":1,"statements_executed":8}' \
   "$tmp_dir/mysql-safety.json"
 make_suite \
   redis \

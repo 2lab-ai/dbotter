@@ -195,6 +195,19 @@ fn operation_classification_is_conservative_for_side_effects() {
         OperationKind::ExecuteMutation
     );
     assert_eq!(
+        classify_execute_operation(QueryLanguage::Sql, r"SELECT 'a\'"),
+        OperationKind::ExecuteRead,
+        "a SELECT valid under NO_BACKSLASH_ESCAPES must use read UI semantics"
+    );
+    assert_eq!(
+        classify_execute_operation(
+            QueryLanguage::Sql,
+            "WITH source AS (SELECT 1) UPDATE t SET value = 1"
+        ),
+        OperationKind::ExecuteMutation,
+        "a CTE mutation must remain a mutation under every relevant session mode"
+    );
+    assert_eq!(
         classify_execute_operation(QueryLanguage::RedisCommand, "GET key"),
         OperationKind::ExecuteRead
     );
@@ -206,6 +219,26 @@ fn operation_classification_is_conservative_for_side_effects() {
         classify_execute_operation(QueryLanguage::RedisCommand, "FUTURECOMMAND key"),
         OperationKind::ExecuteMutation
     );
+}
+
+#[test]
+fn mode_dependent_mysql_selection_builds_a_read_ui_intent() {
+    let profile = profile("mysql-mode", 12, DriverKind::MySql, None, TlsMode::Disabled);
+    let mut model = UiModel::default();
+    let workspace = model.workspace_mut(WorkspaceKey::new(profile.id.clone(), profile.generation));
+    workspace.editor_text = r"SELECT 'a\'".to_owned();
+    let intent = build_execute_intent(
+        &profile,
+        workspace,
+        EditorCursor::with_selection(
+            workspace.editor_text.chars().count(),
+            0..workspace.editor_text.chars().count(),
+        ),
+    )
+    .expect("the exact server mode will decide this selected statement");
+
+    assert_eq!(intent.operation_kind(), OperationKind::ExecuteRead);
+    assert_eq!(intent.text(), r"SELECT 'a\'");
 }
 
 fn author_ids(output: &eframe::egui::FullOutput) -> BTreeSet<String> {

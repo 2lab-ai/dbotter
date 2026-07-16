@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use dbotter::config::{ConfigWriter, MigrationConsent, MutationFailpoint, MutationFaultInjector};
 use dbotter::drivers::{
     CatalogBrowser, ConnectedResources, ConnectionPing, DriverError, KeyspaceBrowser,
-    MySqlPreparedExecution, RedisExecution,
+    MySqlCapabilitySnapshot, MySqlProvenReadLease, MySqlReadAdmission, MySqlReadExecution,
+    MySqlUnprovenReadLease, RedisExecution,
 };
 use dbotter::model::{
     CatalogLevel, CatalogPage, CatalogRequest, CatalogRetainedCounts, ConnectionDraft,
@@ -31,6 +32,72 @@ use dbotter::ui::{
     PostCloseState, ProfileSnapshot, SubmitError, TaskScope, UiCommand, UiEvent, UiModel, UiPort,
     WORK_CAPACITY, WorkspaceKey, bounded_ports, controller_ports, spawn_with_service,
 };
+
+fn test_mysql_capabilities() -> MySqlCapabilitySnapshot {
+    MySqlCapabilitySnapshot::new(
+        "8.4.0".to_owned(),
+        "MySQL Community Server - GPL".to_owned(),
+        "utf8mb4".to_owned(),
+        "utf8mb4".to_owned(),
+        "utf8mb4".to_owned(),
+        "utf8mb4_0900_ai_ci".to_owned(),
+        "+00:00".to_owned(),
+        "STRICT_TRANS_TABLES".to_owned(),
+        Some(false),
+    )
+}
+
+#[async_trait]
+trait TestMySqlReadTarget: Send + Sync {
+    async fn execute_test(
+        &self,
+        request: &PreparedMySqlRequest,
+    ) -> Result<QueryResult, DriverError>;
+}
+
+#[derive(Clone)]
+struct TestMySqlReadPort<T>(Arc<T>);
+
+#[async_trait]
+impl<T> MySqlReadExecution for TestMySqlReadPort<T>
+where
+    T: TestMySqlReadTarget + 'static,
+{
+    async fn begin_read_admission(
+        &self,
+        _timeout: Duration,
+    ) -> Result<MySqlReadAdmission, DriverError> {
+        Ok(MySqlReadAdmission::new(
+            test_mysql_capabilities(),
+            Box::new(Self(self.0.clone())),
+        ))
+    }
+}
+
+#[async_trait]
+impl<T> MySqlUnprovenReadLease for TestMySqlReadPort<T>
+where
+    T: TestMySqlReadTarget + 'static,
+{
+    async fn prove_read_only(
+        self: Box<Self>,
+    ) -> Result<Box<dyn MySqlProvenReadLease>, DriverError> {
+        Ok(self)
+    }
+}
+
+#[async_trait]
+impl<T> MySqlProvenReadLease for TestMySqlReadPort<T>
+where
+    T: TestMySqlReadTarget + 'static,
+{
+    async fn execute_prepared(
+        &mut self,
+        request: &PreparedMySqlRequest,
+    ) -> Result<QueryResult, DriverError> {
+        self.0.execute_test(request).await
+    }
+}
 
 fn typed_profile_error(
     kind: dbotter::model::OperationKind,
@@ -3678,8 +3745,8 @@ impl ConnectionPing for CountingMySqlResources {
 }
 
 #[async_trait]
-impl MySqlPreparedExecution for CountingMySqlResources {
-    async fn execute_prepared(
+impl TestMySqlReadTarget for CountingMySqlResources {
+    async fn execute_test(
         &self,
         _request: &PreparedMySqlRequest,
     ) -> Result<QueryResult, DriverError> {
@@ -3713,7 +3780,7 @@ impl SessionHandle for CountingSession {
         });
         Some(ConnectedResources::MySql {
             ping: resources.clone(),
-            execution: resources.clone(),
+            execution: Arc::new(TestMySqlReadPort(resources.clone())),
             catalog: resources,
         })
     }
@@ -3786,8 +3853,8 @@ impl ConnectionPing for ExecuteTestResources {
 }
 
 #[async_trait]
-impl MySqlPreparedExecution for ExecuteTestResources {
-    async fn execute_prepared(
+impl TestMySqlReadTarget for ExecuteTestResources {
+    async fn execute_test(
         &self,
         _request: &PreparedMySqlRequest,
     ) -> Result<QueryResult, DriverError> {
@@ -3845,7 +3912,7 @@ impl SessionHandle for ExecuteTestSession {
     fn connected_resources(&self) -> Option<ConnectedResources> {
         Some(ConnectedResources::MySql {
             ping: self.resources.clone(),
-            execution: self.resources.clone(),
+            execution: Arc::new(TestMySqlReadPort(self.resources.clone())),
             catalog: self.resources.clone(),
         })
     }
@@ -3960,8 +4027,8 @@ impl ConnectionPing for RedisLifecycleResources {
 }
 
 #[async_trait]
-impl MySqlPreparedExecution for CatalogLifecycleResources {
-    async fn execute_prepared(
+impl TestMySqlReadTarget for CatalogLifecycleResources {
+    async fn execute_test(
         &self,
         _request: &PreparedMySqlRequest,
     ) -> Result<QueryResult, DriverError> {
@@ -4040,7 +4107,7 @@ impl SessionHandle for CatalogLifecycleSession {
     fn connected_resources(&self) -> Option<ConnectedResources> {
         Some(ConnectedResources::MySql {
             ping: self.resources.clone(),
-            execution: self.resources.clone(),
+            execution: Arc::new(TestMySqlReadPort(self.resources.clone())),
             catalog: self.resources.clone(),
         })
     }

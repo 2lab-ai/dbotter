@@ -23,7 +23,8 @@ use crate::drivers::mysql_catalog::{
 use crate::drivers::{ConnectedResources, DriverError, Session};
 use crate::execution::{
     ExecutionLanguage, ExecutionTarget, ExecutionTargetError, ValidatedExecutionTarget,
-    classify_execution_kind, extract_and_validate_target,
+    classify_execution_kind, classify_mysql_execution_kind_with_sql_mode,
+    extract_and_validate_target, mysql_may_be_read_with_session_mode,
 };
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionDraft, ConnectionProfile, CredentialMode, DraftId,
@@ -302,7 +303,10 @@ impl ServiceError {
             Self::Driver(
                 DriverError::Unavailable { .. }
                 | DriverError::Unsupported { .. }
-                | DriverError::PreparedStatementUnsupported { .. },
+                | DriverError::PreparedStatementUnsupported { .. }
+                | DriverError::MySqlCapabilityDecode { .. }
+                | DriverError::MySqlReadOnlyNotProven { .. }
+                | DriverError::MySqlReadOnlyDenied,
             ) => PublicSummary::UnsupportedFeature,
             Self::Driver(_) => PublicSummary::NetworkUnavailable,
             Self::Config(_) => PublicSummary::ConfigWriteNotCommitted,
@@ -846,7 +850,10 @@ impl SessionDisposition {
                     Self::Evict
                 }
             }
-            DriverError::InvalidCatalogRequest => Self::Keep,
+            DriverError::InvalidCatalogRequest
+            | DriverError::MySqlCapabilityDecode { .. }
+            | DriverError::MySqlReadOnlyNotProven { .. }
+            | DriverError::MySqlReadOnlyDenied => Self::Keep,
             DriverError::RedisKeyMissing | DriverError::RedisKeyTypeChanged => Self::Keep,
             DriverError::InvalidConfig { .. }
             | DriverError::Unavailable { .. }
@@ -923,10 +930,23 @@ impl SessionLease {
     pub(crate) async fn execute_typed(
         &self,
         request: &TypedExecuteRequest,
+        timeout: Duration,
     ) -> Result<QueryResult, DriverError> {
         match (request, self.connected_resources()?) {
             (TypedExecuteRequest::MySql(request), ConnectedResources::MySql { execution, .. }) => {
-                execution.execute_prepared(request).await
+                let admission = execution.begin_read_admission(timeout).await?;
+                let kind = classify_mysql_execution_kind_with_sql_mode(
+                    &request.statement,
+                    admission.capabilities().sql_mode(),
+                )
+                .ok_or(DriverError::MySqlCapabilityDecode { field: "sql_mode" })?;
+                if kind != OperationKind::ExecuteRead {
+                    return Err(DriverError::MySqlReadOnlyNotProven {
+                        reason: "statement classification denied",
+                    });
+                }
+                let mut proven = admission.prove_read_only().await?;
+                proven.execute_prepared(request).await
             }
             (TypedExecuteRequest::Redis(request), ConnectedResources::Redis { execution, .. }) => {
                 execution.execute_command(request).await
@@ -2067,7 +2087,13 @@ impl ApplicationService {
                 actual: request.language,
             });
         }
-        if classify_execution_kind(execution_language, &target) == OperationKind::ExecuteMutation {
+        let kind = classify_execution_kind(execution_language, &target);
+        let needs_exact_mysql_mode = matches!(
+            &target,
+            ExecutionTarget::MySqlText(statement)
+                if mysql_may_be_read_with_session_mode(statement)
+        );
+        if kind == OperationKind::ExecuteMutation && !needs_exact_mysql_mode {
             if profile.safety.effective_access() == ProfileAccess::ReadOnly {
                 return Err(ServiceError::ReadOnlyProfile {
                     code: PublicCode::ReadOnlyProfile,
@@ -2136,16 +2162,23 @@ impl ApplicationService {
         &self,
         request: ExecuteRequest,
     ) -> Result<ExecuteOutcome, ServiceError> {
+        let started = Instant::now();
         let typed_request = self.prepare_execute_request(&request).await?;
+        let acquire_timeout =
+            remaining_execute_timeout(started, request.timeout, typed_request.driver())?;
         let lease = self
             .acquire_session_at(
                 request.operation_id,
                 request.profile_id.clone(),
                 request.profile_generation,
-                request.timeout,
+                acquire_timeout,
             )
             .await?;
-        let result = lease.execute_typed(&typed_request).await;
+        let result =
+            match remaining_execute_timeout(started, request.timeout, typed_request.driver()) {
+                Ok(timeout) => lease.execute_typed(&typed_request, timeout).await,
+                Err(error) => Err(error),
+            };
         let observation = self.observe_session(&lease, request.operation_id).await;
         let disposition = result.as_ref().err().map_or(
             SessionDisposition::Keep,
@@ -3136,6 +3169,7 @@ fn execution_target_error(error: ExecutionTargetError) -> ServiceError {
         | ExecutionTargetError::InvalidSelectionRange
         | ExecutionTargetError::NoCurrentStatement
         | ExecutionTargetError::MultipleStatements
+        | ExecutionTargetError::ForbiddenExecutableComment
         | ExecutionTargetError::RedisShellParseFailed
         | ExecutionTargetError::RedisCommandDenied
         | ExecutionTargetError::RedisTargetTooLarge
@@ -3143,6 +3177,20 @@ fn execution_target_error(error: ExecutionTargetError) -> ServiceError {
         | ExecutionTargetError::RedisTokenTooLarge => PublicCode::StatementTarget,
     };
     ServiceError::InvalidRequest { code }
+}
+
+fn remaining_execute_timeout(
+    started: Instant,
+    timeout: Duration,
+    driver: DriverKind,
+) -> Result<Duration, DriverError> {
+    timeout
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(DriverError::Timeout {
+            driver,
+            seconds: timeout.as_secs(),
+        })
 }
 
 fn service_request_error(error: RequestValidationError) -> ServiceError {
@@ -3157,6 +3205,7 @@ fn service_request_error(error: RequestValidationError) -> ServiceError {
         | RequestValidationError::InvalidRedisScanCount
         | RequestValidationError::RedisKeyTooLarge => PublicCode::RedisScan,
         RequestValidationError::EmptyStatement
+        | RequestValidationError::MySqlStatementTooLarge
         | RequestValidationError::EmptyRedisCommand
         | RequestValidationError::RedisCommandTooLarge
         | RequestValidationError::TooManyRedisTokens

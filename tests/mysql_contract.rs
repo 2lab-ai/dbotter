@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use dbotter::drivers::{self, DriverError, MySqlPreparedExecution, Session};
+use dbotter::drivers::{self, DriverError, MySqlReadExecution, Session};
 use dbotter::model::{
     Cell, ConnectionProfile, CredentialMode, DriverKind, OperationId, PreparedMySqlRequest,
     ProfileAccess, ProfileEnvironment, ProfileGeneration, ProfileId, ProfileSafetyPosture,
@@ -44,7 +44,11 @@ async fn mysql_session() -> Session {
 }
 
 async fn execute(session: &Session, text: &str) -> Result<QueryResult, DriverError> {
-    session
+    let admission = session
+        .begin_read_admission(Duration::from_secs(10))
+        .await?;
+    let mut proven = admission.prove_read_only().await?;
+    proven
         .execute_prepared(&PreparedMySqlRequest {
             identity: RequestIdentity::new(
                 ProfileId("mysql-contract".to_owned()),
@@ -66,7 +70,7 @@ async fn leading_comments_and_quoted_semicolons_are_one_row_query() {
     let session = mysql_session().await;
     let result = execute(
         &session,
-        "  /* leading ; block comment */\n -- leading ; line comment\n SELECT ';' AS semi, 'a;b' AS embedded; /* trailing ; comment */",
+        "  /* leading ; block comment */\n -- leading ; line comment\n SELECT ';' AS semi, 'a;b' AS embedded;",
     )
     .await
     .expect("commented SELECT with quoted semicolons");
@@ -90,46 +94,19 @@ async fn leading_comments_and_quoted_semicolons_are_one_row_query() {
 }
 
 #[tokio::test]
-async fn multiple_statements_are_rejected_by_prepare_without_executing_either() {
+async fn multiple_statements_are_rejected_before_the_read_target() {
     if !live_contract_enabled() {
         return;
     }
     let session = mysql_session().await;
-    execute(
-        &session,
-        "DROP TABLE IF EXISTS dbotter_prepared_only_marker",
-    )
-    .await
-    .expect("drop prepared-only marker fixture");
-    execute(
-        &session,
-        "CREATE TABLE dbotter_prepared_only_marker (marker VARCHAR(32) PRIMARY KEY)",
-    )
-    .await
-    .expect("create prepared-only marker fixture");
-
-    let error = execute(
-        &session,
-        "INSERT INTO dbotter_prepared_only_marker VALUES ('first'); INSERT INTO dbotter_prepared_only_marker VALUES ('second')",
-    )
+    let error = execute(&session, "SELECT 1 AS first; SELECT 2 AS second")
         .await
-        .expect_err("server prepare must reject multiple statements");
-    assert!(matches!(error, DriverError::MySql(_)));
-
-    let result = execute(
-        &session,
-        "SELECT marker FROM dbotter_prepared_only_marker ORDER BY marker",
-    )
-    .await
-    .expect("inspect prepared-only marker fixture");
-    assert!(
-        result.rows.is_empty(),
-        "neither statement may be resubmitted"
-    );
+        .expect_err("the proven read lease must reject a multi-statement target");
+    assert!(matches!(error, DriverError::MySqlReadOnlyNotProven { .. }));
 }
 
 #[tokio::test]
-async fn select_show_and_explain_are_metadata_classified_result_sets() {
+async fn select_is_a_result_set_while_metadata_statement_families_are_denied() {
     if !live_contract_enabled() {
         return;
     }
@@ -144,47 +121,31 @@ async fn select_show_and_explain_are_metadata_classified_result_sets() {
 
     let show = execute(&session, "SHOW STATUS LIKE 'Threads_connected'")
         .await
-        .expect("SHOW result set");
-    assert!(!show.columns.is_empty());
-    assert!(!show.rows.is_empty());
-    assert_eq!(show.affected_rows, 0);
+        .expect_err("SHOW is outside the v1.1 editor read grammar");
+    assert!(matches!(show, DriverError::MySqlReadOnlyNotProven { .. }));
 
     let explain = execute(&session, "EXPLAIN SELECT 1")
         .await
-        .expect("EXPLAIN result set");
-    assert!(!explain.columns.is_empty());
-    assert!(!explain.rows.is_empty());
-    assert_eq!(explain.affected_rows, 0);
+        .expect_err("EXPLAIN is outside the v1.1 editor read grammar");
+    assert!(matches!(
+        explain,
+        DriverError::MySqlReadOnlyNotProven { .. }
+    ));
 }
 
 #[tokio::test]
-async fn mutation_returns_affected_count_instead_of_rows() {
+async fn mutation_is_denied_by_the_proven_read_port() {
     if !live_contract_enabled() {
         return;
     }
     let session = mysql_session().await;
-    execute(
+    let error = execute(
         &session,
-        "DROP TABLE IF EXISTS dbotter_sql_mutation_contract",
+        "INSERT INTO dbotter_live_execute (id, marker) VALUES (1, 'plain')",
     )
     .await
-    .expect("drop mutation fixture");
-    execute(
-        &session,
-        "CREATE TABLE dbotter_sql_mutation_contract (id INT PRIMARY KEY, marker VARCHAR(32) NOT NULL)",
-    )
-    .await
-    .expect("create mutation fixture");
-    let result = execute(
-        &session,
-        "INSERT INTO dbotter_sql_mutation_contract (id, marker) VALUES (1, 'plain')",
-    )
-    .await
-    .expect("insert mutation");
-
-    assert!(result.columns.is_empty());
-    assert!(result.rows.is_empty());
-    assert_eq!(result.affected_rows, 1);
+    .expect_err("mutation must not reach the proven read port");
+    assert!(matches!(error, DriverError::MySqlReadOnlyNotProven { .. }));
 }
 
 #[tokio::test]
@@ -206,56 +167,29 @@ async fn cte_select_is_a_result_set() {
 }
 
 #[tokio::test]
-async fn cte_update_is_a_mutation() {
+async fn cte_update_is_denied_by_the_proven_read_port() {
     if !live_contract_enabled() {
         return;
     }
     let session = mysql_session().await;
-    execute(
-        &session,
-        "DROP TABLE IF EXISTS dbotter_sql_cte_mutation_contract",
-    )
-    .await
-    .expect("drop CTE fixture");
-    execute(
-        &session,
-        "CREATE TABLE dbotter_sql_cte_mutation_contract (id INT PRIMARY KEY, marker VARCHAR(32) NOT NULL)",
-    )
-    .await
-    .expect("create CTE fixture");
-    execute(
-        &session,
-        "INSERT INTO dbotter_sql_cte_mutation_contract (id, marker) VALUES (1, 'before')",
-    )
-    .await
-    .expect("seed CTE fixture");
-
-    let result = execute(
+    let error = execute(
         &session,
         "WITH source AS (SELECT 1 AS id, 'after' AS marker) UPDATE dbotter_sql_cte_mutation_contract AS target JOIN source ON source.id = target.id SET target.marker = source.marker",
     )
     .await
-    .expect("CTE UPDATE");
-
-    assert!(result.columns.is_empty());
-    assert!(result.rows.is_empty());
-    assert_eq!(result.affected_rows, 1);
+    .expect_err("CTE UPDATE must not reach the proven read port");
+    assert!(matches!(error, DriverError::MySqlReadOnlyNotProven { .. }));
 }
 
 #[tokio::test]
-async fn unsupported_prepare_returns_static_typed_error_without_resubmit() {
+async fn non_select_prepared_family_is_denied_before_prepare() {
     if !live_contract_enabled() {
         return;
     }
     let session = mysql_session().await;
     let error = execute(&session, "USE dbotter")
         .await
-        .expect_err("USE is unsupported by the server prepared protocol");
+        .expect_err("USE must not cross the read-only driver boundary");
 
-    assert!(matches!(
-        error,
-        DriverError::PreparedStatementUnsupported {
-            session_healthy: true
-        }
-    ));
+    assert!(matches!(error, DriverError::MySqlReadOnlyNotProven { .. }));
 }

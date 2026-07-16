@@ -58,6 +58,12 @@ pub enum DriverError {
     RedisParse(String),
     #[error("mysql server prepared protocol does not support this statement")]
     PreparedStatementUnsupported { session_healthy: bool },
+    #[error("mysql capability field could not be decoded")]
+    MySqlCapabilityDecode { field: &'static str },
+    #[error("mysql read-only session could not be proven")]
+    MySqlReadOnlyNotProven { reason: &'static str },
+    #[error("mysql server enforced the read-only session")]
+    MySqlReadOnlyDenied,
     #[error("mysql catalog request or page token is invalid")]
     InvalidCatalogRequest,
     #[error("unsupported {driver} operation")]
@@ -102,6 +108,15 @@ impl fmt::Debug for DriverError {
                 .debug_struct("PreparedStatementUnsupported")
                 .field("session_healthy", session_healthy)
                 .finish(),
+            Self::MySqlCapabilityDecode { field } => formatter
+                .debug_struct("MySqlCapabilityDecode")
+                .field("field", field)
+                .finish(),
+            Self::MySqlReadOnlyNotProven { reason } => formatter
+                .debug_struct("MySqlReadOnlyNotProven")
+                .field("reason", reason)
+                .finish(),
+            Self::MySqlReadOnlyDenied => formatter.write_str("MySqlReadOnlyDenied"),
             Self::InvalidCatalogRequest => formatter.write_str("InvalidCatalogRequest"),
             Self::Unsupported { driver, .. } => formatter
                 .debug_struct("Unsupported")
@@ -135,15 +150,148 @@ impl DriverError {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct MySqlCapabilitySnapshot {
+    version: String,
+    version_comment: String,
+    character_set_client: String,
+    character_set_connection: String,
+    character_set_results: String,
+    collation_connection: String,
+    time_zone: String,
+    sql_mode: String,
+    partial_revokes: Option<bool>,
+}
+
+impl MySqlCapabilitySnapshot {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        version: String,
+        version_comment: String,
+        character_set_client: String,
+        character_set_connection: String,
+        character_set_results: String,
+        collation_connection: String,
+        time_zone: String,
+        sql_mode: String,
+        partial_revokes: Option<bool>,
+    ) -> Self {
+        Self {
+            version,
+            version_comment,
+            character_set_client,
+            character_set_connection,
+            character_set_results,
+            collation_connection,
+            time_zone,
+            sql_mode,
+            partial_revokes,
+        }
+    }
+
+    #[must_use]
+    pub fn sql_mode(&self) -> &str {
+        &self.sql_mode
+    }
+
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    #[must_use]
+    pub fn version_comment(&self) -> &str {
+        &self.version_comment
+    }
+
+    #[must_use]
+    pub fn character_sets(&self) -> [&str; 3] {
+        [
+            &self.character_set_client,
+            &self.character_set_connection,
+            &self.character_set_results,
+        ]
+    }
+
+    #[must_use]
+    pub fn collation_connection(&self) -> &str {
+        &self.collation_connection
+    }
+
+    #[must_use]
+    pub fn time_zone(&self) -> &str {
+        &self.time_zone
+    }
+
+    #[must_use]
+    pub const fn partial_revokes(&self) -> Option<bool> {
+        self.partial_revokes
+    }
+}
+
+impl fmt::Debug for MySqlCapabilitySnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MySqlCapabilitySnapshot(<redacted>)")
+    }
+}
+
+pub struct MySqlReadAdmission {
+    capabilities: MySqlCapabilitySnapshot,
+    lease: Box<dyn MySqlUnprovenReadLease>,
+}
+
+impl MySqlReadAdmission {
+    #[must_use]
+    pub fn new(
+        capabilities: MySqlCapabilitySnapshot,
+        lease: Box<dyn MySqlUnprovenReadLease>,
+    ) -> Self {
+        Self {
+            capabilities,
+            lease,
+        }
+    }
+
+    #[must_use]
+    pub fn capabilities(&self) -> &MySqlCapabilitySnapshot {
+        &self.capabilities
+    }
+
+    pub async fn prove_read_only(self) -> Result<Box<dyn MySqlProvenReadLease>, DriverError> {
+        self.lease.prove_read_only().await
+    }
+}
+
+impl fmt::Debug for MySqlReadAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MySqlReadAdmission(<redacted>)")
+    }
+}
+
 #[async_trait]
 pub trait ConnectionPing: Send + Sync {
     async fn ping(&self, timeout: Duration) -> Result<(), DriverError>;
 }
 
 #[async_trait]
-pub trait MySqlPreparedExecution: Send + Sync {
-    async fn execute_prepared(
+pub trait MySqlReadExecution: Send + Sync {
+    async fn begin_read_admission(
         &self,
+        timeout: Duration,
+    ) -> Result<MySqlReadAdmission, DriverError>;
+}
+
+#[async_trait]
+pub trait MySqlUnprovenReadLease: Send {
+    async fn prove_read_only(self: Box<Self>)
+    -> Result<Box<dyn MySqlProvenReadLease>, DriverError>;
+}
+
+#[async_trait]
+pub trait MySqlProvenReadLease: Send {
+    async fn execute_prepared(
+        &mut self,
         request: &PreparedMySqlRequest,
     ) -> Result<QueryResult, DriverError>;
 }
@@ -179,7 +327,7 @@ pub trait KeyspaceBrowser: Send + Sync {
 pub enum ConnectedResources {
     MySql {
         ping: Arc<dyn ConnectionPing>,
-        execution: Arc<dyn MySqlPreparedExecution>,
+        execution: Arc<dyn MySqlReadExecution>,
         catalog: Arc<dyn CatalogBrowser>,
     },
     Redis {
@@ -235,16 +383,16 @@ impl ConnectionPing for Session {
 }
 
 #[async_trait]
-impl MySqlPreparedExecution for Session {
-    async fn execute_prepared(
+impl MySqlReadExecution for Session {
+    async fn begin_read_admission(
         &self,
-        request: &PreparedMySqlRequest,
-    ) -> Result<QueryResult, DriverError> {
+        timeout: Duration,
+    ) -> Result<MySqlReadAdmission, DriverError> {
         match self {
-            Self::MySql(session) => session.execute_prepared(request).await,
+            Self::MySql(session) => session.begin_read_admission(timeout).await,
             Self::Redis(_) => Err(DriverError::Unsupported {
                 driver: DriverKind::Redis,
-                operation: "mysql prepared execution".to_owned(),
+                operation: "mysql read admission".to_owned(),
             }),
         }
     }
