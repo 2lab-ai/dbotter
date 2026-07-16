@@ -20,10 +20,11 @@ pub use adapter::{
 };
 pub use app::DEFAULT_EXECUTE_ROW_LIMIT;
 pub use editor::{
-    EDITOR_CANCEL_ID, EDITOR_EXECUTE_ID, EDITOR_HISTORY_ID, EDITOR_INPUT_ID, EDITOR_ROW_LIMIT_ID,
-    EDITOR_TARGET_ID, EDITOR_TIMEOUT_ID, EditorCursor, EditorExecuteIntent, EditorIntent,
-    EditorSurface, EditorValidationError, build_execute_intent, classify_execute_operation,
-    editor_target_label, pending_cancel_intent,
+    EDITOR_CANCEL_ID, EDITOR_EXECUTE_ALL_ID, EDITOR_EXECUTE_ID, EDITOR_HISTORY_ID, EDITOR_INPUT_ID,
+    EDITOR_PENDING_ID, EDITOR_ROW_LIMIT_ID, EDITOR_TARGET_ID, EDITOR_TIMEOUT_ID, EditorCursor,
+    EditorExecuteBatchIntent, EditorExecuteIntent, EditorIntent, EditorSurface,
+    EditorValidationError, build_execute_all_intent, build_execute_intent,
+    classify_execute_operation, editor_target_label, pending_cancel_intent,
 };
 pub use layout::{
     CompactFallback, FallbackSurface, LayoutMode, NativeLayout, Pane, ResolvedLayout, SplitLayout,

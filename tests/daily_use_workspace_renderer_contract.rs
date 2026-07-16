@@ -139,10 +139,11 @@ fn session_only_workspace_retention_is_explicit_in_the_actual_renderer() {
 fn result_renderer_keeps_multiple_execution_outputs_selectable() {
     let results = function_body(APP_RENDERER_SOURCE, "show_result_surface");
     assert!(
-        results.contains("result_tabs()")
+        results.contains("selected_editor_tab_id")
+            && results.contains("result_tabs_for_editor")
             && results.contains("select_result_tab")
             && results.contains("close_result_tab"),
-        "the actual result surface must render, select and close retained result tabs"
+        "the actual result surface must scope retained outputs to the selected editor, then render, select and close them"
     );
     assert!(
         results.contains("result.output.") && results.contains("result.output.close."),

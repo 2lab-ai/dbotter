@@ -10,8 +10,8 @@ use dbotter::model::{
 };
 use dbotter::ui::{
     EditorCursor, EditorIntent, EditorSurface, EditorValidationError, ProfileSnapshot,
-    ResultAreaTab, UiCommand, UiModel, WorkspaceKey, build_execute_intent,
-    classify_execute_operation, editor_target_label, pending_cancel_intent,
+    ResultAreaTab, UiCommand, UiModel, WorkspaceKey, build_execute_all_intent,
+    build_execute_intent, classify_execute_operation, editor_target_label, pending_cancel_intent,
 };
 use eframe::egui::{Context, Event, Key, Modifiers, RawInput, accesskit};
 
@@ -96,6 +96,7 @@ fn workspace_defaults_and_explicit_selection_produce_the_exact_command_tuple() {
             operation_id,
             profile_id,
             profile_generation,
+            editor_tab_id,
             language,
             text,
             row_limit,
@@ -104,6 +105,7 @@ fn workspace_defaults_and_explicit_selection_produce_the_exact_command_tuple() {
             assert_eq!(operation_id, OperationId(91));
             assert_eq!(profile_id, ProfileId("mysql-a".to_owned()));
             assert_eq!(profile_generation, ProfileGeneration(7));
+            assert_eq!(editor_tab_id, None);
             assert_eq!(language, QueryLanguage::Sql);
             assert_eq!(text, "SELECT 1;");
             assert_eq!(row_limit, 500);
@@ -111,6 +113,78 @@ fn workspace_defaults_and_explicit_selection_produce_the_exact_command_tuple() {
         }
         other => panic!("expected Execute, got {other:?}"),
     }
+}
+
+#[test]
+fn run_all_builds_one_redacted_whole_source_batch_intent() {
+    let profile = profile("mysql-batch", 9, DriverKind::MySql, None, TlsMode::Required);
+    let mut model = UiModel::default();
+    let workspace = model.workspace_mut(WorkspaceKey::new(profile.id.clone(), profile.generation));
+    workspace.editor_text = "SELECT 1;\nSELECT 2;".to_owned();
+
+    let batch = build_execute_all_intent(&profile, workspace).expect("read-only batch intent");
+    assert_eq!(batch.profile_id(), &profile.id);
+    assert_eq!(batch.profile_generation(), profile.generation);
+    assert_eq!(batch.language(), QueryLanguage::Sql);
+    assert_eq!(batch.text(), "SELECT 1;\nSELECT 2;");
+    assert_eq!(batch.target_count(), 2);
+    assert_eq!(batch.row_limit(), 500);
+    assert_eq!(batch.timeout_ms(), 30_000);
+    assert_eq!(batch.operation_kind(), OperationKind::ExecuteRead);
+    let debug = format!("{batch:?}");
+    assert!(debug.contains("target_count: 2"));
+    assert!(!debug.contains("SELECT 1"));
+
+    let command = batch.into_ui_command(OperationId(92));
+    assert!(!format!("{command:?}").contains("SELECT 1"));
+    match command {
+        UiCommand::ExecuteBatch {
+            operation_id,
+            profile_id,
+            profile_generation,
+            editor_tab_id,
+            language,
+            text,
+            row_limit,
+            timeout_ms,
+        } => {
+            assert_eq!(operation_id, OperationId(92));
+            assert_eq!(profile_id, profile.id);
+            assert_eq!(profile_generation, profile.generation);
+            assert_eq!(editor_tab_id, None);
+            assert_eq!(language, QueryLanguage::Sql);
+            assert_eq!(text, "SELECT 1;\nSELECT 2;");
+            assert_eq!(row_limit, 500);
+            assert_eq!(timeout_ms, 30_000);
+        }
+        other => panic!("expected ExecuteBatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn run_all_fails_closed_before_returning_mixed_or_denied_batches() {
+    let mysql = profile("mysql-batch", 9, DriverKind::MySql, None, TlsMode::Required);
+    let mut model = UiModel::default();
+    let workspace = model.workspace_mut(WorkspaceKey::new(mysql.id.clone(), mysql.generation));
+    workspace.editor_text = "SELECT 1; UPDATE accounts SET enabled = 0;".to_owned();
+    assert_eq!(
+        build_execute_all_intent(&mysql, workspace).unwrap_err(),
+        EditorValidationError::BatchMutationUnavailable
+    );
+
+    let redis = profile("redis-batch", 4, DriverKind::Redis, None, TlsMode::Required);
+    let redis_workspace =
+        model.workspace_mut(WorkspaceKey::new(redis.id.clone(), redis.generation));
+    redis_workspace.editor_text = "GET safe\nSET safe changed".to_owned();
+    assert_eq!(
+        build_execute_all_intent(&redis, redis_workspace).unwrap_err(),
+        EditorValidationError::Target(ExecutionTargetError::RedisCommandDenied)
+    );
+    redis_workspace.editor_text = "GET safe\nMONITOR".to_owned();
+    assert_eq!(
+        build_execute_all_intent(&redis, redis_workspace).unwrap_err(),
+        EditorValidationError::Target(ExecutionTargetError::RedisCommandDenied)
+    );
 }
 
 #[test]
@@ -152,8 +226,8 @@ fn redis_caret_uses_one_physical_line_and_keeps_the_correct_language() {
     );
     let mut model = UiModel::default();
     let workspace = model.workspace_mut(WorkspaceKey::new(profile.id.clone(), profile.generation));
-    workspace.editor_text = "PING\nSET key \"a;b\"".to_owned();
-    let caret = "PING\nSET".chars().count();
+    workspace.editor_text = "PING\nGET \"a;b\"".to_owned();
+    let caret = "PING\nGET".chars().count();
 
     let intent = build_execute_intent(&profile, workspace, EditorCursor::caret(caret))
         .expect("the Redis physical line is valid");
@@ -161,8 +235,8 @@ fn redis_caret_uses_one_physical_line_and_keeps_the_correct_language() {
     assert_eq!(intent.profile_id(), &ProfileId("redis-b".to_owned()));
     assert_eq!(intent.profile_generation(), ProfileGeneration(11));
     assert_eq!(intent.language(), QueryLanguage::RedisCommand);
-    assert_eq!(intent.text(), "SET key \"a;b\"");
-    assert_eq!(intent.operation_kind(), OperationKind::ExecuteMutation);
+    assert_eq!(intent.text(), "GET \"a;b\"");
+    assert_eq!(intent.operation_kind(), OperationKind::ExecuteRead);
 
     let target = editor_target_label(&profile);
     for expected in [
@@ -328,6 +402,62 @@ fn raw_input_shortcut_submits_once_and_pending_work_exposes_exact_cancel() {
     let pending_ids = author_ids(&pending_output);
     assert!(pending_ids.contains("editor.execute"));
     assert!(pending_ids.contains("editor.cancel"));
+}
+
+#[test]
+fn shifted_execute_shortcut_emits_one_whole_source_run_all_intent() {
+    let profile = profile(
+        "mysql-batch-shortcut",
+        12,
+        DriverKind::MySql,
+        Some("app"),
+        TlsMode::Required,
+    );
+    let mut model = UiModel::default();
+    let workspace = model.workspace_mut(WorkspaceKey::new(profile.id.clone(), profile.generation));
+    workspace.editor_text = "SELECT 1;\nSELECT 2;".to_owned();
+
+    #[cfg(target_os = "macos")]
+    let modifiers = Modifiers {
+        shift: true,
+        mac_cmd: true,
+        command: true,
+        ..Modifiers::default()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let modifiers = Modifiers {
+        shift: true,
+        ctrl: true,
+        command: true,
+        ..Modifiers::default()
+    };
+    let context = Context::default();
+    let mut surface = EditorSurface::default();
+    let mut emitted = Vec::new();
+    let _ = context.run_ui(
+        RawInput {
+            events: vec![Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..RawInput::default()
+        },
+        |ui| {
+            if let Some(intent) = surface.show(ui, &profile, workspace, true) {
+                emitted.push(intent);
+            }
+        },
+    );
+
+    assert_eq!(emitted.len(), 1);
+    let EditorIntent::ExecuteAll(batch) = &emitted[0] else {
+        panic!("Shift+Cmd/Ctrl+Enter must emit ExecuteAll");
+    };
+    assert_eq!(batch.target_count(), 2);
+    assert_eq!(batch.text(), "SELECT 1;\nSELECT 2;");
 }
 
 #[test]

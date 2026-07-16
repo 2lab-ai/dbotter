@@ -28,9 +28,10 @@ use dbotter::service::{
     SessionConnector, SessionDisposition, SessionHandle, UpdateProfileRequest,
 };
 use dbotter::ui::{
-    CONTROL_CAPACITY, ConnectionFailureOutcome, ConnectionState, EVENT_CAPACITY, MUTATION_CAPACITY,
-    PostCloseState, ProfileSnapshot, SubmitError, TaskScope, UiCommand, UiEvent, UiModel, UiPort,
-    WORK_CAPACITY, WorkspaceKey, bounded_ports, controller_ports, spawn_with_service,
+    CONTROL_CAPACITY, ConnectionFailureOutcome, ConnectionState, EVENT_CAPACITY, EditorTabId,
+    MUTATION_CAPACITY, PostCloseState, ProfileSnapshot, SubmitError, TaskScope, UiCommand, UiEvent,
+    UiModel, UiPort, WORK_CAPACITY, WorkspaceKey, bounded_ports, controller_ports,
+    spawn_with_service,
 };
 
 fn test_mysql_capabilities() -> MySqlCapabilitySnapshot {
@@ -700,6 +701,7 @@ fn ui_connection_state_table_covers_credentials_cache_disposition_and_shutdown()
         operation_id: OperationId(43),
         profile_id: profile_id.clone(),
         profile_generation: generation,
+        editor_tab_id: None,
         session_generation: SessionGeneration(7),
         result: empty_query_result(),
     });
@@ -1107,6 +1109,7 @@ async fn p3_invalid_execute_targets_fail_before_session_acquisition() {
             operation_id,
             profile_id,
             profile_generation: generation,
+            editor_tab_id: None,
             language,
             text: text.to_owned(),
             row_limit: 100,
@@ -1146,6 +1149,7 @@ async fn p3_valid_execute_reaches_typed_prepared_resource_and_retains_exact_prov
         operation_id: OperationId(191),
         profile_id: profile.profile_id.clone(),
         profile_generation: profile.profile_generation,
+        editor_tab_id: None,
         language: dbotter::model::QueryLanguage::Sql,
         text: "SELECT 1".to_owned(),
         row_limit: 500,
@@ -1181,6 +1185,196 @@ async fn p3_valid_execute_reaches_typed_prepared_resource_and_retains_exact_prov
 }
 
 #[tokio::test]
+async fn d3_run_all_emits_one_correlated_batch_completion() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let connector = Arc::new(CountingConnector::default());
+    let service = test_service(&path, connector.clone());
+    let profile = service
+        .create_profile(create_request("mysql-d3-batch", OperationId(200)))
+        .await
+        .expect("mysql profile");
+    let (mut ui, service_port) = controller_ports();
+    let runtime = spawn_with_service(service_port, service);
+
+    ui.try_submit(UiCommand::ExecuteBatch {
+        operation_id: OperationId(201),
+        profile_id: profile.profile_id.clone(),
+        profile_generation: profile.profile_generation,
+        editor_tab_id: None,
+        language: dbotter::model::QueryLanguage::Sql,
+        text: "SELECT 1; SELECT 2;".to_owned(),
+        row_limit: 500,
+        timeout_ms: 1_000,
+    })
+    .expect("batch execute submits");
+    let finished = wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::QueryBatchFinished {
+                operation_id: OperationId(201),
+                profile_id,
+                profile_generation,
+                results,
+                ..
+            } if profile_id == &profile.profile_id
+                && *profile_generation == profile.profile_generation
+                && results.len() == 2
+        )
+    })
+    .await;
+    let UiEvent::QueryBatchFinished { results, .. } = finished else {
+        panic!("expected batch query results");
+    };
+    assert!(
+        results
+            .iter()
+            .all(|result| result.provenance.operation_id == OperationId(201))
+    );
+    assert_eq!(connector.connects.load(Ordering::SeqCst), 1);
+    assert_eq!(connector.executes.load(Ordering::SeqCst), 2);
+    shutdown(&ui, runtime, OperationId(209)).await;
+}
+
+#[tokio::test]
+async fn d3_run_all_retains_prior_results_and_stops_after_a_typed_target_error() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let connector = Arc::new(CountingConnector::default());
+    connector.fail_on_execute.store(2, Ordering::SeqCst);
+    let service = test_service(&path, connector.clone());
+    let profile = service
+        .create_profile(create_request("mysql-d3-batch-partial", OperationId(202)))
+        .await
+        .expect("mysql profile");
+    let (mut ui, service_port) = controller_ports();
+    let runtime = spawn_with_service(service_port, service);
+    let operation_id = OperationId(203);
+    let editor_tab_id = EditorTabId(41);
+
+    ui.try_submit(UiCommand::ExecuteBatch {
+        operation_id,
+        profile_id: profile.profile_id.clone(),
+        profile_generation: profile.profile_generation,
+        editor_tab_id: Some(editor_tab_id),
+        language: dbotter::model::QueryLanguage::Sql,
+        text: "SELECT 1; SELECT 2; SELECT 3;".to_owned(),
+        row_limit: 500,
+        timeout_ms: 1_000,
+    })
+    .expect("batch execute submits");
+    let finished = wait_for_event(&mut ui, |event| {
+        matches!(
+            event,
+            UiEvent::QueryBatchFinished {
+                operation_id: actual,
+                profile_id,
+                profile_generation,
+                editor_tab_id: Some(actual_editor_tab_id),
+                ..
+            } if *actual == operation_id
+                && profile_id == &profile.profile_id
+                && *profile_generation == profile.profile_generation
+                && *actual_editor_tab_id == editor_tab_id
+        )
+    })
+    .await;
+    let UiEvent::QueryBatchFinished {
+        operation_id: actual_operation_id,
+        profile_id: actual_profile_id,
+        profile_generation: actual_profile_generation,
+        editor_tab_id: actual_editor_tab_id,
+        target_count,
+        completed_targets,
+        discarded_results,
+        results,
+        error,
+        session_disposition,
+        ..
+    } = finished
+    else {
+        panic!("expected batch query results");
+    };
+    assert_eq!(actual_operation_id, operation_id);
+    assert_eq!(actual_profile_id, profile.profile_id);
+    assert_eq!(actual_profile_generation, profile.profile_generation);
+    assert_eq!(actual_editor_tab_id, Some(editor_tab_id));
+    assert_eq!(target_count, 3);
+    assert_eq!(completed_targets, 1);
+    assert_eq!(discarded_results, 0);
+    assert_eq!(results.len(), 1);
+    assert!(error.is_some());
+    assert_eq!(session_disposition, SessionDisposition::Keep);
+    assert!(results.iter().all(|result| {
+        result.provenance.operation_id == operation_id
+            && result.provenance.profile_id == profile.profile_id
+            && result.provenance.profile_generation == profile.profile_generation
+    }));
+    assert_eq!(connector.executes.load(Ordering::SeqCst), 2);
+
+    tokio::task::yield_now().await;
+    assert_eq!(
+        ui.drain_events(EVENT_CAPACITY)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    UiEvent::QueryBatchFinished {
+                        operation_id: actual,
+                        ..
+                    } if *actual == operation_id
+                )
+            })
+            .count(),
+        0,
+        "a batch operation emits exactly one correlated terminal event"
+    );
+    shutdown(&ui, runtime, OperationId(204)).await;
+}
+
+#[tokio::test]
+async fn d3_run_all_cancel_drops_the_single_batch_driver_future_before_session_close() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let session = Arc::new(ExecuteTestSession::new(ExecuteResourceBehavior::Blocked));
+    let service = test_service_with_connector(
+        &path,
+        Arc::new(ExecuteTestConnector {
+            session: session.clone(),
+        }),
+    );
+    let profile = service
+        .create_profile(create_request("mysql-d3-batch-cancel", OperationId(205)))
+        .await
+        .expect("mysql profile");
+    let (mut ui, service_port) = controller_ports();
+    let runtime = spawn_with_service(service_port, service);
+
+    ui.try_submit(UiCommand::ExecuteBatch {
+        operation_id: OperationId(206),
+        profile_id: profile.profile_id,
+        profile_generation: profile.profile_generation,
+        editor_tab_id: None,
+        language: dbotter::model::QueryLanguage::Sql,
+        text: "SELECT 1; SELECT 2;".to_owned(),
+        row_limit: 500,
+        timeout_ms: 5_000,
+    })
+    .expect("batch execute submits");
+    session.resources.wait_until_started().await;
+    ui.try_submit(UiCommand::CancelOperation {
+        operation_id: OperationId(206),
+    })
+    .expect("batch cancel submits");
+    wait_for_event(&mut ui, |event| terminal_is(event, OperationId(206), true)).await;
+
+    assert!(session.resources.execute_dropped.load(Ordering::SeqCst));
+    assert!(!session.close_before_execute_drop.load(Ordering::SeqCst));
+    assert_eq!(session.closes.load(Ordering::SeqCst), 1);
+    shutdown(&ui, runtime, OperationId(209)).await;
+}
+
+#[tokio::test]
 async fn p3_execute_cancel_drops_driver_future_before_exact_session_close() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");
@@ -1202,6 +1396,7 @@ async fn p3_execute_cancel_drops_driver_future_before_exact_session_close() {
         operation_id: OperationId(211),
         profile_id: profile.profile_id,
         profile_generation: profile.profile_generation,
+        editor_tab_id: None,
         language: dbotter::model::QueryLanguage::Sql,
         text: "SELECT 1".to_owned(),
         row_limit: 500,
@@ -1616,6 +1811,7 @@ async fn p3_driver_session_disposition_is_identical_in_cache_event_and_ui_outcom
             operation_id: execute_operation,
             profile_id,
             profile_generation: profile.profile_generation,
+            editor_tab_id: None,
             language: dbotter::model::QueryLanguage::Sql,
             text: "SELECT 7".to_owned(),
             row_limit: 500,
@@ -3730,11 +3926,13 @@ async fn stale_reconnect_cannot_evict_a_newer_profile_generation_session() {
 #[derive(Default)]
 struct CountingSession {
     executes: Arc<AtomicUsize>,
+    fail_on_execute: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
 struct CountingMySqlResources {
     executes: Arc<AtomicUsize>,
+    fail_on_execute: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -3750,7 +3948,12 @@ impl TestMySqlReadTarget for CountingMySqlResources {
         &self,
         _request: &PreparedMySqlRequest,
     ) -> Result<QueryResult, DriverError> {
-        self.executes.fetch_add(1, Ordering::SeqCst);
+        let ordinal = self.executes.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_on_execute.load(Ordering::SeqCst) == ordinal {
+            return Err(DriverError::MySqlServer {
+                code: MySqlPublicErrorCode::new(1064, "42000").expect("valid injected syntax code"),
+            });
+        }
         Ok(empty_driver_result())
     }
 }
@@ -3777,6 +3980,7 @@ impl SessionHandle for CountingSession {
     fn connected_resources(&self) -> Option<ConnectedResources> {
         let resources = Arc::new(CountingMySqlResources {
             executes: self.executes.clone(),
+            fail_on_execute: self.fail_on_execute.clone(),
         });
         Some(ConnectedResources::MySql {
             ping: resources.clone(),
@@ -3790,6 +3994,7 @@ impl SessionHandle for CountingSession {
 struct CountingConnector {
     connects: AtomicUsize,
     executes: Arc<AtomicUsize>,
+    fail_on_execute: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -3803,6 +4008,7 @@ impl SessionConnector for CountingConnector {
         self.connects.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(CountingSession {
             executes: self.executes.clone(),
+            fail_on_execute: self.fail_on_execute.clone(),
         }))
     }
 }

@@ -21,12 +21,13 @@ use crate::model::{
 };
 use crate::public_error::{PublicOperationError, SafeContext};
 use crate::service::{
-    ApplicationService, RuntimeCreateOutcome, RuntimeDeleteOutcome, RuntimeMutationFailure,
-    RuntimeReloadOutcome, RuntimeUpdateOutcome, ServiceError, SessionDisposition, TestDraftRequest,
+    ApplicationService, RetainedBatchExecution, RuntimeCreateOutcome, RuntimeDeleteOutcome,
+    RuntimeMutationFailure, RuntimeReloadOutcome, RuntimeUpdateOutcome, ServiceError,
+    SessionDisposition, TestDraftRequest,
 };
 
 use super::adapter::{ControlKey, DraftTestIntent, ServicePort, UiCommand};
-use super::editor::classify_execute_operation;
+use super::editor::{classify_execute_batch_operation, classify_execute_operation};
 use super::model::{
     ConfigPresentation, ConnectionFailureOutcome, PostCloseState, ProfileSnapshot, UiEvent,
 };
@@ -612,6 +613,12 @@ enum ProfileWork {
     Execute {
         request: crate::model::ExecuteRequest,
         kind: OperationKind,
+        editor_tab_id: Option<super::model::EditorTabId>,
+    },
+    ExecuteBatch {
+        request: crate::model::ExecuteBatchRequest,
+        kind: OperationKind,
+        editor_tab_id: Option<super::model::EditorTabId>,
     },
     BrowseCatalog {
         request: crate::model::CatalogRequest,
@@ -722,7 +729,13 @@ impl ProfileWork {
                 kind,
                 ..
             } => (*operation_id, profile_id, *profile_generation, *kind),
-            Self::Execute { request, kind } => (
+            Self::Execute { request, kind, .. } => (
+                request.operation_id,
+                &request.profile_id,
+                request.profile_generation,
+                *kind,
+            ),
+            Self::ExecuteBatch { request, kind, .. } => (
                 request.operation_id,
                 &request.profile_id,
                 request.profile_generation,
@@ -1020,6 +1033,7 @@ fn handle_work(
             operation_id,
             profile_id,
             profile_generation,
+            editor_tab_id,
             language,
             text,
             row_limit,
@@ -1037,6 +1051,32 @@ fn handle_work(
                     timeout: duration_from_millis(timeout_ms),
                 },
                 kind,
+                editor_tab_id,
+            }
+        }
+        UiCommand::ExecuteBatch {
+            operation_id,
+            profile_id,
+            profile_generation,
+            editor_tab_id,
+            language,
+            text,
+            row_limit,
+            timeout_ms,
+        } => {
+            let kind = classify_execute_batch_operation(language, &text, row_limit, timeout_ms);
+            ProfileWork::ExecuteBatch {
+                request: crate::model::ExecuteBatchRequest {
+                    operation_id,
+                    profile_id,
+                    profile_generation,
+                    language,
+                    text,
+                    row_limit,
+                    timeout: duration_from_millis(timeout_ms),
+                },
+                kind,
+                editor_tab_id,
             }
         }
         UiCommand::BrowseCatalog(request) => ProfileWork::BrowseCatalog { request },
@@ -2013,9 +2053,16 @@ async fn run_profile_work(
             )
             .await
         }
-        ProfileWork::Execute { request, kind } => {
-            run_execute(service, request, kind, cancel, messages).await
-        }
+        ProfileWork::Execute {
+            request,
+            kind,
+            editor_tab_id,
+        } => run_execute(service, request, kind, editor_tab_id, cancel, messages).await,
+        ProfileWork::ExecuteBatch {
+            request,
+            kind,
+            editor_tab_id,
+        } => run_execute_batch(service, request, kind, editor_tab_id, cancel, messages).await,
         ProfileWork::BrowseCatalog { request } => {
             run_catalog_browse(service, request, cancel, messages).await
         }
@@ -2141,6 +2188,7 @@ async fn run_execute(
     service: &ApplicationService,
     request: crate::model::ExecuteRequest,
     kind: OperationKind,
+    editor_tab_id: Option<super::model::EditorTabId>,
     cancel: &CancellationToken,
     messages: &mpsc::UnboundedSender<ControllerMessage>,
 ) -> UiEvent {
@@ -2258,6 +2306,7 @@ async fn run_execute(
             operation_id,
             profile_id,
             profile_generation,
+            editor_tab_id,
             session_generation,
             result: service.retain_execute_result(&typed_request, result),
         },
@@ -2302,6 +2351,220 @@ async fn run_execute(
             )
         }
         (ExecuteAttempt::Driver(_), Err(error)) => {
+            service.evict_session_lease(&lease).await;
+            failed_from_service(
+                operation_id,
+                profile_id,
+                profile_generation,
+                Some(session_generation),
+                kind,
+                &error,
+            )
+        }
+    }
+}
+
+async fn run_execute_batch(
+    service: &ApplicationService,
+    request: crate::model::ExecuteBatchRequest,
+    kind: OperationKind,
+    editor_tab_id: Option<super::model::EditorTabId>,
+    cancel: &CancellationToken,
+    messages: &mpsc::UnboundedSender<ControllerMessage>,
+) -> UiEvent {
+    let operation_id = request.operation_id;
+    let profile_id = request.profile_id.clone();
+    let profile_generation = request.profile_generation;
+    let timeout = request.timeout;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let prepare = service.prepare_execute_batch_request(&request);
+    tokio::pin!(prepare);
+    let typed_batch = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return failed_profile_event(
+                operation_id,
+                profile_id,
+                profile_generation,
+                None,
+                kind,
+                PublicSummary::OperationCancelled,
+            );
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            return failed_profile_event(
+                operation_id,
+                profile_id,
+                profile_generation,
+                None,
+                kind,
+                PublicSummary::OperationTimedOut,
+            );
+        }
+        result = &mut prepare => match result {
+            Ok(batch) => batch,
+            Err(error) => {
+                return failed_from_service(
+                    operation_id,
+                    profile_id,
+                    profile_generation,
+                    None,
+                    kind,
+                    &error,
+                );
+            }
+        }
+    };
+    let acquire = service.acquire_session_at(
+        operation_id,
+        profile_id.clone(),
+        profile_generation,
+        timeout,
+    );
+    tokio::pin!(acquire);
+    let lease = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return failed_profile_event(
+                operation_id,
+                profile_id,
+                profile_generation,
+                None,
+                kind,
+                PublicSummary::OperationCancelled,
+            );
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            return failed_profile_event(
+                operation_id,
+                profile_id,
+                profile_generation,
+                None,
+                kind,
+                PublicSummary::OperationTimedOut,
+            );
+        }
+        result = &mut acquire => match result {
+            Ok(lease) => lease,
+            Err(error) => {
+                return failed_from_service(
+                    operation_id,
+                    profile_id,
+                    profile_generation,
+                    None,
+                    kind,
+                    &error,
+                );
+            }
+        }
+    };
+    let session_generation = lease.identity().session_generation;
+    let _ = messages.send(ControllerMessage::SessionAcquired {
+        operation_id,
+        session_generation,
+    });
+    tokio::task::yield_now().await;
+    let target_count = typed_batch.len();
+    enum ExecuteBatchAttempt {
+        Driver(Result<RetainedBatchExecution, crate::drivers::DriverError>),
+        Cancelled,
+        TimedOut,
+    }
+    let attempt = {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let execute = lease.execute_typed_batch(
+            &typed_batch,
+            remaining,
+            |identity, driver, retention, result| {
+                service.retain_result(identity, driver, retention, result)
+            },
+        );
+        tokio::pin!(execute);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => ExecuteBatchAttempt::Cancelled,
+            () = tokio::time::sleep_until(deadline) => ExecuteBatchAttempt::TimedOut,
+            result = &mut execute => ExecuteBatchAttempt::Driver(result),
+        }
+    };
+    let observation = service.observe_session(&lease, operation_id).await;
+    match (attempt, observation) {
+        (ExecuteBatchAttempt::Driver(Ok(mut outcome)), Ok(())) => {
+            let (error, session_disposition) = if let Some(error) = outcome.failure.take() {
+                let session_disposition = SessionDisposition::for_driver_error(&error);
+                let service_error = ServiceError::from(error);
+                let (summary, code) = service_error.public_error_parts();
+                if session_disposition == SessionDisposition::Evict {
+                    service.evict_session_lease(&lease).await;
+                }
+                (
+                    Some(public_profile_error(
+                        kind,
+                        profile_id.clone(),
+                        operation_id,
+                        summary,
+                        code,
+                    )),
+                    session_disposition,
+                )
+            } else {
+                (None, SessionDisposition::Keep)
+            };
+            UiEvent::QueryBatchFinished {
+                operation_id,
+                profile_id,
+                profile_generation,
+                editor_tab_id,
+                session_generation,
+                target_count,
+                completed_targets: outcome.completed_targets,
+                discarded_results: outcome.discarded_results,
+                results: outcome.results,
+                error,
+                session_disposition,
+            }
+        }
+        (ExecuteBatchAttempt::Driver(Err(error)), Ok(())) => {
+            let disposition = SessionDisposition::for_driver_error(&error);
+            let service_error = ServiceError::from(error);
+            let (summary, code) = service_error.public_error_parts();
+            if disposition == SessionDisposition::Evict {
+                service.evict_session_lease(&lease).await;
+            }
+            failed_profile_event_with_disposition(
+                operation_id,
+                profile_id,
+                profile_generation,
+                session_generation,
+                kind,
+                summary,
+                code,
+                disposition,
+            )
+        }
+        (ExecuteBatchAttempt::Cancelled, _) => {
+            service.evict_session_lease(&lease).await;
+            failed_profile_event(
+                operation_id,
+                profile_id,
+                profile_generation,
+                Some(session_generation),
+                kind,
+                PublicSummary::OperationCancelled,
+            )
+        }
+        (ExecuteBatchAttempt::TimedOut, _) => {
+            service.evict_session_lease(&lease).await;
+            failed_profile_event(
+                operation_id,
+                profile_id,
+                profile_generation,
+                Some(session_generation),
+                kind,
+                PublicSummary::OperationTimedOut,
+            )
+        }
+        (ExecuteBatchAttempt::Driver(_), Err(error)) => {
             service.evict_session_lease(&lease).await;
             failed_from_service(
                 operation_id,
@@ -4222,6 +4485,17 @@ fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEven
             PublicCode::None,
         ),
         UiCommand::Execute {
+            operation_id,
+            profile_id,
+            profile_generation,
+            ..
+        } => UiEvent::ExecuteUnavailable {
+            operation_id,
+            profile_id,
+            profile_generation,
+            summary,
+        },
+        UiCommand::ExecuteBatch {
             operation_id,
             profile_id,
             profile_generation,

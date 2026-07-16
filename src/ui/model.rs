@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::config::ConfigSourceVersion;
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionProfile, CredentialMode, DraftId, DriverAvailability,
-    DriverKind, ExportFormat, OperationId, OperationKind, OverwritePolicy, ProfileGeneration,
-    ProfileId, PublicSummary, QueryLanguage, RedisKeyInspectRequest, RedisKeyPage,
-    RedisScanRequest, RedisValuePreview, ResultId, ResultSnapshot, SessionGeneration,
+    DriverKind, ExportFormat, MAX_PROFILE_RESULT_BYTES, OperationId, OperationKind,
+    OverwritePolicy, ProfileGeneration, ProfileId, PublicSummary, QueryLanguage,
+    RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, ResultId,
+    ResultSnapshot, SessionGeneration,
 };
 use crate::public_error::PublicOperationError;
 use crate::secrets::EnvironmentAvailability;
@@ -95,7 +96,8 @@ impl WorkspaceKey {
 }
 
 pub const MAX_EDITOR_TABS: usize = 20;
-pub const MAX_RESULT_TABS: usize = 20;
+pub const MAX_RESULT_TABS_PER_EDITOR: usize = 10;
+pub const MAX_RESULT_TABS_PER_PROFILE: usize = 40;
 const MAX_EDITOR_TAB_TITLE_BYTES: usize = 120;
 pub const MAX_EDITOR_TAB_TEXT_BYTES: usize = 256 * 1024;
 
@@ -184,6 +186,7 @@ pub struct ResultTabId(pub u64);
 #[derive(Clone)]
 pub struct ResultTab {
     id: ResultTabId,
+    origin_editor_tab_id: Option<EditorTabId>,
     snapshot: Arc<ResultSnapshot>,
     view: ResultViewState,
 }
@@ -193,6 +196,7 @@ impl std::fmt::Debug for ResultTab {
         formatter
             .debug_struct("ResultTab")
             .field("id", &self.id)
+            .field("origin_editor_tab_id", &self.origin_editor_tab_id)
             .field("snapshot", &"<retained>")
             .finish_non_exhaustive()
     }
@@ -207,8 +211,12 @@ impl ResultTab {
         &self.snapshot
     }
 
+    pub const fn origin_editor_tab_id(&self) -> Option<EditorTabId> {
+        self.origin_editor_tab_id
+    }
+
     pub fn title(&self) -> String {
-        format!("Result {}", self.snapshot.provenance.operation_id.0)
+        format!("Result {}", self.snapshot.provenance.result_id.0)
     }
 
     pub(crate) const fn can_close(&self) -> bool {
@@ -220,6 +228,7 @@ impl ResultTab {
 pub enum ResultTabError {
     NotFound,
     Busy,
+    CapacityProtected,
 }
 
 impl std::fmt::Display for ResultTabError {
@@ -227,6 +236,9 @@ impl std::fmt::Display for ResultTabError {
         formatter.write_str(match self {
             Self::NotFound => "result tab is no longer available",
             Self::Busy => "cancel the active result operation before closing this tab",
+            Self::CapacityProtected => {
+                "result capacity is occupied by the selected or active result"
+            }
         })
     }
 }
@@ -343,6 +355,7 @@ impl ProfileWorkspace {
             return Err(EditorTabError::TextTooLarge);
         }
         self.sync_selected_editor_tab_from_surface()?;
+        let had_editor_tabs = !self.editor_tabs.is_empty();
         let id = EditorTabId(self.next_editor_tab_id.max(1));
         self.next_editor_tab_id = id.0.saturating_add(1);
         let dirty = !text.is_empty();
@@ -355,6 +368,9 @@ impl ProfileWorkspace {
         });
         self.selected_editor_tab = Some(id);
         self.load_editor_tab_into_surface(id);
+        if had_editor_tabs {
+            self.activate_result_for_editor(Some(id));
+        }
         Ok(id)
     }
 
@@ -400,6 +416,7 @@ impl ProfileWorkspace {
         self.sync_selected_editor_tab_from_surface()?;
         self.selected_editor_tab = Some(tab_id);
         self.load_editor_tab_into_surface(tab_id);
+        self.activate_result_for_editor(Some(tab_id));
         Ok(())
     }
 
@@ -433,10 +450,12 @@ impl ProfileWorkspace {
                 .map(EditorTab::id);
             if let Some(selected) = self.selected_editor_tab {
                 self.load_editor_tab_into_surface(selected);
+                self.activate_result_for_editor(Some(selected));
             } else {
                 self.editor_text.clear();
                 self.caret_character_index = 0;
                 self.selection_character_range = None;
+                self.activate_result_for_editor(None);
             }
         }
     }
@@ -491,6 +510,21 @@ impl ProfileWorkspace {
         &self.result_tabs
     }
 
+    pub fn result_tabs_for_editor(
+        &self,
+        editor_tab_id: Option<EditorTabId>,
+    ) -> impl DoubleEndedIterator<Item = &ResultTab> {
+        self.result_tabs.iter().filter(move |tab| {
+            tab.origin_editor_tab_id.is_none() || tab.origin_editor_tab_id == editor_tab_id
+        })
+    }
+
+    pub fn retained_result_bytes(&self) -> usize {
+        self.result_tabs.iter().fold(0_usize, |total, tab| {
+            total.saturating_add(tab.snapshot.retained_bytes)
+        })
+    }
+
     pub const fn selected_result_tab_id(&self) -> Option<ResultTabId> {
         self.selected_result_tab
     }
@@ -504,29 +538,101 @@ impl ProfileWorkspace {
         &mut self,
         snapshot: Arc<ResultSnapshot>,
     ) -> Result<ResultTabId, ResultTabError> {
+        self.append_result_tab_for_editor(snapshot, None)
+    }
+
+    pub(crate) fn append_result_tab_for_editor(
+        &mut self,
+        snapshot: Arc<ResultSnapshot>,
+        origin_editor_tab_id: Option<EditorTabId>,
+    ) -> Result<ResultTabId, ResultTabError> {
         self.sync_selected_result_tab_from_surface();
-        if self.result_tabs.len() >= MAX_RESULT_TABS {
-            let eviction = self
+        let mut evictions = vec![false; self.result_tabs.len()];
+        let mut retained_count = self.result_tabs.len();
+        let mut retained_bytes = self.retained_result_bytes();
+
+        if let Some(editor_tab_id) = origin_editor_tab_id {
+            let editor_result_count = self
                 .result_tabs
                 .iter()
-                .position(|tab| Some(tab.id) != self.selected_result_tab)
-                .unwrap_or(0);
-            self.result_tabs.remove(eviction);
+                .filter(|tab| tab.origin_editor_tab_id == Some(editor_tab_id))
+                .count();
+            let mut required_evictions = editor_result_count
+                .saturating_add(1)
+                .saturating_sub(MAX_RESULT_TABS_PER_EDITOR);
+            for (index, tab) in self.result_tabs.iter().enumerate() {
+                if required_evictions == 0 {
+                    break;
+                }
+                if tab.origin_editor_tab_id == Some(editor_tab_id)
+                    && Some(tab.id) != self.selected_result_tab
+                    && tab.can_close()
+                {
+                    evictions[index] = true;
+                    retained_count = retained_count.saturating_sub(1);
+                    retained_bytes = retained_bytes.saturating_sub(tab.snapshot.retained_bytes);
+                    required_evictions -= 1;
+                }
+            }
+            if required_evictions > 0 {
+                return Err(ResultTabError::CapacityProtected);
+            }
+        }
+
+        while retained_count.saturating_add(1) > MAX_RESULT_TABS_PER_PROFILE
+            || retained_bytes.saturating_add(snapshot.retained_bytes) > MAX_PROFILE_RESULT_BYTES
+        {
+            let Some((index, tab)) = self.result_tabs.iter().enumerate().find(|(index, tab)| {
+                !evictions[*index] && Some(tab.id) != self.selected_result_tab && tab.can_close()
+            }) else {
+                return Err(ResultTabError::CapacityProtected);
+            };
+            evictions[index] = true;
+            retained_count = retained_count.saturating_sub(1);
+            retained_bytes = retained_bytes.saturating_sub(tab.snapshot.retained_bytes);
+        }
+
+        for index in (0..evictions.len()).rev() {
+            if evictions[index] {
+                self.result_tabs.remove(index);
+            }
         }
         let id = ResultTabId(self.next_result_tab_id.max(1));
         self.next_result_tab_id = id.0.saturating_add(1);
         let mut view = ResultViewState::default();
         view.reset_for(snapshot.provenance.result_id);
+        let activate =
+            origin_editor_tab_id.is_none() || origin_editor_tab_id == self.selected_editor_tab;
         self.result_tabs.push(ResultTab {
             id,
+            origin_editor_tab_id,
             snapshot: snapshot.clone(),
             view: view.clone(),
         });
-        self.selected_result_tab = Some(id);
-        self.result = Some(snapshot);
-        self.result_view = view;
-        self.result_area_tab = ResultAreaTab::Results;
+        if activate {
+            self.selected_result_tab = Some(id);
+            self.result = Some(snapshot);
+            self.result_view = view;
+            self.result_area_tab = ResultAreaTab::Results;
+        }
         Ok(id)
+    }
+
+    fn activate_result_for_editor(&mut self, editor_tab_id: Option<EditorTabId>) {
+        self.sync_selected_result_tab_from_surface();
+        let replacement = self
+            .result_tabs_for_editor(editor_tab_id)
+            .next_back()
+            .map(|tab| (tab.id, tab.snapshot.clone(), tab.view.clone()));
+        if let Some((id, snapshot, view)) = replacement {
+            self.selected_result_tab = Some(id);
+            self.result = Some(snapshot);
+            self.result_view = view;
+        } else {
+            self.selected_result_tab = None;
+            self.result = None;
+            self.result_view = ResultViewState::default();
+        }
     }
 
     pub fn select_result_tab(&mut self, tab_id: ResultTabId) -> Result<(), ResultTabError> {
@@ -555,10 +661,24 @@ impl ProfileWorkspace {
             return Ok(());
         }
 
+        let selected_editor_tab = self.selected_editor_tab;
         let replacement = self
             .result_tabs
-            .get(index)
-            .or_else(|| self.result_tabs.last())
+            .iter()
+            .skip(index)
+            .find(|tab| {
+                tab.origin_editor_tab_id.is_none()
+                    || tab.origin_editor_tab_id == selected_editor_tab
+            })
+            .or_else(|| {
+                self.result_tabs[..index.min(self.result_tabs.len())]
+                    .iter()
+                    .rev()
+                    .find(|tab| {
+                        tab.origin_editor_tab_id.is_none()
+                            || tab.origin_editor_tab_id == selected_editor_tab
+                    })
+            })
             .map(|tab| (tab.id, tab.snapshot.clone(), tab.view.clone()));
         if let Some((id, snapshot, view)) = replacement {
             self.selected_result_tab = Some(id);
@@ -843,8 +963,22 @@ pub enum UiEvent {
         operation_id: OperationId,
         profile_id: ProfileId,
         profile_generation: ProfileGeneration,
+        editor_tab_id: Option<EditorTabId>,
         session_generation: SessionGeneration,
         result: ResultSnapshot,
+    },
+    QueryBatchFinished {
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        editor_tab_id: Option<EditorTabId>,
+        session_generation: SessionGeneration,
+        target_count: usize,
+        completed_targets: usize,
+        discarded_results: usize,
+        results: Vec<ResultSnapshot>,
+        error: Option<PublicOperationError>,
+        session_disposition: SessionDisposition,
     },
     ResultExported {
         operation_id: OperationId,
@@ -1209,26 +1343,122 @@ impl UiModel {
                 operation_id,
                 profile_id,
                 profile_generation,
+                editor_tab_id,
                 session_generation,
                 result,
             } => {
                 if self.event_is_current(&profile_id, profile_generation) {
                     let duration_ms = result.provenance.duration_ms;
-                    {
+                    let (origin_missing, result_retained) = {
                         let workspace = self.exact_workspace_mut(&profile_id, profile_generation);
                         if workspace.pending_execute != Some(operation_id) {
                             return;
                         }
                         workspace.pending_execute = None;
-                        workspace.error = None;
-                        let _ = workspace.append_result_tab(Arc::new(result));
-                    }
-                    self.status = format!("Query finished in {duration_ms} ms");
+                        if editor_tab_id
+                            .is_some_and(|tab_id| workspace.editor_tab(tab_id).is_none())
+                        {
+                            (true, false)
+                        } else {
+                            workspace.error = None;
+                            (
+                                false,
+                                workspace
+                                    .append_result_tab_for_editor(Arc::new(result), editor_tab_id)
+                                    .is_ok(),
+                            )
+                        }
+                    };
+                    self.status = if origin_missing {
+                        "The originating editor tab is no longer available.".to_owned()
+                    } else if !result_retained {
+                        "Query finished, but its result was not retained because active results occupy the 32 MiB profile limit."
+                            .to_owned()
+                    } else {
+                        format!("Query finished in {duration_ms} ms")
+                    };
                     self.connection_states.insert(
                         profile_id,
                         ConnectionState::Connected {
                             session_generation,
                             elapsed_ms: 0,
+                        },
+                    );
+                }
+            }
+            UiEvent::QueryBatchFinished {
+                operation_id,
+                profile_id,
+                profile_generation,
+                editor_tab_id,
+                session_generation,
+                target_count,
+                completed_targets,
+                mut discarded_results,
+                results,
+                error,
+                session_disposition,
+            } => {
+                if self.event_is_current(&profile_id, profile_generation) {
+                    let error_summary = error.as_ref().map(|error| error.summary);
+                    let duration_ms = results.iter().fold(0_u128, |total, result| {
+                        total.saturating_add(result.provenance.duration_ms)
+                    });
+                    let origin_missing = {
+                        let workspace = self.exact_workspace_mut(&profile_id, profile_generation);
+                        if workspace.pending_execute != Some(operation_id) {
+                            return;
+                        }
+                        workspace.pending_execute = None;
+                        if editor_tab_id
+                            .is_some_and(|tab_id| workspace.editor_tab(tab_id).is_none())
+                        {
+                            true
+                        } else {
+                            workspace.error = error;
+                            for result in results {
+                                if workspace
+                                    .append_result_tab_for_editor(Arc::new(result), editor_tab_id)
+                                    .is_err()
+                                {
+                                    discarded_results = discarded_results.saturating_add(1);
+                                }
+                            }
+                            false
+                        }
+                    };
+                    self.status = if origin_missing {
+                        "The originating editor tab is no longer available.".to_owned()
+                    } else if let Some(summary) = error_summary {
+                        let mut status = format!(
+                            "Run all stopped after {completed_targets}/{target_count} targets: {}",
+                            summary.message()
+                        );
+                        if discarded_results > 0 {
+                            status.push_str(&format!(
+                                " ({discarded_results} completed results were not retained.)"
+                            ));
+                        }
+                        status
+                    } else {
+                        let mut status = format!(
+                            "Run all finished: {completed_targets}/{target_count} targets in {duration_ms} ms."
+                        );
+                        if discarded_results > 0 {
+                            status.push_str(&format!(
+                                " {discarded_results} results were not retained at the 32 MiB profile limit."
+                            ));
+                        }
+                        status
+                    };
+                    self.connection_states.insert(
+                        profile_id,
+                        match session_disposition {
+                            SessionDisposition::Keep => ConnectionState::Connected {
+                                session_generation,
+                                elapsed_ms: 0,
+                            },
+                            SessionDisposition::Evict => ConnectionState::Disconnected,
                         },
                     );
                 }
@@ -1729,16 +1959,18 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot, UiEvent,
-        UiModel, WorkspaceKey,
+        ConnectionFailureOutcome, ConnectionState, EditorTabId, MAX_RESULT_TABS_PER_EDITOR,
+        MAX_RESULT_TABS_PER_PROFILE, PostCloseState, ProfileSnapshot, ProfileWorkspace,
+        ResultTabError, UiEvent, UiModel, WorkspaceKey,
     };
     use crate::model::{
         CatalogLevel, CatalogPage, CatalogRequest, CatalogRetainedCounts, ConnectionProfile,
-        CredentialMode, DriverAvailability, DriverKind, OperationId, OperationKind, ProfileAccess,
-        ProfileEnvironment, ProfileGeneration, ProfileId, ProfileSafetyPosture, PublicCode,
-        PublicSummary, QueryResult, RedisKeyFilter, RedisKeyPage, RedisScanConsistency,
-        RedisScanRequest, RedisTlsConfig, RequestIdentity, ResultId, ResultProvenance,
-        ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
+        CredentialMode, DriverAvailability, DriverKind, MAX_PROFILE_RESULT_BYTES, OperationId,
+        OperationKind, ProfileAccess, ProfileEnvironment, ProfileGeneration, ProfileId,
+        ProfileSafetyPosture, PublicCode, PublicSummary, QueryLanguage, QueryResult,
+        RedisKeyFilter, RedisKeyPage, RedisScanConsistency, RedisScanRequest, RedisTlsConfig,
+        RequestIdentity, ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
+        SessionGeneration, TlsMode,
     };
     use crate::public_error::{PublicOperationError, SafeContext};
     use crate::service::SessionDisposition;
@@ -1774,6 +2006,184 @@ mod tests {
             profile_generation: ProfileGeneration(1),
             operation_id: OperationId(operation_id),
         }
+    }
+
+    fn result_with_id(result_id: u64) -> Arc<ResultSnapshot> {
+        let mut snapshot = result(result_id as u128);
+        snapshot.provenance.result_id = ResultId(result_id);
+        Arc::new(snapshot)
+    }
+
+    #[test]
+    fn result_tab_per_editor_cap_evicts_oldest_from_same_editor() {
+        assert_eq!(MAX_RESULT_TABS_PER_EDITOR, 10);
+        let mut workspace = ProfileWorkspace::default();
+        let editor_a = EditorTabId(11);
+        let editor_b = EditorTabId(12);
+
+        for result_id in 1..=MAX_RESULT_TABS_PER_EDITOR as u64 {
+            workspace
+                .append_result_tab_for_editor(result_with_id(result_id), Some(editor_a))
+                .expect("editor A result fits");
+        }
+        workspace
+            .append_result_tab_for_editor(result_with_id(100), Some(editor_b))
+            .expect("editor B result fits");
+        workspace
+            .append_result_tab_for_editor(result_with_id(11), Some(editor_a))
+            .expect("editor A oldest inactive result is evicted");
+
+        assert_eq!(
+            workspace
+                .result_tabs()
+                .iter()
+                .filter(|tab| tab.origin_editor_tab_id() == Some(editor_a))
+                .count(),
+            MAX_RESULT_TABS_PER_EDITOR
+        );
+        assert_eq!(
+            workspace
+                .result_tabs()
+                .iter()
+                .filter(|tab| tab.origin_editor_tab_id() == Some(editor_b))
+                .count(),
+            1
+        );
+        assert!(workspace.result_snapshot(ResultId(1)).is_none());
+        assert!(workspace.result_snapshot(ResultId(2)).is_some());
+        assert!(workspace.result_snapshot(ResultId(11)).is_some());
+        assert!(workspace.result_snapshot(ResultId(100)).is_some());
+    }
+
+    #[test]
+    fn result_tab_profile_cap_evicts_oldest_global_inactive() {
+        assert_eq!(MAX_RESULT_TABS_PER_PROFILE, 40);
+        let mut workspace = ProfileWorkspace::default();
+        for result_id in 1..=MAX_RESULT_TABS_PER_PROFILE as u64 {
+            workspace
+                .append_result_tab(result_with_id(result_id))
+                .expect("profile result fits");
+        }
+
+        workspace
+            .append_result_tab(result_with_id(41))
+            .expect("global oldest inactive result is evicted");
+
+        assert_eq!(workspace.result_tabs().len(), MAX_RESULT_TABS_PER_PROFILE);
+        assert!(workspace.result_snapshot(ResultId(1)).is_none());
+        assert!(workspace.result_snapshot(ResultId(2)).is_some());
+        assert!(workspace.result_snapshot(ResultId(40)).is_some());
+        assert!(workspace.result_snapshot(ResultId(41)).is_some());
+    }
+
+    #[test]
+    fn closing_selected_result_never_activates_another_editors_result() {
+        let mut workspace = ProfileWorkspace::default();
+        let editor_a = workspace
+            .create_editor_tab(QueryLanguage::Sql, "Editor A", "")
+            .expect("editor A");
+        let result_a = workspace
+            .append_result_tab_for_editor(result_with_id(1), Some(editor_a))
+            .expect("editor A result");
+        let editor_b = workspace
+            .create_editor_tab(QueryLanguage::Sql, "Editor B", "")
+            .expect("editor B");
+        let result_b = workspace
+            .append_result_tab_for_editor(result_with_id(2), Some(editor_b))
+            .expect("editor B result");
+
+        workspace
+            .close_result_tab(result_b)
+            .expect("close editor B result");
+
+        assert_eq!(workspace.selected_editor_tab_id(), Some(editor_b));
+        assert_eq!(workspace.selected_result_tab_id(), None);
+        assert!(workspace.result.is_none());
+        assert!(workspace.result_snapshot(ResultId(1)).is_some());
+
+        workspace
+            .select_editor_tab(editor_a)
+            .expect("return to editor A");
+        assert_eq!(workspace.selected_result_tab_id(), Some(result_a));
+        assert_eq!(
+            workspace
+                .result
+                .as_ref()
+                .map(|result| result.provenance.result_id),
+            Some(ResultId(1))
+        );
+    }
+
+    #[test]
+    fn result_tab_capacity_rejects_when_every_candidate_is_protected() {
+        let mut workspace = ProfileWorkspace::default();
+        let editor = EditorTabId(21);
+        let mut tab_ids = Vec::new();
+        for result_id in 1..=MAX_RESULT_TABS_PER_EDITOR as u64 {
+            tab_ids.push(
+                workspace
+                    .append_result_tab_for_editor(result_with_id(result_id), Some(editor))
+                    .expect("editor result fits"),
+            );
+        }
+        for result_id in 1..MAX_RESULT_TABS_PER_EDITOR as u64 {
+            assert!(
+                workspace.begin_result_export(ResultId(result_id), OperationId(500 + result_id),)
+            );
+        }
+        workspace
+            .select_result_tab(*tab_ids.last().expect("last result tab"))
+            .expect("last result is selected");
+
+        assert_eq!(
+            workspace.append_result_tab_for_editor(result_with_id(11), Some(editor)),
+            Err(ResultTabError::CapacityProtected)
+        );
+        assert_eq!(workspace.result_tabs().len(), MAX_RESULT_TABS_PER_EDITOR);
+        assert!(workspace.result_snapshot(ResultId(1)).is_some());
+        assert!(workspace.result_snapshot(ResultId(10)).is_some());
+        assert!(workspace.result_snapshot(ResultId(11)).is_none());
+    }
+
+    #[test]
+    fn aggregate_result_bytes_evict_oldest_inactive_and_never_active_exports() {
+        let mut workspace = ProfileWorkspace::default();
+        let mut result_ids = Vec::new();
+        for result_id in 31..=34 {
+            let mut snapshot = result(result_id);
+            snapshot.provenance.result_id = ResultId(result_id as u64);
+            snapshot.retained_bytes = 8 * 1024 * 1024;
+            workspace
+                .append_result_tab(Arc::new(snapshot))
+                .expect("four exact-cap results fit");
+            result_ids.push(ResultId(result_id as u64));
+        }
+        assert_eq!(workspace.retained_result_bytes(), MAX_PROFILE_RESULT_BYTES);
+
+        for (index, result_id) in result_ids.iter().take(3).enumerate() {
+            assert!(workspace.begin_result_export(*result_id, OperationId(300 + index as u64)));
+        }
+        let mut rejected = result(35);
+        rejected.provenance.result_id = ResultId(35);
+        rejected.retained_bytes = 8 * 1024 * 1024;
+        assert_eq!(
+            workspace.append_result_tab(Arc::new(rejected)),
+            Err(ResultTabError::CapacityProtected),
+            "the selected result and three active exports cannot be evicted"
+        );
+        assert_eq!(workspace.retained_result_bytes(), MAX_PROFILE_RESULT_BYTES);
+
+        workspace.finish_result_export(ResultId(31), OperationId(300));
+        let mut replacement = result(36);
+        replacement.provenance.result_id = ResultId(36);
+        replacement.retained_bytes = 8 * 1024 * 1024;
+        workspace
+            .append_result_tab(Arc::new(replacement))
+            .expect("the oldest inactive result is now evictable");
+        assert_eq!(workspace.retained_result_bytes(), MAX_PROFILE_RESULT_BYTES);
+        assert!(workspace.result_snapshot(ResultId(31)).is_none());
+        assert!(workspace.result_snapshot(ResultId(32)).is_some());
+        assert!(workspace.result_snapshot(ResultId(36)).is_some());
     }
 
     #[test]
@@ -2016,6 +2426,7 @@ mod tests {
             operation_id: OperationId(1),
             profile_id,
             profile_generation: generation,
+            editor_tab_id: None,
             session_generation: SessionGeneration(1),
             result: result(99),
         });

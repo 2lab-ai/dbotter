@@ -7,7 +7,8 @@ use eframe::egui;
 
 use crate::execution::{
     ExecutionLanguage, ExecutionTarget, ExecutionTargetError, MAX_EXECUTE_ROW_LIMIT,
-    MAX_EXECUTE_TIMEOUT_SECONDS, classify_execution_kind, extract_and_validate_target,
+    MAX_EXECUTE_TIMEOUT_SECONDS, classify_execution_batch_kind, classify_execution_kind,
+    extract_and_validate_all_targets, extract_and_validate_target,
     mysql_may_be_read_with_session_mode,
 };
 use crate::model::{
@@ -17,7 +18,8 @@ use crate::model::{
 use super::accessibility::named_author_id;
 use super::adapter::UiCommand;
 use super::model::{
-    MAX_EDITOR_TAB_TEXT_BYTES, ProfileSnapshot, ProfileWorkspace, ResultAreaTab, WorkspaceKey,
+    EditorTabId, MAX_EDITOR_TAB_TEXT_BYTES, ProfileSnapshot, ProfileWorkspace, ResultAreaTab,
+    WorkspaceKey,
 };
 use super::theme::OpenAiTheme;
 
@@ -26,8 +28,10 @@ pub const EDITOR_INPUT_ID: &str = "editor.input";
 pub const EDITOR_ROW_LIMIT_ID: &str = "editor.row_limit";
 pub const EDITOR_TIMEOUT_ID: &str = "editor.timeout";
 pub const EDITOR_EXECUTE_ID: &str = "editor.execute";
+pub const EDITOR_EXECUTE_ALL_ID: &str = "editor.execute_all";
 pub const EDITOR_HISTORY_ID: &str = "editor.history";
 pub const EDITOR_CANCEL_ID: &str = "editor.cancel";
+pub const EDITOR_PENDING_ID: &str = "editor.pending";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditorCursor {
@@ -60,6 +64,7 @@ pub enum EditorValidationError {
     RowLimit,
     Timeout,
     Target(ExecutionTargetError),
+    BatchMutationUnavailable,
     UnsupportedDriver,
 }
 
@@ -69,7 +74,9 @@ impl EditorValidationError {
             Self::TextTooLarge => EDITOR_INPUT_ID,
             Self::RowLimit => EDITOR_ROW_LIMIT_ID,
             Self::Timeout => EDITOR_TIMEOUT_ID,
-            Self::Target(_) | Self::UnsupportedDriver => EDITOR_INPUT_ID,
+            Self::Target(_) | Self::BatchMutationUnavailable | Self::UnsupportedDriver => {
+                EDITOR_INPUT_ID
+            }
         }
     }
 
@@ -81,6 +88,9 @@ impl EditorValidationError {
             Self::RowLimit => "Enter a row limit from 1 to 10000.",
             Self::Timeout => "Enter a timeout from 1 to 300 seconds.",
             Self::Target(error) => error.summary(),
+            Self::BatchMutationUnavailable => {
+                "Run all currently accepts only preflighted read-only targets."
+            }
             Self::UnsupportedDriver => "This driver does not support query execution.",
         }
     }
@@ -98,6 +108,7 @@ impl std::error::Error for EditorValidationError {}
 pub struct EditorExecuteIntent {
     profile_id: ProfileId,
     profile_generation: ProfileGeneration,
+    editor_tab_id: Option<EditorTabId>,
     language: QueryLanguage,
     text: String,
     row_limit: u32,
@@ -112,6 +123,10 @@ impl EditorExecuteIntent {
 
     pub const fn profile_generation(&self) -> ProfileGeneration {
         self.profile_generation
+    }
+
+    pub const fn editor_tab_id(&self) -> Option<EditorTabId> {
+        self.editor_tab_id
     }
 
     pub const fn language(&self) -> QueryLanguage {
@@ -139,6 +154,7 @@ impl EditorExecuteIntent {
             operation_id,
             profile_id: self.profile_id,
             profile_generation: self.profile_generation,
+            editor_tab_id: self.editor_tab_id,
             language: self.language,
             text: self.text,
             row_limit: self.row_limit,
@@ -153,8 +169,90 @@ impl fmt::Debug for EditorExecuteIntent {
             .debug_struct("EditorExecuteIntent")
             .field("profile_id", &self.profile_id)
             .field("profile_generation", &self.profile_generation)
+            .field("editor_tab_id", &self.editor_tab_id)
             .field("language", &self.language)
             .field("text", &"<redacted>")
+            .field("row_limit", &self.row_limit)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("operation_kind", &self.operation_kind)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct EditorExecuteBatchIntent {
+    profile_id: ProfileId,
+    profile_generation: ProfileGeneration,
+    editor_tab_id: Option<EditorTabId>,
+    language: QueryLanguage,
+    text: String,
+    target_count: usize,
+    row_limit: u32,
+    timeout_ms: u64,
+    operation_kind: OperationKind,
+}
+
+impl EditorExecuteBatchIntent {
+    pub fn profile_id(&self) -> &ProfileId {
+        &self.profile_id
+    }
+
+    pub const fn profile_generation(&self) -> ProfileGeneration {
+        self.profile_generation
+    }
+
+    pub const fn editor_tab_id(&self) -> Option<EditorTabId> {
+        self.editor_tab_id
+    }
+
+    pub const fn language(&self) -> QueryLanguage {
+        self.language
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub const fn target_count(&self) -> usize {
+        self.target_count
+    }
+
+    pub const fn row_limit(&self) -> u32 {
+        self.row_limit
+    }
+
+    pub const fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+
+    pub const fn operation_kind(&self) -> OperationKind {
+        self.operation_kind
+    }
+
+    pub fn into_ui_command(self, operation_id: OperationId) -> UiCommand {
+        UiCommand::ExecuteBatch {
+            operation_id,
+            profile_id: self.profile_id,
+            profile_generation: self.profile_generation,
+            editor_tab_id: self.editor_tab_id,
+            language: self.language,
+            text: self.text,
+            row_limit: self.row_limit,
+            timeout_ms: self.timeout_ms,
+        }
+    }
+}
+
+impl fmt::Debug for EditorExecuteBatchIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EditorExecuteBatchIntent")
+            .field("profile_id", &self.profile_id)
+            .field("profile_generation", &self.profile_generation)
+            .field("editor_tab_id", &self.editor_tab_id)
+            .field("language", &self.language)
+            .field("text", &"<redacted>")
+            .field("target_count", &self.target_count)
             .field("row_limit", &self.row_limit)
             .field("timeout_ms", &self.timeout_ms)
             .field("operation_kind", &self.operation_kind)
@@ -165,6 +263,7 @@ impl fmt::Debug for EditorExecuteIntent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorIntent {
     Execute(EditorExecuteIntent),
+    ExecuteAll(EditorExecuteBatchIntent),
     Cancel { operation_id: OperationId },
 }
 
@@ -200,11 +299,48 @@ pub fn build_execute_intent(
     Ok(EditorExecuteIntent {
         profile_id: profile.id.clone(),
         profile_generation: profile.generation,
+        editor_tab_id: workspace.selected_editor_tab_id(),
         language: query_language,
         text,
         row_limit,
         timeout_ms: u64::from(timeout_seconds) * 1_000,
         operation_kind,
+    })
+}
+
+pub fn build_execute_all_intent(
+    profile: &ProfileSnapshot,
+    workspace: &ProfileWorkspace,
+) -> Result<EditorExecuteBatchIntent, EditorValidationError> {
+    let row_limit = parse_row_limit(&workspace.row_limit)?;
+    let timeout_seconds = parse_timeout(&workspace.timeout_seconds)?;
+    let (execution_language, query_language) = match profile.driver {
+        DriverKind::MySql => (ExecutionLanguage::MySql, QueryLanguage::Sql),
+        DriverKind::Redis => (ExecutionLanguage::Redis, QueryLanguage::RedisCommand),
+        DriverKind::MongoDb => return Err(EditorValidationError::UnsupportedDriver),
+    };
+    let validated = extract_and_validate_all_targets(
+        &workspace.editor_text,
+        execution_language,
+        row_limit,
+        timeout_seconds,
+    )
+    .map_err(EditorValidationError::Target)?;
+    if classify_execution_batch_kind(execution_language, validated.targets())
+        != OperationKind::ExecuteRead
+    {
+        return Err(EditorValidationError::BatchMutationUnavailable);
+    }
+    Ok(EditorExecuteBatchIntent {
+        profile_id: profile.id.clone(),
+        profile_generation: profile.generation,
+        editor_tab_id: workspace.selected_editor_tab_id(),
+        language: query_language,
+        text: workspace.editor_text.clone(),
+        target_count: validated.targets().len(),
+        row_limit,
+        timeout_ms: u64::from(timeout_seconds) * 1_000,
+        operation_kind: OperationKind::ExecuteRead,
     })
 }
 
@@ -246,6 +382,33 @@ pub fn classify_execute_operation(language: QueryLanguage, text: &str) -> Operat
         QueryLanguage::MongoDocument => return OperationKind::ExecuteMutation,
     };
     classify_validated_operation(execution_language, &target)
+}
+
+/// Classifies an adapter batch without trusting its command shape. Any invalid
+/// or mode-dependent source is mutation-shaped until the service revalidates it.
+pub fn classify_execute_batch_operation(
+    language: QueryLanguage,
+    text: &str,
+    row_limit: u32,
+    timeout_ms: u64,
+) -> OperationKind {
+    if !timeout_ms.is_multiple_of(1_000) {
+        return OperationKind::ExecuteMutation;
+    }
+    let Ok(timeout_seconds) = u32::try_from(timeout_ms / 1_000) else {
+        return OperationKind::ExecuteMutation;
+    };
+    let execution_language = match language {
+        QueryLanguage::Sql => ExecutionLanguage::MySql,
+        QueryLanguage::RedisCommand => ExecutionLanguage::Redis,
+        QueryLanguage::MongoDocument => return OperationKind::ExecuteMutation,
+    };
+    let Ok(batch) =
+        extract_and_validate_all_targets(text, execution_language, row_limit, timeout_seconds)
+    else {
+        return OperationKind::ExecuteMutation;
+    };
+    classify_execution_batch_kind(execution_language, batch.targets())
 }
 
 fn classify_validated_operation(
@@ -349,6 +512,7 @@ impl EditorSurface {
         ui.add_space(16.0);
         ui.label("Statement or command");
         let execute_enabled = enabled && workspace.pending_execute.is_none();
+        let shortcut_all_pressed = execute_enabled && consume_execute_all_shortcut(ui);
         let shortcut_pressed = execute_enabled && consume_execute_shortcut(ui);
         let previous_editor_text = workspace.editor_text.clone();
         let editor_output = egui::TextEdit::multiline(&mut workspace.editor_text)
@@ -392,6 +556,7 @@ impl EditorSurface {
         let mut row_response = None;
         let mut timeout_response = None;
         let mut execute_clicked = false;
+        let mut execute_all_clicked = false;
         let mut history_clicked = false;
         let mut cancel_clicked = false;
         ui.horizontal_wrapped(|ui| {
@@ -440,6 +605,20 @@ impl EditorSurface {
                 let execute =
                     named_author_id(execute, EDITOR_EXECUTE_ID, "Run current or selection");
                 execute_clicked = execute.clicked();
+            });
+            ui.vertical(|ui| {
+                ui.label("Script");
+                let execute_all = ui.add_enabled(
+                    execute_enabled,
+                    egui::Button::new("Run all")
+                        .min_size(egui::vec2(112.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                );
+                execute_all_clicked = named_author_id(
+                    execute_all,
+                    EDITOR_EXECUTE_ALL_ID,
+                    "Run all statements or commands",
+                )
+                .clicked();
             });
             ui.vertical(|ui| {
                 ui.label("Inspect");
@@ -496,6 +675,23 @@ impl EditorSurface {
             None
         } else if cancel_clicked {
             pending_cancel_intent(workspace)
+        } else if execute_all_clicked || shortcut_all_pressed {
+            match build_execute_all_intent(profile, workspace) {
+                Ok(intent) => {
+                    self.validation_error = None;
+                    Some(EditorIntent::ExecuteAll(intent))
+                }
+                Err(error) => {
+                    self.validation_error = Some(error);
+                    request_validation_focus(
+                        error,
+                        &editor_response,
+                        row_response.as_ref(),
+                        timeout_response.as_ref(),
+                    );
+                    None
+                }
+            }
         } else if execute_clicked || shortcut_pressed {
             let cursor = self
                 .cursor
@@ -508,19 +704,12 @@ impl EditorSurface {
                 }
                 Err(error) => {
                     self.validation_error = Some(error);
-                    match error.control_id() {
-                        EDITOR_ROW_LIMIT_ID => {
-                            if let Some(response) = &row_response {
-                                response.request_focus();
-                            }
-                        }
-                        EDITOR_TIMEOUT_ID => {
-                            if let Some(response) = &timeout_response {
-                                response.request_focus();
-                            }
-                        }
-                        _ => editor_response.request_focus(),
-                    }
+                    request_validation_focus(
+                        error,
+                        &editor_response,
+                        row_response.as_ref(),
+                        timeout_response.as_ref(),
+                    );
                     None
                 }
             }
@@ -533,16 +722,43 @@ impl EditorSurface {
             ui.strong(format!("Error: {}", error.message()));
         } else if let Some(operation_id) = workspace.pending_execute {
             ui.add_space(8.0);
-            ui.label(format!(
-                "Executing operation {}. Cancel stops waiting; server state may be unknown.",
-                operation_id.0
-            ));
+            ui.horizontal(|ui| {
+                let spinner = ui.add(egui::Spinner::new());
+                let _ = named_author_id(spinner, EDITOR_PENDING_ID, "Execution in progress");
+                ui.label(format!(
+                    "Executing operation {}. Cancel stops waiting; server state may be unknown.",
+                    operation_id.0
+                ));
+            });
         } else {
             ui.add_space(8.0);
-            ui.weak("Run current: Cmd+Enter on macOS · Ctrl+Enter on Windows and Linux");
+            ui.weak(
+                "Run current: Cmd/Ctrl+Enter · Run all: Shift+Cmd/Ctrl+Enter (read-only baseline)",
+            );
         }
 
         intent
+    }
+}
+
+fn request_validation_focus(
+    error: EditorValidationError,
+    editor_response: &egui::Response,
+    row_response: Option<&egui::Response>,
+    timeout_response: Option<&egui::Response>,
+) {
+    match error.control_id() {
+        EDITOR_ROW_LIMIT_ID => {
+            if let Some(response) = row_response {
+                response.request_focus();
+            }
+        }
+        EDITOR_TIMEOUT_ID => {
+            if let Some(response) = timeout_response {
+                response.request_focus();
+            }
+        }
+        _ => editor_response.request_focus(),
     }
 }
 
@@ -601,12 +817,48 @@ fn consume_execute_shortcut(ui: &egui::Ui) -> bool {
     })
 }
 
+fn consume_execute_all_shortcut(ui: &egui::Ui) -> bool {
+    ui.input_mut(|input| {
+        let mut pressed = false;
+        input.events.retain(|event| {
+            let egui::Event::Key {
+                key,
+                pressed: key_pressed,
+                repeat,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            let matches = *key == egui::Key::Enter
+                && *key_pressed
+                && platform_execute_all_modifiers(*modifiers);
+            if matches && !*repeat {
+                pressed = true;
+            }
+            !matches
+        });
+        pressed
+    })
+}
+
 #[cfg(target_os = "macos")]
 const fn platform_execute_modifiers(modifiers: egui::Modifiers) -> bool {
     modifiers.mac_cmd && !modifiers.ctrl && !modifiers.shift && !modifiers.alt
 }
 
+#[cfg(target_os = "macos")]
+const fn platform_execute_all_modifiers(modifiers: egui::Modifiers) -> bool {
+    modifiers.mac_cmd && !modifiers.ctrl && modifiers.shift && !modifiers.alt
+}
+
 #[cfg(not(target_os = "macos"))]
 const fn platform_execute_modifiers(modifiers: egui::Modifiers) -> bool {
     modifiers.ctrl && !modifiers.mac_cmd && !modifiers.shift && !modifiers.alt
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn platform_execute_all_modifiers(modifiers: egui::Modifiers) -> bool {
+    modifiers.ctrl && !modifiers.mac_cmd && modifiers.shift && !modifiers.alt
 }

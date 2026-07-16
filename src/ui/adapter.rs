@@ -18,7 +18,7 @@ use crate::service::{
     CreateProfileRequest, DeleteProfileRequest, TestDraftRequest, UpdateProfileRequest,
 };
 
-use super::model::UiEvent;
+use super::model::{EditorTabId, UiEvent};
 
 pub enum DraftTestIntent {
     Secretless {
@@ -128,6 +128,17 @@ pub enum UiCommand {
         operation_id: OperationId,
         profile_id: ProfileId,
         profile_generation: ProfileGeneration,
+        editor_tab_id: Option<EditorTabId>,
+        language: QueryLanguage,
+        text: String,
+        row_limit: u32,
+        timeout_ms: u64,
+    },
+    ExecuteBatch {
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        editor_tab_id: Option<EditorTabId>,
         language: QueryLanguage,
         text: String,
         row_limit: u32,
@@ -165,6 +176,7 @@ impl UiCommand {
             Self::RefreshProfiles { operation_id }
             | Self::TestConnection { operation_id, .. }
             | Self::Execute { operation_id, .. }
+            | Self::ExecuteBatch { operation_id, .. }
             | Self::CancelOperation { operation_id }
             | Self::DisconnectProfile { operation_id, .. }
             | Self::ReconnectProfile { operation_id, .. }
@@ -193,6 +205,7 @@ impl UiCommand {
             | Self::TestDraftConnection(_)
             | Self::PrepareDraftConnectionTest(_)
             | Self::Execute { .. }
+            | Self::ExecuteBatch { .. }
             | Self::BrowseCatalog(_)
             | Self::ScanRedisKeys(_)
             | Self::InspectRedisKey(_)
@@ -262,6 +275,7 @@ impl fmt::Debug for UiCommand {
                 operation_id,
                 profile_id,
                 profile_generation,
+                editor_tab_id,
                 language,
                 row_limit,
                 timeout_ms,
@@ -271,6 +285,27 @@ impl fmt::Debug for UiCommand {
                 .field("operation_id", operation_id)
                 .field("profile_id", profile_id)
                 .field("profile_generation", profile_generation)
+                .field("editor_tab_id", editor_tab_id)
+                .field("language", language)
+                .field("text", &"<redacted>")
+                .field("row_limit", row_limit)
+                .field("timeout_ms", timeout_ms)
+                .finish(),
+            Self::ExecuteBatch {
+                operation_id,
+                profile_id,
+                profile_generation,
+                editor_tab_id,
+                language,
+                row_limit,
+                timeout_ms,
+                ..
+            } => formatter
+                .debug_struct("UiCommand::ExecuteBatch")
+                .field("operation_id", operation_id)
+                .field("profile_id", profile_id)
+                .field("profile_generation", profile_generation)
+                .field("editor_tab_id", editor_tab_id)
                 .field("language", language)
                 .field("text", &"<redacted>")
                 .field("row_limit", row_limit)
@@ -532,6 +567,7 @@ impl ServicePort {
             | UiEvent::DraftConnectionReady { operation_id, .. }
             | UiEvent::DraftOperationFailed { operation_id, .. }
             | UiEvent::QueryFinished { operation_id, .. }
+            | UiEvent::QueryBatchFinished { operation_id, .. }
             | UiEvent::ResultExported { operation_id, .. }
             | UiEvent::ResultExportFailed { operation_id, .. }
             | UiEvent::OperationFailed { operation_id, .. }

@@ -31,8 +31,9 @@ use super::accessibility::{
 };
 use super::adapter::{SubmitError, UiCommand, UiPort};
 use super::editor::{
-    EDITOR_INPUT_ID, EDITOR_ROW_LIMIT_ID, EDITOR_TIMEOUT_ID, EditorCursor, EditorIntent,
-    EditorSurface, build_execute_intent,
+    EDITOR_INPUT_ID, EDITOR_ROW_LIMIT_ID, EDITOR_TIMEOUT_ID, EditorCursor,
+    EditorExecuteBatchIntent, EditorExecuteIntent, EditorIntent, EditorSurface,
+    build_execute_intent,
 };
 use super::layout::{
     CompactFallback, FallbackSurface, LayoutMode, NativeLayout, Pane, SplitLayout,
@@ -848,6 +849,11 @@ impl DbotterApp {
 
     fn poll_events(&mut self) {
         for mut event in self.port.drain_events(EVENT_DRAIN_LIMIT) {
+            if let UiEvent::ConfigUncertain { operation_id } = &event
+                && !self.model.profiles_operation_is_newer(*operation_id)
+            {
+                continue;
+            }
             match self.redis_resource_event_disposition(&event) {
                 RedisResourceEventDisposition::Ignore => continue,
                 RedisResourceEventDisposition::StaleTerminal(operation_id) => {
@@ -1192,6 +1198,11 @@ impl DbotterApp {
     }
 
     fn finish_active_operation(&mut self, event: &UiEvent) {
+        if let UiEvent::ConfigUncertain { operation_id } = event
+            && !self.model.profiles_operation_is_newer(*operation_id)
+        {
+            return;
+        }
         if matches!(
             event,
             UiEvent::ConfigUncertain { .. } | UiEvent::RuntimeShutdown { .. }
@@ -1213,6 +1224,11 @@ impl DbotterApp {
                 ..
             }
             | UiEvent::QueryFinished {
+                operation_id,
+                profile_id,
+                ..
+            }
+            | UiEvent::QueryBatchFinished {
                 operation_id,
                 profile_id,
                 ..
@@ -1747,47 +1763,10 @@ impl DbotterApp {
         }
         match intent {
             EditorIntent::Execute(intent) => {
-                let profile_id = intent.profile_id().clone();
-                let profile_generation = intent.profile_generation();
-                let operation_kind = intent.operation_kind();
-                let workspace_key =
-                    super::model::WorkspaceKey::new(profile_id.clone(), profile_generation);
-                if self.model.active_generation(intent.profile_id())
-                    != Some(intent.profile_generation())
-                {
-                    self.model.status = "The selected profile generation is stale.".to_owned();
-                    return;
-                }
-                if self
-                    .model
-                    .workspace(&workspace_key)
-                    .is_some_and(|workspace| workspace.pending_execute.is_some())
-                {
-                    self.model.status = "Execute is already pending".to_owned();
-                    return;
-                }
-                if self.active_operations.contains_key(&profile_id) {
-                    self.model.status =
-                        "Another operation is active for this connection".to_owned();
-                    return;
-                }
-                let operation_id = self.model.next_operation();
-                match self.port.try_submit(intent.into_ui_command(operation_id)) {
-                    Ok(()) => {
-                        self.model.workspace_mut(workspace_key).pending_execute =
-                            Some(operation_id);
-                        self.active_operations.insert(
-                            profile_id,
-                            ActiveOperation {
-                                operation_id,
-                                profile_generation,
-                                kind: operation_kind,
-                            },
-                        );
-                        self.model.status = "Executing…".to_owned();
-                    }
-                    Err(error) => self.report_submit_error(error),
-                }
+                let _ = self.submit_editor_execute(intent);
+            }
+            EditorIntent::ExecuteAll(intent) => {
+                self.submit_editor_batch(intent);
             }
             EditorIntent::Cancel { operation_id } => {
                 if !self
@@ -1807,6 +1786,95 @@ impl DbotterApp {
                     }
                     Err(error) => self.report_submit_error(error),
                 }
+            }
+        }
+    }
+
+    fn submit_editor_batch(&mut self, intent: EditorExecuteBatchIntent) {
+        let profile_id = intent.profile_id().clone();
+        let profile_generation = intent.profile_generation();
+        let operation_kind = intent.operation_kind();
+        let target_count = intent.target_count();
+        let workspace_key = WorkspaceKey::new(profile_id.clone(), profile_generation);
+        if target_count == 0 || operation_kind != OperationKind::ExecuteRead {
+            self.model.status = "Run all accepts a non-empty read-only batch.".to_owned();
+            return;
+        }
+        if self.model.active_generation(&profile_id) != Some(profile_generation) {
+            self.model.status = "The selected profile generation is stale.".to_owned();
+            return;
+        }
+        if self
+            .model
+            .workspace(&workspace_key)
+            .is_some_and(|workspace| workspace.pending_execute.is_some())
+        {
+            self.model.status = "Execute is already pending".to_owned();
+            return;
+        }
+        if self.active_operations.contains_key(&profile_id) {
+            self.model.status = "Another operation is active for this connection".to_owned();
+            return;
+        }
+        let operation_id = self.model.next_operation();
+        match self.port.try_submit(intent.into_ui_command(operation_id)) {
+            Ok(()) => {
+                self.model.workspace_mut(workspace_key).pending_execute = Some(operation_id);
+                self.active_operations.insert(
+                    profile_id,
+                    ActiveOperation {
+                        operation_id,
+                        profile_generation,
+                        kind: operation_kind,
+                    },
+                );
+                self.model.status = format!("Run all: executing {target_count} targets…");
+            }
+            Err(error) => self.report_submit_error(error),
+        }
+    }
+
+    fn submit_editor_execute(&mut self, intent: EditorExecuteIntent) -> bool {
+        let profile_id = intent.profile_id().clone();
+        let profile_generation = intent.profile_generation();
+        let operation_kind = intent.operation_kind();
+        let workspace_key = WorkspaceKey::new(profile_id.clone(), profile_generation);
+        if self.model.active_generation(intent.profile_id()) != Some(profile_generation) {
+            self.model.status = "The selected profile generation is stale.".to_owned();
+            return false;
+        }
+        if self
+            .model
+            .workspace(&workspace_key)
+            .is_some_and(|workspace| workspace.pending_execute.is_some())
+        {
+            self.model.status = "Execute is already pending".to_owned();
+            return false;
+        }
+        if self.active_operations.contains_key(&profile_id) {
+            self.model.status = "Another operation is active for this connection".to_owned();
+            return false;
+        }
+        let operation_id = self.model.next_operation();
+        match self.port.try_submit(intent.into_ui_command(operation_id)) {
+            Ok(()) => {
+                self.model
+                    .workspace_mut(workspace_key.clone())
+                    .pending_execute = Some(operation_id);
+                self.active_operations.insert(
+                    profile_id,
+                    ActiveOperation {
+                        operation_id,
+                        profile_generation,
+                        kind: operation_kind,
+                    },
+                );
+                self.model.status = "Executing…".to_owned();
+                true
+            }
+            Err(error) => {
+                self.report_submit_error(error);
+                false
             }
         }
     }
@@ -3695,6 +3763,10 @@ impl DbotterApp {
             .as_ref()
             .and_then(|key| self.model.workspace(key))
             .map_or(ResultAreaTab::Results, ProfileWorkspace::result_area_tab);
+        let selected_editor_tab_id = selected_workspace_key
+            .as_ref()
+            .and_then(|key| self.model.workspace(key))
+            .and_then(ProfileWorkspace::selected_editor_tab_id);
         let mut next_area = None;
         ui.horizontal(|ui| {
             let results = ui.selectable_label(selected_area == ResultAreaTab::Results, "Results");
@@ -3720,13 +3792,19 @@ impl DbotterApp {
             if let Some(workspace) = selected_workspace_key
                 .as_ref()
                 .and_then(|key| self.model.workspace(key))
-                && !workspace.result_tabs().is_empty()
+                && workspace
+                    .result_tabs_for_editor(selected_editor_tab_id)
+                    .next()
+                    .is_some()
             {
                 ui.heading("Execution history");
                 egui::ScrollArea::vertical()
                     .id_salt("result.history.list")
                     .show(ui, |ui| {
-                        for tab in workspace.result_tabs().iter().rev() {
+                        for tab in workspace
+                            .result_tabs_for_editor(selected_editor_tab_id)
+                            .rev()
+                        {
                             let result = tab.snapshot();
                             ui.label(format!(
                                 "Operation {} · {} ms · {} returned rows · {} affected rows",
@@ -3749,8 +3827,7 @@ impl DbotterApp {
             .and_then(|key| self.model.workspace(key))
             .map_or_else(Vec::new, |workspace| {
                 workspace
-                    .result_tabs()
-                    .iter()
+                    .result_tabs_for_editor(selected_editor_tab_id)
                     .map(|tab| (tab.id(), tab.title(), tab.can_close()))
                     .collect::<Vec<_>>()
             });
@@ -3758,6 +3835,8 @@ impl DbotterApp {
             .as_ref()
             .and_then(|key| self.model.workspace(key))
             .and_then(ProfileWorkspace::selected_result_tab_id);
+        let selected_result = selected_result
+            .filter(|selected| result_tabs.iter().any(|(tab_id, _, _)| tab_id == selected));
         let mut select_result = None;
         let mut close_result = None;
         egui::ScrollArea::horizontal()
@@ -4609,7 +4688,9 @@ mod tests {
     use crate::service::SessionDisposition;
     use crate::ui::accessibility::{accesskit_author_node, assert_accesskit_value_confined};
     use crate::ui::adapter::{ServicePort, UiCommand, bounded_ports};
-    use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
+    use crate::ui::editor::{
+        EditorCursor, EditorIntent, build_execute_all_intent, build_execute_intent,
+    };
     use crate::ui::layout::{NativeLayout, WorkspaceGeometry};
     use crate::ui::model::{ConfigPresentation, ProfileSnapshot, UiEvent, WorkspaceKey};
     use crate::ui::redis_explorer::RedisExplorerIntent;
@@ -4902,6 +4983,18 @@ mod tests {
             },
             ResultRetentionPolicy::mysql(1),
         )
+    }
+
+    fn result_snapshot_for_operation(
+        profile: &ProfileSnapshot,
+        value: &str,
+        operation_id: OperationId,
+        result_id: ResultId,
+    ) -> ResultSnapshot {
+        let mut snapshot = result_snapshot(profile, value);
+        snapshot.provenance.operation_id = operation_id;
+        snapshot.provenance.result_id = result_id;
+        snapshot
     }
 
     fn redis_keys_for(app: &DbotterApp, key: &WorkspaceKey) -> Option<Vec<Vec<u8>>> {
@@ -6229,6 +6322,7 @@ mod tests {
                 operation_id,
                 profile_id,
                 profile_generation,
+                editor_tab_id,
                 language,
                 text,
                 row_limit,
@@ -6236,6 +6330,7 @@ mod tests {
             } => {
                 assert_eq!(profile_id, mysql.id);
                 assert_eq!(profile_generation, mysql.generation);
+                assert_eq!(editor_tab_id, Some(selected));
                 assert_eq!(language, QueryLanguage::Sql);
                 assert_eq!(text, "SELECT * FROM `app`.`widgets` LIMIT 200");
                 assert_eq!(row_limit, 500);
@@ -6884,7 +6979,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_active_tracking_clears_on_generation_change_uncertainty_and_shutdown() {
+    fn active_tracking_ignores_stale_uncertainty_but_clears_on_current_uncertainty_and_shutdown() {
         let (ui_port, mut service) = bounded_ports(4);
         let mut app = DbotterApp::new(ui_port);
         assert!(service.try_next_command().is_some());
@@ -6931,6 +7026,23 @@ mod tests {
         });
         assert!(app.active_operations.is_empty());
         assert!(app.pending_deletes.is_empty());
+
+        let mut refreshed = profile(DriverKind::MySql, DriverAvailability::Ready);
+        refreshed.id = profile_id.clone();
+        refreshed.persisted.id = profile_id.0.clone();
+        refreshed.generation = ProfileGeneration(2);
+        app.model.fold(crate::ui::UiEvent::ProfilesLoaded {
+            operation_id: OperationId(100),
+            profiles: vec![refreshed],
+            config: Default::default(),
+        });
+        app.active_operations.insert(profile_id.clone(), current);
+        assert!(service.try_emit(crate::ui::UiEvent::ConfigUncertain {
+            operation_id: OperationId(99),
+        }));
+        app.poll_events();
+        assert_eq!(app.active_operations.get(&profile_id), Some(&current));
+        assert!(!app.model.is_config_uncertain());
 
         app.active_operations.insert(profile_id, current);
         app.finish_active_operation(&crate::ui::UiEvent::RuntimeShutdown {
@@ -7541,6 +7653,388 @@ mod tests {
             Some(operation_id),
             "Cancel submission waits for the correlated terminal event"
         );
+    }
+
+    #[test]
+    fn run_all_submits_one_batch_and_retains_every_successful_result() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::RefreshProfiles { .. })
+        ));
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        let origin_editor_tab_id = app
+            .model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Batch source", "SELECT 1;\nSELECT 2;")
+            .expect("batch source tab");
+        let batch =
+            build_execute_all_intent(&profile, app.model.workspace(&key).expect("workspace"))
+                .expect("read-only batch");
+
+        app.submit_editor_intent(EditorIntent::ExecuteAll(batch));
+        let (operation_id, command_editor_tab_id, source) = match service.try_next_command() {
+            Some(UiCommand::ExecuteBatch {
+                operation_id,
+                editor_tab_id,
+                text,
+                ..
+            }) => (operation_id, editor_tab_id, text),
+            other => panic!("expected one batch command, got {other:?}"),
+        };
+        assert_eq!(command_editor_tab_id, Some(origin_editor_tab_id));
+        assert_eq!(source, "SELECT 1;\nSELECT 2;");
+        assert!(service.try_next_command().is_none());
+        assert_eq!(app.model.status, "Run all: executing 2 targets…");
+
+        let other_editor_tab_id = app
+            .model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Other work", "SELECT 3")
+            .expect("another tab can be selected while the batch runs");
+        assert!(service.try_emit(UiEvent::QueryBatchFinished {
+            operation_id,
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            editor_tab_id: Some(origin_editor_tab_id),
+            session_generation: SessionGeneration(7),
+            target_count: 2,
+            completed_targets: 2,
+            discarded_results: 0,
+            results: vec![
+                result_snapshot_for_operation(&profile, "first", operation_id, ResultId(101)),
+                result_snapshot_for_operation(&profile, "second", operation_id, ResultId(102)),
+            ],
+            error: None,
+            session_disposition: SessionDisposition::Keep,
+        }));
+        app.poll_events();
+
+        assert!(service.try_next_command().is_none());
+        assert_eq!(app.model.status, "Run all finished: 2/2 targets in 8 ms.");
+        {
+            let workspace = app.model.workspace(&key).expect("workspace retained");
+            assert_eq!(workspace.result_tabs().len(), 2);
+            assert_eq!(
+                workspace
+                    .result_tabs()
+                    .iter()
+                    .map(|tab| tab.title())
+                    .collect::<Vec<_>>(),
+                ["Result 101", "Result 102"],
+                "one batch operation still needs distinct result-tab labels"
+            );
+            assert!(
+                workspace
+                    .result_tabs()
+                    .iter()
+                    .all(|tab| tab.origin_editor_tab_id() == Some(origin_editor_tab_id))
+            );
+            assert_eq!(
+                workspace
+                    .result_tabs_for_editor(Some(other_editor_tab_id))
+                    .count(),
+                0,
+                "the selected editor must not inherit another editor's results"
+            );
+            assert_eq!(
+                workspace
+                    .result_tabs_for_editor(Some(origin_editor_tab_id))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                workspace.selected_editor_tab_id(),
+                Some(other_editor_tab_id),
+                "a completion must not move the user away from their current editor"
+            );
+            assert_eq!(workspace.selected_result_tab_id(), None);
+            assert!(workspace.result.is_none());
+            assert!(workspace.pending_execute.is_none());
+        }
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let other_editor_frame = context
+            .run_ui(RawInput::default(), |ui| app.show_result_surface(ui))
+            .platform_output
+            .accesskit_update
+            .expect("other editor result surface must emit AccessKit");
+        assert!(
+            other_editor_frame.nodes.iter().all(|(_, node)| node
+                .author_id()
+                .is_none_or(|id| !id.starts_with("result.output."))),
+            "another editor's result tabs must not render in the selected editor"
+        );
+        assert!(
+            other_editor_frame.nodes.iter().any(|(_, node)| {
+                node.label() == Some("No result yet") || node.value() == Some("No result yet")
+            }),
+            "the selected editor without results must render its empty state"
+        );
+
+        app.model
+            .workspace_mut(key.clone())
+            .select_editor_tab(origin_editor_tab_id)
+            .expect("return to the batch source tab");
+        let expected_result_tab_ids = {
+            let workspace = app.model.workspace(&key).expect("workspace retained");
+            assert_eq!(
+                workspace.selected_result_tab_id(),
+                workspace
+                    .result_tabs_for_editor(Some(origin_editor_tab_id))
+                    .next_back()
+                    .map(|tab| tab.id())
+            );
+            assert_eq!(
+                workspace
+                    .selected_result_tab()
+                    .map(|tab| tab.snapshot().provenance.result_id),
+                Some(ResultId(102)),
+                "returning to the origin editor must activate its newest result"
+            );
+            assert_eq!(
+                workspace
+                    .result
+                    .as_ref()
+                    .map(|result| result.provenance.result_id),
+                Some(ResultId(102))
+            );
+            workspace
+                .result_tabs_for_editor(Some(origin_editor_tab_id))
+                .map(|tab| format!("result.output.{}", tab.id().0))
+                .collect::<Vec<_>>()
+        };
+        let origin_editor_frame = context
+            .run_ui(RawInput::default(), |ui| app.show_result_surface(ui))
+            .platform_output
+            .accesskit_update
+            .expect("origin editor result surface must emit AccessKit");
+        let origin_editor_ids = origin_editor_frame
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.author_id())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            expected_result_tab_ids
+                .iter()
+                .all(|expected| origin_editor_ids.contains(expected.as_str())),
+            "returning to the origin editor must render all of its result tabs"
+        );
+    }
+
+    #[test]
+    fn run_all_partial_failure_retains_origin_result_and_keeps_connected_session() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::RefreshProfiles { .. })
+        ));
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.model.connection_states.insert(
+            profile.id.clone(),
+            ConnectionState::Connected {
+                session_generation: SessionGeneration(9),
+                elapsed_ms: 12,
+            },
+        );
+        let origin_editor_tab_id = app
+            .model
+            .workspace_mut(key.clone())
+            .create_editor_tab(
+                QueryLanguage::Sql,
+                "Partial batch",
+                "SELECT 1;\nSELECT broken;\nSELECT 3;",
+            )
+            .expect("origin editor tab");
+        let batch =
+            build_execute_all_intent(&profile, app.model.workspace(&key).expect("workspace"))
+                .expect("three-target batch");
+
+        app.submit_editor_intent(EditorIntent::ExecuteAll(batch));
+        let operation_id = match service.try_next_command() {
+            Some(UiCommand::ExecuteBatch {
+                operation_id,
+                editor_tab_id,
+                text,
+                ..
+            }) => {
+                assert_eq!(editor_tab_id, Some(origin_editor_tab_id));
+                assert_eq!(text, "SELECT 1;\nSELECT broken;\nSELECT 3;");
+                operation_id
+            }
+            other => panic!("expected one batch command, got {other:?}"),
+        };
+        assert!(service.try_next_command().is_none());
+
+        let error = PublicOperationError::new(
+            OperationKind::ExecuteRead,
+            PublicSummary::SyntaxRejected,
+            PublicCode::StatementTarget,
+            &SafeContext::profile(profile.id.clone(), operation_id),
+        )
+        .expect("typed public execution error");
+        let terminal = UiEvent::QueryBatchFinished {
+            operation_id,
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            editor_tab_id: Some(origin_editor_tab_id),
+            session_generation: SessionGeneration(9),
+            target_count: 3,
+            completed_targets: 1,
+            discarded_results: 0,
+            results: vec![result_snapshot_for_operation(
+                &profile,
+                "retained",
+                operation_id,
+                ResultId(201),
+            )],
+            error: Some(error),
+            session_disposition: SessionDisposition::Keep,
+        };
+        assert!(service.try_emit(terminal.clone()));
+        app.poll_events();
+
+        let expected_status = "Run all stopped after 1/3 targets: The server rejected the syntax.";
+        let result_tab_id = {
+            let workspace = app.model.workspace(&key).expect("workspace retained");
+            assert!(workspace.pending_execute.is_none());
+            assert_eq!(workspace.result_tabs().len(), 1);
+            assert_eq!(
+                workspace
+                    .result_tabs_for_editor(Some(origin_editor_tab_id))
+                    .count(),
+                1
+            );
+            let result_tab = workspace.result_tabs().first().expect("partial result tab");
+            assert_eq!(
+                result_tab.origin_editor_tab_id(),
+                Some(origin_editor_tab_id)
+            );
+            assert_eq!(workspace.selected_result_tab_id(), Some(result_tab.id()));
+            assert_eq!(
+                workspace
+                    .result
+                    .as_ref()
+                    .map(|result| result.provenance.result_id),
+                Some(ResultId(201))
+            );
+            assert_eq!(
+                workspace.error.as_ref().map(|error| error.summary),
+                Some(PublicSummary::SyntaxRejected)
+            );
+            result_tab.id()
+        };
+        assert!(!app.active_operations.contains_key(&profile.id));
+        assert_eq!(app.model.status, expected_status);
+        assert_eq!(
+            app.model.connection_state(&profile.id),
+            &ConnectionState::Connected {
+                session_generation: SessionGeneration(9),
+                elapsed_ms: 0,
+            }
+        );
+        assert!(service.try_next_command().is_none());
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let frame = context
+            .run_ui(RawInput::default(), |ui| {
+                app.show_result_surface(ui);
+                app.show_status_strip(ui);
+            })
+            .platform_output
+            .accesskit_update
+            .expect("partial batch frame must emit AccessKit");
+        let (_, retained_tab) =
+            accesskit_author_node(&frame, &format!("result.output.{}", result_tab_id.0));
+        assert_eq!(retained_tab.label(), Some("Execution result tab"));
+        let (_, operation_status) = accesskit_author_node(&frame, "status.operation");
+        assert_eq!(operation_status.value(), Some(expected_status));
+
+        assert!(service.try_emit(terminal));
+        app.poll_events();
+        let workspace = app.model.workspace(&key).expect("workspace retained");
+        assert!(workspace.pending_execute.is_none());
+        assert_eq!(workspace.result_tabs().len(), 1);
+        assert_eq!(workspace.selected_result_tab_id(), Some(result_tab_id));
+        assert_eq!(app.model.status, expected_status);
+        assert_eq!(
+            app.model.connection_state(&profile.id),
+            &ConnectionState::Connected {
+                session_generation: SessionGeneration(9),
+                elapsed_ms: 0,
+            }
+        );
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn run_all_failure_terminates_the_single_correlated_operation() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.model.workspace_mut(key.clone()).editor_text =
+            "SELECT 1;\nSELECT 2;\nSELECT 3;".to_owned();
+        let batch =
+            build_execute_all_intent(&profile, app.model.workspace(&key).expect("workspace"))
+                .expect("read-only batch");
+        app.submit_editor_intent(EditorIntent::ExecuteAll(batch));
+        let operation_id = match service.try_next_command() {
+            Some(UiCommand::ExecuteBatch {
+                operation_id, text, ..
+            }) => {
+                assert_eq!(text, "SELECT 1;\nSELECT 2;\nSELECT 3;");
+                operation_id
+            }
+            other => panic!("expected one batch command, got {other:?}"),
+        };
+        let error = PublicOperationError::new_or_internal(
+            OperationKind::ExecuteRead,
+            PublicSummary::OperationCancelled,
+            PublicCode::None,
+            &SafeContext::profile(profile.id.clone(), operation_id),
+        );
+        assert!(service.try_emit(UiEvent::OperationFailed {
+            operation_id,
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            session_generation: Some(SessionGeneration(8)),
+            kind: OperationKind::ExecuteRead,
+            summary: error.summary,
+            error,
+            session_disposition: None,
+            connection_outcome: crate::ui::ConnectionFailureOutcome::Preserve,
+        }));
+        app.poll_events();
+
+        assert!(service.try_next_command().is_none());
+        assert!(!app.active_operations.contains_key(&profile.id));
+        assert_eq!(app.model.status, "The operation was cancelled.");
+        let workspace = app.model.workspace(&key).expect("workspace retained");
+        assert_eq!(workspace.result_tabs().len(), 0);
+        assert!(workspace.pending_execute.is_none());
     }
 
     #[test]
