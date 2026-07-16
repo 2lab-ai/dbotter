@@ -143,7 +143,7 @@ fn result_grid_exposes_filter_sort_and_keyboard_record_detail() {
 
     let (_, filter) = author_node("result.filter");
     assert_eq!(filter.role(), accesskit::Role::TextInput);
-    assert!(filter.supports_action(accesskit::Action::SetTextSelection));
+    assert!(filter.supports_action(accesskit::Action::Focus));
     let (_, sort) = author_node("result.sort.0");
     assert!(sort.supports_action(accesskit::Action::Click));
 
