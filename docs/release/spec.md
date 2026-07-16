@@ -1,8 +1,8 @@
 # dbotter — approved preview release contract
 
-Status: **A usable-MVP Preview is installed; the daily-use Preview candidate is
-not yet published.** Historical executable-only prereleases or tap formulas do
-not satisfy this contract, and no stable release is authorized.
+Status: **The source-bound daily-use Preview candidate is published and installed
+through xbrew; the complete installed AX journey and final typed receipt remain
+pending.** No stable release is authorized.
 
 The baseline normative sources are `docs/usable-mvp/spec.md` D1/§10,
 `docs/usable-mvp/trace.md` T10, and `docs/usable-mvp/plan.md` P8/P9/§5–§7.

@@ -1,8 +1,9 @@
 # dbotter — T10 preview release vertical trace
 
-Status: **P8/P9 Not started.** This trace refines main trace T10; it does not
-claim that historical workflows, prereleases, or formulas satisfy the approved
-contract.
+Status: **P8 release gates are GREEN; P9 has a public Preview/xbrew launch
+checkpoint, while merge-source publication, installed AX and the final receipt
+remain pending.** This trace records only the exact candidate and locally
+observed installation evidence below.
 
 Normative anchors: approved trace T10, approved plan P8/P9 and §5–§7, and
 `docs/release/spec.md`.
@@ -11,13 +12,29 @@ Normative anchors: approved trace T10, approved plan P8/P9 and §5–§7, and
 
 | ID | Scenario | Status | Required evidence |
 |---|---|---|---|
-| T10.R1 | reusable verification gates one candidate source | Not started | source/hermetic/live/negative receipt |
-| T10.R2 | target builds become signed manifest-linked artifacts | Not started | build/package/codesign/plutil/hash |
-| T10.R3 | immutable preview dispatches an exact tap update | Not started | release/manifest/tap/monotonicity |
-| T10.R4 | Homebrew shim and installed CLI prove exact executable | Not started | brew/identity/config/check/exec/browse |
-| T10.R5 | exact installed app completes native AX journey | Not started | PID/AX/recovery/disclosure/export |
+| T10.R1 | reusable verification gates one candidate source | GREEN | run `29513008288` attempt 2; source/hermetic/live/package gates |
+| T10.R2 | target builds become signed manifest-linked artifacts | GREEN | four target builds and immutable manifest-linked prerelease |
+| T10.R3 | immutable preview dispatches an exact tap update | GREEN | release tag and tap commit `1fcb761a7baf` |
+| T10.R4 | Homebrew shim and installed CLI prove exact executable | In progress | xbrew version, exact identity/config/bundle/shim proven; full check/exec/browse receipt pending |
+| T10.R5 | exact installed app completes native AX journey | In progress | exact installed PID/bundle proven; AX automation unavailable on this host |
 | T10.R6 | final typed receipt closes the source→install chain | Not started | schema/leak/digest/provenance verdicts |
 | T10.R7 | repair-forward rollback preserves compatibility | Not started | higher version/config preflight/runbook |
+
+## Current published checkpoint
+
+- Source: `11a839fadadbbe6d380f516a37b1708ea4917cd1`.
+- Preview run: `29513008288`, attempt 2; attempt 1 ended before verification
+  because the hosted runner exhausted its device space.
+- Prerelease: `preview-2026-07-16-161750-29513008288-2-11a839fadadb`.
+- xbrew/Homebrew version: `2026.07.16.161750.29513008288.2`.
+- Tap formula commit: `1fcb761a7baf181a1516c56ceb5c202e14606dcc`.
+- Local installed identity: Preview channel, source above,
+  `aarch64-apple-darwin`, bundle id `ai.2lab.dbotter.preview`; the Homebrew shim
+  resolves into that formula installation.
+- Local launch: the exact installed app was launched with the isolated visual
+  fixture config and registered by LaunchServices. Computer-use AX readback
+  failed with host automation authentication errors, so no visual or AX pass is
+  claimed here.
 
 ## T10.R1 — reusable verification gate
 
@@ -214,7 +231,12 @@ authorize a weaker trace.
 
 ## Trace deviations
 
-P0 reconciled documentation only. There is no implementation deviation because
-P8/P9 have not started. Future deviations must be recorded before code with the
-affected T10.R id, source/manifest/config impact, rollback impact, and new
-contract evidence.
+- Attempt 1 of run `29513008288` failed before verification because the hosted
+  runner exhausted device space; attempt 2 reused the same source SHA and passed
+  the full Preview graph. No gate was skipped or weakened.
+- This checkpoint was manually dispatched from `feat/daily-use-v1`, not a merge
+  commit on `main`; P9 therefore remains incomplete even though the immutable
+  prerelease, tap update and local xbrew launch succeeded.
+- The local computer-use server rejected AX readback because its sender was not
+  authenticated. Exact PID/path/bundle evidence was retained, but T10.R5 and
+  T10.R6 remain incomplete and no visual pass is claimed.
