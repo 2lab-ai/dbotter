@@ -6,10 +6,14 @@
   (worktree `.worktrees/feat-daily-use-v1`), currently **Stage 1** of
   `docs/daily-use/plan.md` (D1 config-v3 + D11 workspace shell in flight).
 - Phase 1 (usable MVP, T0–T10) is the delivered Preview baseline. Its
-  ledger is reconciled in branch commit `9781856`; until that commit lands
-  on `main`, the `main` copies of `README.md`/`01`–`04` are STALE — do not
-  make decisions from them. The reconciled ledger routes all current
-  status through `docs/daily-use/evidence.md`.
+  ledger reconciliation landed on `main` (cherry-pick `cd65583` of branch
+  commit `9781856`); all current status routes through
+  `docs/daily-use/evidence.md`.
+- The contract is **DUV1 v1.1** (2026-07-16 amendment, spec §9 log):
+  reads run only on a proven server-enforced read-only session (no
+  PureBuiltin allowlist; the MySQL 8.4-only gate is write-only), D7/D8
+  are deferred to P1, and DU-05 has no TerminalProven fence. Work started
+  from v1.0 semantics must rebase onto the v1.1 tuple first.
 - Do not infer phase from branch names — read this pointer, then the
   phase tuple below.
 
@@ -53,16 +57,12 @@ ledger first. Code lands only on top of a truthful ledger.
 - The active spec tuple is frozen. Never silently edit a frozen `DU-*`
   row to make a test pass; scope changes go through change control and
   are descoped BEFORE implementation, not after.
-- **Pending descope decision (owner: user, raised 2026-07-16)** — do not
-  start implementation in these areas until resolved:
-  1. DU-03 closed PureBuiltin function allowlist (and, coupled to it,
-     the MySQL 8.4-only capability gate): proposed replacement is
-     connection-layer read-only enforcement plus statement-class
-     checks.
-  2. DU-07 typed Redis mutations and DU-08 CSV import: proposed
-     deferral to P1.
-  3. DU-05 OutcomeUnknown crash-replay fanout: proposed simplification
-     to "detect ambiguity → surface to the user".
+- The descope items previously listed here were executed on 2026-07-16
+  as the **DUV1 v1.1 amendment** — see `docs/daily-use/spec.md` §9
+  amendment log and the recomputed freeze tuple in `04-patch-plan.md`.
+  v1.1 is subject to the owner's normal review/veto like any spec
+  version; implement against the current tuple, and raise any objection
+  as a new §9 change rather than a silent edit.
 
 ## Engineering invariants
 

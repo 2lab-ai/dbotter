@@ -9,7 +9,8 @@ Freeze tuple: [`../../04-patch-plan.md`](../../04-patch-plan.md)
 This file records implementation status and is intentionally not part of the
 Stage 0 spec/trace/plan hash tuple. Every advancement names the exact commit and
 retained command, run, artifact or native receipt. Updating status here cannot
-weaken or reinterpret a frozen requirement.
+weaken or reinterpret a frozen requirement. Rows deferred by the spec §9
+v1.1 amendment are marked `deferred` rather than deleted.
 
 | Trace | RED commit | GREEN commit | Local/live evidence | Native/installed evidence | Status |
 |---|---|---|---|---|---|
@@ -19,8 +20,8 @@ weaken or reinterpret a frozen requirement.
 | D4 | — | — | — | — | not started |
 | D5 | — | — | — | — | not started |
 | D6 | — | — | — | — | not started |
-| D7 | — | — | — | — | not started |
-| D8 | — | — | — | — | not started |
+| D7 | — | — | — | — | deferred (P1, v1.1) |
+| D8 | — | — | — | — | deferred import (P1, v1.1); export baseline retained |
 | D9 | — | — | — | — | not started |
 | D10 | — | — | — | — | not started |
 | D11 | — | — | — | — | not started |

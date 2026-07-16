@@ -1,6 +1,6 @@
 # dbotter Daily-use v1 — delivery plan
 
-The frozen product contract is [`spec.md`](spec.md), with [`trace.md`](trace.md) as the vertical source of truth. Work proceeds as reviewable, pushed slices. A green unit is not a release: integration continues through Preview installation and installed-app proof.
+The frozen product contract is [`spec.md`](spec.md) (v1.1 — the 2026-07-16 amendment defers D7/D8 to P1 and moves read admission to server-enforced read-only sessions; see spec §9), with [`trace.md`](trace.md) as the vertical source of truth. Work proceeds as reviewable, pushed slices. A green unit is not a release: integration continues through Preview installation and installed-app proof.
 
 ## Stage 0 — research and freeze
 
@@ -33,27 +33,25 @@ Exit: restart proof retains multiple tabs and searchable history; after only the
 - Add serialized MySQL connection worker with begin/commit/rollback and rollback-on-close semantics.
 - Add fail-closed `partial_revokes=OFF` plus direct global metadata-visibility proof and live restricted-schema negative fixtures.
 - Enforce Safe writes and production posture before driver work.
-- Add pending-change and OutcomeUnknown UI states with crash-replayable Unknown shard fanout before acknowledgement.
+- Add pending-change and OutcomeUnknown UI states with a durable Unknown fence and idempotent fold/retry before acknowledgement.
 - Commit/push RED and GREEN checkpoints separately.
 
-Exit: live MySQL proves rollback and commit across tabs, plus disconnect rollback.
+Exit: live MySQL proves rollback and commit across tabs, plus disconnect rollback; an in-transaction ReadOnly statement with a function call or view reference is denied before I/O.
 
-## Stage 3 — safe edits and transfer (D6, D7, D8, D9, D10, D11)
+## Stage 3 — safe MySQL edits and result detail (D6, D9, D10, D11 — D7/D8 deferred to P1 by v1.1)
 
-- Start from RED typed mutation, conflict, confirmation and CSV bound contracts.
+- Start from RED typed mutation, conflict and confirmation contracts.
 - Add staged identifiable MySQL row add/update/delete and review/apply/discard.
-- Add Redis String/Hash/List/Set/Sorted Set changes, TTL/persist/delete and production confirmation.
-- Add bounded CSV parse/map/preview/import through the active MySQL transaction.
 - Complete record/value detail and explicit local filter/sort.
 - Commit/push each driver slice and the integrated UI slice.
 
-Exit: live MySQL and Redis matrices pass; no stage/import auto-commits.
+Exit: live MySQL matrices pass; no stage auto-commits.
 
 ## Stage 4 — independent review and full gates (D1–D11)
 
 - Run format, lint, unit, contract, controller and full checks.
 - Run live MySQL and Redis tests with retained receipts.
-- Run native accessibility/keyboard/copy/import/export journeys at wide and minimum window sizes.
+- Run native accessibility/keyboard/copy/export journeys at wide and minimum window sizes.
 - Launch the installed app with only the disposable synthetic visual fixture, verify the AX allowlist/forbidden sentinel, strip raster metadata, then retain the exact DU-11 four-journey screenshot matrix at 1,440×900 and 840×560; have an external visual/UX reviewer check context preservation, density, overlap, clipping, status clarity and action reachability.
 - Assign an independent senior review for safety, privacy, UX and spec/trace/code conformance.
 - Fix all Critical/High findings and rerun affected plus full gates.
