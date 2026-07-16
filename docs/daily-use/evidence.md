@@ -16,7 +16,7 @@ v1.1 amendment are marked `deferred` rather than deleted.
 |---|---|---|---|---|---|
 | D1 | — | — | — | — | not started |
 | D2 | — | — | — | — | not started |
-| D3 | `4da8a57` — `test(d3): freeze server-enforced MySQL read session` | — | RED contract: `cargo test --features desktop --test daily_use_mysql_read_session_contract` must fail until the generic execution port is removed and same-connection read-only proof precedes general SELECT dispatch | — | RED |
+| D3 | `4da8a57` — `test(d3): freeze server-enforced MySQL read session` | `4f047aa` — `feat(d3): enforce server-proven MySQL reads` | `just check`; `just check-all`; exact-source `./scripts/verify-live-contracts.sh --config config/local.example.toml --expected-sha 4f047aa35e1330a6b3173d5fd674c6e3cebfc765` → `live contracts: ok`. Local receipt `artifacts/live-contract-receipt.json`, SHA-256 `66b300cd72b969af059467e57dcfdab213819640fc39294da25e167895b55243`, records all three suites and MySQL safety `statements_executed=8`, `server_side_effect_denied_attempts=1`, `raw_fallback_attempts=0`. | — | GREEN read-admission slice; complete D3 native/installed journeys pending |
 | D4 | — | — | — | — | not started |
 | D5 | — | — | — | — | not started |
 | D6 | — | — | — | — | not started |
