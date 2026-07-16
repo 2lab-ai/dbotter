@@ -717,6 +717,9 @@ const DU01_CREDENTIAL_SENTINEL: &str = "du01-credential-sentinel";
 const DU01_POSTURE_SENTINEL: &str = "DU01 posture sentinel";
 const DU01_MYSQL_READ: &str = "SELECT 7";
 const DU01_MYSQL_MUTATION: &str = "UPDATE widgets SET value = 1 WHERE id = 7 LIMIT 1";
+const DU01_MYSQL_UDF_READ_SHAPE: &str = "SELECT side_effecting_udf()";
+const DU01_MYSQL_VIEW_READ_SHAPE: &str = "SELECT * FROM sql_security_definer_view";
+const DU01_MYSQL_EXPLAIN_ANALYZE: &str = "EXPLAIN ANALYZE SELECT 7";
 const DU01_REDIS_READ: &str = "GET du01:key";
 const DU01_REDIS_MUTATION: &str = "SET du01:key du01-value";
 
@@ -932,6 +935,36 @@ async fn du01_access_admission_is_effective_read_only_without_blocking_read_path
             OperationKind::ExecuteMutation,
         ),
         (
+            ExecutionLanguage::MySql,
+            ExecutionTarget::MySqlText(DU01_MYSQL_UDF_READ_SHAPE.to_owned()),
+            OperationKind::ExecuteMutation,
+        ),
+        (
+            ExecutionLanguage::MySql,
+            ExecutionTarget::MySqlText(DU01_MYSQL_VIEW_READ_SHAPE.to_owned()),
+            OperationKind::ExecuteMutation,
+        ),
+        (
+            ExecutionLanguage::MySql,
+            ExecutionTarget::MySqlText(DU01_MYSQL_EXPLAIN_ANALYZE.to_owned()),
+            OperationKind::ExecuteMutation,
+        ),
+        (
+            ExecutionLanguage::MySql,
+            ExecutionTarget::MySqlText("SHOW TABLES".to_owned()),
+            OperationKind::ExecuteMutation,
+        ),
+        (
+            ExecutionLanguage::MySql,
+            ExecutionTarget::MySqlText("DESCRIBE widgets".to_owned()),
+            OperationKind::ExecuteMutation,
+        ),
+        (
+            ExecutionLanguage::MySql,
+            ExecutionTarget::MySqlText("DESC widgets".to_owned()),
+            OperationKind::ExecuteMutation,
+        ),
+        (
             ExecutionLanguage::Redis,
             ExecutionTarget::RedisArgv(vec!["GET".to_owned(), "du01:key".to_owned()]),
             OperationKind::ExecuteRead,
@@ -966,6 +999,33 @@ async fn du01_access_admission_is_effective_read_only_without_blocking_read_path
             ProfileAccess::ReadOnly,
             QueryLanguage::RedisCommand,
             DU01_REDIS_MUTATION,
+        )
+        .await,
+        observe_classified_access_admission(
+            "classified read-only MySQL UDF-shaped target",
+            OperationId(711),
+            DriverKind::MySql,
+            ProfileAccess::ReadOnly,
+            QueryLanguage::Sql,
+            DU01_MYSQL_UDF_READ_SHAPE,
+        )
+        .await,
+        observe_classified_access_admission(
+            "classified read-only MySQL view-shaped target",
+            OperationId(712),
+            DriverKind::MySql,
+            ProfileAccess::ReadOnly,
+            QueryLanguage::Sql,
+            DU01_MYSQL_VIEW_READ_SHAPE,
+        )
+        .await,
+        observe_classified_access_admission(
+            "classified read-only MySQL EXPLAIN ANALYZE target",
+            OperationId(713),
+            DriverKind::MySql,
+            ProfileAccess::ReadOnly,
+            QueryLanguage::Sql,
+            DU01_MYSQL_EXPLAIN_ANALYZE,
         )
         .await,
         observe_legacy_access_admission(
@@ -3359,6 +3419,14 @@ async fn assert_identity_transplant_fails_closed(mutation: MatrixMutation) {
         connector.session.closes.load(Ordering::SeqCst) >= before.len(),
         "{mutation:?} must close every cached pre-mutation session"
     );
+
+    let reload = service
+        .reload_configuration()
+        .await
+        .expect_err("reload must not accept a transplanted immutable profile identity");
+    assert!(matches!(reload, ServiceError::ConfigUncertain));
+    assert!(service.is_config_uncertain());
+    assert_eq!(service.profiles_snapshot().await, before);
 
     let disk = load_path(&path).expect("strict-valid transplanted disk remains reloadable");
     assert_eq!(disk.source_version, ConfigSourceVersion::V3);
