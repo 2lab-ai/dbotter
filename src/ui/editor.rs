@@ -16,7 +16,9 @@ use crate::model::{
 
 use super::accessibility::named_author_id;
 use super::adapter::UiCommand;
-use super::model::{MAX_EDITOR_TAB_TEXT_BYTES, ProfileSnapshot, ProfileWorkspace, WorkspaceKey};
+use super::model::{
+    MAX_EDITOR_TAB_TEXT_BYTES, ProfileSnapshot, ProfileWorkspace, ResultAreaTab, WorkspaceKey,
+};
 use super::theme::OpenAiTheme;
 
 pub const EDITOR_TARGET_ID: &str = "editor.target";
@@ -24,6 +26,7 @@ pub const EDITOR_INPUT_ID: &str = "editor.input";
 pub const EDITOR_ROW_LIMIT_ID: &str = "editor.row_limit";
 pub const EDITOR_TIMEOUT_ID: &str = "editor.timeout";
 pub const EDITOR_EXECUTE_ID: &str = "editor.execute";
+pub const EDITOR_HISTORY_ID: &str = "editor.history";
 pub const EDITOR_CANCEL_ID: &str = "editor.cancel";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -389,6 +392,7 @@ impl EditorSurface {
         let mut row_response = None;
         let mut timeout_response = None;
         let mut execute_clicked = false;
+        let mut history_clicked = false;
         let mut cancel_clicked = false;
         ui.horizontal_wrapped(|ui| {
             ui.vertical(|ui| {
@@ -426,19 +430,25 @@ impl EditorSurface {
                         ui.add_enabled(
                             execute_enabled,
                             egui::Button::new(
-                                egui::RichText::new("Execute").color(egui::Color32::WHITE),
+                                egui::RichText::new("Run current").color(egui::Color32::WHITE),
                             )
                             .fill(egui::Color32::BLACK)
-                            .min_size(egui::vec2(112.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                            .min_size(egui::vec2(128.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
                         )
                     })
                     .inner;
-                let execute = named_author_id(
-                    execute,
-                    EDITOR_EXECUTE_ID,
-                    "Execute selected or current target",
-                );
+                let execute =
+                    named_author_id(execute, EDITOR_EXECUTE_ID, "Run current or selection");
                 execute_clicked = execute.clicked();
+            });
+            ui.vertical(|ui| {
+                ui.label("Inspect");
+                let history = ui.add_sized(
+                    [112.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                    egui::Button::new("History"),
+                );
+                history_clicked =
+                    named_author_id(history, EDITOR_HISTORY_ID, "Open execution history").clicked();
             });
             if workspace.pending_execute.is_some() {
                 ui.vertical(|ui| {
@@ -461,6 +471,9 @@ impl EditorSurface {
                 .is_some_and(egui::Response::changed);
         if controls_changed && !editor_limit_exceeded {
             self.validation_error = None;
+        }
+        if history_clicked {
+            workspace.select_result_area_tab(ResultAreaTab::History);
         }
 
         if let Some(control_id) = self.requested_focus.take() {
@@ -526,7 +539,7 @@ impl EditorSurface {
             ));
         } else {
             ui.add_space(8.0);
-            ui.weak("Cmd+Enter on macOS · Ctrl+Enter on Windows and Linux");
+            ui.weak("Run current: Cmd+Enter on macOS · Ctrl+Enter on Windows and Linux");
         }
 
         intent

@@ -151,6 +151,7 @@ required_ax_ids=(
   editor.row_limit
   editor.timeout
   editor.execute
+  editor.history
   editor.cancel
   result.table
   result.copy.cell

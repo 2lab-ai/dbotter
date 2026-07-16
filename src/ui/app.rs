@@ -6732,7 +6732,7 @@ mod tests {
 
         let (_, execute) = accesskit_author_node(&update, "editor.execute");
         assert_eq!(execute.author_id(), Some("editor.execute"));
-        assert_eq!(execute.label(), Some("Execute selected or current target"));
+        assert_eq!(execute.label(), Some("Run current or selection"));
         assert_eq!(execute.role(), accesskit::Role::Button);
         assert!(execute.supports_action(accesskit::Action::Focus));
         assert!(execute.supports_action(accesskit::Action::Click));
