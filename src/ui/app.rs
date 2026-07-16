@@ -35,7 +35,8 @@ use super::editor::{
     EditorSurface, build_execute_intent,
 };
 use super::layout::{
-    CompactFallback, FallbackSurface, LayoutMode, NativeLayout, WorkspaceGeometry,
+    CompactFallback, FallbackSurface, LayoutMode, NativeLayout, Pane, SplitLayout,
+    WorkspaceGeometry,
 };
 use super::model::{
     ConnectionState, EditorTabError, EditorTabId, ProfileSnapshot, ProfileWorkspace, ResultAreaTab,
@@ -311,6 +312,7 @@ pub struct DbotterApp {
     result_export_formats: HashMap<ResultId, ExportFormat>,
     connection_filter: String,
     workspace_geometries: HashMap<WorkspaceKey, WorkspaceGeometry>,
+    collapsed_workspace_panes: HashMap<WorkspaceKey, Pane>,
     compact_fallback: CompactFallback,
     compact_restore_focus: Option<egui::Id>,
     compact_workspace: Option<WorkspaceKey>,
@@ -347,6 +349,7 @@ impl DbotterApp {
             result_export_formats: HashMap::new(),
             connection_filter: String::new(),
             workspace_geometries,
+            collapsed_workspace_panes: HashMap::new(),
             compact_fallback: CompactFallback::default(),
             compact_restore_focus: None,
             compact_workspace: None,
@@ -827,6 +830,12 @@ impl DbotterApp {
                 self.workspace_geometries
                     .insert(refreshed.clone(), geometry);
             }
+            if let Some(pane) = self.collapsed_workspace_panes.remove(&previous)
+                && !self.collapsed_workspace_panes.contains_key(&refreshed)
+            {
+                self.collapsed_workspace_panes
+                    .insert(refreshed.clone(), pane);
+            }
             if self.compact_workspace.as_ref() == Some(&previous) {
                 self.compact_workspace = Some(refreshed.clone());
             }
@@ -1305,6 +1314,9 @@ impl DbotterApp {
         });
         self.pending_deletes.retain(|profile_id, pending| {
             self.model.active_generation(profile_id) == Some(pending.profile_generation)
+        });
+        self.collapsed_workspace_panes.retain(|key, _| {
+            self.model.active_generation(&key.profile_id) == Some(key.profile_generation)
         });
         self.retry_recipes
             .retain_current(&self.model.active_generations);
@@ -3515,6 +3527,38 @@ impl DbotterApp {
     }
 
     fn show_editor_result_shell(&mut self, root_ui: &mut egui::Ui, geometry: WorkspaceGeometry) {
+        let workspace_key = self.model.selected_workspace_key();
+        let collapsed = workspace_key
+            .as_ref()
+            .and_then(|key| self.collapsed_workspace_panes.get(key))
+            .copied();
+        if let Some(pane) = collapsed {
+            let mut restore = false;
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let (label, author_id) = match pane {
+                    Pane::Editor => ("Restore editor", "workspace.editor.restore"),
+                    Pane::Subordinate => ("Restore results/history", "workspace.results.restore"),
+                };
+                let button = ui.add_sized(
+                    [184.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                    egui::Button::new(label),
+                );
+                restore = named_author_id(button, author_id, label).clicked();
+                ui.separator();
+                match pane {
+                    Pane::Editor => self.show_result_surface(ui),
+                    Pane::Subordinate => self.show_editor_surface(ui),
+                }
+            });
+            if restore {
+                if let Some(key) = workspace_key {
+                    self.collapsed_workspace_panes.remove(&key);
+                }
+                self.remember_workspace_geometry(None, Some(NativeLayout::DEFAULT_EDITOR_SHARE));
+            }
+            return;
+        }
+
         let total_extent = root_ui
             .available_height()
             .max(NativeLayout::PANE_MIN_EXTENT * 2.0);
@@ -3529,15 +3573,26 @@ impl DbotterApp {
             .show_separator_line(false)
             .exact_size(subordinate_extent)
             .show(root_ui, |ui| {
-                let next_editor_extent = show_workspace_splitter(ui, total_extent, editor_extent);
+                let next_layout = show_workspace_splitter(ui, total_extent, editor_extent);
                 self.show_result_surface(ui);
-                next_editor_extent
+                next_layout
             });
-        if let Some(next_editor_extent) = result_panel.inner {
-            self.remember_workspace_geometry(
-                None,
-                Some((next_editor_extent / total_extent).clamp(0.01, 0.99)),
-            );
+        if let Some(next_layout) = result_panel.inner {
+            if next_layout.editor_restore_label().is_some() {
+                if let Some(key) = workspace_key {
+                    self.collapsed_workspace_panes.insert(key, Pane::Editor);
+                }
+            } else if next_layout.subordinate_restore_label().is_some() {
+                if let Some(key) = workspace_key {
+                    self.collapsed_workspace_panes
+                        .insert(key, Pane::Subordinate);
+                }
+            } else if let Some(next_editor_extent) = next_layout.editor_extent() {
+                self.remember_workspace_geometry(
+                    None,
+                    Some((next_editor_extent / total_extent).clamp(0.01, 0.99)),
+                );
+            }
         }
 
         egui::CentralPanel::default().show(root_ui, |ui| self.show_editor_surface(ui));
@@ -4057,7 +4112,7 @@ fn show_workspace_splitter(
     ui: &mut egui::Ui,
     total_extent: f32,
     editor_extent: f32,
-) -> Option<f32> {
+) -> Option<SplitLayout> {
     let strip_extent = NativeLayout::SPLITTER_ACCESSIBLE_HIT_EXTENT;
     let reset_width = 112.0;
     let gap = NativeLayout::ADJACENT_ACTION_GAP;
@@ -4079,17 +4134,20 @@ fn show_workspace_splitter(
     let handle = ui
         .interact(
             handle_rect,
-            ui.id().with("workspace.splitter"),
+            egui::Id::new("workspace.splitter.handle"),
             egui::Sense::click_and_drag(),
         )
         .on_hover_cursor(egui::CursorIcon::ResizeVertical);
 
     let minimum = NativeLayout::PANE_MIN_EXTENT;
     let maximum = (total_extent - NativeLayout::PANE_MIN_EXTENT).max(minimum);
-    let mut next_editor_extent = editor_extent.clamp(minimum, maximum);
+    let editor_extent = editor_extent.clamp(minimum, maximum);
+    let mut next_layout = SplitLayout::from_editor_extent(total_extent, editor_extent);
     if handle.dragged() {
-        next_editor_extent = (next_editor_extent + ui.input(|input| input.pointer.delta().y))
-            .clamp(minimum, maximum);
+        next_layout = SplitLayout::from_editor_extent(
+            total_extent,
+            editor_extent + ui.input(|input| input.pointer.delta().y),
+        );
     }
     if handle.has_focus() {
         let keyboard_steps = ui.input_mut(|input| {
@@ -4098,16 +4156,24 @@ fn show_workspace_splitter(
             i32::from(downward) - i32::from(upward)
         });
         if keyboard_steps != 0 {
-            next_editor_extent = (next_editor_extent
-                + keyboard_steps as f32 * NativeLayout::SPLITTER_KEYBOARD_STEP)
-                .clamp(minimum, maximum);
+            handle.request_focus();
+            next_layout = SplitLayout::from_editor_extent(
+                total_extent,
+                editor_extent + keyboard_steps as f32 * NativeLayout::SPLITTER_KEYBOARD_STEP,
+            );
         }
     }
     if handle.double_clicked() {
-        next_editor_extent = total_extent * NativeLayout::DEFAULT_EDITOR_SHARE;
+        next_layout = SplitLayout::reset(total_extent);
     }
 
-    let value_for_accessibility = next_editor_extent;
+    let value_for_accessibility = next_layout.editor_extent().unwrap_or_else(|| {
+        if next_layout.editor_restore_label().is_some() {
+            minimum
+        } else {
+            maximum
+        }
+    });
     handle.widget_info(|| {
         let mut info = egui::WidgetInfo::labeled(
             egui::WidgetType::ResizeHandle,
@@ -4147,11 +4213,15 @@ fn show_workspace_splitter(
     );
     let reset = named_author_id(reset, "workspace.split.reset", "Reset split to 60/40");
     if reset.clicked() {
-        next_editor_extent = total_extent * NativeLayout::DEFAULT_EDITOR_SHARE;
+        next_layout = SplitLayout::reset(total_extent);
     }
 
-    let changed = (next_editor_extent - editor_extent).abs() > f32::EPSILON;
-    changed.then_some(next_editor_extent)
+    let changed = next_layout.editor_restore_label().is_some()
+        || next_layout.subordinate_restore_label().is_some()
+        || next_layout
+            .editor_extent()
+            .is_some_and(|next| (next - editor_extent).abs() > f32::EPSILON);
+    changed.then_some(next_layout)
 }
 
 fn restore_workspace_geometries(
@@ -5235,16 +5305,36 @@ mod tests {
             })],
         );
 
-        let arrow = |key| Event::Key {
+        let key_event = |key, pressed| Event::Key {
             key,
             physical_key: Some(key),
-            pressed: true,
+            pressed,
             repeat: false,
             modifiers: Modifiers::NONE,
         };
+        let key_tap = |key| vec![key_event(key, true), key_event(key, false)];
         let collapse = |app: &mut DbotterApp, key, restore_id: &str| {
             (0..128).find_map(|_| {
-                let output = render(app, vec![arrow(key)]);
+                let settled = render(app, Vec::new());
+                let settled = settled.platform_output.accesskit_update?;
+                if settled
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.author_id() == Some(restore_id))
+                {
+                    return Some(settled);
+                }
+                let (splitter_id, _) = accesskit_author_node(&settled, "workspace.splitter");
+                let _ = render(
+                    app,
+                    vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                        action: accesskit::Action::Focus,
+                        target_tree: accesskit::TreeId::ROOT,
+                        target_node: splitter_id,
+                        data: None,
+                    })],
+                );
+                let output = render(app, key_tap(key));
                 let update = output.platform_output.accesskit_update?;
                 update
                     .nodes
@@ -5255,7 +5345,13 @@ mod tests {
         };
 
         let editor_collapsed = collapse(&mut app, Key::ArrowUp, "workspace.editor.restore")
-            .expect("crossing 160 points must expose Restore editor");
+            .unwrap_or_else(|| {
+                panic!(
+                    "crossing 160 points must expose Restore editor: geometry={:?}, collapsed={:?}",
+                    app.workspace_geometries.get(&key),
+                    app.collapsed_workspace_panes.get(&key)
+                )
+            });
         let (restore_editor_id, restore_editor) =
             accesskit_author_node(&editor_collapsed, "workspace.editor.restore");
         assert_eq!(restore_editor.role(), accesskit::Role::Button);
@@ -5269,7 +5365,7 @@ mod tests {
                 data: None,
             })],
         );
-        let _ = render(&mut app, vec![arrow(Key::Enter)]);
+        let _ = render(&mut app, key_tap(Key::Enter));
         let restored = render(&mut app, Vec::new());
         let restored = restored
             .platform_output
@@ -5316,7 +5412,7 @@ mod tests {
                 data: None,
             })],
         );
-        let _ = render(&mut app, vec![arrow(Key::Enter)]);
+        let _ = render(&mut app, key_tap(Key::Enter));
         let restored = render(&mut app, Vec::new());
         let restored = restored
             .platform_output
