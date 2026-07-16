@@ -37,6 +37,30 @@ access = "read-write"
 instance_id = "00112233445566778899aabbccddeeff"
 "#;
 
+const V3_REDIS_PROFILE: &str = r#"version = 3
+
+[[profiles]]
+id = "daily-redis"
+name = "Daily Redis"
+driver = "redis"
+host = "127.0.0.1"
+port = 6379
+tls = "required"
+credential_mode = "none"
+environment = "development"
+access = "read-write"
+instance_id = "ffeeddccbbaa99887766554433221100"
+redis_tls = { ca_file = "redis-ca.pem" }
+"#;
+
+fn assert_v3_invalid_profile(raw: &str) {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    fs::write(&path, raw).expect("invalid v3 fixture");
+
+    assert!(matches!(load_path(&path), Err(ConfigError::InvalidProfile)));
+}
+
 #[test]
 fn config_v3_compatibility_json_is_exact() {
     assert_eq!(
@@ -142,13 +166,61 @@ fn v3_malformed_instance_identity_fails_as_an_invalid_profile() {
 }
 
 #[test]
-fn v2_rejects_v3_posture_fields_instead_of_silently_classifying_legacy() {
+fn v3_top_level_extra_field_fails_before_service_construction() {
+    assert_v3_invalid_profile(&V3_PROFILE.replacen(
+        "version = 3\n",
+        "version = 3\nunexpected_top_level = true\n",
+        1,
+    ));
+}
+
+#[test]
+fn v3_profile_level_extra_field_fails_before_service_construction() {
+    assert_v3_invalid_profile(&format!("{V3_PROFILE}unexpected_profile_field = true\n"));
+}
+
+#[test]
+fn v3_nested_redis_tls_extra_field_fails_before_service_construction() {
+    assert_v3_invalid_profile(&V3_REDIS_PROFILE.replace(
+        "redis_tls = { ca_file = \"redis-ca.pem\" }",
+        "redis_tls = { ca_file = \"redis-ca.pem\", unexpected_nested = true }",
+    ));
+}
+
+#[test]
+fn v2_rejects_each_v3_posture_field_instead_of_silently_classifying_legacy() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");
-    fs::write(&path, V3_PROFILE.replace("version = 3", "version = 2"))
-        .expect("v2 injection fixture");
 
-    assert!(matches!(load_path(&path), Err(ConfigError::InvalidProfile)));
+    for injected in [
+        "environment = \"development\"",
+        "access = \"read-write\"",
+        "instance_id = \"00112233445566778899aabbccddeeff\"",
+    ] {
+        fs::write(&path, format!("{V2_PROFILE}{injected}\n"))
+            .expect("v2 posture injection fixture");
+        assert!(
+            matches!(load_path(&path), Err(ConfigError::InvalidProfile)),
+            "v2 must explicitly reject {injected}"
+        );
+    }
+}
+
+#[test]
+fn v2_keeps_permissive_loading_for_non_v3_extension_fields() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let fixture = format!("{V2_PROFILE}legacy_extension = \"still-readable\"\n");
+    fs::write(&path, &fixture).expect("v2 extension fixture");
+
+    assert_eq!(
+        c424e4e_v2_reader::load_before_service_or_network(path.clone(), || {}, || {}),
+        Ok(()),
+        "the frozen version-2 reader accepted arbitrary profile extensions"
+    );
+    let loaded = load_path(&path).expect("current reader preserves version-2 permissiveness");
+    assert_eq!(loaded.source_version, ConfigSourceVersion::V2);
+    assert!(loaded.migration_required);
 }
 
 #[test]
