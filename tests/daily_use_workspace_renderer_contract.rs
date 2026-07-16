@@ -122,6 +122,20 @@ fn result_area_exposes_distinct_results_and_history_tabs() {
 }
 
 #[test]
+fn session_only_workspace_retention_is_explicit_in_the_actual_renderer() {
+    assert!(
+        APP_RENDERER_SOURCE.contains("Session workspace")
+            && APP_RENDERER_SOURCE.contains("tabs and history clear on quit"),
+        "the Preview must disclose that query tabs and history are session-only"
+    );
+    let tabs = function_body(APP_RENDERER_SOURCE, "show_editor_tab_strip");
+    assert!(
+        tabs.contains("is_dirty()") && tabs.contains("editor.tab.discard"),
+        "dirty editor tabs need visible state and an explicit discard confirmation"
+    );
+}
+
+#[test]
 fn result_renderer_keeps_multiple_execution_outputs_selectable() {
     let results = function_body(APP_RENDERER_SOURCE, "show_result_surface");
     assert!(

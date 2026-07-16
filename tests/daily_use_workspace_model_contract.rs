@@ -4,11 +4,13 @@ use std::sync::Arc;
 
 use dbotter::model::{
     ConnectionProfile, CredentialMode, DriverKind, OperationId, ProfileAccess, ProfileEnvironment,
-    ProfileGeneration, ProfileId, ProfileSafetyPosture, QueryLanguage, QueryResult, RedisTlsConfig,
-    ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot, TlsMode,
+    ProfileGeneration, ProfileId, ProfileInstanceId, ProfileSafetyPosture, QueryLanguage,
+    QueryResult, RedisTlsConfig, ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
+    TlsMode,
 };
 use dbotter::ui::{
-    ProfileSnapshot, ProfileWorkspace, ResultAreaTab, UiModel, WorkspaceGeometry, WorkspaceKey,
+    EditorTabError, MAX_EDITOR_TAB_TEXT_BYTES, ProfileSnapshot, ProfileWorkspace, ResultAreaTab,
+    UiEvent, UiModel, WorkspaceGeometry, WorkspaceKey,
 };
 
 fn profile(id: &str, generation: u64) -> ProfileSnapshot {
@@ -20,9 +22,10 @@ fn profile(id: &str, generation: u64) -> ProfileSnapshot {
         port: 3306,
         database: Some("app".to_owned()),
         username: None,
-        safety: ProfileSafetyPosture::new(
+        safety: ProfileSafetyPosture::classified(
             ProfileEnvironment::Development,
             ProfileAccess::ReadWrite,
+            ProfileInstanceId::from_bytes([id.as_bytes()[0]; 16]),
         ),
         tls: TlsMode::Required,
         credential_mode: CredentialMode::None,
@@ -88,11 +91,103 @@ fn editor_tab_strip_supports_create_rename_duplicate_select_and_close() {
     workspace
         .select_editor_tab(duplicate)
         .expect("duplicate should be selectable");
+    assert_eq!(
+        workspace.close_editor_tab(original),
+        Err(EditorTabError::Dirty),
+        "dirty drafts require an explicit discard confirmation"
+    );
+    assert!(workspace.editor_tab(original).is_some());
     workspace
-        .close_editor_tab(original)
-        .expect("close should remove the local draft");
+        .discard_editor_tab(original)
+        .expect("confirmed discard should remove the local draft");
     assert!(workspace.editor_tab(original).is_none());
     assert_eq!(workspace.selected_editor_tab_id(), Some(duplicate));
+}
+
+#[test]
+fn editor_text_is_bounded_and_oversize_surface_sync_fails_without_replacing_the_tab() {
+    assert_eq!(MAX_EDITOR_TAB_TEXT_BYTES, 256 * 1024);
+    let mut workspace = ProfileWorkspace::default();
+    let tab = workspace
+        .create_editor_tab(QueryLanguage::Sql, "Bounded", "SELECT 1")
+        .expect("bounded tab");
+    let retained = workspace
+        .editor_tab(tab)
+        .expect("tab retained")
+        .text()
+        .to_owned();
+    workspace.editor_text = "x".repeat(MAX_EDITOR_TAB_TEXT_BYTES + 1);
+
+    assert_eq!(
+        workspace.sync_selected_editor_tab_from_surface(),
+        Err(EditorTabError::TextTooLarge)
+    );
+    assert_eq!(
+        workspace
+            .editor_tab(tab)
+            .expect("tab still retained")
+            .text(),
+        retained
+    );
+}
+
+#[test]
+fn profile_edit_retags_only_editor_context_for_the_same_immutable_instance() {
+    let original = profile("alpha", 1);
+    let refreshed = profile("alpha", 2);
+    let original_key = WorkspaceKey::new(original.id.clone(), original.generation);
+    let refreshed_key = WorkspaceKey::new(refreshed.id.clone(), refreshed.generation);
+    let mut model = UiModel::default();
+    model.fold(UiEvent::ProfilesLoaded {
+        operation_id: OperationId(100),
+        profiles: vec![original.clone()],
+        config: Default::default(),
+    });
+    let tab = model
+        .workspace_mut(original_key.clone())
+        .create_editor_tab(QueryLanguage::Sql, "Draft", "SELECT retained_draft")
+        .expect("draft tab");
+    model
+        .workspace_mut(original_key.clone())
+        .append_result_tab(Arc::new(result(&original, 101)))
+        .expect("stale result fixture");
+
+    model.fold(UiEvent::ProfilesLoaded {
+        operation_id: OperationId(101),
+        profiles: vec![refreshed],
+        config: Default::default(),
+    });
+
+    assert!(model.workspace(&original_key).is_none());
+    let retained = model
+        .workspace(&refreshed_key)
+        .expect("same immutable instance retains its editor workspace");
+    assert_eq!(
+        retained.editor_tab(tab).expect("draft retained").text(),
+        "SELECT retained_draft"
+    );
+    assert!(
+        retained.result_tabs().is_empty(),
+        "generation-bound results must not cross a profile edit"
+    );
+
+    let mut replacement = profile("alpha", 3);
+    replacement.persisted.safety = ProfileSafetyPosture::classified(
+        ProfileEnvironment::Development,
+        ProfileAccess::ReadWrite,
+        ProfileInstanceId::from_bytes([0xff; 16]),
+    );
+    model.fold(UiEvent::ProfilesLoaded {
+        operation_id: OperationId(102),
+        profiles: vec![replacement.clone()],
+        config: Default::default(),
+    });
+    assert!(
+        model
+            .workspace(&WorkspaceKey::new(replacement.id, replacement.generation))
+            .is_none(),
+        "a replacement instance must never inherit another instance's drafts"
+    );
 }
 
 #[test]
