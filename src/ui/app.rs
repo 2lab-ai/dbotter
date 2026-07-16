@@ -1946,8 +1946,19 @@ impl DbotterApp {
     ) {
         if let MySqlExplorerIntent::InsertTemplate(template) = intent {
             let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
-            self.model.workspace_mut(key).editor_text = template;
-            self.model.status = "Bounded SELECT template inserted; it was not executed".to_owned();
+            let outcome = self.model.workspace_mut(key).create_editor_tab(
+                profile.driver.language(),
+                "Data query",
+                template,
+            );
+            match outcome {
+                Ok(_) => {
+                    self.editor_surface = EditorSurface::default();
+                    self.model.status =
+                        "Bounded SELECT opened in a new tab; it was not executed".to_owned();
+                }
+                Err(error) => self.model.status = error.to_string(),
+            }
             return;
         }
         if self.model.is_config_uncertain() {

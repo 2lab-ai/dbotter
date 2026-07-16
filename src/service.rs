@@ -83,6 +83,8 @@ pub enum ServiceError {
     InvalidRequest { code: PublicCode },
     #[error("profile access does not allow this operation")]
     ReadOnlyProfile { code: PublicCode },
+    #[error("mutation review is not available in this preview")]
+    MutationReviewUnavailable,
     #[error("row limit must be between 1 and 10000")]
     InvalidRowLimit,
     #[error(transparent)]
@@ -147,6 +149,7 @@ impl fmt::Debug for ServiceError {
                 .debug_struct("AccessAdmissionRejected")
                 .field("code", code)
                 .finish(),
+            Self::MutationReviewUnavailable => formatter.write_str("MutationReviewUnavailable"),
             Self::InvalidRowLimit => formatter.write_str("InvalidRowLimit"),
             Self::InvalidProfile(error) => formatter
                 .debug_tuple("InvalidProfile")
@@ -264,6 +267,7 @@ impl ServiceError {
                 PublicSummary::PermissionDenied
             }
             Self::ReadOnlyProfile { .. } => PublicSummary::PermissionDenied,
+            Self::MutationReviewUnavailable => PublicSummary::UnsupportedFeature,
             Self::Driver(error) if error.is_mysql_authentication_failed() => {
                 PublicSummary::AuthenticationFailed
             }
@@ -2063,12 +2067,13 @@ impl ApplicationService {
                 actual: request.language,
             });
         }
-        if classify_execution_kind(execution_language, &target) == OperationKind::ExecuteMutation
-            && profile.safety.effective_access() == ProfileAccess::ReadOnly
-        {
-            return Err(ServiceError::ReadOnlyProfile {
-                code: PublicCode::ReadOnlyProfile,
-            });
+        if classify_execution_kind(execution_language, &target) == OperationKind::ExecuteMutation {
+            if profile.safety.effective_access() == ProfileAccess::ReadOnly {
+                return Err(ServiceError::ReadOnlyProfile {
+                    code: PublicCode::ReadOnlyProfile,
+                });
+            }
+            return Err(ServiceError::MutationReviewUnavailable);
         }
         let identity = RequestIdentity::new(
             request.profile_id.clone(),
