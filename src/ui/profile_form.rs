@@ -27,6 +27,10 @@ const REDIS_CA_FILE_PICK_ID: &str = "profile.redis_tls.ca_file.pick";
 const PROFILE_NAME_ID: &str = "profile.name";
 const PROFILE_ID_ID: &str = "profile.connection_id";
 const PROFILE_AUTO_ID_ID: &str = "profile.connection_id.auto";
+const PROFILE_ENVIRONMENT_DEVELOPMENT_ID: &str = "profile.posture.environment.development";
+const PROFILE_ENVIRONMENT_PRODUCTION_ID: &str = "profile.posture.environment.production";
+const PROFILE_ACCESS_READ_WRITE_ID: &str = "profile.posture.access.read_write";
+const PROFILE_ACCESS_READ_ONLY_ID: &str = "profile.posture.access.read_only";
 const PROFILE_SESSION_KEEP_ID: &str = "profile.credential.session.keep";
 const PROFILE_SESSION_REPLACE_ID: &str = "profile.credential.session.replace";
 const PROFILE_SESSION_FORGET_ID: &str = "profile.credential.session.forget";
@@ -39,6 +43,7 @@ const PROFILE_TEST_ID: &str = "profile.test_draft";
 const PROFILE_SAVE_ID: &str = "profile.save";
 const PROFILE_SAVE_CONNECT_ID: &str = "profile.save_connect";
 const PROFILE_CANCEL_ID: &str = "profile.cancel";
+const PROFILE_POSTURE_CONTROL_WIDTH: f32 = 176.0;
 const DRAFT_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1164,6 +1169,53 @@ impl ProfileEditor {
                 self.errors.database.as_deref(),
             );
             text_field(ui, "Username (optional)", &mut self.draft.username, None);
+
+            ui.label("Environment");
+            ui.horizontal_wrapped(|ui| {
+                if posture_option(
+                    ui,
+                    self.draft.environment == ProfileEnvironment::Development,
+                    "Development",
+                    PROFILE_ENVIRONMENT_DEVELOPMENT_ID,
+                    "Development environment",
+                ) {
+                    self.draft.environment = ProfileEnvironment::Development;
+                }
+                if posture_option(
+                    ui,
+                    self.draft.environment == ProfileEnvironment::Production,
+                    "PRODUCTION",
+                    PROFILE_ENVIRONMENT_PRODUCTION_ID,
+                    "Production environment",
+                ) {
+                    self.draft.environment = ProfileEnvironment::Production;
+                }
+            });
+            ui.small("PRODUCTION keeps its additional review and confirmation guardrails.");
+
+            ui.label("Access");
+            ui.horizontal_wrapped(|ui| {
+                if posture_option(
+                    ui,
+                    self.draft.access == ProfileAccess::ReadWrite,
+                    "Read/write",
+                    PROFILE_ACCESS_READ_WRITE_ID,
+                    "Read/write access",
+                ) {
+                    self.draft.access = ProfileAccess::ReadWrite;
+                }
+                if posture_option(
+                    ui,
+                    self.draft.access == ProfileAccess::ReadOnly,
+                    "Read-only",
+                    PROFILE_ACCESS_READ_ONLY_ID,
+                    "Read-only access",
+                ) {
+                    self.draft.access = ProfileAccess::ReadOnly;
+                }
+            });
+            ui.small("Read-only blocks mutations before user-target dispatch.");
+
             ui.label("TLS");
             let mut selected_tls = self.draft.tls;
             egui::ComboBox::from_id_salt(if self.draft.driver == DriverKind::Redis {
@@ -1422,6 +1474,36 @@ fn tls_name(tls: TlsMode) -> &'static str {
     }
 }
 
+fn posture_option(
+    ui: &mut egui::Ui,
+    selected: bool,
+    label: &'static str,
+    author_id: &'static str,
+    accessibility_name: &'static str,
+) -> bool {
+    let response = ui
+        .push_id(author_id, |ui| {
+            ui.add(
+                egui::Button::new(label)
+                    .selected(selected)
+                    .frame(true)
+                    .frame_when_inactive(true)
+                    .corner_radius(egui::CornerRadius::ZERO)
+                    .min_size(egui::vec2(
+                        PROFILE_POSTURE_CONTROL_WIDTH,
+                        OpenAiTheme::MIN_CONTROL_HEIGHT,
+                    )),
+            )
+        })
+        .inner;
+    let response = named_author_id(response, author_id, accessibility_name);
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::RadioButton);
+        node.set_selected(selected);
+    });
+    response.clicked()
+}
+
 fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String, error: Option<&str>) {
     ui.label(label);
     ui.text_edit_singleline(value);
@@ -1481,7 +1563,7 @@ mod tests {
     use crate::ui::accessibility::{assert_accesskit_omits, assert_accesskit_value_confined};
     use crate::ui::adapter::{DraftTestIntent, UiCommand, bounded_ports};
     use crate::ui::model::UiEvent;
-    use eframe::egui::{Context, RawInput, accesskit};
+    use eframe::egui::{Context, Event, Key, Modifiers, RawInput, accesskit};
 
     fn valid_editor(driver: DriverKind) -> ProfileEditor {
         let mut editor = ProfileEditor::new(DraftId(101), driver);
@@ -1494,13 +1576,20 @@ mod tests {
     fn profile_accesskit_update(editor: &mut ProfileEditor) -> accesskit::TreeUpdate {
         let context = Context::default();
         context.enable_accesskit();
-        context
-            .run_ui(RawInput::default(), |ui| {
-                let _ = editor.show(ui);
-            })
+        render_profile_editor(&context, editor, RawInput::default())
             .platform_output
             .accesskit_update
             .expect("actual ProfileEditor must emit AccessKit")
+    }
+
+    fn render_profile_editor(
+        context: &Context,
+        editor: &mut ProfileEditor,
+        input: RawInput,
+    ) -> eframe::egui::FullOutput {
+        context.run_ui(input, |ui| {
+            let _ = editor.show(ui);
+        })
     }
 
     fn author_node<'a>(
@@ -1637,8 +1726,14 @@ mod tests {
         for author_id in expected_order {
             let node = author_node(&update, author_id).1;
             assert_eq!(node.role(), accesskit::Role::RadioButton, "{author_id}");
-            assert!(node.supports_action(accesskit::Action::Focus), "{author_id}");
-            assert!(node.supports_action(accesskit::Action::Click), "{author_id}");
+            assert!(
+                node.supports_action(accesskit::Action::Focus),
+                "{author_id}"
+            );
+            assert!(
+                node.supports_action(accesskit::Action::Click),
+                "{author_id}"
+            );
             let bounds = node
                 .bounds()
                 .unwrap_or_else(|| panic!("{author_id} must expose actual bounds"));
@@ -1665,6 +1760,101 @@ mod tests {
             author_node(&update, expected_order[3]).1.is_selected(),
             Some(false)
         );
+    }
+
+    #[test]
+    fn profile_posture_controls_activate_from_keyboard_focus_with_space_and_enter() {
+        let context = Context::default();
+        context.enable_accesskit();
+        let mut editor = valid_editor(DriverKind::MySql);
+
+        let initial = render_profile_editor(&context, &mut editor, RawInput::default());
+        let initial_update = initial
+            .platform_output
+            .accesskit_update
+            .expect("initial posture AccessKit tree");
+        let production = author_node(&initial_update, "profile.posture.environment.production").0;
+
+        let mut focus_production = RawInput::default();
+        focus_production
+            .events
+            .push(Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: production,
+                data: None,
+            }));
+        let focused = render_profile_editor(&context, &mut editor, focus_production);
+        assert_eq!(
+            focused
+                .platform_output
+                .accesskit_update
+                .expect("focused posture AccessKit tree")
+                .focus,
+            production
+        );
+
+        let mut press_space = RawInput::default();
+        press_space.events.push(Event::Key {
+            key: Key::Space,
+            physical_key: Some(Key::Space),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
+        let _ = render_profile_editor(&context, &mut editor, press_space);
+        assert_eq!(editor.draft.environment, ProfileEnvironment::Production);
+
+        let refreshed = render_profile_editor(&context, &mut editor, RawInput::default());
+        let refreshed_update = refreshed
+            .platform_output
+            .accesskit_update
+            .expect("updated posture AccessKit tree");
+        let read_only = author_node(&refreshed_update, "profile.posture.access.read_only").0;
+        let mut focus_read_only = RawInput::default();
+        focus_read_only
+            .events
+            .push(Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: read_only,
+                data: None,
+            }));
+        let _ = render_profile_editor(&context, &mut editor, focus_read_only);
+        let mut press_enter = RawInput::default();
+        press_enter.events.push(Event::Key {
+            key: Key::Enter,
+            physical_key: Some(Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
+        let _ = render_profile_editor(&context, &mut editor, press_enter);
+        assert_eq!(editor.draft.access, ProfileAccess::ReadOnly);
+    }
+
+    #[test]
+    fn profile_posture_defaults_and_edit_round_trip_are_exact() {
+        let add = ProfileDraft::new(DriverKind::MySql);
+        assert_eq!(add.environment, ProfileEnvironment::Development);
+        assert_eq!(add.access, ProfileAccess::ReadWrite);
+
+        let mut profile = valid_editor(DriverKind::MySql)
+            .draft
+            .validate()
+            .expect("valid profile draft");
+        profile.safety =
+            ProfileSafetyPosture::new(ProfileEnvironment::Production, ProfileAccess::ReadOnly);
+        let edit = ProfileEditor::edit(DraftId(417), &profile, ProfileGeneration(9), false);
+        assert_eq!(edit.draft.environment, ProfileEnvironment::Production);
+        assert_eq!(edit.draft.access, ProfileAccess::ReadOnly);
+
+        let round_trip = edit.draft.validate().expect("edited posture validates");
+        assert_eq!(
+            round_trip.safety.environment(),
+            Some(ProfileEnvironment::Production)
+        );
+        assert_eq!(round_trip.safety.access(), Some(ProfileAccess::ReadOnly));
     }
 
     #[test]
