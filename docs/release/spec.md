@@ -1,14 +1,19 @@
 # dbotter — approved preview release contract
 
-Status: **P8/P9 Not started.** Historical executable-only prereleases or tap
-formulas do not satisfy this contract.
+Status: **A usable-MVP Preview is installed; the daily-use Preview candidate is
+not yet published.** Historical executable-only prereleases or tap formulas do
+not satisfy this contract, and no stable release is authorized.
 
-Normative sources are `docs/usable-mvp/spec.md` D1/§10,
+The baseline normative sources are `docs/usable-mvp/spec.md` D1/§10,
 `docs/usable-mvp/trace.md` T10, and `docs/usable-mvp/plan.md` P8/P9/§5–§7.
+The daily-use overlay is `docs/daily-use/spec.md` §5,
+`docs/daily-use/trace.md` D1/D11, and `docs/daily-use/plan.md` D1/D11; where the
+overlay tightens compatibility or installed evidence, it governs the next
+Preview.
 
 ## Objective and scope
 
-Publish one source-bound usable-MVP preview, update the Homebrew preview formula
+Publish one source-bound daily-use preview, update the Homebrew preview formula
 with explicit immutable inputs, install it, and prove the exact installed app,
 CLI, native accessibility journey, and safe receipt.
 
@@ -52,7 +57,7 @@ dbotter config-contract --format json
 It returns exactly:
 
 ```text
-{read_versions:[1,2],write_version:2,migration_backup_suffix:".v1.bak"}
+{read_versions:[1,2,3],write_version:3,migration_backup_suffixes:{"1":".v1.bak","2":".v2.bak"}}
 ```
 
 No identity field appears in the config contract and no compatibility field
