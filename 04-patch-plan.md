@@ -20,12 +20,14 @@ No production code starts until:
 4. the exact three-file SHA-256 tuple below replaces `PENDING` and is committed/pushed as the Stage 0 freeze.
 
 ```text
-4d24f472de775c46f0e50f93a78ba0eb13734543c6229b2a12bcfc5360ce2324  docs/daily-use/spec.md
-a7b5707b860c1b930c91d36c33e17b8b6b73081704b5a6a03da56449342074dc  docs/daily-use/trace.md
-80e2829a18615ab4a1394712079e32779870976b64c0bd28dbb6064c12efcfbe  docs/daily-use/plan.md
+b14c7828c4ec2633c93e7b2773b00cdeca4519df4b0328842e5e3a1bdafd4b54  docs/daily-use/spec.md
+e99d4d1346f305f6769ba2fef013e9a2cd5f5dd8af3f5571e5140a4cb2f806d6  docs/daily-use/trace.md
+13c3f84849b7c916b1211b637b36aba50b5b5314f9d4815610a2a156978ad575  docs/daily-use/plan.md
 ```
 
 Changing any frozen artifact invalidates the tuple and requires a new independent contract review before implementation resumes.
+
+v1.1 amendment (2026-07-16): spec/trace/plan revised under spec §9 — DU-07/DU-08 deferred to P1; read admission moved to server-enforced read-only sessions (PureBuiltin allowlist removed; the MySQL 8.4-only gate now applies to writes only); DU-05 terminal persistence simplified (TerminalProven fence removed; crash ⇒ conservative Unknown). The tuple above is the v1.1 freeze; the v1.0 tuple remains in git history. The independent contract review was rerun for v1.1 per this gate.
 
 `docs/daily-use/evidence.md` is deliberately outside this tuple. Evidence-only
 status/receipt updates there do not invalidate the normative hashes; any change
@@ -40,7 +42,7 @@ The old frozen usable-MVP hash set remains historical and unchanged under `docs/
 | 0 | all routing | research/gap audit, closed spec/trace, independent review, exact hashes | Complete |
 | 1 | D1, D3, D4, D9 foundation, D10, D11 | RED then GREEN durable safe workspace and CLI bootstrap | Not started |
 | 2 | D2, D5, D9, D11 | RED then GREEN typed table data and real MySQL transaction worker | Not started |
-| 3 | D6, D7, D8, D9, D10, D11 | RED/GREEN safe MySQL/Redis edits, CSV import and result detail | Not started |
+| 3 | D6, D9, D10, D11 | RED/GREEN safe MySQL row edits and result detail (D7/D8 deferred to P1 by v1.1) | Not started |
 | 4 | D1–D11 | full/live/native gates, independent conformance review and fixes | Not started |
 | 5 | D12 | merge, Preview, public/tap proof, xbrew reinstall and installed use | Not started |
 

@@ -37,8 +37,8 @@ The current Preview is useful for bounded inspection and one-off commands, but i
 - the editor and current result are in-memory single-workspace state;
 - there are no persistent query tabs or searchable execution history;
 - MySQL execution currently uses pooled auto-commit connections, with no managed Begin/Commit/Rollback UI;
-- the MySQL explorer does not open/edit table rows, and the Redis explorer has no type-aware mutation controls;
-- there is no CSV import flow;
+- the MySQL explorer does not open/edit table rows; Redis type-aware mutation is deferred to P1 (DUV1 v1.1);
+- there is no CSV import flow (deferred to P1 by DUV1 v1.1);
 - the CLI cannot bootstrap profiles or accept a session credential safely from stdin;
 - the long profile form and editor/result layout still lack the persistent navigator, resizable multi-pane context/status density and minimum-window reachability required by the Daily-use contract.
 
@@ -105,7 +105,7 @@ Profile bootstrap, stdin credentials/targets and table/CSV/TSV output are frozen
 - Persist no value supplied through credential channels and never log credential-bearing URIs. Valid arbitrary editor/history text may itself contain literals; the app discloses that boundary and provides per-profile persistence opt-outs.
 - Never expose backend prose at public error boundaries.
 - Sensitive request types use redacted manual `Debug` and are not serializable.
-- UI state owns no live client; no Rust mutex/RwLock or borrowed in-process guard crosses `await`. A synchronous owner may retain a nonblocking OS advisory-lock file descriptor across a safety-critical MySQL transaction or one Redis mutation/recovery operation.
+- UI state owns no live client; no Rust mutex/RwLock or borrowed in-process guard crosses `await`. A synchronous owner may retain a nonblocking OS advisory-lock file descriptor across a safety-critical MySQL transaction.
 - User SQL values never enter generated mutation text by string concatenation.
 - No production `unwrap`, `expect`, `panic!` or `todo!`.
 - A capability is not marked ready without its required live and installed proof.

@@ -1,6 +1,6 @@
 # dbotter — current trace ledger
 
-Status: **Daily-use v1 contract frozen; implementation rows not started**
+Status: **Daily-use v1 contract frozen (v1.1 amendment 2026-07-16); row states live in `docs/daily-use/evidence.md`**
 
 Authoritative trace: [`docs/daily-use/trace.md`](docs/daily-use/trace.md)
 
@@ -24,9 +24,9 @@ Only the mutable ledger in `docs/daily-use/evidence.md` changes these states.
 |---|---|---|
 | T0–T3, T8–T9 | config/profile/credential lifecycle, controller, recovery, native profile UI | D1, D4, D10, D11 |
 | T4 | exact target, prepared MySQL/policy Redis execution, cancel, result provenance | D3, D5, D9, D10 |
-| T5 | bounded lazy MySQL schemas/relations/columns | D2, D6, D8 |
-| T6 | bounded Redis SCAN/inspect and Required TLS | D2, D7 |
-| T7 | result copy and bounded no-clobber export | D8, D9 |
+| T5 | bounded lazy MySQL schemas/relations/columns | D2, D6 |
+| T6 | bounded Redis SCAN/inspect and Required TLS | D2 |
+| T7 | result copy and bounded no-clobber export | D8 (export baseline), D9 |
 | T10 | CI/Preview/tap/package/install/AX receipt machinery | D12 |
 
 The baseline was integrated through source commit `340133dca652a7bf51d652f06cdb7436b42bbc58`. This routing statement does not mark any new D row GREEN.
@@ -41,8 +41,8 @@ The baseline was integrated through source commit `340133dca652a7bf51d652f06cdb7
 | D4 | durable drafts/history, privacy posture and profile lifecycle | Not started | filesystem failpoints/restart/native |
 | D5 | one-connection MySQL transaction state machine | Not started | actor/service/live MySQL/native |
 | D6 | lossless staged MySQL row add/update/delete | Not started | typed DML/conflict/live MySQL/native |
-| D7 | type-aware Redis edit/TTL/delete | Not started | typed atomic mutation/live Redis/native |
-| D8 | bounded reviewed CSV import and retained export | Not started | parser/transaction/live MySQL/native file |
+| D7 | type-aware Redis edit/TTL/delete | Deferred (P1, v1.1) | typed atomic mutation/live Redis/native (P1) |
+| D8 | retained export; CSV import deferred (P1, v1.1) | Deferred import; export baseline retained | existing export receipts |
 | D9 | bounded result tabs, local inspect/filter/sort/copy | Not started | result model/controller/native |
 | D10 | clean-install CLI bootstrap and automation | Not started | CLI contract/shell installed journey |
 | D11 | OpenAI visual language with DBeaver-reference persistent navigator/editor/result/status usability, wide/min reachability/accessibility/cancel | Not started | RawInput/AccessKit/native AX/wide+min screenshots/external review |
@@ -53,9 +53,9 @@ The baseline was integrated through source commit `340133dca652a7bf51d652f06cdb7
 The exact vocabulary lives in the Daily-use trace/spec. These ownership rules are global:
 
 - profile network work carries stable user-facing `ProfileId`, immutable `ProfileInstanceId`, `ProfileGeneration`, `SessionGeneration` and `OperationId` where applicable;
-- workspace drafts/history and durable MySQL Active/Resolving/TerminalProven/OutcomeUnknown or Redis RedisApplying/RedisOutcomeUnknown safety fences bind immutable `ProfileInstanceId`; in-memory result/stage/transaction state also binds the active profile generation;
-- TerminalProven and OutcomeUnknown independently replay their TransactionId disposition through the durable profile shard and live state before their allowed cleanup; Unknown fanout failure retains the fence and global block;
-- editor/result tab, history, table page, staged edit, Redis review and import plan each have their own stable local identity; every MySQL transaction carries a stable TransactionId and Redis unknown recovery carries only a private-root HMAC key token;
+- workspace drafts/history and durable MySQL Active/Resolving/OutcomeUnknown safety fences bind immutable `ProfileInstanceId` (Redis fence classes are P1 with DU-07); in-memory result/stage/transaction state also binds the active profile generation;
+- a proven terminal outcome folds its TransactionId disposition through the durable profile shard and live state before Resolving is removed (a crash inside that window conservatively converts to OutcomeUnknown); OutcomeUnknown replays the same fold idempotently, and Unknown fold failure retains the fence and global block;
+- editor/result tab, history, table page and staged edit each have their own stable local identity; every MySQL transaction carries a stable TransactionId;
 - export retains `(ResultId, OperationId)`; global load/shutdown/storage work retains its explicit operation identity;
 - a fold never borrows the currently selected profile/tab/result to repair missing identity;
 - transaction data work routes through the profile's worker while active; no UI object owns the live connection.

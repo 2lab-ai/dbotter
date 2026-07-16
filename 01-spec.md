@@ -49,8 +49,8 @@ Release-blocking contracts:
 | DU-04 | atomic local drafts/history with disclosure, opt-outs, bounds and profile lifecycle |
 | DU-05 | real profile-scoped MySQL transaction worker and explicit unknown recovery |
 | DU-06 | lossless identifiable staged MySQL row editing with conflict detection |
-| DU-07 | bounded type-aware Redis mutations, TTL/delete and binary-safe production confirmation |
-| DU-08 | reviewed bounded relational CSV import inside the active transaction; retained export |
+| DU-07 | deferred to P1 by v1.1 — v1 keeps Redis read/browse/inspect; typed mutations/TTL/delete return in P1 |
+| DU-08 | retained bounded export; relational CSV import deferred to P1 by v1.1 |
 | DU-09 | bounded result tabs, local filter/sort and record/value detail |
 | DU-10 | clean-install CLI profile bootstrap, safe stdin, structured output and exact exit codes |
 | DU-11 | OpenAI visual language plus DBeaver-reference navigator/editor/result/status usability floor, wide/minimum reachability, keyboard/AX and exact cancellation |
@@ -61,13 +61,13 @@ D12 binds all product rows to the exact reviewed source commit, public Preview a
 
 - Trace before code: update D1–D12 before changing a cross-layer command, event, state or persistence contract.
 - Identity is explicit across async boundaries; stale/cancelled/mismatched events never overwrite newer state.
-- No Rust mutex/RwLock or borrowed in-process guard crosses `await`; stateful MySQL transaction ownership uses a serialized async worker. The synchronous owner of the nonblocking OS advisory safety lease retains its file descriptor across an unresolved MySQL safety-fence lifetime or one Redis mutation/recovery operation without exposing guarded in-memory data to async code.
+- No Rust mutex/RwLock or borrowed in-process guard crosses `await`; stateful MySQL transaction ownership uses a serialized async worker. The synchronous owner of the nonblocking OS advisory safety lease retains its file descriptor across an unresolved MySQL safety-fence lifetime without exposing guarded in-memory data to async code.
 - Credential-channel values do not enter config/workspace/history/log/error/evidence data. Public UI screenshots use only the isolated tracked synthetic fixture and never the user's config/data.
 - User-controlled identifiers are validated/quoted and generated mutation values use typed parameters.
 - Unknown SQL/Redis operations, raw transaction/session controls and MySQL implicit-commit operations fail closed before user-target I/O; bounded static capability/catalog reads are not user-target dispatch.
 - Read-only rejects every mutation before user-target/typed-mutation dispatch; a metadata-only lease may classify bounded source. Production requires the exact review/confirmation contract.
 - MySQL mutation requires exact typed `@@GLOBAL.partial_revokes=OFF` plus direct non-role-only global SELECT/TRIGGER/REFERENCES visibility; otherwise reads may remain available but every mutation is disabled before target DML.
-- A MySQL OutcomeUnknown fence is the TransactionId replay authority for durable Unknown history/result/stage/import fanout and cannot be acknowledged or removed before that fanout agrees.
+- A MySQL OutcomeUnknown fence is the TransactionId replay authority for the durable Unknown history/result/stage fold and cannot be acknowledged or removed before that fold agrees.
 - Every retained list/file/value is bounded; driver transient-allocation limitations remain disclosed.
 - File writes are permission-restricted, atomic and fail closed on uncertain durability.
 - Public errors are closed/static and contain no backend prose or user data.

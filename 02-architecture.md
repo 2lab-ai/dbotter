@@ -95,22 +95,7 @@ delete→purge-or-orphan and clear operations across config/shards/index; startu
 replays a valid intent idempotently and blocks destructive guesses for a corrupt
 intent.
 
-The per-instance safety union is driver-specific. MySQL Begin writes Active,
-terminal intent writes Resolving, a proven server terminal writes
-TerminalProven for replayable shard fanout, and uncertainty writes
-OutcomeUnknown, all with the stable TransactionId. TerminalProven is the
-Committed/RolledBack replay authority; OutcomeUnknown is independently the
-Unknown shard/history/result/stage/import replay authority and cannot be
-acknowledged or removed until its idempotent TransactionId fanout is fsynced
-and any live state is folded. Redis mutation writes RedisApplying before wire
-dispatch and response uncertainty writes RedisOutcomeUnknown with only an
-HMAC key token and action class. These fences survive editor/history opt-out
-and general workspace clearing. Startup conservatively converts in-flight
-fences to their driver Unknown state; MySQL requires durable acknowledgement,
-while Redis requires a matching-key fresh inspection plus explicit durable
-acknowledgement. A Redis fence blocks profile update/duplicate/delete until
-matching-key recovery or a separately typed unknown-recovery abandonment.
-Neither driver automatically retries uncertain mutation.
+The per-instance safety fence is MySQL-only in v1.1. Begin writes Active, terminal intent writes Resolving, and uncertainty writes OutcomeUnknown, all with the stable TransactionId. A proven terminal outcome folds live state, rewrites the profile shard for its TransactionId with one atomic fsynced write, then removes the Resolving fence; a crash inside that window conservatively converts to OutcomeUnknown at startup. OutcomeUnknown is the Unknown shard/history/result/stage replay authority and cannot be acknowledged or removed until its idempotent TransactionId fold is fsynced and any live state is folded. These fences survive editor/history opt-out and general workspace clearing; acknowledgement must be durable. (Redis mutation fences RedisApplying/RedisOutcomeUnknown are deferred to P1 with DU-07.) No uncertain mutation is automatically retried.
 
 All files use private permissions, same-directory atomic replacement,
 file/parent durability and destination-fingerprint conflict detection. Unknown
@@ -127,32 +112,11 @@ enforces per-target/token/depth limits and produces the complete closed typed
 batch before user-target 1. Redis needs no capability query, so both phases
 finish before its first network I/O.
 
-MySQL P0 first proves an exact official Oracle MySQL 8.4 session with utf8mb4,
-UTC and known sql_mode. The same typed capability result decodes
-`@@GLOBAL.partial_revokes`; typed reads may remain available when it is ON, but
-every mutation requires exact OFF plus complete direct global metadata
-visibility. It admits only:
+MySQL P0 splits admission by direction (v1.1). Reads: a ReadOnly batch may execute on any MySQL-wire server whose typed capability query succeeded and whose dedicated read lease proves server-enforced read-only state (`SET SESSION TRANSACTION READ ONLY` plus typed `@@SESSION.transaction_read_only = 1`) before user-target dispatch; the proven read-only session — not a client AST/function/relation proof — is the read-safety authority for out-of-transaction reads (v1.1 removed the PureBuiltin allowlist and base-table-only relation proof on that path; views are readable there). While a profile transaction is ActiveClean or ActivePending, reads route through the read-write worker where no read-only session is possible; ReadOnly admission on that path is DU-03 item 10's strict structural rule — catalog-proven base tables only, zero function invocations, zero view references — denied before user-target I/O. Writes: unchanged from v1.0 — an exact official Oracle MySQL 8.4 session with utf8mb4, UTC and the closed sql_mode list, typed `@@GLOBAL.partial_revokes=OFF` and complete direct global metadata visibility; single-table INSERT/UPDATE/DELETE proved against trigger-free InnoDB catalog metadata. Raw SHOW/DESCRIBE/EXPLAIN/ANALYZE, REPLACE, raw transaction/session controls, executable/MariaDB comments, implicit-commit forms, DDL/admin, multi-table or unbounded DML and ambiguity are denied before user-target I/O; optimizer-hint comments are admitted for reads only. The intended connection's sql_mode drives the lexer for splitting/classification. A Read-only profile may acquire the metadata-only lease, but mutation has zero user-target dispatch. Run-all is fully parsed/classified and all writable targets are metadata-preflighted before target 1. Shared metadata locks are retained by the active worker so ALTER or relevant inbound FK/trigger drift cannot invalidate the write proof.
 
-- SELECT whose recursive AST uses the frozen PureBuiltin table and references
-  only catalog-proven base tables; and
-- single-table INSERT/UPDATE/DELETE proved against trigger-free InnoDB catalog
-  metadata after exact partial_revokes=OFF and direct non-role-only global
-  SELECT/TRIGGER/REFERENCES visibility proof.
-
-Views, raw SHOW/DESCRIBE/EXPLAIN/ANALYZE, REPLACE, raw transaction/session
-controls, executable/hint/MariaDB comments, implicit-commit forms, DDL/admin,
-unsupported functions, stored/loadable/UDF calls, multi-table or unbounded DML
-and ambiguity are denied before user-target I/O. The intended connection's
-exact version/family/charset/time-zone/sql_mode drives the lexer. A Read-only
-profile may acquire that metadata-only lease, but mutation has zero user-target
-dispatch. Run-all is fully parsed/classified and all relations/writable targets
-are metadata-preflighted before target 1. Shared metadata locks are retained by
-the active worker so ALTER or relevant inbound FK/trigger drift cannot
-invalidate the complete proof.
-
-Redis raw execution uses the exact command/arity/option table in DU-03.
-Explorer writes are not raw editor text: they are typed DU-07 operations backed
-by one-key static atomic scripts.
+Redis raw execution uses the exact read command/arity/option table in DU-03.
+Explorer mutation (typed DU-07 operations) is deferred to P1; v1.1 ships Redis
+read/browse/inspect only.
 
 ## 6. MySQL data and transaction architecture
 
@@ -178,19 +142,22 @@ AutoCommit
 ```
 
 The worker initializes utf8mb4/+00:00 and proves autocommit=1/in_transaction=0
-before Begin. All editor reads/DML, table reads, row Apply and CSV import inside
-an active transaction use that same worker/connection. DDL/session controls
+before Begin. All editor reads/DML, table reads and row Apply (CSV import: P1) inside
+an active transaction use that same worker/connection. Worker-routed ReadOnly
+statements follow DU-03 item 10's in-transaction structural rule (base tables
+only, no function invocation, no view reference); typed table-data reads remain
+typed static plans. DDL/session controls
 remain outside the model. No GUI DML reaches an auto-commit connection.
 Terminal requests use explicit AND NO CHAIN NO RELEASE and prove
 in_transaction=0 even after a success response. Results/history distinguish
 statement success from AppliedPendingTransaction. After a proven outcome the
-worker persists TerminalProven, idempotently rewrites/fsyncs the profile shard
-by TransactionId, folds memory, then removes the fence. Startup replays any
-TerminalProven, so separate files are never assumed cross-file atomic; earlier
-Resolving crashes become OutcomeUnknown. That fence similarly replays an
-idempotent TransactionId fanout to durable Unknown plus the live-memory fold;
+worker folds memory, idempotently rewrites/fsyncs the profile shard by
+TransactionId, then removes the Resolving fence; separate files are never
+assumed cross-file atomic, and a crash before removal conservatively becomes
+OutcomeUnknown at startup (v1.1 removed the TerminalProven fence kind). The OutcomeUnknown fence replays an
+idempotent TransactionId fold to durable Unknown plus the live-memory fold;
 status, restart and acknowledgement rerun it, and acknowledgement cannot remove
-the fence until durable agreement. A failure at any conversion, fanout or
+the fence until durable agreement. A failure at any conversion, fold or
 removal phase remains blocking and replayable rather than leaving Pending
 history without an authority.
 
@@ -206,28 +173,11 @@ ApplyOutcomeUnknown; partial Apply is never presented as local/discardable.
 Local/unknown/applied stage surfaces are lifecycle-guarded and non-evictable.
 Apply never commits; only shared controls resolve AppliedPendingTransaction.
 
-D8 parses/maps CSV through the same MysqlInputCell contract on a bounded
-blocking lane and applies parameterized batches only to a completeness-proven,
-trigger-free InnoDB table inside an operation savepoint on the same worker.
-Error/cancel proves rollback to that savepoint or raises OutcomeUnknown; earlier
-profile transaction changes are preserved.
+D8 in v1.1 retains only the existing bounded no-clobber result export. The v1.0 CSV-import architecture (MysqlInputCell parse/map on a bounded blocking lane, savepoint-scoped parameterized batches on the transaction worker) is deferred to P1 unchanged.
 
-## 7. Redis mutation architecture
+## 7. Redis mutation architecture (P1)
 
-D7 retains raw key/payload bytes only in memory and a Missing-or-present
-inspection revision. Static one-key Lua inspection/mutation scripts run an O(1)
-STRLEN or cardinality<=512 gate before capped exact MEMORY/DUMP proof, then
-recheck revision/old member/value and apply exactly one frozen
-String/Hash/List/Set/Sorted Set/TTL/DeleteKey action. Before target mutation,
-redis.acl_check_cmd validates the exact action and recovery commands without a
-second/probe key. Missing create/add paths use a no-DUMP revision.
-
-Read-only rejects before dispatch. Review confirmation binds the exact decoded
-payload, key/revision, profile/generation and expiry. The durable RedisApplying
-fence precedes wire dispatch; response/restoration uncertainty becomes
-RedisOutcomeUnknown with only an HMAC key token. Startup keeps all profile
-mutation blocked until matching-key fresh inspection and explicit acknowledgement.
-Lossy rendered text is never write identity.
+Deferred to P1 by DUV1 v1.1. The v1.0 architecture — memory-only raw bytes, revision-checked one-key static Lua inspect/mutate scripts with O(1) cardinality and capped MEMORY/DUMP gates, `redis.acl_check_cmd` preflight, RedisApplying/RedisOutcomeUnknown fences and matching-key recovery — remains in git history as the P1 baseline. v1.1 ships Redis read/browse/inspect only.
 
 ## 8. Result, CLI and UI ownership
 
