@@ -24,7 +24,7 @@ v1.1 amendment are marked `deferred` rather than deleted.
 | D8 | — | — | — | — | deferred import (P1, v1.1); export baseline retained |
 | D9 | — | — | — | — | not started |
 | D10 | — | — | — | — | not started |
-| D11 | — | — | — | — | not started |
+| D11 | `96d708f` — `test(d11): require object-to-data execution` | — | RED contract: `cargo test --all-features ui::app::tests::mysql_data_action_opens_a_new_tab_and_submits_the_exact_bounded_read -- --exact --nocapture` fails because `Data` opens a bounded query tab but submits no execution command. | — | RED object-to-data slice; complete D11 journeys pending |
 | D12 | — | — | — | — | not started |
 
 ## v1.1 branch reconciliation
