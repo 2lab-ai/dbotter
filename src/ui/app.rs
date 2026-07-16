@@ -70,7 +70,6 @@ enum EditorTabAction {
     Rename(EditorTabId),
     New,
     Duplicate(EditorTabId),
-    Close(EditorTabId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3869,6 +3868,7 @@ impl DbotterApp {
         );
 
         let mut select = None;
+        let mut close_tab = None;
         egui::ScrollArea::horizontal()
             .id_salt("editor.tab-strip")
             .show(ui, |ui| {
@@ -3879,18 +3879,40 @@ impl DbotterApp {
                         } else {
                             title.clone()
                         };
-                        let response = ui.add_sized(
-                            [132.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
-                            egui::Button::new(label).selected(selected == Some(*tab_id)),
-                        );
-                        let response = named_dynamic_author_id(
-                            response,
-                            format!("editor.tab.{}", tab_id.0),
-                            "Editor tab",
-                        );
-                        if response.clicked() {
-                            select = Some(*tab_id);
-                        }
+                        ui.push_id(tab_id.0, |ui| {
+                            ui.horizontal(|ui| {
+                                let response = ui.add_sized(
+                                    [120.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                                    egui::Button::new(label).selected(selected == Some(*tab_id)),
+                                );
+                                let response = named_dynamic_author_id(
+                                    response,
+                                    format!("editor.tab.{}", tab_id.0),
+                                    "Editor tab",
+                                );
+                                if response.clicked() {
+                                    select = Some(*tab_id);
+                                }
+
+                                let close = ui
+                                    .add_enabled(
+                                        enabled,
+                                        egui::Button::new("×").min_size(egui::vec2(
+                                            OpenAiTheme::MIN_CONTROL_HEIGHT,
+                                            OpenAiTheme::MIN_CONTROL_HEIGHT,
+                                        )),
+                                    )
+                                    .on_hover_text("Close editor tab");
+                                let close = named_dynamic_author_id(
+                                    close,
+                                    format!("editor.tab.close.{}", tab_id.0),
+                                    "Close editor tab",
+                                );
+                                if close.clicked() {
+                                    close_tab = Some(*tab_id);
+                                }
+                            });
+                        });
                     }
                 });
             });
@@ -3900,6 +3922,11 @@ impl DbotterApp {
             "workspace.session-retention",
             "Session-only query tabs and history",
         );
+
+        if let Some(tab_id) = close_tab {
+            self.request_editor_tab_close(key.clone(), tab_id, "editor.tab.discard");
+            return;
+        }
 
         if let Some(tab_id) = select
             && self
@@ -3953,20 +3980,7 @@ impl DbotterApp {
             {
                 action = selected.map(EditorTabAction::Duplicate);
             }
-            let close = ui.add_enabled(
-                enabled && selected.is_some(),
-                egui::Button::new("Close")
-                    .min_size(egui::vec2(80.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
-            );
-            if named_author_id(close, "editor.tab.close", "Close editor tab").clicked() {
-                action = selected.map(EditorTabAction::Close);
-            }
         });
-
-        if let Some(EditorTabAction::Close(tab_id)) = action {
-            self.request_editor_tab_close(key.clone(), tab_id, "editor.tab.discard");
-            return;
-        }
         let workspace = self.model.workspace_mut(key.clone());
         let outcome = match action {
             Some(EditorTabAction::Rename(tab_id)) => workspace.rename_editor_tab(tab_id, title),
@@ -3979,7 +3993,6 @@ impl DbotterApp {
             Some(EditorTabAction::Duplicate(tab_id)) => {
                 workspace.duplicate_editor_tab(tab_id).map(|_| ())
             }
-            Some(EditorTabAction::Close(_)) => Ok(()),
             None => Ok(()),
         };
         if let Err(error) = outcome {
