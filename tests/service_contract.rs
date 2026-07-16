@@ -31,7 +31,8 @@ use dbotter::secrets::{
 use dbotter::service::{
     ApplicationService, CheckOutcome, CreateProfileRequest, DeleteProfileRequest, ExecuteOutcome,
     ProfileMutationOutcome, ProfileValidationError, SecretResolver, ServiceError, SessionConnector,
-    SessionDisposition, SessionHandle, UpdateProfileRequest, validate_config_mutation,
+    SessionDisposition, SessionHandle, UpdateProfileRequest, validate_config_identity,
+    validate_config_mutation,
 };
 
 #[async_trait]
@@ -3173,6 +3174,244 @@ async fn create_profile_instance_id_rewrite_at_observation_fails_closed() {
 }
 
 #[tokio::test]
+async fn create_observation_rejects_existing_instance_identity_transplant() {
+    assert_identity_transplant_fails_closed(MatrixMutation::Create).await;
+}
+
+#[tokio::test]
+async fn update_observation_rejects_existing_instance_identity_transplant() {
+    assert_identity_transplant_fails_closed(MatrixMutation::Update).await;
+}
+
+#[tokio::test]
+async fn delete_observation_rejects_deleted_instance_identity_transplant() {
+    assert_identity_transplant_fails_closed(MatrixMutation::Delete).await;
+}
+
+async fn assert_identity_transplant_fails_closed(mutation: MatrixMutation) {
+    const TARGET_ID: &str = "identity-transplant-target";
+    const SOURCE_ID: &str = "identity-transplant-source";
+    const STABLE_ID: &str = "identity-transplant-stable";
+    const TRANSPLANTED_ID: &str = "identity-transplant-destination";
+    const SECRET_SENTINEL: &str = "identity-transplant-secret-sentinel";
+
+    let directory = tempfile::tempdir().expect("identity transplant tempdir");
+    let path = directory.path().join("config.toml");
+    let target = classified_profile(
+        TARGET_ID,
+        named_draft(DriverKind::MySql, "Identity transplant target"),
+        1,
+    );
+    let source = classified_profile(
+        SOURCE_ID,
+        named_draft(DriverKind::MySql, "Identity transplant source"),
+        2,
+    );
+    let stable = classified_profile(
+        STABLE_ID,
+        named_draft(DriverKind::Redis, "Identity transplant stable"),
+        3,
+    );
+    let initial_profiles = match mutation {
+        MatrixMutation::Create => vec![source, stable],
+        MatrixMutation::Update => vec![target, source, stable],
+        MatrixMutation::Delete => vec![target, stable],
+    };
+    let persisted = write_v3_profiles(&path, initial_profiles);
+    let original = match mutation {
+        MatrixMutation::Create | MatrixMutation::Update => persisted_profile(&persisted, SOURCE_ID),
+        MatrixMutation::Delete => persisted_profile(&persisted, TARGET_ID),
+    };
+    let original_instance_id = original
+        .safety
+        .instance_id()
+        .expect("transplant source remains classified");
+    let deleted_profile = matches!(mutation, MatrixMutation::Delete).then_some(original);
+    let rewrite = Arc::new(TransplantProfileInstanceAtObservation::new(
+        mutation,
+        TARGET_ID,
+        SOURCE_ID,
+        TRANSPLANTED_ID,
+        deleted_profile,
+    ));
+    let connector = Arc::new(FakeConnector::new(false));
+    let store = Arc::new(SessionSecretStore::default());
+    let mut seeded_ids = persisted
+        .iter()
+        .map(|profile| ProfileId(profile.id.clone()))
+        .collect::<Vec<_>>();
+    seeded_ids.push(ProfileId(TRANSPLANTED_ID.to_owned()));
+    seeded_ids.push(ProfileId(TARGET_ID.to_owned()));
+    for profile_id in &seeded_ids {
+        store
+            .apply(
+                profile_id,
+                SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(
+                    SECRET_SENTINEL.to_owned(),
+                ))),
+            )
+            .expect("seed identity transplant secret");
+    }
+    let service = ApplicationService::with_dependencies(
+        &path,
+        connector.clone(),
+        Arc::new(MissingEnvironment),
+        store.clone(),
+        ConfigWriter::with_fault_injector(rewrite),
+    )
+    .expect("identity transplant service");
+    for (index, profile) in persisted.iter().enumerate() {
+        service
+            .check(
+                OperationId(940 + index as u64),
+                ProfileId(profile.id.clone()),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("cache every pre-mutation profile");
+    }
+    let before = service.profiles_snapshot().await;
+    assert_eq!(service.cached_session_count().await, before.len());
+    let target_id = ProfileId(TARGET_ID.to_owned());
+    let target_generation = match mutation {
+        MatrixMutation::Create => None,
+        MatrixMutation::Update | MatrixMutation::Delete => Some(
+            service
+                .profile_generation(&target_id)
+                .await
+                .expect("target generation"),
+        ),
+    };
+
+    let result = match mutation {
+        MatrixMutation::Create => {
+            let mut draft = named_draft(DriverKind::MySql, "Created transplant target");
+            draft.host = "created-transplant-target.internal".to_owned();
+            draft.credential_mode = CredentialMode::Session;
+            service
+                .create_profile(create_request(
+                    DraftId(950),
+                    OperationId(950),
+                    Some(TARGET_ID),
+                    draft,
+                    SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(
+                        SECRET_SENTINEL.to_owned(),
+                    ))),
+                ))
+                .await
+        }
+        MatrixMutation::Update => {
+            let mut draft = persisted_profile(&persisted, TARGET_ID).as_draft();
+            draft.name = "Updated transplant target".to_owned();
+            draft.host = "updated-transplant-target.internal".to_owned();
+            service
+                .update_profile(UpdateProfileRequest {
+                    profile_id: target_id.clone(),
+                    expected_generation: target_generation.expect("update generation"),
+                    operation_id: OperationId(951),
+                    draft,
+                    secret_update: SessionSecretUpdate::Clear,
+                    migration_consent: MigrationConsent::Cancelled,
+                })
+                .await
+        }
+        MatrixMutation::Delete => {
+            service
+                .delete_profile(DeleteProfileRequest {
+                    profile_id: target_id.clone(),
+                    expected_generation: target_generation.expect("delete generation"),
+                    operation_id: OperationId(952),
+                    migration_consent: MigrationConsent::Cancelled,
+                })
+                .await
+        }
+    };
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("{mutation:?} accepted a transplanted immutable profile identity"),
+    };
+
+    assert!(matches!(&error, ServiceError::ConfigUncertain));
+    assert_eq!(
+        error.public_error_parts(),
+        (
+            PublicSummary::ResourceStale,
+            PublicCode::ConfigExternalChange
+        )
+    );
+    assert!(service.is_config_uncertain());
+    assert_eq!(service.profiles_snapshot().await, before);
+    assert!(
+        service
+            .profiles_snapshot()
+            .await
+            .iter()
+            .all(|profile| profile.id != TRANSPLANTED_ID)
+    );
+    assert_eq!(service.source_version().await, ConfigSourceVersion::V3);
+    assert_eq!(service.cached_session_count().await, 0);
+    assert!(
+        store
+            .is_empty()
+            .expect("identity transplant clears secrets")
+    );
+    assert!(
+        connector.session.closes.load(Ordering::SeqCst) >= before.len(),
+        "{mutation:?} must close every cached pre-mutation session"
+    );
+
+    let disk = load_path(&path).expect("strict-valid transplanted disk remains reloadable");
+    assert_eq!(disk.source_version, ConfigSourceVersion::V3);
+    validate_config_identity(&disk.config).expect("transplanted disk remains identity-valid v3");
+    let transplanted = disk
+        .config
+        .profiles
+        .iter()
+        .find(|profile| profile.id == TRANSPLANTED_ID)
+        .expect("transplanted row remains exact disk truth");
+    assert_eq!(
+        transplanted.safety.instance_id(),
+        Some(original_instance_id)
+    );
+    assert!(
+        disk.config
+            .profiles
+            .iter()
+            .all(|profile| profile.id != SOURCE_ID),
+        "{mutation:?} removes the original identity binding from disk"
+    );
+    match mutation {
+        MatrixMutation::Create => {
+            let created = disk
+                .config
+                .profiles
+                .iter()
+                .find(|profile| profile.id == TARGET_ID)
+                .expect("intended create result remains on disk");
+            assert_eq!(created.name, "Created transplant target");
+            assert_ne!(created.safety.instance_id(), Some(original_instance_id));
+        }
+        MatrixMutation::Update => {
+            let updated = disk
+                .config
+                .profiles
+                .iter()
+                .find(|profile| profile.id == TARGET_ID)
+                .expect("intended update result remains on disk");
+            assert_eq!(updated.name, "Updated transplant target");
+            assert_eq!(updated.host, "updated-transplant-target.internal");
+        }
+        MatrixMutation::Delete => assert!(
+            disk.config
+                .profiles
+                .iter()
+                .all(|profile| profile.id != TARGET_ID),
+            "intended deleted ProfileId remains absent on disk"
+        ),
+    }
+}
+
+#[tokio::test]
 async fn identity_or_source_rewrite_during_observation_is_committed_unknown_and_uncertain() {
     for rewrite in [
         ObservationRewrite::DuplicateId,
@@ -4952,6 +5191,95 @@ impl MutationFaultInjector for RewriteCreatedInstanceIdAtObservation {
             Some(substituted_instance_id);
         let encoded = toml::to_string(&config)
             .map_err(|_| std::io::Error::other("rewritten v3 config did not serialize"))?;
+        fs::write(path, encoded)
+    }
+}
+
+struct TransplantProfileInstanceAtObservation {
+    mutation: MatrixMutation,
+    target_id: String,
+    source_id: String,
+    transplanted_id: String,
+    deleted_profile: Option<ConnectionProfile>,
+    fired: AtomicBool,
+}
+
+impl TransplantProfileInstanceAtObservation {
+    fn new(
+        mutation: MatrixMutation,
+        target_id: &str,
+        source_id: &str,
+        transplanted_id: &str,
+        deleted_profile: Option<ConnectionProfile>,
+    ) -> Self {
+        Self {
+            mutation,
+            target_id: target_id.to_owned(),
+            source_id: source_id.to_owned(),
+            transplanted_id: transplanted_id.to_owned(),
+            deleted_profile,
+            fired: AtomicBool::new(false),
+        }
+    }
+}
+
+impl MutationFaultInjector for TransplantProfileInstanceAtObservation {
+    fn check(&self, point: MutationFailpoint, path: &Path) -> std::io::Result<()> {
+        if point != MutationFailpoint::MainObservationLoad
+            || self.fired.swap(true, Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let mut config = load_path(path)
+            .map_err(|_| std::io::Error::other("committed v3 config was not readable"))?
+            .config;
+        if config
+            .profiles
+            .iter()
+            .any(|profile| profile.id == self.transplanted_id)
+        {
+            return Err(std::io::Error::other(
+                "transplant destination unexpectedly exists",
+            ));
+        }
+        match self.mutation {
+            MatrixMutation::Create | MatrixMutation::Update => {
+                if !config
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.id == self.target_id)
+                {
+                    return Err(std::io::Error::other(
+                        "intended create or update target result is absent",
+                    ));
+                }
+                let source = config
+                    .profiles
+                    .iter_mut()
+                    .find(|profile| profile.id == self.source_id)
+                    .ok_or_else(|| std::io::Error::other("transplant source is absent"))?;
+                source.id.clone_from(&self.transplanted_id);
+            }
+            MatrixMutation::Delete => {
+                if config
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.id == self.target_id)
+                {
+                    return Err(std::io::Error::other(
+                        "intended delete target result is still present",
+                    ));
+                }
+                let mut transplanted = self
+                    .deleted_profile
+                    .clone()
+                    .ok_or_else(|| std::io::Error::other("deleted transplant source is absent"))?;
+                transplanted.id.clone_from(&self.transplanted_id);
+                config.profiles.push(transplanted);
+            }
+        }
+        let encoded = toml::to_string(&config)
+            .map_err(|_| std::io::Error::other("transplanted v3 config did not serialize"))?;
         fs::write(path, encoded)
     }
 }
