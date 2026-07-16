@@ -51,6 +51,9 @@ use super::theme::OpenAiTheme;
 
 const EVENT_DRAIN_LIMIT: usize = 128;
 const RETRY_RECIPE_LIMIT: usize = 64;
+const WORKSPACE_GEOMETRY_STORAGE_KEY: &str = "dbotter.workspace-geometry.v1";
+const MAX_RETAINED_WORKSPACE_GEOMETRIES: usize = 128;
+const MAX_WORKSPACE_GEOMETRY_STORAGE_BYTES: usize = 64 * 1024;
 pub const DEFAULT_EXECUTE_ROW_LIMIT: u32 = 500;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -294,6 +297,11 @@ pub struct DbotterApp {
 
 impl DbotterApp {
     pub fn new(port: UiPort) -> Self {
+        Self::new_with_storage(port, None)
+    }
+
+    pub fn new_with_storage(port: UiPort, storage: Option<&dyn eframe::Storage>) -> Self {
+        let workspace_geometries = restore_workspace_geometries(storage);
         let mut app = Self {
             port,
             model: UiModel::default(),
@@ -316,7 +324,7 @@ impl DbotterApp {
             committed_export_destinations: HashMap::new(),
             result_export_formats: HashMap::new(),
             connection_filter: String::new(),
-            workspace_geometries: HashMap::new(),
+            workspace_geometries,
             compact_fallback: CompactFallback::default(),
             compact_restore_focus: None,
             compact_workspace: None,
@@ -343,13 +351,10 @@ impl DbotterApp {
     }
 
     fn result_snapshot(&self, result_id: ResultId) -> Option<Arc<ResultSnapshot>> {
-        self.model.workspaces.values().find_map(|workspace| {
-            workspace
-                .result
-                .as_ref()
-                .filter(|result| result.provenance.result_id == result_id)
-                .cloned()
-        })
+        self.model
+            .workspaces
+            .values()
+            .find_map(|workspace| workspace.result_snapshot(result_id))
     }
 
     fn begin_result_export_state(
@@ -358,16 +363,8 @@ impl DbotterApp {
         operation_id: OperationId,
     ) -> bool {
         for workspace in self.model.workspaces.values_mut() {
-            if workspace
-                .result
-                .as_ref()
-                .is_some_and(|result| result.provenance.result_id == result_id)
-            {
-                if workspace.result_view.begin_export(result_id, operation_id) {
-                    return true;
-                }
-                workspace.result_view.reset_for(result_id);
-                return workspace.result_view.begin_export(result_id, operation_id);
+            if workspace.result_snapshot(result_id).is_some() {
+                return workspace.begin_result_export(result_id, operation_id);
             }
         }
         false
@@ -375,7 +372,7 @@ impl DbotterApp {
 
     fn finish_result_export_state(&mut self, result_id: ResultId, operation_id: OperationId) {
         for workspace in self.model.workspaces.values_mut() {
-            let _ = workspace.result_view.finish_export(result_id, operation_id);
+            workspace.finish_result_export(result_id, operation_id);
         }
     }
 
@@ -749,11 +746,17 @@ impl DbotterApp {
             .model
             .workspaces
             .values()
-            .filter_map(|workspace| {
+            .flat_map(|workspace| {
                 workspace
-                    .result
-                    .as_ref()
-                    .map(|result| result.provenance.result_id)
+                    .result_tabs()
+                    .iter()
+                    .map(|tab| tab.snapshot().provenance.result_id)
+                    .chain(
+                        workspace
+                            .result
+                            .as_ref()
+                            .map(|result| result.provenance.result_id),
+                    )
             })
             .chain(
                 self.pending_export_destinations
@@ -3361,19 +3364,26 @@ impl DbotterApp {
         }
         let selected_area = next_area.unwrap_or(selected_area);
         if selected_area == ResultAreaTab::History {
-            if let Some(result) = selected_workspace_key.and_then(|key| {
-                self.model
-                    .workspace(&key)
-                    .and_then(|workspace| workspace.result.clone())
-            }) {
+            if let Some(workspace) = selected_workspace_key
+                .as_ref()
+                .and_then(|key| self.model.workspace(key))
+                && !workspace.result_tabs().is_empty()
+            {
                 ui.heading("Execution history");
-                ui.label(format!(
-                    "Operation {} · {} ms · {} returned rows · {} affected rows",
-                    result.provenance.operation_id.0,
-                    result.provenance.duration_ms,
-                    result.rows.len(),
-                    result.affected_rows
-                ));
+                egui::ScrollArea::vertical()
+                    .id_salt("result.history.list")
+                    .show(ui, |ui| {
+                        for tab in workspace.result_tabs().iter().rev() {
+                            let result = tab.snapshot();
+                            ui.label(format!(
+                                "Operation {} · {} ms · {} returned rows · {} affected rows",
+                                result.provenance.operation_id.0,
+                                result.provenance.duration_ms,
+                                result.rows.len(),
+                                result.affected_rows
+                            ));
+                        }
+                    });
                 ui.small("History metadata is retained in this running workspace.");
             } else {
                 ui.weak("No execution history yet");
@@ -3381,19 +3391,58 @@ impl DbotterApp {
             return;
         }
 
+        let result_tabs = selected_workspace_key
+            .as_ref()
+            .and_then(|key| self.model.workspace(key))
+            .map_or_else(Vec::new, |workspace| {
+                workspace
+                    .result_tabs()
+                    .iter()
+                    .map(|tab| (tab.id(), tab.title()))
+                    .collect::<Vec<_>>()
+            });
+        let selected_result = selected_workspace_key
+            .as_ref()
+            .and_then(|key| self.model.workspace(key))
+            .and_then(ProfileWorkspace::selected_result_tab_id);
+        let mut select_result = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("result.output.tabs")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (tab_id, title) in &result_tabs {
+                        let tab = ui.add_sized(
+                            [132.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                            egui::Button::new(title).selected(selected_result == Some(*tab_id)),
+                        );
+                        let tab = named_dynamic_author_id(
+                            tab,
+                            format!("result.output.{}", tab_id.0),
+                            "Execution result tab",
+                        );
+                        if tab.clicked() {
+                            select_result = Some(*tab_id);
+                        }
+                    }
+                });
+            });
+        if let (Some(key), Some(tab_id)) = (selected_workspace_key.clone(), select_result) {
+            let _ = self.model.workspace_mut(key).select_result_tab(tab_id);
+        }
+
         let mut result_intent = None;
-        if let Some(result) = selected_workspace_key.and_then(|key| {
+        let mut has_result = false;
+        if let Some(key) = selected_workspace_key {
             let workspace = self.model.workspace_mut(key);
-            workspace
-                .result
-                .clone()
-                .map(|result| (result, &mut workspace.result_view))
-        }) {
-            let (result, result_view) = result;
-            if let Some(intent) = result_view.show(ui, result.as_ref(), true) {
-                result_intent = Some((result, intent));
+            if let Some(result) = workspace.result.clone() {
+                has_result = true;
+                if let Some(intent) = workspace.result_view.show(ui, result.as_ref(), true) {
+                    result_intent = Some((result, intent));
+                }
+                workspace.sync_selected_result_tab_from_surface();
             }
-        } else {
+        }
+        if !has_result {
             ui.weak("No result yet");
         }
         if let Some((result, intent)) = result_intent {
@@ -3633,6 +3682,60 @@ impl eframe::App for DbotterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show_native(ui);
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let mut retained = self
+            .workspace_geometries
+            .iter()
+            .map(|(key, geometry)| (key.clone(), *geometry))
+            .collect::<Vec<_>>();
+        retained.sort_by(|left, right| {
+            left.0
+                .profile_id
+                .0
+                .cmp(&right.0.profile_id.0)
+                .then_with(|| {
+                    left.0
+                        .profile_generation
+                        .0
+                        .cmp(&right.0.profile_generation.0)
+                })
+        });
+        retained.truncate(MAX_RETAINED_WORKSPACE_GEOMETRIES);
+        if let Ok(encoded) = serde_json::to_string(&retained)
+            && encoded.len() <= MAX_WORKSPACE_GEOMETRY_STORAGE_BYTES
+        {
+            storage.set_string(WORKSPACE_GEOMETRY_STORAGE_KEY, encoded);
+        }
+    }
+}
+
+fn restore_workspace_geometries(
+    storage: Option<&dyn eframe::Storage>,
+) -> HashMap<WorkspaceKey, WorkspaceGeometry> {
+    let Some(encoded) = storage.and_then(|storage| {
+        storage
+            .get_string(WORKSPACE_GEOMETRY_STORAGE_KEY)
+            .filter(|encoded| encoded.len() <= MAX_WORKSPACE_GEOMETRY_STORAGE_BYTES)
+    }) else {
+        return HashMap::new();
+    };
+    let Ok(retained) = serde_json::from_str::<Vec<(WorkspaceKey, WorkspaceGeometry)>>(&encoded)
+    else {
+        return HashMap::new();
+    };
+    retained
+        .into_iter()
+        .take(MAX_RETAINED_WORKSPACE_GEOMETRIES)
+        .map(|(key, geometry)| {
+            let geometry = WorkspaceGeometry::restore(
+                geometry.navigator_width(),
+                geometry.editor_share(),
+                geometry.inspector_visible(),
+            );
+            (key, geometry)
+        })
+        .collect()
 }
 
 fn catalog_request_with_identity(
@@ -3961,9 +4064,31 @@ mod tests {
     use crate::ui::accessibility::{accesskit_author_node, assert_accesskit_value_confined};
     use crate::ui::adapter::{ServicePort, UiCommand, bounded_ports};
     use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
+    use crate::ui::layout::WorkspaceGeometry;
     use crate::ui::model::{ConfigPresentation, ProfileSnapshot, UiEvent, WorkspaceKey};
     use crate::ui::redis_explorer::RedisExplorerIntent;
     use eframe::egui::{self, Context, Event, Key, Modifiers, RawInput, accesskit};
+
+    #[derive(Default)]
+    struct MemoryStorage {
+        values: HashMap<String, String>,
+    }
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.values.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.values.insert(key.to_owned(), value);
+        }
+
+        fn remove_string(&mut self, key: &str) {
+            self.values.remove(key);
+        }
+
+        fn flush(&mut self) {}
+    }
 
     fn profile(driver: DriverKind, availability: DriverAvailability) -> ProfileSnapshot {
         let persisted = ConnectionProfile {
@@ -4017,6 +4142,39 @@ mod tests {
         let context = Context::default();
         context.enable_accesskit();
         let _ = context.run_ui(RawInput::default(), |ui| app.explorer_contents(ui));
+    }
+
+    #[test]
+    fn native_storage_round_trips_only_bounded_workspace_geometry_and_rejects_corruption() {
+        let (ui, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui);
+        assert!(service.try_next_command().is_some());
+        let key = WorkspaceKey::new(ProfileId("geometry".to_owned()), ProfileGeneration(7));
+        let geometry = WorkspaceGeometry::restore(360.0, 0.70, false);
+        app.workspace_geometries.insert(key.clone(), geometry);
+
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        let encoded = storage
+            .values
+            .get(super::WORKSPACE_GEOMETRY_STORAGE_KEY)
+            .expect("geometry storage value");
+        assert!(encoded.len() <= super::MAX_WORKSPACE_GEOMETRY_STORAGE_BYTES);
+        assert!(!encoded.contains("SELECT"));
+
+        let (restored_ui, mut restored_service) = bounded_ports(4);
+        let restored = DbotterApp::new_with_storage(restored_ui, Some(&storage));
+        assert!(restored_service.try_next_command().is_some());
+        assert_eq!(restored.workspace_geometries.get(&key), Some(&geometry));
+
+        storage.values.insert(
+            super::WORKSPACE_GEOMETRY_STORAGE_KEY.to_owned(),
+            "not-json".to_owned(),
+        );
+        let (corrupt_ui, mut corrupt_service) = bounded_ports(4);
+        let corrupt = DbotterApp::new_with_storage(corrupt_ui, Some(&storage));
+        assert!(corrupt_service.try_next_command().is_some());
+        assert!(corrupt.workspace_geometries.is_empty());
     }
 
     fn shell_author_ids(app: &mut DbotterApp, width: f32, height: f32) -> BTreeSet<String> {

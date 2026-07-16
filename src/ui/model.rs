@@ -95,6 +95,7 @@ impl WorkspaceKey {
 }
 
 pub const MAX_EDITOR_TABS: usize = 20;
+pub const MAX_RESULT_TABS: usize = 20;
 const MAX_EDITOR_TAB_TITLE_BYTES: usize = 120;
 const MAX_EDITOR_TAB_TEXT_BYTES: usize = 1024 * 1024;
 
@@ -169,6 +170,53 @@ pub enum ResultAreaTab {
     History,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResultTabId(pub u64);
+
+#[derive(Clone)]
+pub struct ResultTab {
+    id: ResultTabId,
+    snapshot: Arc<ResultSnapshot>,
+    view: ResultViewState,
+}
+
+impl std::fmt::Debug for ResultTab {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResultTab")
+            .field("id", &self.id)
+            .field("snapshot", &"<retained>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResultTab {
+    pub const fn id(&self) -> ResultTabId {
+        self.id
+    }
+
+    pub fn snapshot(&self) -> &Arc<ResultSnapshot> {
+        &self.snapshot
+    }
+
+    pub fn title(&self) -> String {
+        format!("Result {}", self.snapshot.provenance.operation_id.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultTabError {
+    NotFound,
+}
+
+impl std::fmt::Display for ResultTabError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("result tab is no longer available")
+    }
+}
+
+impl std::error::Error for ResultTabError {}
+
 #[derive(Clone)]
 pub struct ProfileWorkspace {
     pub editor_text: String,
@@ -193,6 +241,9 @@ pub struct ProfileWorkspace {
     selected_editor_tab: Option<EditorTabId>,
     next_editor_tab_id: u64,
     result_area_tab: ResultAreaTab,
+    result_tabs: Vec<ResultTab>,
+    selected_result_tab: Option<ResultTabId>,
+    next_result_tab_id: u64,
 }
 
 impl std::fmt::Debug for ProfileWorkspace {
@@ -203,6 +254,8 @@ impl std::fmt::Debug for ProfileWorkspace {
             .field("editor_tabs", &self.editor_tabs)
             .field("selected_editor_tab", &self.selected_editor_tab)
             .field("result_area_tab", &self.result_area_tab)
+            .field("result_tabs", &self.result_tabs)
+            .field("selected_result_tab", &self.selected_result_tab)
             .field("pending_execute", &self.pending_execute)
             .field("result", &self.result.as_ref().map(|_| "<retained>"))
             .finish_non_exhaustive()
@@ -234,6 +287,9 @@ impl Default for ProfileWorkspace {
             selected_editor_tab: None,
             next_editor_tab_id: 1,
             result_area_tab: ResultAreaTab::Results,
+            result_tabs: Vec::new(),
+            selected_result_tab: None,
+            next_result_tab_id: 1,
         }
     }
 }
@@ -367,6 +423,134 @@ impl ProfileWorkspace {
 
     pub const fn select_result_area_tab(&mut self, tab: ResultAreaTab) {
         self.result_area_tab = tab;
+    }
+
+    pub fn result_tabs(&self) -> &[ResultTab] {
+        &self.result_tabs
+    }
+
+    pub const fn selected_result_tab_id(&self) -> Option<ResultTabId> {
+        self.selected_result_tab
+    }
+
+    pub fn selected_result_tab(&self) -> Option<&ResultTab> {
+        let selected = self.selected_result_tab?;
+        self.result_tabs.iter().find(|tab| tab.id == selected)
+    }
+
+    pub fn append_result_tab(
+        &mut self,
+        snapshot: Arc<ResultSnapshot>,
+    ) -> Result<ResultTabId, ResultTabError> {
+        self.sync_selected_result_tab_from_surface();
+        if self.result_tabs.len() >= MAX_RESULT_TABS {
+            let eviction = self
+                .result_tabs
+                .iter()
+                .position(|tab| Some(tab.id) != self.selected_result_tab)
+                .unwrap_or(0);
+            self.result_tabs.remove(eviction);
+        }
+        let id = ResultTabId(self.next_result_tab_id.max(1));
+        self.next_result_tab_id = id.0.saturating_add(1);
+        let mut view = ResultViewState::default();
+        view.reset_for(snapshot.provenance.result_id);
+        self.result_tabs.push(ResultTab {
+            id,
+            snapshot: snapshot.clone(),
+            view: view.clone(),
+        });
+        self.selected_result_tab = Some(id);
+        self.result = Some(snapshot);
+        self.result_view = view;
+        self.result_area_tab = ResultAreaTab::Results;
+        Ok(id)
+    }
+
+    pub fn select_result_tab(&mut self, tab_id: ResultTabId) -> Result<(), ResultTabError> {
+        self.sync_selected_result_tab_from_surface();
+        let Some(tab) = self.result_tabs.iter().find(|tab| tab.id == tab_id) else {
+            return Err(ResultTabError::NotFound);
+        };
+        self.selected_result_tab = Some(tab_id);
+        self.result = Some(tab.snapshot.clone());
+        self.result_view = tab.view.clone();
+        self.result_area_tab = ResultAreaTab::Results;
+        Ok(())
+    }
+
+    pub(crate) fn sync_selected_result_tab_from_surface(&mut self) {
+        let Some(selected) = self.selected_result_tab else {
+            return;
+        };
+        let Some(tab) = self.result_tabs.iter_mut().find(|tab| tab.id == selected) else {
+            return;
+        };
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|result| Arc::ptr_eq(result, &tab.snapshot))
+        {
+            tab.view = self.result_view.clone();
+        }
+    }
+
+    pub(crate) fn result_snapshot(&self, result_id: ResultId) -> Option<Arc<ResultSnapshot>> {
+        self.result_tabs
+            .iter()
+            .find(|tab| tab.snapshot.provenance.result_id == result_id)
+            .map(|tab| tab.snapshot.clone())
+            .or_else(|| {
+                self.result
+                    .as_ref()
+                    .filter(|result| result.provenance.result_id == result_id)
+                    .cloned()
+            })
+    }
+
+    pub(crate) fn begin_result_export(
+        &mut self,
+        result_id: ResultId,
+        operation_id: OperationId,
+    ) -> bool {
+        self.sync_selected_result_tab_from_surface();
+        let mut accepted = false;
+        for tab in &mut self.result_tabs {
+            if tab.snapshot.provenance.result_id == result_id {
+                accepted = tab.view.begin_export(result_id, operation_id);
+                if accepted && self.selected_result_tab == Some(tab.id) {
+                    self.result_view = tab.view.clone();
+                }
+                break;
+            }
+        }
+        if accepted {
+            return true;
+        }
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|result| result.provenance.result_id == result_id)
+        {
+            if self.result_view.begin_export(result_id, operation_id) {
+                return true;
+            }
+            self.result_view.reset_for(result_id);
+            return self.result_view.begin_export(result_id, operation_id);
+        }
+        false
+    }
+
+    pub(crate) fn finish_result_export(&mut self, result_id: ResultId, operation_id: OperationId) {
+        for tab in &mut self.result_tabs {
+            if tab.snapshot.provenance.result_id == result_id {
+                let _ = tab.view.finish_export(result_id, operation_id);
+                if self.selected_result_tab == Some(tab.id) {
+                    self.result_view = tab.view.clone();
+                }
+            }
+        }
+        let _ = self.result_view.finish_export(result_id, operation_id);
     }
 
     fn load_editor_tab_into_surface(&mut self, tab_id: EditorTabId) {
@@ -944,8 +1128,7 @@ impl UiModel {
                         }
                         workspace.pending_execute = None;
                         workspace.error = None;
-                        workspace.result_view.reset_for(result.provenance.result_id);
-                        workspace.result = Some(Arc::new(result));
+                        let _ = workspace.append_result_tab(Arc::new(result));
                     }
                     self.status = format!("Query finished in {duration_ms} ms");
                     self.connection_states.insert(

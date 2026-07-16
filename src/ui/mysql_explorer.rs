@@ -10,7 +10,7 @@ use crate::model::{
     CatalogRequest, OperationId, PublicSummary,
 };
 
-use super::accessibility::named_author_id;
+use super::accessibility::{named_author_id, named_dynamic_author_id};
 use super::theme::OpenAiTheme;
 
 const OPENAI_CANVAS: egui::Color32 = egui::Color32::WHITE;
@@ -381,15 +381,17 @@ impl MySqlExplorerState {
             if relations.nodes.is_empty() {
                 ui.label(egui::RichText::new("No relations match.").color(OPENAI_INK_60));
             }
-            for relation_node in relations.nodes {
+            for (relation_index, relation_node) in relations.nodes.into_iter().enumerate() {
                 let CatalogNodeIdentity::Relation { relation, .. } = relation_node.identity else {
                     continue;
                 };
+                let relation_kind = relation_node.kind;
                 let relation_key = (schema.to_owned(), relation.clone());
                 let expanded = self.expanded_relations.contains(&relation_key);
+                let author_scope = stable_author_scope(schema);
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
-                    let kind = match relation_node.kind {
+                    let kind = match relation_kind {
                         CatalogNodeKind::View => "View",
                         CatalogNodeKind::Table => "Table",
                         CatalogNodeKind::Schema | CatalogNodeKind::Column => "Relation",
@@ -398,12 +400,14 @@ impl MySqlExplorerState {
                         egui::RichText::new(format!("{} · {kind}", relation_node.name))
                             .color(OPENAI_INK),
                     );
-                    let label = if expanded {
-                        "Hide columns"
-                    } else {
-                        "Show columns"
-                    };
-                    if secondary_button(ui, label, !self.is_pending()).clicked() {
+                    let structure_author_id = "navigator.object.structure";
+                    let structure = secondary_button(ui, "Structure", !self.is_pending());
+                    let structure = named_dynamic_author_id(
+                        structure,
+                        format!("{structure_author_id}.{author_scope:x}.{relation_index}"),
+                        "Open relation structure",
+                    );
+                    if structure.clicked() {
                         if expanded {
                             self.expanded_relations.remove(&relation_key);
                         } else {
@@ -421,22 +425,21 @@ impl MySqlExplorerState {
                             }
                         }
                     }
-                    if self.branches.contains_key(&BranchKey::Columns(
-                        relation_key.0.clone(),
-                        relation.clone(),
-                    )) && secondary_button(ui, "Refresh columns", !self.is_pending()).clicked()
-                    {
-                        intents.push(MySqlExplorerIntent::LoadColumns {
-                            schema: schema.to_owned(),
-                            relation: relation.clone(),
-                            prefix: normalized_prefix(&self.prefix),
-                            token: None,
-                        });
-                    }
-                    if secondary_button(ui, "Insert SELECT", true).clicked() {
+                    let data_author_id = "navigator.object.data";
+                    let data_available = relation_kind == CatalogNodeKind::Table;
+                    let data = secondary_button(ui, "Data", data_available);
+                    let data = named_dynamic_author_id(
+                        data,
+                        format!("{data_author_id}.{author_scope:x}.{relation_index}"),
+                        "Open bounded table data query",
+                    );
+                    if data.clicked() && data_available {
                         intents.push(MySqlExplorerIntent::InsertTemplate(
                             bounded_select_template(schema, &relation),
                         ));
+                    }
+                    if relation_kind == CatalogNodeKind::View {
+                        ui.small("View data unavailable: nested view safety is not proven.");
                     }
                 });
                 if self.expanded_relations.contains(&relation_key) {
@@ -503,6 +506,15 @@ impl MySqlExplorerState {
             }
         });
     }
+}
+
+fn stable_author_scope(value: &str) -> u64 {
+    value
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 fn branch_for_request(request: &CatalogRequest) -> BranchKey {

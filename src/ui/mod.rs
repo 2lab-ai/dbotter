@@ -31,8 +31,8 @@ pub use layout::{
 };
 pub use model::{
     ConfigPresentation, ConnectionFailureOutcome, ConnectionState, EditorTab, EditorTabError,
-    EditorTabId, PostCloseState, ProfileSnapshot, ProfileWorkspace, ResultAreaTab, UiEvent,
-    UiModel, WorkspaceKey,
+    EditorTabId, PostCloseState, ProfileSnapshot, ProfileWorkspace, ResultAreaTab, ResultTab,
+    ResultTabError, ResultTabId, UiEvent, UiModel, WorkspaceKey,
 };
 pub use mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 pub use native_harness::NativeUiHarness;
@@ -66,7 +66,14 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<(), AppError> {
     let native_result = eframe::run_native(
         "dbotter",
         options,
-        Box::new(move |_| Ok(Box::new(app::DbotterApp::new(ui)))),
+        Box::new(move |creation| {
+            let app = if creation.storage.is_some() {
+                app::DbotterApp::new_with_storage(ui, creation.storage)
+            } else {
+                app::DbotterApp::new(ui)
+            };
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|error| AppError::Desktop(error.to_string()));
     let _ = shutdown.request_shutdown();
