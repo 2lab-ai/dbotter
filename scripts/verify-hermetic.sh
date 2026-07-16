@@ -59,6 +59,8 @@ required_inputs=(
   scripts/dispatch-and-verify-tap.sh
   scripts/build-linux-artifact.sh
   scripts/validate-tap-dispatch.py
+  scripts/check-installed-receipt-contract.sh
+  scripts/validate-installed-receipt-config-contract.py
   scripts/test-installed-receipt-contract.sh
   scripts/test-macos-package-contract.sh
   scripts/test-macos-package-live.sh
@@ -132,10 +134,13 @@ jq -e \
   ' <<<"$identity_json" >/dev/null || fail "source-built identity is not exact"
 jq -e '
   type == "object"
-  and (keys | sort) == ["migration_backup_suffix", "read_versions", "write_version"]
-  and .read_versions == [1, 2]
-  and .write_version == 2
-  and .migration_backup_suffix == ".v1.bak"
+  and (keys | sort) == ["migration_backup_suffixes", "read_versions", "write_version"]
+  and .read_versions == [1, 2, 3]
+  and .write_version == 3
+  and (.migration_backup_suffixes | type == "object")
+  and (.migration_backup_suffixes | (keys | sort) == ["1", "2"])
+  and .migration_backup_suffixes["1"] == ".v1.bak"
+  and .migration_backup_suffixes["2"] == ".v2.bak"
 ' <<<"$config_json" >/dev/null || fail "source-built config contract is not exact"
 
 mkdir -p artifacts

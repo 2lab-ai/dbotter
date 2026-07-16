@@ -159,10 +159,13 @@ jobs:
               and .arch == $arch
             ' <<<"$identity" >/dev/null
           jq -e '
-            (keys | sort) == ["migration_backup_suffix", "read_versions", "write_version"]
-            and .read_versions == [1, 2]
-            and .write_version == 2
-            and .migration_backup_suffix == ".v1.bak"
+            (keys | sort) == ["migration_backup_suffixes", "read_versions", "write_version"]
+            and .read_versions == [1, 2, 3]
+            and .write_version == 3
+            and (.migration_backup_suffixes | type == "object")
+            and (.migration_backup_suffixes | (keys | sort) == ["1", "2"])
+            and .migration_backup_suffixes["1"] == ".v1.bak"
+            and .migration_backup_suffixes["2"] == ".v2.bak"
           ' <<<"$config" >/dev/null
 
       - name: Package signed macOS app

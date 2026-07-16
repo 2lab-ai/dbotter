@@ -3,7 +3,7 @@
     "name": "identity-config-conflation",
     "operation": "set",
     "path": ["identity", "read_versions"],
-    "value": [1, 2]
+    "value": [1, 2, 3]
   },
   {
     "name": "missing-disclosure-assertion",
@@ -62,6 +62,47 @@
     "name": "config-contract-mismatch",
     "operation": "set",
     "path": ["config_contract", "write_version"],
+    "value": 1
+  },
+  {
+    "name": "config-contract-read-version-bool",
+    "operation": "set",
+    "path": ["config_contract", "read_versions", 0],
+    "value": true
+  },
+  {
+    "name": "config-contract-read-versions-float",
+    "operation": "set",
+    "path": ["config_contract", "read_versions"],
+    "value": [1.0, 2.0, 3.0]
+  },
+  {
+    "name": "config-contract-write-version-bool",
+    "operation": "set",
+    "path": ["config_contract", "write_version"],
+    "value": true
+  },
+  {
+    "name": "config-contract-write-version-float",
+    "operation": "set",
+    "path": ["config_contract", "write_version"],
+    "value": 3.0
+  },
+  {
+    "name": "config-contract-missing-v2-suffix",
+    "operation": "remove",
+    "path": ["config_contract", "migration_backup_suffixes", "2"]
+  },
+  {
+    "name": "config-contract-extra-suffix",
+    "operation": "set",
+    "path": ["config_contract", "migration_backup_suffixes", "3"],
+    "value": ".v3.bak"
+  },
+  {
+    "name": "config-contract-suffix-type",
+    "operation": "set",
+    "path": ["config_contract", "migration_backup_suffixes", "1"],
     "value": 1
   },
   {

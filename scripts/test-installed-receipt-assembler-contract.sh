@@ -63,6 +63,10 @@ expect_reject() {
 }
 
 expect_reject source-overall source '.source.assertions.overall = false'
+expect_reject source-config-bool source '.source.build.config_contract.read_versions = [true, 2, 3]'
+expect_reject source-config-suffix-missing source 'del(.source.build.config_contract.migration_backup_suffixes["2"])'
+expect_reject source-config-suffix-extra source '.source.build.config_contract.migration_backup_suffixes["3"] = ".v3.bak"'
+expect_reject source-config-suffix-type source '.source.build.config_contract.migration_backup_suffixes["1"] = 1'
 expect_reject package-source package '.package.source_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
 expect_reject live-v1-schema live '.live.schema = "dbotter.live-contract-receipt.v1"'
 expect_reject live-source live '.live.source.commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'

@@ -42,7 +42,8 @@ TOP_LEVEL_KEYS = {
     "created_at",
     "artifacts",
 }
-CONFIG_KEYS = {"read_versions", "write_version", "migration_backup_suffix"}
+CONFIG_KEYS = {"read_versions", "write_version", "migration_backup_suffixes"}
+MIGRATION_BACKUP_SUFFIX_KEYS = {"1", "2"}
 MACOS_ARTIFACT_KEYS = {
     "target",
     "arch",
@@ -129,15 +130,22 @@ def require_positive_integer(value: Any, location: str) -> int:
 def require_config_contract(value: Any, location: str) -> dict[str, Any]:
     config = require_exact_object(value, CONFIG_KEYS, location)
     read_versions = config["read_versions"]
+    backup_suffixes = require_exact_object(
+        config["migration_backup_suffixes"],
+        MIGRATION_BACKUP_SUFFIX_KEYS,
+        f"{location}.migration_backup_suffixes",
+    )
     if (
         not isinstance(read_versions, list)
-        or len(read_versions) != 2
+        or len(read_versions) != 3
         or any(type(version) is not int for version in read_versions)
-        or read_versions != [1, 2]
+        or read_versions != [1, 2, 3]
         or type(config["write_version"]) is not int
-        or config["write_version"] != 2
-        or type(config["migration_backup_suffix"]) is not str
-        or config["migration_backup_suffix"] != ".v1.bak"
+        or config["write_version"] != 3
+        or type(backup_suffixes["1"]) is not str
+        or backup_suffixes["1"] != ".v1.bak"
+        or type(backup_suffixes["2"]) is not str
+        or backup_suffixes["2"] != ".v2.bak"
     ):
         raise ContractError(f"{location} is not the exact typed three-field contract")
     return config

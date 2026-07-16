@@ -9,10 +9,13 @@ def timestamp: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[
 def absolute_path: type == "string" and startswith("/") and (test("[[:cntrl:]]") | not);
 
 def config_contract:
-  exact_keys(["read_versions", "write_version", "migration_backup_suffix"])
-  and .read_versions == [1, 2]
-  and .write_version == 2
-  and .migration_backup_suffix == ".v1.bak";
+  exact_keys(["read_versions", "write_version", "migration_backup_suffixes"])
+  and .read_versions == [1, 2, 3]
+  and .write_version == 3
+  and (.migration_backup_suffixes |
+    exact_keys(["1", "2"])
+    and .["1"] == ".v1.bak"
+    and .["2"] == ".v2.bak");
 
 def binary_identity:
   exact_keys(["package_version", "channel", "build_id", "source_sha", "target", "arch"])

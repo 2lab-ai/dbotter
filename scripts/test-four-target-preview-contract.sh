@@ -44,9 +44,9 @@ jq -n \
     version: $version,
     package_version: $package_version,
     config_contract: {
-      read_versions: [1, 2],
-      write_version: 2,
-      migration_backup_suffix: ".v1.bak"
+      read_versions: [1, 2, 3],
+      write_version: 3,
+      migration_backup_suffixes: {"1": ".v1.bak", "2": ".v2.bak"}
     },
     run_id: 123456789,
     run_attempt: 2,

@@ -176,9 +176,9 @@ assert_type_confused_manifest_rejected() {
       | .tap.formula_blob = $formula_blob
       | .tap.formula_sha256 = $formula_sha256
       | .preflight.candidate.config_contract = {
-          read_versions: [1, 2],
-          write_version: 2,
-          migration_backup_suffix: ".v1.bak"
+          read_versions: [1, 2, 3],
+          write_version: 3,
+          migration_backup_suffixes: {"1": ".v1.bak", "2": ".v2.bak"}
         }
     ' "$proof" >"$candidate_proof"
 
@@ -200,11 +200,19 @@ assert_type_confused_manifest_rejected() {
 }
 
 assert_type_confused_manifest_rejected \
-  read_versions_bool '.config_contract.read_versions = [true, 2]'
+  read_versions_bool '.config_contract.read_versions = [true, 2, 3]'
 assert_type_confused_manifest_rejected \
-  read_versions_float '.config_contract.read_versions = [1.0, 2.0]'
+  read_versions_float '.config_contract.read_versions = [1.0, 2.0, 3.0]'
 assert_type_confused_manifest_rejected \
-  write_version_float '.config_contract.write_version = 2.0'
+  write_version_float '.config_contract.write_version = 3.0'
+assert_type_confused_manifest_rejected \
+  migration_suffixes_not_object '.config_contract.migration_backup_suffixes = ".v1.bak"'
+assert_type_confused_manifest_rejected \
+  migration_suffixes_missing_v2 'del(.config_contract.migration_backup_suffixes["2"])'
+assert_type_confused_manifest_rejected \
+  migration_suffixes_extra '.config_contract.migration_backup_suffixes["3"] = ".v3.bak"'
+assert_type_confused_manifest_rejected \
+  migration_suffixes_v1_non_string '.config_contract.migration_backup_suffixes["1"] = 1'
 
 missing_preflight="$tmp_dir/missing-preflight.json"
 jq 'del(.preflight)' "$proof" >"$missing_preflight"
@@ -239,14 +247,14 @@ if "${validate[@]/$proof/$wrong_candidate_config_type}" >/dev/null 2>&1; then
 fi
 
 wrong_candidate_config_float="$tmp_dir/wrong-candidate-config-float.json"
-jq '.preflight.candidate.config_contract.read_versions = [1.0, 2.0]' \
+jq '.preflight.candidate.config_contract.read_versions = [1.0, 2.0, 3.0]' \
   "$proof" >"$wrong_candidate_config_float"
 if "${validate[@]/$proof/$wrong_candidate_config_float}" >/dev/null 2>&1; then
   fail "proof accepted floating-point candidate read versions"
 fi
 
 wrong_candidate_write_float="$tmp_dir/wrong-candidate-write-float.json"
-jq '.preflight.candidate.config_contract.write_version = 2.0' \
+jq '.preflight.candidate.config_contract.write_version = 3.0' \
   "$proof" >"$wrong_candidate_write_float"
 if "${validate[@]/$proof/$wrong_candidate_write_float}" >/dev/null 2>&1; then
   fail "proof accepted a floating-point candidate write version"

@@ -21,7 +21,7 @@
   "release": {
     "tag": "preview-2026-07-15-123456-123456789-2-0123456789ab",
     "manifest_url": "https://github.com/2lab-ai/dbotter/releases/download/preview-2026-07-15-123456-123456789-2-0123456789ab/preview-manifest.json",
-    "manifest_sha256": "5cbf656cee423d071fb5202a81d14f5aebc86a9204e6b77e9eba2368010a0b74",
+    "manifest_sha256": "6b2eb980ef5cd74ac35b38e56d2a6314efa524fc6db64a681f3f4595ea521fa0",
     "version": "2026.07.15.123456.123456789.2"
   },
   "formula": {
@@ -62,9 +62,9 @@
     "arch": "x86_64"
   },
   "config_contract": {
-    "read_versions": [1, 2],
-    "write_version": 2,
-    "migration_backup_suffix": ".v1.bak"
+    "read_versions": [1, 2, 3],
+    "write_version": 3,
+    "migration_backup_suffixes": {"1": ".v1.bak", "2": ".v2.bak"}
   },
   "checks": {
     "version": true,

@@ -104,10 +104,13 @@ jq -e '
 ' <<<"$identity_json" >/dev/null || fail "binary identity is not the exact preview six-field object"
 jq -e '
   type == "object"
-  and (keys | sort) == ["migration_backup_suffix", "read_versions", "write_version"]
-  and .read_versions == [1, 2]
-  and .write_version == 2
-  and .migration_backup_suffix == ".v1.bak"
+  and (keys | sort) == ["migration_backup_suffixes", "read_versions", "write_version"]
+  and .read_versions == [1, 2, 3]
+  and .write_version == 3
+  and (.migration_backup_suffixes | type == "object")
+  and (.migration_backup_suffixes | (keys | sort) == ["1", "2"])
+  and .migration_backup_suffixes["1"] == ".v1.bak"
+  and .migration_backup_suffixes["2"] == ".v2.bak"
 ' <<<"$config_json" >/dev/null || fail "binary config contract is not the exact approved object"
 
 package_version="$(jq -r '.package_version' <<<"$identity_json")"

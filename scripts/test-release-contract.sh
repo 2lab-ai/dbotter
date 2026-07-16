@@ -25,9 +25,13 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 typed_config_cases='[
-  {"name":"read_versions_bool","filter":".config_contract.read_versions = [true, 2]"},
-  {"name":"read_versions_float","filter":".config_contract.read_versions = [1.0, 2.0]"},
-  {"name":"write_version_float","filter":".config_contract.write_version = 2.0"}
+  {"name":"read_versions_bool","filter":".config_contract.read_versions = [true, 2, 3]"},
+  {"name":"read_versions_float","filter":".config_contract.read_versions = [1.0, 2.0, 3.0]"},
+  {"name":"write_version_float","filter":".config_contract.write_version = 3.0"},
+  {"name":"migration_suffixes_not_object","filter":".config_contract.migration_backup_suffixes = \".v1.bak\""},
+  {"name":"migration_suffixes_missing_v2","filter":"del(.config_contract.migration_backup_suffixes[\"2\"])"},
+  {"name":"migration_suffixes_extra","filter":".config_contract.migration_backup_suffixes[\"3\"] = \".v3.bak\""},
+  {"name":"migration_suffixes_v1_non_string","filter":".config_contract.migration_backup_suffixes[\"1\"] = 1"}
 ]'
 typed_config_case_count="$(jq 'length' <<<"$typed_config_cases")"
 typed_config_case_index=0
@@ -37,7 +41,7 @@ while [ "$typed_config_case_index" -lt "$typed_config_case_count" ]; do
   candidate="$tmp_dir/typed-$name.json"
   jq "$filter" "$valid_manifest" >"$candidate"
   if ./scripts/check-release-contract.sh --manifest "$candidate" >/dev/null 2>&1; then
-    fail "type-confused config contract was accepted: $name"
+    fail "invalid config contract was accepted: $name"
   fi
   typed_config_case_index=$((typed_config_case_index + 1))
 done

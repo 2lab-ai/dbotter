@@ -32,9 +32,9 @@ URI_SECRET_RE = re.compile(
     re.IGNORECASE,
 )
 CONFIG_CONTRACT = {
-    "read_versions": [1, 2],
-    "write_version": 2,
-    "migration_backup_suffix": ".v1.bak",
+    "read_versions": [1, 2, 3],
+    "write_version": 3,
+    "migration_backup_suffixes": {"1": ".v1.bak", "2": ".v2.bak"},
 }
 APP_BUNDLE_ID = "ai.2lab.dbotter.preview"
 ICON_SHA256 = "5548922d61e5d3bc0dda0abe795e8dd77afda63a763c5482815e262d718559bd"
@@ -233,10 +233,27 @@ def require_live_receipt(
 
 
 def require_config(value: Any, location: str) -> dict[str, Any]:
-    exact(value, set(CONFIG_CONTRACT), location)
-    if value != CONFIG_CONTRACT:
+    config = exact(value, set(CONFIG_CONTRACT), location)
+    read_versions = config["read_versions"]
+    backup_suffixes = exact(
+        config["migration_backup_suffixes"],
+        set(CONFIG_CONTRACT["migration_backup_suffixes"]),
+        f"{location}.migration_backup_suffixes",
+    )
+    if (
+        not isinstance(read_versions, list)
+        or len(read_versions) != 3
+        or any(type(version) is not int for version in read_versions)
+        or read_versions != [1, 2, 3]
+        or type(config["write_version"]) is not int
+        or config["write_version"] != 3
+        or type(backup_suffixes["1"]) is not str
+        or backup_suffixes["1"] != ".v1.bak"
+        or type(backup_suffixes["2"]) is not str
+        or backup_suffixes["2"] != ".v2.bak"
+    ):
         raise AssembleError(f"{location} is not the approved config contract")
-    return value
+    return config
 
 
 def require_identity(value: Any, location: str) -> dict[str, Any]:

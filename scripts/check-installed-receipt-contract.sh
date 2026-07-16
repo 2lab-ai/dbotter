@@ -38,6 +38,7 @@ command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 
 "$root/scripts/validate-preview-manifest.py" "$manifest" >/dev/null
 "$root/scripts/validate-receipt-timestamps.py" "$receipt" >/dev/null
+python3 "$root/scripts/validate-installed-receipt-config-contract.py" "$receipt" >/dev/null
 manifest_sha256=$(receipt_sha256_file "$manifest")
 
 if receipt_candidate_has_static_leak "$receipt"; then

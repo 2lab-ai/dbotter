@@ -35,11 +35,19 @@
     "config_contract": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["read_versions", "write_version", "migration_backup_suffix"],
+      "required": ["read_versions", "write_version", "migration_backup_suffixes"],
       "properties": {
-        "read_versions": {"const": [1, 2]},
-        "write_version": {"const": 2},
-        "migration_backup_suffix": {"const": ".v1.bak"}
+        "read_versions": {"type": "array", "const": [1, 2, 3]},
+        "write_version": {"type": "integer", "const": 3},
+        "migration_backup_suffixes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["1", "2"],
+          "properties": {
+            "1": {"type": "string", "const": ".v1.bak"},
+            "2": {"type": "string", "const": ".v2.bak"}
+          }
+        }
       }
     },
     "run_id": {"type": "integer", "minimum": 1},

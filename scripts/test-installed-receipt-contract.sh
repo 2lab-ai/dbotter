@@ -25,22 +25,29 @@ case_count=$(jq 'length' "$cases")
 index=0
 while [ "$index" -lt "$case_count" ]; do
   name=$(jq -r ".[$index].name" "$cases")
-  operation=$(jq -r ".[$index].operation" "$cases")
-  path=$(jq -c ".[$index].path" "$cases")
   candidate="$tmp_dir/$index.json"
-  case "$operation" in
-    set)
-      value=$(jq -c ".[$index].value" "$cases")
-      jq --argjson path "$path" --argjson value "$value" \
-        'setpath($path; $value)' "$valid" >"$candidate"
-      ;;
-    remove)
-      jq --argjson path "$path" 'delpaths([$path])' "$valid" >"$candidate"
-      ;;
-    *)
-      fail "unknown fixture operation: $operation"
-      ;;
-  esac
+  python3 - "$cases" "$index" "$valid" "$candidate" <<'PY'
+import json
+import pathlib
+import sys
+
+cases_path, index, valid_path, candidate_path = sys.argv[1:]
+case = json.loads(pathlib.Path(cases_path).read_text(encoding="utf-8"))[int(index)]
+document = json.loads(pathlib.Path(valid_path).read_text(encoding="utf-8"))
+cursor = document
+for component in case["path"][:-1]:
+    cursor = cursor[component]
+leaf = case["path"][-1]
+if case["operation"] == "set":
+    cursor[leaf] = case["value"]
+elif case["operation"] == "remove":
+    del cursor[leaf]
+else:
+    raise SystemExit(f"unknown fixture operation: {case['operation']}")
+pathlib.Path(candidate_path).write_text(
+    json.dumps(document, indent=2) + "\n", encoding="utf-8"
+)
+PY
   if "$root/scripts/check-installed-receipt-contract.sh" \
     --manifest "$manifest" "$candidate" >/dev/null 2>&1; then
     fail "invalid installed receipt was accepted: $name"

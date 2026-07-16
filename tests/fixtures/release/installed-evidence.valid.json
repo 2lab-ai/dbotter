@@ -23,9 +23,9 @@
         "arch": "x86_64"
       },
       "config_contract": {
-        "read_versions": [1, 2],
-        "write_version": 2,
-        "migration_backup_suffix": ".v1.bak"
+        "read_versions": [1, 2, 3],
+        "write_version": 3,
+        "migration_backup_suffixes": {"1": ".v1.bak", "2": ".v2.bak"}
       }
     },
     "started_at": "2026-07-15T13:00:00Z",
@@ -69,9 +69,9 @@
       "arch": "x86_64"
     },
     "config_contract": {
-      "read_versions": [1, 2],
-      "write_version": 2,
-      "migration_backup_suffix": ".v1.bak"
+      "read_versions": [1, 2, 3],
+      "write_version": 3,
+      "migration_backup_suffixes": {"1": ".v1.bak", "2": ".v2.bak"}
     }
   },
   "live": {
@@ -712,7 +712,7 @@
     "schema": "dbotter.installed-cli-evidence.v1",
     "started_at": "2026-07-15T13:05:00Z",
     "source_sha": "0123456789abcdef0123456789abcdef01234567",
-    "manifest_sha256": "5cbf656cee423d071fb5202a81d14f5aebc86a9204e6b77e9eba2368010a0b74",
+    "manifest_sha256": "6b2eb980ef5cd74ac35b38e56d2a6314efa524fc6db64a681f3f4595ea521fa0",
     "formula": {"name": "dbotter-preview", "version": "2026.07.15.123456.123456789.2"},
     "app": {
       "path": "/usr/local/opt/dbotter-preview/Dbotter Preview.app",
@@ -743,9 +743,9 @@
       "arch": "x86_64"
     },
     "config_contract": {
-      "read_versions": [1, 2],
-      "write_version": 2,
-      "migration_backup_suffix": ".v1.bak"
+      "read_versions": [1, 2, 3],
+      "write_version": 3,
+      "migration_backup_suffixes": {"1": ".v1.bak", "2": ".v2.bak"}
     },
     "assertions": {
       "formula": true,
@@ -865,7 +865,7 @@
     "version": "2026.07.15.123456.123456789.2",
     "prefix": "/usr/local/opt/dbotter-preview",
     "manifest_url": "https://github.com/2lab-ai/dbotter/releases/download/preview-2026-07-15-123456-123456789-2-0123456789ab/preview-manifest.json",
-    "manifest_sha256": "5cbf656cee423d071fb5202a81d14f5aebc86a9204e6b77e9eba2368010a0b74",
+    "manifest_sha256": "6b2eb980ef5cd74ac35b38e56d2a6314efa524fc6db64a681f3f4595ea521fa0",
     "assertions": {"tap_dispatch": true, "manifest": true, "install": true, "overall": true}
   }
 }

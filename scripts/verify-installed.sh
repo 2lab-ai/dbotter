@@ -140,8 +140,16 @@ jq -e \
   ' <<<"$identity_json" >/dev/null || fail "installed six-field identity mismatch"
 jq -e \
   --argjson expected "$(jq -c '.config_contract' "$manifest")" \
-  '(keys | sort) == ["migration_backup_suffix", "read_versions", "write_version"] and . == $expected' \
-  <<<"$config_json" >/dev/null || fail "installed three-field config contract mismatch"
+  'type == "object"
+   and (keys | sort) == ["migration_backup_suffixes", "read_versions", "write_version"]
+   and .read_versions == [1, 2, 3]
+   and .write_version == 3
+   and (.migration_backup_suffixes | type == "object")
+   and (.migration_backup_suffixes | (keys | sort) == ["1", "2"])
+   and .migration_backup_suffixes["1"] == ".v1.bak"
+   and .migration_backup_suffixes["2"] == ".v2.bak"
+   and . == $expected' \
+  <<<"$config_json" >/dev/null || fail "installed config contract mismatch"
 
 formula_line="$(brew list --versions dbotter-preview)"
 formula_version="$(awk '{print $2}' <<<"$formula_line")"

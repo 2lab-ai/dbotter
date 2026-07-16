@@ -60,6 +60,7 @@ for executable in \
   scripts/dispatch-and-verify-tap.sh \
   scripts/build-linux-artifact.sh \
   scripts/check-installed-receipt-contract.sh \
+  scripts/validate-installed-receipt-config-contract.py \
   scripts/build-macos-app.sh \
   scripts/build-icns.py \
   scripts/validate-macos-package.py \
@@ -107,6 +108,10 @@ require_literal scripts/verify-hermetic.sh 'src/export.rs'
 require_literal scripts/verify-hermetic.sh 'tests/export_file_contract.rs'
 require_literal scripts/verify-hermetic.sh 'scripts/native-ax-driver.swift'
 require_literal scripts/verify-hermetic.sh 'scripts/build-native-ax-driver.sh'
+require_literal scripts/verify-hermetic.sh 'scripts/check-installed-receipt-contract.sh'
+require_literal scripts/verify-hermetic.sh 'scripts/validate-installed-receipt-config-contract.py'
+require_literal scripts/check-installed-receipt-contract.sh \
+  'python3 "$root/scripts/validate-installed-receipt-config-contract.py" "$receipt"'
 require_literal scripts/verify-live-contracts.sh 'p4_live_catalog_fixture_proves_pages_caps_permissions_and_cli'
 require_literal scripts/verify-live-contracts.sh 'live_mysql_safety_receipt'
 require_literal scripts/verify-live-contracts.sh 'redis_live_receipt'

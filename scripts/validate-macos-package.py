@@ -70,9 +70,9 @@ RECEIPT_KEYS = {
 }
 IDENTITY_KEYS = {"package_version", "channel", "build_id", "source_sha", "target", "arch"}
 CONFIG = {
-    "read_versions": [1, 2],
-    "write_version": 2,
-    "migration_backup_suffix": ".v1.bak",
+    "read_versions": [1, 2, 3],
+    "write_version": 3,
+    "migration_backup_suffixes": {"1": ".v1.bak", "2": ".v2.bak"},
 }
 ICON_MEMBERS = {
     "icon_16x16.png": 16,
@@ -119,6 +119,30 @@ def exact_object(value: Any, keys: set[str], location: str) -> dict[str, Any]:
             f"extra={sorted(actual - keys)}"
         )
     return value
+
+
+def exact_config_contract(value: Any, location: str) -> dict[str, Any]:
+    config = exact_object(value, set(CONFIG), location)
+    read_versions = config["read_versions"]
+    backup_suffixes = exact_object(
+        config["migration_backup_suffixes"],
+        set(CONFIG["migration_backup_suffixes"]),
+        f"{location}.migration_backup_suffixes",
+    )
+    if (
+        not isinstance(read_versions, list)
+        or len(read_versions) != 3
+        or any(type(version) is not int for version in read_versions)
+        or read_versions != [1, 2, 3]
+        or type(config["write_version"]) is not int
+        or config["write_version"] != 3
+        or type(backup_suffixes["1"]) is not str
+        or backup_suffixes["1"] != ".v1.bak"
+        or type(backup_suffixes["2"]) is not str
+        or backup_suffixes["2"] != ".v2.bak"
+    ):
+        raise ContractError(f"{location} is not the exact typed contract")
+    return config
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -178,9 +202,10 @@ def validate(args: argparse.Namespace) -> None:
             raise ContractError(f"{location} must be a regular file, not a link")
 
     identity = exact_object(run_json([str(embedded), "version", "--format", "json"], "identity"), IDENTITY_KEYS, "identity")
-    config = run_json([str(embedded), "config-contract", "--format", "json"], "config contract")
-    if config != CONFIG:
-        raise ContractError("embedded executable config contract is not exact")
+    config = exact_config_contract(
+        run_json([str(embedded), "config-contract", "--format", "json"], "config contract"),
+        "config contract",
+    )
     if identity["channel"] != "preview" or identity["source_sha"] != args.expected_source_sha:
         raise ContractError("embedded executable is not bound to expected preview source")
     if f"preview-{identity['build_id']}" != args.expected_tag:
