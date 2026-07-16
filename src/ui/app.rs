@@ -6848,6 +6848,52 @@ mod tests {
     }
 
     #[test]
+    fn actual_status_strip_reports_and_clears_selected_result_metrics() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        let result_tab = app
+            .model
+            .workspace_mut(key.clone())
+            .append_result_tab(Arc::new(result_snapshot(&profile, "visible")))
+            .expect("result tab");
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let with_result = context.run_ui(RawInput::default(), |ui| app.show_status_strip(ui));
+        let with_result = with_result
+            .platform_output
+            .accesskit_update
+            .expect("status strip must emit AccessKit");
+        let (_, result_status) = accesskit_author_node(&with_result, "status.result");
+        assert_eq!(result_status.label(), Some("Selected result summary"));
+        assert_eq!(
+            result_status.value(),
+            Some("4 ms · 1 returned · 0 affected · Complete")
+        );
+
+        app.model
+            .workspace_mut(key)
+            .close_result_tab(result_tab)
+            .expect("last result closes");
+        let without_result = context.run_ui(RawInput::default(), |ui| app.show_status_strip(ui));
+        let without_result = without_result
+            .platform_output
+            .accesskit_update
+            .expect("empty status strip must emit AccessKit");
+        let (_, result_status) = accesskit_author_node(&without_result, "status.result");
+        assert_eq!(result_status.value(), Some("None"));
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
     fn result_export_submission_owns_pending_state_and_commits_only_the_correlated_path() {
         let directory = tempfile::tempdir().expect("tempdir");
         let destination = directory.path().join("result.json");
