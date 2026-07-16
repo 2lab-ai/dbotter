@@ -1616,6 +1616,58 @@ mod tests {
     }
 
     #[test]
+    fn actual_profile_posture_controls_have_stable_ids_state_order_and_44pt_geometry() {
+        let mut editor = valid_editor(DriverKind::MySql);
+        let update = profile_accesskit_update(&mut editor);
+        let expected_order = [
+            "profile.posture.environment.development",
+            "profile.posture.environment.production",
+            "profile.posture.access.read_write",
+            "profile.posture.access.read_only",
+        ];
+        let actual_order = author_order(&update);
+        let positions = expected_order.map(|author_id| {
+            actual_order
+                .iter()
+                .position(|actual| actual == author_id)
+                .unwrap_or_else(|| panic!("missing ordered posture AX id {author_id}"))
+        });
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+
+        for author_id in expected_order {
+            let node = author_node(&update, author_id).1;
+            assert_eq!(node.role(), accesskit::Role::RadioButton, "{author_id}");
+            assert!(node.supports_action(accesskit::Action::Focus), "{author_id}");
+            assert!(node.supports_action(accesskit::Action::Click), "{author_id}");
+            let bounds = node
+                .bounds()
+                .unwrap_or_else(|| panic!("{author_id} must expose actual bounds"));
+            assert!(
+                bounds.height() >= f64::from(crate::ui::theme::OpenAiTheme::MIN_CONTROL_HEIGHT),
+                "{author_id} was only {}pt high",
+                bounds.height()
+            );
+        }
+
+        assert_eq!(
+            author_node(&update, expected_order[0]).1.is_selected(),
+            Some(true)
+        );
+        assert_eq!(
+            author_node(&update, expected_order[1]).1.is_selected(),
+            Some(false)
+        );
+        assert_eq!(
+            author_node(&update, expected_order[2]).1.is_selected(),
+            Some(true)
+        );
+        assert_eq!(
+            author_node(&update, expected_order[3]).1.is_selected(),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn actual_profile_accesskit_confines_ca_path_and_omits_session_secret() {
         const CA_PATH: &str = "/tmp/dbotter-ca-value-sentinel.pem";
         const SECRET: &str = "dbotter-session-secret-sentinel";
