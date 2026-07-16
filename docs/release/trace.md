@@ -1,9 +1,9 @@
 # dbotter — T10 preview release vertical trace
 
-Status: **P8 release gates are GREEN; P9 has a public Preview/xbrew launch
-checkpoint, while merge-source publication, installed AX and the final receipt
-remain pending.** This trace records only the exact candidate and locally
-observed installation evidence below.
+Status: **P8 release gates are GREEN; P9 has a new exact public Preview/xbrew
+launch checkpoint at `8a22e139`, while merge-source publication, installed AX
+and the final receipt remain pending.** This trace records only the exact
+candidate and locally observed installation evidence below.
 
 Normative anchors: approved trace T10, approved plan P8/P9 and §5–§7, and
 `docs/release/spec.md`.
@@ -12,9 +12,9 @@ Normative anchors: approved trace T10, approved plan P8/P9 and §5–§7, and
 
 | ID | Scenario | Status | Required evidence |
 |---|---|---|---|
-| T10.R1 | reusable verification gates one candidate source | GREEN | run `29513008288` attempt 2; source/hermetic/live/package gates |
+| T10.R1 | reusable verification gates one candidate source | GREEN | run `29534925455`; source/hermetic/live/package gates |
 | T10.R2 | target builds become signed manifest-linked artifacts | GREEN | four target builds and immutable manifest-linked prerelease |
-| T10.R3 | immutable preview dispatches an exact tap update | GREEN | release tag and tap commit `1fcb761a7baf` |
+| T10.R3 | immutable preview dispatches an exact tap update | GREEN | release tag and tap commit `2df809aeaaed` |
 | T10.R4 | Homebrew shim and installed CLI prove exact executable | In progress | xbrew version, exact identity/config/bundle/shim proven; full check/exec/browse receipt pending |
 | T10.R5 | exact installed app completes native AX journey | In progress | exact installed PID/bundle proven; AX automation unavailable on this host |
 | T10.R6 | final typed receipt closes the source→install chain | Not started | schema/leak/digest/provenance verdicts |
@@ -22,19 +22,24 @@ Normative anchors: approved trace T10, approved plan P8/P9 and §5–§7, and
 
 ## Current published checkpoint
 
-- Source: `11a839fadadbbe6d380f516a37b1708ea4917cd1`.
-- Preview run: `29513008288`, attempt 2; attempt 1 ended before verification
-  because the hosted runner exhausted its device space.
-- Prerelease: `preview-2026-07-16-161750-29513008288-2-11a839fadadb`.
-- xbrew/Homebrew version: `2026.07.16.161750.29513008288.2`.
-- Tap formula commit: `1fcb761a7baf181a1516c56ceb5c202e14606dcc`.
+- Source: `8a22e1393134450025a275be19a97332d06317b7`.
+- Preview run: `29534925455`, attempt 1, terminal `success`; hermetic, live,
+  macOS package, four target builds, publish and tap jobs were all GREEN.
+- Prerelease: `preview-2026-07-16-213015-29534925455-1-8a22e1393134`;
+  manifest SHA-256 `78972dda57348b78bb23bea519b044528698a39b30aa9e6741d0fc8f270f00a8`.
+- xbrew/Homebrew version: `2026.07.16.213015.29534925455.1`.
+- Tap formula commit: `2df809aeaaedee82cb489b2f5e730bbe109b6748`;
+  downstream run `29537253541` was terminal `success`.
 - Local installed identity: Preview channel, source above,
   `aarch64-apple-darwin`, bundle id `ai.2lab.dbotter.preview`; the Homebrew shim
-  resolves into that formula installation.
-- Local launch: the exact installed app was launched with the isolated visual
-  fixture config and registered by LaunchServices. Computer-use AX readback
-  failed with host automation authentication errors, so no visual or AX pass is
-  claimed here.
+  resolves into that formula installation. The installed executable SHA-256 is
+  `7aa265123800f6f4b1b6b36d9f7dc654c17dfae941a937942126998aa6ae1706`,
+  and strict deep code-sign verification passed.
+- Local launch: PID `12486` runs the exact new Cellar app with isolated config
+  argument `/private/tmp/dbotter-preview-8a22e139.toml`. The prior Preview PID
+  `95507` was preserved instead of terminated. Computer-use app discovery
+  returned `procNotFound` and state readback timed out, so no visual or AX pass
+  is claimed here and the canonical stale-process precondition remains open.
 
 ## T10.R1 — reusable verification gate
 
@@ -234,9 +239,19 @@ authorize a weaker trace.
 - Attempt 1 of run `29513008288` failed before verification because the hosted
   runner exhausted device space; attempt 2 reused the same source SHA and passed
   the full Preview graph. No gate was skipped or weakened.
+- Run `29533048106` at source `195fc16d53c02998682ea46bcd2b49feaeb1a04c`
+  failed `verify/live` before any build, release or tap mutation because the
+  Redis live fixture seeded data through the newly read-only editor command
+  path. Commit `8a22e13` moved only fixture administration to a typed direct
+  Redis test connection, retained the editor-path write denial, and the exact
+  rerun `29534925455` passed the complete Preview graph.
 - This checkpoint was manually dispatched from `feat/daily-use-v1`, not a merge
   commit on `main`; P9 therefore remains incomplete even though the immutable
   prerelease, tap update and local xbrew launch succeeded.
-- The local computer-use server rejected AX readback because its sender was not
-  authenticated. Exact PID/path/bundle evidence was retained, but T10.R5 and
-  T10.R6 remain incomplete and no visual pass is claimed.
+- `xbrew install` correctly detected the prior installation; after `brew update`
+  synchronized the tap, `xbrew update 2lab-ai/tap/dbotter-preview` upgraded the
+  exact formula. The prior running Preview process was intentionally preserved,
+  so no canonical stale-process rejection or termination is claimed.
+- The local computer-use server returned `procNotFound` for app discovery and
+  timed out reading state. Exact PID/path/bundle evidence was retained, but
+  T10.R5 and T10.R6 remain incomplete and no visual pass is claimed.
