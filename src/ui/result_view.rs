@@ -61,6 +61,10 @@ impl fmt::Debug for ResultViewState {
 }
 
 impl ResultViewState {
+    pub(crate) const fn has_pending_export(&self) -> bool {
+        self.pending_export.is_some()
+    }
+
     pub(crate) fn reset_for(&mut self, result_id: ResultId) {
         self.result_id = Some(result_id);
         self.selected_rows.clear();

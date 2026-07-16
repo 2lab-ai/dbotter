@@ -210,16 +210,24 @@ impl ResultTab {
     pub fn title(&self) -> String {
         format!("Result {}", self.snapshot.provenance.operation_id.0)
     }
+
+    pub(crate) const fn can_close(&self) -> bool {
+        !self.view.has_pending_export()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResultTabError {
     NotFound,
+    Busy,
 }
 
 impl std::fmt::Display for ResultTabError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("result tab is no longer available")
+        formatter.write_str(match self {
+            Self::NotFound => "result tab is no longer available",
+            Self::Busy => "cancel the active result operation before closing this tab",
+        })
     }
 }
 
@@ -530,6 +538,37 @@ impl ProfileWorkspace {
         self.result = Some(tab.snapshot.clone());
         self.result_view = tab.view.clone();
         self.result_area_tab = ResultAreaTab::Results;
+        Ok(())
+    }
+
+    pub fn close_result_tab(&mut self, tab_id: ResultTabId) -> Result<(), ResultTabError> {
+        self.sync_selected_result_tab_from_surface();
+        let Some(index) = self.result_tabs.iter().position(|tab| tab.id == tab_id) else {
+            return Err(ResultTabError::NotFound);
+        };
+        if !self.result_tabs[index].can_close() {
+            return Err(ResultTabError::Busy);
+        }
+        let was_selected = self.selected_result_tab == Some(tab_id);
+        self.result_tabs.remove(index);
+        if !was_selected {
+            return Ok(());
+        }
+
+        let replacement = self
+            .result_tabs
+            .get(index)
+            .or_else(|| self.result_tabs.last())
+            .map(|tab| (tab.id, tab.snapshot.clone(), tab.view.clone()));
+        if let Some((id, snapshot, view)) = replacement {
+            self.selected_result_tab = Some(id);
+            self.result = Some(snapshot);
+            self.result_view = view;
+        } else {
+            self.selected_result_tab = None;
+            self.result = None;
+            self.result_view = ResultViewState::default();
+        }
         Ok(())
     }
 

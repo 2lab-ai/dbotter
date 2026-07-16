@@ -3667,7 +3667,7 @@ impl DbotterApp {
                 workspace
                     .result_tabs()
                     .iter()
-                    .map(|tab| (tab.id(), tab.title()))
+                    .map(|tab| (tab.id(), tab.title(), tab.can_close()))
                     .collect::<Vec<_>>()
             });
         let selected_result = selected_workspace_key
@@ -3675,27 +3675,57 @@ impl DbotterApp {
             .and_then(|key| self.model.workspace(key))
             .and_then(ProfileWorkspace::selected_result_tab_id);
         let mut select_result = None;
+        let mut close_result = None;
         egui::ScrollArea::horizontal()
             .id_salt("result.output.tabs")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (tab_id, title) in &result_tabs {
-                        let tab = ui.add_sized(
-                            [132.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
-                            egui::Button::new(title).selected(selected_result == Some(*tab_id)),
-                        );
-                        let tab = named_dynamic_author_id(
-                            tab,
-                            format!("result.output.{}", tab_id.0),
-                            "Execution result tab",
-                        );
-                        if tab.clicked() {
-                            select_result = Some(*tab_id);
-                        }
+                    for (tab_id, title, can_close) in &result_tabs {
+                        ui.push_id(tab_id.0, |ui| {
+                            ui.horizontal(|ui| {
+                                let tab = ui.add_sized(
+                                    [120.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                                    egui::Button::new(title)
+                                        .selected(selected_result == Some(*tab_id)),
+                                );
+                                let tab = named_dynamic_author_id(
+                                    tab,
+                                    format!("result.output.{}", tab_id.0),
+                                    "Execution result tab",
+                                );
+                                if tab.clicked() {
+                                    select_result = Some(*tab_id);
+                                }
+
+                                let close = ui
+                                    .add_enabled(
+                                        *can_close,
+                                        egui::Button::new("×").min_size(egui::vec2(
+                                            OpenAiTheme::MIN_CONTROL_HEIGHT,
+                                            OpenAiTheme::MIN_CONTROL_HEIGHT,
+                                        )),
+                                    )
+                                    .on_hover_text(if *can_close {
+                                        "Close result tab"
+                                    } else {
+                                        "Cancel the active result operation before closing"
+                                    });
+                                let close = named_dynamic_author_id(
+                                    close,
+                                    format!("result.output.close.{}", tab_id.0),
+                                    "Close result tab",
+                                );
+                                if close.clicked() {
+                                    close_result = Some(*tab_id);
+                                }
+                            });
+                        });
                     }
                 });
             });
-        if let (Some(key), Some(tab_id)) = (selected_workspace_key.clone(), select_result) {
+        if let (Some(key), Some(tab_id)) = (selected_workspace_key.clone(), close_result) {
+            let _ = self.model.workspace_mut(key).close_result_tab(tab_id);
+        } else if let (Some(key), Some(tab_id)) = (selected_workspace_key.clone(), select_result) {
             let _ = self.model.workspace_mut(key).select_result_tab(tab_id);
         }
 
