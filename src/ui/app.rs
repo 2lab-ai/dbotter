@@ -4370,7 +4370,7 @@ mod tests {
     use crate::ui::accessibility::{accesskit_author_node, assert_accesskit_value_confined};
     use crate::ui::adapter::{ServicePort, UiCommand, bounded_ports};
     use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
-    use crate::ui::layout::WorkspaceGeometry;
+    use crate::ui::layout::{NativeLayout, WorkspaceGeometry};
     use crate::ui::model::{ConfigPresentation, ProfileSnapshot, UiEvent, WorkspaceKey};
     use crate::ui::redis_explorer::RedisExplorerIntent;
     use eframe::egui::{self, Context, Event, Key, Modifiers, RawInput, accesskit};
@@ -4820,6 +4820,155 @@ mod tests {
         }
         assert!(!ids.contains("navigator.open"));
         assert!(!ids.contains("inspector.open"));
+    }
+
+    #[test]
+    fn actual_wide_splitter_is_accessible_keyboard_adjustable_and_resettable() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.model.workspace_mut(key);
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let render = |app: &mut DbotterApp, events: Vec<Event>| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 900.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| app.show_native(ui),
+            )
+        };
+
+        let initial = render(&mut app, Vec::new());
+        let initial_update = initial
+            .platform_output
+            .accesskit_update
+            .expect("wide splitter frame must emit AccessKit");
+        let (splitter_id, splitter) = accesskit_author_node(&initial_update, "workspace.splitter");
+        assert_eq!(splitter.role(), accesskit::Role::Splitter);
+        assert!(splitter.supports_action(accesskit::Action::Focus));
+        let bounds = splitter.bounds().expect("splitter needs native bounds");
+        assert!(
+            bounds.y1 - bounds.y0 >= f64::from(NativeLayout::SPLITTER_ACCESSIBLE_HIT_EXTENT),
+            "splitter hit area must be at least 44 points"
+        );
+        let initial_editor_extent = splitter
+            .numeric_value()
+            .expect("splitter needs an editor-extent value");
+        for expected in [
+            "navigator",
+            "object-editor-tabs",
+            "result-history-tabs",
+            "status-action-context",
+            "workspace.split.reset",
+        ] {
+            assert!(
+                initial_update
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.author_id() == Some(expected)),
+                "splitter frame lost {expected}"
+            );
+        }
+
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: splitter_id,
+                data: None,
+            })],
+        );
+        let adjusted = render(
+            &mut app,
+            vec![Event::Key {
+                key: Key::ArrowDown,
+                physical_key: Some(Key::ArrowDown),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        let adjusted_update = adjusted
+            .platform_output
+            .accesskit_update
+            .expect("adjusted splitter frame must emit AccessKit");
+        let (_, adjusted_splitter) = accesskit_author_node(&adjusted_update, "workspace.splitter");
+        let adjusted_editor_extent = adjusted_splitter
+            .numeric_value()
+            .expect("adjusted splitter needs a value");
+        assert!(
+            (adjusted_editor_extent
+                - initial_editor_extent
+                - f64::from(NativeLayout::SPLITTER_KEYBOARD_STEP))
+            .abs()
+                < 0.01,
+            "ArrowDown must move the rendered splitter by exactly five points"
+        );
+        for expected in [
+            "navigator",
+            "object-editor-tabs",
+            "result-history-tabs",
+            "status-action-context",
+        ] {
+            assert!(
+                adjusted_update
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.author_id() == Some(expected)),
+                "splitter adjustment lost {expected}"
+            );
+        }
+
+        let (reset_id, _) = accesskit_author_node(&adjusted_update, "workspace.split.reset");
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: reset_id,
+                data: None,
+            })],
+        );
+        let _ = render(
+            &mut app,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        let reset = render(&mut app, Vec::new());
+        let reset_update = reset
+            .platform_output
+            .accesskit_update
+            .expect("reset splitter frame must emit AccessKit");
+        let (_, reset_splitter) = accesskit_author_node(&reset_update, "workspace.splitter");
+        assert!(
+            (reset_splitter
+                .numeric_value()
+                .expect("reset splitter needs a value")
+                - initial_editor_extent)
+                .abs()
+                < 0.01,
+            "Reset split must restore the rendered 60/40 geometry"
+        );
     }
 
     #[test]
