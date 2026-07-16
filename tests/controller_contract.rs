@@ -1550,7 +1550,7 @@ async fn p3_driver_session_disposition_is_identical_in_cache_event_and_ui_outcom
             profile_id,
             profile_generation: profile.profile_generation,
             language: dbotter::model::QueryLanguage::Sql,
-            text: "USE dbotter".to_owned(),
+            text: "SELECT 7".to_owned(),
             row_limit: 500,
             timeout_ms: 1_000,
         })
