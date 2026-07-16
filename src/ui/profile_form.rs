@@ -1191,7 +1191,9 @@ impl ProfileEditor {
                     self.draft.environment = ProfileEnvironment::Production;
                 }
             });
-            ui.small("PRODUCTION keeps its additional review and confirmation guardrails.");
+            ui.small(
+                "PRODUCTION remains visibly classified. This Preview blocks changes until mutation review is available.",
+            );
 
             ui.label("Access");
             ui.horizontal_wrapped(|ui| {
@@ -1214,7 +1216,9 @@ impl ProfileEditor {
                     self.draft.access = ProfileAccess::ReadOnly;
                 }
             });
-            ui.small("Read-only blocks mutations before user-target dispatch.");
+            ui.small(
+                "Read-only blocks mutations before user-target dispatch. Read/write records intended posture; this Preview still blocks changes.",
+            );
 
             ui.label("TLS");
             let mut selected_tls = self.draft.tls;

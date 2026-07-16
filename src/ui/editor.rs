@@ -15,7 +15,7 @@ use crate::model::{
 
 use super::accessibility::named_author_id;
 use super::adapter::UiCommand;
-use super::model::{ProfileSnapshot, ProfileWorkspace, WorkspaceKey};
+use super::model::{MAX_EDITOR_TAB_TEXT_BYTES, ProfileSnapshot, ProfileWorkspace, WorkspaceKey};
 use super::theme::OpenAiTheme;
 
 pub const EDITOR_TARGET_ID: &str = "editor.target";
@@ -52,6 +52,7 @@ impl EditorCursor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditorValidationError {
+    TextTooLarge,
     RowLimit,
     Timeout,
     Target(ExecutionTargetError),
@@ -61,6 +62,7 @@ pub enum EditorValidationError {
 impl EditorValidationError {
     pub const fn control_id(self) -> &'static str {
         match self {
+            Self::TextTooLarge => EDITOR_INPUT_ID,
             Self::RowLimit => EDITOR_ROW_LIMIT_ID,
             Self::Timeout => EDITOR_TIMEOUT_ID,
             Self::Target(_) | Self::UnsupportedDriver => EDITOR_INPUT_ID,
@@ -69,6 +71,9 @@ impl EditorValidationError {
 
     pub const fn message(self) -> &'static str {
         match self {
+            Self::TextTooLarge => {
+                "Query text is limited to 256 KiB; the latest input was rejected."
+            }
             Self::RowLimit => "Enter a row limit from 1 to 10000.",
             Self::Timeout => "Enter a timeout from 1 to 300 seconds.",
             Self::Target(error) => error.summary(),
@@ -329,15 +334,21 @@ impl EditorSurface {
         ui.label("Statement or command");
         let execute_enabled = enabled && workspace.pending_execute.is_none();
         let shortcut_pressed = execute_enabled && consume_execute_shortcut(ui);
+        let previous_editor_text = workspace.editor_text.clone();
         let editor_output = egui::TextEdit::multiline(&mut workspace.editor_text)
             .id(editor_id)
             .code_editor()
+            .char_limit(MAX_EDITOR_TAB_TEXT_BYTES.saturating_add(1))
             .lock_focus(false)
             .desired_rows(12)
             .desired_width(f32::INFINITY)
             .interactive(enabled)
             .hint_text("SELECT 1  or  GET key")
             .show(ui);
+        let editor_limit_exceeded = workspace.editor_text.len() > MAX_EDITOR_TAB_TEXT_BYTES;
+        if editor_limit_exceeded {
+            workspace.editor_text = previous_editor_text;
+        }
         if let Some(cursor_range) = editor_output.cursor_range {
             let caret = cursor_range.primary.index.0;
             let selection = (!cursor_range.is_empty()).then(|| {
@@ -356,6 +367,10 @@ impl EditorSurface {
             EDITOR_INPUT_ID,
             "Statement or command",
         );
+        if editor_limit_exceeded {
+            self.validation_error = Some(EditorValidationError::TextTooLarge);
+            editor_response.request_focus();
+        }
 
         ui.add_space(16.0);
         let mut row_response = None;
@@ -431,7 +446,7 @@ impl EditorSurface {
             || timeout_response
                 .as_ref()
                 .is_some_and(egui::Response::changed);
-        if controls_changed {
+        if controls_changed && !editor_limit_exceeded {
             self.validation_error = None;
         }
 
@@ -451,7 +466,9 @@ impl EditorSurface {
             }
         }
 
-        let intent = if cancel_clicked {
+        let intent = if editor_limit_exceeded {
+            None
+        } else if cancel_clicked {
             pending_cancel_intent(workspace)
         } else if execute_clicked || shortcut_pressed {
             let cursor = self

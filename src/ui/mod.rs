@@ -31,8 +31,8 @@ pub use layout::{
 };
 pub use model::{
     ConfigPresentation, ConnectionFailureOutcome, ConnectionState, EditorTab, EditorTabError,
-    EditorTabId, PostCloseState, ProfileSnapshot, ProfileWorkspace, ResultAreaTab, ResultTab,
-    ResultTabError, ResultTabId, UiEvent, UiModel, WorkspaceKey,
+    EditorTabId, MAX_EDITOR_TAB_TEXT_BYTES, PostCloseState, ProfileSnapshot, ProfileWorkspace,
+    ResultAreaTab, ResultTab, ResultTabError, ResultTabId, UiEvent, UiModel, WorkspaceKey,
 };
 pub use mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 pub use native_harness::NativeUiHarness;

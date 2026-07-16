@@ -97,7 +97,7 @@ impl WorkspaceKey {
 pub const MAX_EDITOR_TABS: usize = 20;
 pub const MAX_RESULT_TABS: usize = 20;
 const MAX_EDITOR_TAB_TITLE_BYTES: usize = 120;
-const MAX_EDITOR_TAB_TEXT_BYTES: usize = 1024 * 1024;
+pub const MAX_EDITOR_TAB_TEXT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -109,6 +109,7 @@ pub struct EditorTab {
     title: String,
     language: QueryLanguage,
     text: String,
+    dirty: bool,
 }
 
 impl std::fmt::Debug for EditorTab {
@@ -119,6 +120,7 @@ impl std::fmt::Debug for EditorTab {
             .field("title", &"<redacted>")
             .field("language", &self.language)
             .field("text", &"<redacted>")
+            .field("dirty", &self.dirty)
             .finish()
     }
 }
@@ -139,6 +141,10 @@ impl EditorTab {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    pub const fn is_dirty(&self) -> bool {
+        self.dirty
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +153,7 @@ pub enum EditorTabError {
     NotFound,
     InvalidTitle,
     TextTooLarge,
+    Dirty,
 }
 
 impl std::fmt::Display for EditorTabError {
@@ -155,7 +162,8 @@ impl std::fmt::Display for EditorTabError {
             Self::LimitReached => "close a tab before creating another",
             Self::NotFound => "editor tab is no longer available",
             Self::InvalidTitle => "tab title must be 1 to 120 UTF-8 bytes",
-            Self::TextTooLarge => "editor tab text exceeds 1 MiB",
+            Self::TextTooLarge => "editor tab text exceeds 256 KiB",
+            Self::Dirty => "discard the unsaved query before closing this tab",
         })
     }
 }
@@ -326,14 +334,16 @@ impl ProfileWorkspace {
         if text.len() > MAX_EDITOR_TAB_TEXT_BYTES {
             return Err(EditorTabError::TextTooLarge);
         }
-        self.sync_selected_editor_tab_from_surface();
+        self.sync_selected_editor_tab_from_surface()?;
         let id = EditorTabId(self.next_editor_tab_id.max(1));
         self.next_editor_tab_id = id.0.saturating_add(1);
+        let dirty = !text.is_empty();
         self.editor_tabs.push(EditorTab {
             id,
             title,
             language,
             text,
+            dirty,
         });
         self.selected_editor_tab = Some(id);
         self.load_editor_tab_into_surface(id);
@@ -350,7 +360,10 @@ impl ProfileWorkspace {
         let Some(tab) = self.editor_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
             return Err(EditorTabError::NotFound);
         };
-        tab.title = title;
+        if tab.title != title {
+            tab.title = title;
+            tab.dirty = true;
+        }
         Ok(())
     }
 
@@ -358,7 +371,7 @@ impl ProfileWorkspace {
         &mut self,
         tab_id: EditorTabId,
     ) -> Result<EditorTabId, EditorTabError> {
-        self.sync_selected_editor_tab_from_surface();
+        self.sync_selected_editor_tab_from_surface()?;
         let Some(source) = self.editor_tab(tab_id).cloned() else {
             return Err(EditorTabError::NotFound);
         };
@@ -376,7 +389,7 @@ impl ProfileWorkspace {
         if self.editor_tab(tab_id).is_none() {
             return Err(EditorTabError::NotFound);
         }
-        self.sync_selected_editor_tab_from_surface();
+        self.sync_selected_editor_tab_from_surface()?;
         self.selected_editor_tab = Some(tab_id);
         self.load_editor_tab_into_surface(tab_id);
         Ok(())
@@ -386,7 +399,23 @@ impl ProfileWorkspace {
         let Some(index) = self.editor_tabs.iter().position(|tab| tab.id == tab_id) else {
             return Err(EditorTabError::NotFound);
         };
-        self.sync_selected_editor_tab_from_surface();
+        self.sync_selected_editor_tab_from_surface()?;
+        if self.editor_tabs.get(index).is_some_and(EditorTab::is_dirty) {
+            return Err(EditorTabError::Dirty);
+        }
+        self.remove_editor_tab(index, tab_id);
+        Ok(())
+    }
+
+    pub fn discard_editor_tab(&mut self, tab_id: EditorTabId) -> Result<(), EditorTabError> {
+        let Some(index) = self.editor_tabs.iter().position(|tab| tab.id == tab_id) else {
+            return Err(EditorTabError::NotFound);
+        };
+        self.remove_editor_tab(index, tab_id);
+        Ok(())
+    }
+
+    fn remove_editor_tab(&mut self, index: usize, tab_id: EditorTabId) {
         let closing_selected = self.selected_editor_tab == Some(tab_id);
         self.editor_tabs.remove(index);
         if closing_selected {
@@ -402,19 +431,44 @@ impl ProfileWorkspace {
                 self.selection_character_range = None;
             }
         }
+    }
+
+    pub fn sync_selected_editor_tab_from_surface(&mut self) -> Result<(), EditorTabError> {
+        if self.editor_text.len() > MAX_EDITOR_TAB_TEXT_BYTES {
+            return Err(EditorTabError::TextTooLarge);
+        }
+        let Some(selected) = self.selected_editor_tab else {
+            return Ok(());
+        };
+        let Some(tab) = self.editor_tabs.iter_mut().find(|tab| tab.id == selected) else {
+            return Ok(());
+        };
+        if tab.text != self.editor_text {
+            tab.text.clone_from(&self.editor_text);
+            tab.dirty = true;
+        }
         Ok(())
     }
 
-    pub fn sync_selected_editor_tab_from_surface(&mut self) {
-        let Some(selected) = self.selected_editor_tab else {
-            return;
-        };
-        let Some(tab) = self.editor_tabs.iter_mut().find(|tab| tab.id == selected) else {
-            return;
-        };
-        if self.editor_text.len() <= MAX_EDITOR_TAB_TEXT_BYTES {
-            tab.text.clone_from(&self.editor_text);
-        }
+    fn retain_editor_context_for_profile_retag(&mut self) {
+        let _ = self.sync_selected_editor_tab_from_surface();
+        self.pending_execute = None;
+        self.result = None;
+        self.result_view = ResultViewState::default();
+        self.error = None;
+        self.catalog_page = None;
+        self.catalog_retry = None;
+        self.catalog_error = None;
+        self.redis_key_page = None;
+        self.redis_scan_retry = None;
+        self.redis_scan_error = None;
+        self.redis_value_preview = None;
+        self.redis_inspect_retry = None;
+        self.redis_inspect_error = None;
+        self.result_area_tab = ResultAreaTab::Results;
+        self.result_tabs.clear();
+        self.selected_result_tab = None;
+        self.next_result_tab_id = 1;
     }
 
     pub const fn result_area_tab(&self) -> ResultAreaTab {
@@ -1559,6 +1613,31 @@ impl UiModel {
                     .is_none_or(|tombstone| profile.generation.0 > tombstone.0)
             })
             .collect::<Vec<_>>();
+        let editor_retages = self
+            .profiles
+            .iter()
+            .filter_map(|previous| {
+                let refreshed = profiles.iter().find(|profile| profile.id == previous.id)?;
+                let previous_instance = previous.persisted.safety.instance_id();
+                let same_instance = previous_instance.is_some()
+                    && previous_instance == refreshed.persisted.safety.instance_id();
+                (same_instance && previous.generation != refreshed.generation).then(|| {
+                    (
+                        WorkspaceKey::new(previous.id.clone(), previous.generation),
+                        WorkspaceKey::new(refreshed.id.clone(), refreshed.generation),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for (previous, refreshed) in editor_retages {
+            if self.workspaces.contains_key(&refreshed) {
+                continue;
+            }
+            if let Some(mut workspace) = self.workspaces.remove(&previous) {
+                workspace.retain_editor_context_for_profile_retag();
+                self.workspaces.insert(refreshed, workspace);
+            }
+        }
         self.connection_states.retain(|profile_id, _| {
             let previous = self
                 .profiles

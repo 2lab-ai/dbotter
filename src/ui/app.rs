@@ -38,8 +38,8 @@ use super::layout::{
     WorkspaceGeometry,
 };
 use super::model::{
-    ConnectionState, EditorTabId, ProfileSnapshot, ProfileWorkspace, ResultAreaTab, UiEvent,
-    UiModel, WorkspaceKey,
+    ConnectionState, EditorTabError, EditorTabId, ProfileSnapshot, ProfileWorkspace, ResultAreaTab,
+    UiEvent, UiModel, WorkspaceKey,
 };
 use super::mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 use super::profile_form::{
@@ -261,6 +261,26 @@ enum DeleteDialogAction {
     Confirm,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct EditorDiscardConfirmation {
+    workspace_key: WorkspaceKey,
+    tab_id: EditorTabId,
+    title: String,
+    discard_author_id: &'static str,
+}
+
+impl std::fmt::Debug for EditorDiscardConfirmation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EditorDiscardConfirmation")
+            .field("workspace_key", &self.workspace_key)
+            .field("tab_id", &self.tab_id)
+            .field("title", &"<redacted>")
+            .field("discard_author_id", &self.discard_author_id)
+            .finish()
+    }
+}
+
 struct PendingExportDestination {
     result_id: ResultId,
     format: ExportFormat,
@@ -283,6 +303,7 @@ pub struct DbotterApp {
     common_error: Option<VisibleError>,
     recovery_dispatch_context: Option<RecoveryDispatchContext>,
     delete_confirmation: Option<DeleteConfirmation>,
+    editor_discard_confirmation: Option<EditorDiscardConfirmation>,
     next_draft_id: u64,
     pending_connect_after_refresh: Option<(ProfileId, OperationId)>,
     pending_export_destinations: HashMap<OperationId, PendingExportDestination>,
@@ -318,6 +339,7 @@ impl DbotterApp {
             common_error: None,
             recovery_dispatch_context: None,
             delete_confirmation: None,
+            editor_discard_confirmation: None,
             next_draft_id: 1,
             pending_connect_after_refresh: None,
             pending_export_destinations: HashMap::new(),
@@ -770,6 +792,52 @@ impl DbotterApp {
             .retain(|result_id, _| current_results.contains(result_id));
     }
 
+    fn workspace_retages_for_profiles(
+        &self,
+        profiles: &[ProfileSnapshot],
+    ) -> Vec<(WorkspaceKey, WorkspaceKey)> {
+        self.model
+            .profiles
+            .iter()
+            .filter_map(|previous| {
+                let refreshed = profiles.iter().find(|profile| profile.id == previous.id)?;
+                let previous_instance = previous.persisted.safety.instance_id();
+                let same_instance = previous_instance.is_some()
+                    && previous_instance == refreshed.persisted.safety.instance_id();
+                (same_instance && previous.generation != refreshed.generation).then(|| {
+                    (
+                        WorkspaceKey::new(previous.id.clone(), previous.generation),
+                        WorkspaceKey::new(refreshed.id.clone(), refreshed.generation),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn apply_workspace_retages(&mut self, retages: Vec<(WorkspaceKey, WorkspaceKey)>) {
+        for (previous, refreshed) in retages {
+            if self.model.active_generation(&refreshed.profile_id)
+                != Some(refreshed.profile_generation)
+            {
+                continue;
+            }
+            if let Some(geometry) = self.workspace_geometries.remove(&previous)
+                && !self.workspace_geometries.contains_key(&refreshed)
+            {
+                self.workspace_geometries
+                    .insert(refreshed.clone(), geometry);
+            }
+            if self.compact_workspace.as_ref() == Some(&previous) {
+                self.compact_workspace = Some(refreshed.clone());
+            }
+            if let Some(confirmation) = self.editor_discard_confirmation.as_mut()
+                && confirmation.workspace_key == previous
+            {
+                confirmation.workspace_key = refreshed;
+            }
+        }
+    }
+
     fn poll_events(&mut self) {
         for mut event in self.port.drain_events(EVENT_DRAIN_LIMIT) {
             match self.redis_resource_event_disposition(&event) {
@@ -862,7 +930,14 @@ impl DbotterApp {
                     _ => None,
                 },
             );
+            let workspace_retages = match &event {
+                UiEvent::ProfilesLoaded { profiles, .. } => {
+                    self.workspace_retages_for_profiles(profiles)
+                }
+                _ => Vec::new(),
+            };
             self.model.fold(event);
+            self.apply_workspace_retages(workspace_retages);
             if let Some((profile_id, loaded, accepted)) = connect_follow_up {
                 self.pending_connect_after_refresh = None;
                 if loaded && accepted && self.model.active_generation(&profile_id).is_some() {
@@ -880,6 +955,18 @@ impl DbotterApp {
         self.prune_redis_explorers();
         self.prune_result_export_state();
         self.prune_active_operations();
+        let keep_editor_discard =
+            self.editor_discard_confirmation
+                .as_ref()
+                .is_some_and(|confirmation| {
+                    self.model
+                        .workspace(&confirmation.workspace_key)
+                        .and_then(|workspace| workspace.editor_tab(confirmation.tab_id))
+                        .is_some()
+                });
+        if self.editor_discard_confirmation.is_some() && !keep_editor_discard {
+            self.editor_discard_confirmation = None;
+        }
         let migration_required = self.model.config.migration_required();
         let migration_backup = self.model.config.migration_backup().map(PathBuf::from);
         if let Some(editor) = self.profile_editor.as_mut() {
@@ -2525,6 +2612,102 @@ impl DbotterApp {
         }
     }
 
+    fn request_editor_tab_close(
+        &mut self,
+        workspace_key: WorkspaceKey,
+        tab_id: EditorTabId,
+        discard_author_id: &'static str,
+    ) {
+        let outcome = self
+            .model
+            .workspace_mut(workspace_key.clone())
+            .close_editor_tab(tab_id);
+        match outcome {
+            Ok(()) => {
+                self.editor_surface = EditorSurface::default();
+                self.model.status = "Query tab closed".to_owned();
+            }
+            Err(EditorTabError::Dirty) => {
+                let title = self
+                    .model
+                    .workspace(&workspace_key)
+                    .and_then(|workspace| workspace.editor_tab(tab_id))
+                    .map_or_else(|| "query tab".to_owned(), |tab| tab.title().to_owned());
+                self.editor_discard_confirmation = Some(EditorDiscardConfirmation {
+                    workspace_key,
+                    tab_id,
+                    title,
+                    discard_author_id,
+                });
+                self.model.status = "Unsaved query requires discard confirmation".to_owned();
+            }
+            Err(error) => self.model.status = error.to_string(),
+        }
+    }
+
+    fn show_editor_discard_confirmation(&mut self, root_ui: &mut egui::Ui) {
+        let Some(confirmation) = self.editor_discard_confirmation.as_ref() else {
+            return;
+        };
+        let title = confirmation.title.clone();
+        let discard_author_id = confirmation.discard_author_id;
+        let mut cancel =
+            root_ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let mut discard = false;
+        egui::Window::new("Discard unsaved query?")
+            .collapsible(false)
+            .resizable(false)
+            .show(root_ui.ctx(), |ui| {
+                ui.heading("Discard unsaved query tab?");
+                ui.label(format!(
+                    "{title} has changes that exist only in this session."
+                ));
+                ui.label("Discard permanently removes this tab's query text.");
+                ui.horizontal(|ui| {
+                    let keep = ui.add_sized(
+                        [104.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                        egui::Button::new("Keep tab"),
+                    );
+                    if named_author_id(keep, "editor.tab.discard.cancel", "Keep unsaved query tab")
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                    let confirm = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("Discard tab").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::BLACK)
+                        .min_size(egui::vec2(128.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                    );
+                    if named_author_id(confirm, discard_author_id, "Discard unsaved query tab")
+                        .clicked()
+                    {
+                        discard = true;
+                    }
+                });
+            });
+        if cancel {
+            self.editor_discard_confirmation = None;
+            self.model.status = "Unsaved query tab kept".to_owned();
+        } else if discard {
+            let confirmation = self.editor_discard_confirmation.take();
+            if let Some(confirmation) = confirmation {
+                let outcome = self
+                    .model
+                    .workspace_mut(confirmation.workspace_key)
+                    .discard_editor_tab(confirmation.tab_id);
+                match outcome {
+                    Ok(()) => {
+                        self.editor_surface = EditorSurface::default();
+                        self.model.status = "Unsaved query tab discarded".to_owned();
+                    }
+                    Err(error) => self.model.status = error.to_string(),
+                }
+            }
+        }
+    }
+
     fn show_credential_prompt(&mut self, root_ui: &mut egui::Ui) {
         let Some(prompt) = self.credential_prompt.as_mut() else {
             return;
@@ -2616,6 +2799,7 @@ impl DbotterApp {
         {
             egui::CentralPanel::default().show(ui, |ui| self.show_first_run(ui));
             self.show_delete_confirmation(ui);
+            self.show_editor_discard_confirmation(ui);
             self.show_credential_prompt(ui);
             return;
         }
@@ -2625,6 +2809,7 @@ impl DbotterApp {
             LayoutMode::Compact => self.show_compact_workspace(ui, compact_fallback),
         }
         self.show_delete_confirmation(ui);
+        self.show_editor_discard_confirmation(ui);
         self.show_credential_prompt(ui);
     }
 
@@ -3323,14 +3508,19 @@ impl DbotterApp {
             let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
             self.show_editor_tab_strip(ui, &profile, &key, editor_enabled);
             ui.separator();
-            let workspace = self.model.workspace_mut(key);
-            editor_intent = self.editor_surface.show(
-                ui,
-                &profile,
-                workspace,
-                editor_enabled && profile.is_ready(),
-            );
-            workspace.sync_selected_editor_tab_from_surface();
+            let sync_error = {
+                let workspace = self.model.workspace_mut(key);
+                editor_intent = self.editor_surface.show(
+                    ui,
+                    &profile,
+                    workspace,
+                    editor_enabled && profile.is_ready(),
+                );
+                workspace.sync_selected_editor_tab_from_surface().err()
+            };
+            if let Some(error) = sync_error {
+                self.model.status = error.to_string();
+            }
         } else {
             ui.weak("Select a connection to edit a statement or command.");
         }
@@ -3488,7 +3678,7 @@ impl DbotterApp {
                     workspace
                         .editor_tabs()
                         .iter()
-                        .map(|tab| (tab.id(), tab.title().to_owned()))
+                        .map(|tab| (tab.id(), tab.title().to_owned(), tab.is_dirty()))
                         .collect::<Vec<_>>(),
                     workspace.selected_editor_tab_id(),
                 )
@@ -3500,10 +3690,15 @@ impl DbotterApp {
             .id_salt("editor.tab-strip")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (tab_id, title) in &tabs {
+                    for (tab_id, title, dirty) in &tabs {
+                        let label = if *dirty {
+                            format!("{title} •")
+                        } else {
+                            title.clone()
+                        };
                         let response = ui.add_sized(
                             [132.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
-                            egui::Button::new(title).selected(selected == Some(*tab_id)),
+                            egui::Button::new(label).selected(selected == Some(*tab_id)),
                         );
                         let response = named_dynamic_author_id(
                             response,
@@ -3516,6 +3711,12 @@ impl DbotterApp {
                     }
                 });
             });
+        let retention = ui.weak("Session workspace • tabs and history clear on quit");
+        named_author_id(
+            retention,
+            "workspace.session-retention",
+            "Session-only query tabs and history",
+        );
 
         if let Some(tab_id) = select
             && self
@@ -3579,6 +3780,10 @@ impl DbotterApp {
             }
         });
 
+        if let Some(EditorTabAction::Close(tab_id)) = action {
+            self.request_editor_tab_close(key.clone(), tab_id, "editor.tab.discard");
+            return;
+        }
         let workspace = self.model.workspace_mut(key.clone());
         let outcome = match action {
             Some(EditorTabAction::Rename(tab_id)) => workspace.rename_editor_tab(tab_id, title),
@@ -3591,7 +3796,7 @@ impl DbotterApp {
             Some(EditorTabAction::Duplicate(tab_id)) => {
                 workspace.duplicate_editor_tab(tab_id).map(|_| ())
             }
-            Some(EditorTabAction::Close(tab_id)) => workspace.close_editor_tab(tab_id),
+            Some(EditorTabAction::Close(_)) => Ok(()),
             None => Ok(()),
         };
         if let Err(error) = outcome {
@@ -4208,6 +4413,43 @@ mod tests {
             .into_iter()
             .filter_map(|(_, node)| node.author_id().map(str::to_owned))
             .collect()
+    }
+
+    #[test]
+    fn dirty_editor_close_opens_an_accessible_discard_guard_without_losing_text() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let mysql = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(mysql.id.clone(), mysql.generation);
+        app.model.profiles = vec![mysql.clone()];
+        app.model.selected_profile = Some(mysql.id.clone());
+        app.model
+            .active_generations
+            .insert(mysql.id.clone(), mysql.generation);
+        let tab = app
+            .model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Unsaved", "SELECT keep_me")
+            .expect("dirty tab");
+
+        app.request_editor_tab_close(key.clone(), tab, "editor.tab.discard");
+
+        assert!(app.editor_discard_confirmation.is_some());
+        assert_eq!(
+            app.model
+                .workspace(&key)
+                .and_then(|workspace| workspace.editor_tab(tab))
+                .map(|tab| tab.text()),
+            Some("SELECT keep_me")
+        );
+        let ids = shell_author_ids(&mut app, 1440.0, 900.0);
+        assert!(ids.contains("editor.tab.discard"));
+        assert!(ids.contains("editor.tab.discard.cancel"));
+        assert!(
+            !format!("{:?}", app.editor_discard_confirmation).contains("SELECT keep_me"),
+            "discard guard Debug must not disclose query text"
+        );
     }
 
     fn redis_page(request: &RedisScanRequest, raw_key: &[u8]) -> RedisKeyPage {
