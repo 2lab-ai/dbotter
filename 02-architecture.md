@@ -1,343 +1,291 @@
-# dbotter — usable MVP architecture
+# dbotter — architecture
 
-Status: **approved target architecture with P1, P2, P3, and P4 independently
-reviewed GREEN. P4's MySQL catalog mandatory live gate is GREEN; T5 remains
-Implementing for P6 native/installed accessibility evidence. T0 remains RED
-overall; T1–T5, T8, and T9 are Implementing; T6, T7, and T10 are Not started.**
+Status: **delivered usable-MVP baseline; Daily-use v1 extension is governed by D1–D12**
 
-Normative detail lives in `docs/usable-mvp/{spec,trace,plan}.md`. This document
-is the repository architecture entrypoint and must remain consistent with those
-frozen artifacts and the T0–T10 ledger in `03-traces.md`.
+Current normative behavior lives in `docs/daily-use/{spec,trace,plan}.md`.
+`docs/usable-mvp/` preserves the old P/T checkpoint evidence and hashes; it is
+historical, not current scope or status authority.
 
-## Decision summary
+## 1. Architectural decision
 
-dbotter remains one Rust package with a library and one binary. The native UI
-and headless CLI share `ApplicationService`; neither reimplements profile
-lookup, credential resolution, capability validation, connection lifecycle,
-typed resource browsing, execution, or public error conversion.
-
-The UI owns pure/display state only. Live sessions, task registry, config
-writer, secrets, and filesystem export workers stay behind typed service and
-runtime boundaries. No lock crosses `.await`.
-
-### P1/P2/P3/P4 checkpoint boundary
-
-P1 implements the config/profile mutation and reconciliation foundation,
-credential storage/resolution types, atomic observed-state and session-cache
-race foundations, and closed public-error/recovery mappings. That bounded slice
-is independently reviewed GREEN.
-
-P2 implements and independently proves the monotonic profile/session generation
-allocator, fingerprinted cache with exact compare-remove, bounded controller,
-reload/Config uncertain fences, tombstone lifecycle, classified cleanup, and
-runtime shutdown. Reserve-before-spawn, coalesced control, one-profile/four-
-global permits, exact event correlation, network-only two-second abort, and
-durable mutation/export joins are part of that GREEN boundary. P2 does not
-complete P6 native/RawInput/AccessKit or visual work, so T2/T3/T9 remain
-Implementing rather than fully GREEN or Verified.
-
-P3 implements and independently proves the typed backend-specific execution,
-catalog, keyspace, bounded result, CLI, and controller seams. MySQL user text
-has one prepared-only entry and no prepared-rejection fallback; Redis command
-policy is constructor-bound and rechecked before I/O; decode and retained
-result budgets are explicit; cancellation drops client work before exact
-session eviction; and one typed session disposition reaches cache, event, and
-UI outcome. T4 is therefore Implementing with its P3 hermetic core GREEN.
-
-P4 implements the MySQL half of the resource seam: three static prepared
-catalog plans, deterministic binary keysets, HMAC-authenticated context-bound
-page tokens, per-profile retention, typed permission mapping, shared CLI
-dispatch, and a profile-generation-scoped Explorer. Review fixes give every
-config path a lazily created private 0600 CSPRNG root sidecar and derive a
-per-connection signing subkey from a redacted canonical digest of all
-`ConnectionFingerprint` fields. They also make catalog lifecycle and session
-identity mirror P2/P3 exactly, freeze existing Load more context, and enforce
-numerical ordinary-text contrast. Its isolated MySQL 8.4 live gate and exact
-implementation/security reviews are GREEN, so `CATALOG` is ready. P5 still owns
-Redis keyspace/TLS, and P6 still owns native RawInput/AccessKit and installed AX
-completion; no complete T4–T6 installed journey is claimed.
-
-## Target topology
+dbotter remains one Rust package with one library and one binary. The native UI
+and headless CLI share `ApplicationService`; neither duplicates profile lookup,
+credential resolution, capability validation, connection lifecycle, resource
+browsing, execution classification or public-error conversion.
 
 ```text
-CLI commands --------------------------------------+
-                                                   v
-egui render -> bounded UiCommand ports -> runtime/controller -> ApplicationService
-     ^                |                      |               |       |
-     |                +-> control lane ------+               |       +-> config writer
-     |                                                       +----------> secret store
-     +<- bounded UiEvent lane <- correlated task registry <--+----------> session cache
-                                                             |             /        \
-                                                             |      MySQL prepared  Redis
-                                                             +-> typed Catalog/Keyspace seams
-                                                             +-> cooperative export worker
+native UI commands ----+
+                        +-> bounded runtime/controller -> ApplicationService
+installed CLI ----------+             |                       |
+                                      |                       +-> config/secrets
+                                      |                       +-> workspace store
+                                      |                       +-> session resources
+                                      +<- correlated events <-+-> MySQL / Redis
 ```
 
-Required capacities and scheduling are contractual:
+The UI owns display and input state. Live sessions, the transaction worker, task
+registry, config/workspace writers, secret resolution and filesystem workers
+stay behind typed service/runtime boundaries. No Rust mutex/RwLock or borrowed
+in-process guard crosses `.await`. A synchronous component may retain the owned
+file descriptor for the nonblocking OS advisory safety lease; it guards
+cross-process ownership, not in-memory state awaited by a task.
 
-- serialized config mutation lane: 16;
-- network work lane: 32;
-- control lane for Cancel/Disconnect/Reconnect cleanup: 16;
-- UI event lane: 128;
-- one active network operation per profile generation, four process-wide;
-- biased controller order: control → mutation → work;
-- Shutdown has an independent watch signal.
+## 2. Delivered baseline
 
-## Identity, generations, and task ownership
+At baseline commit `340133dca652a7bf51d652f06cdb7436b42bbc58` the
+integrated source already provides:
 
-The closed identity domains are not interchangeable:
+- atomic v1/v2-era profile configuration and non-persisted
+  None/Session/Environment credential modes;
+- native MySQL/Redis profile lifecycle, connection recovery and exact
+  operation correlation;
+- prepared-protocol MySQL execution and policy-checked Redis command execution;
+- lazy bounded MySQL schema/relation/column browsing and Redis SCAN/inspect;
+- bounded result snapshots, copy and no-clobber CSV/TSV/JSON export;
+- native accessibility identifiers plus Preview/package/tap/install
+  verification machinery.
 
-- saved-profile work: `(ProfileId, ProfileGeneration, OperationId)`;
-- draft work and Create: `(DraftId, OperationId)`;
-- export: `(ResultId, OperationId)`;
-- global load/shutdown: `OperationId`.
+Those are foundations, not proof of Daily-use completion. In particular, the
+baseline has a pooled MySQL auto-commit execution path, one memory-only
+editor/result per profile, no table-row/Redis explorer mutations, no import and
+no clean-install CLI profile bootstrap.
 
-The registry shape is exact:
+## 3. Identity and async ownership
 
-```rust
-struct RegisteredTask {
-    operation_id: OperationId,
-    scope: TaskScope,
-    cancel: CancellationToken,
-    join: JoinHandle,
-}
+Identity domains remain distinct:
 
-enum TaskScope {
-    Profile {
-        profile_id: ProfileId,
-        profile_generation: ProfileGeneration,
-        session_generation: Option<SessionGeneration>,
-    },
-    Draft { draft_id: DraftId },
-    Export { result_id: ResultId },
-    Global,
-}
+- saved-profile work: `(ProfileId, ProfileInstanceId, ProfileGeneration, OperationId)`;
+- draft profile work: `(DraftId, OperationId)`;
+- editor/result work: `(ProfileInstanceId, EditorTabId, ResultTabId, OperationId)`;
+- transaction work: `(ProfileInstanceId, ProfileGeneration, TransactionId, TransactionOperationId)`;
+- staged/import/Redis reviews: their typed local ID plus profile generation and
+  operation ID;
+- Redis uncertain-mutation recovery: `(ProfileInstanceId, OperationId,
+  HmacKeyToken)` without raw key/payload bytes;
+- export: `(ResultId, OperationId)`.
+
+Runtime uses monotonic generations and compare-matched session eviction. Every
+completion is folded only when its complete identity is still current. A stale
+or cancelled event cannot replace a newer tab, result, transaction, stage,
+review or connection state.
+
+The bounded task registry owns cancellation and joins. Control work remains
+independent from ordinary network admission so Cancel/Disconnect/Shutdown can
+make progress. A blocking file/parser worker checks cancellation at bounded
+chunks and is joined before cleanup is reported complete.
+
+## 4. Configuration, credentials and local durability
+
+The config path is resolved once by the existing global precedence. Daily-use
+D1 extends the writer to config v3:
+
+- reads versions 1, 2 and 3, writes only version 3;
+- legacy data normalizes in memory without startup mutation;
+- first confirmed legacy mutation creates the exact source-version backup and
+  uses the existing atomic/no-clobber durability boundary;
+- environment/access posture is non-secret profile data;
+- credential values remain only in credential channels and never serialize.
+
+D4 owns `<full-config-path>.workspace-v1/`. Config v3 gives every profile an
+immutable CSPRNG `ProfileInstanceId`; legacy profiles are Unclassified/read-only
+until explicit migration assigns posture and instance IDs. Profile and orphan
+shards are validated by embedded instance identity. `index.json` is a
+derived cache. A single durable lifecycle journal orders duplicate,
+delete→purge-or-orphan and clear operations across config/shards/index; startup
+replays a valid intent idempotently and blocks destructive guesses for a corrupt
+intent.
+
+The per-instance safety union is driver-specific. MySQL Begin writes Active,
+terminal intent writes Resolving, a proven server terminal writes
+TerminalProven for replayable shard fanout, and uncertainty writes
+OutcomeUnknown, all with the stable TransactionId. TerminalProven is the
+Committed/RolledBack replay authority; OutcomeUnknown is independently the
+Unknown shard/history/result/stage/import replay authority and cannot be
+acknowledged or removed until its idempotent TransactionId fanout is fsynced
+and any live state is folded. Redis mutation writes RedisApplying before wire
+dispatch and response uncertainty writes RedisOutcomeUnknown with only an
+HMAC key token and action class. These fences survive editor/history opt-out
+and general workspace clearing. Startup conservatively converts in-flight
+fences to their driver Unknown state; MySQL requires durable acknowledgement,
+while Redis requires a matching-key fresh inspection plus explicit durable
+acknowledgement. A Redis fence blocks profile update/duplicate/delete until
+matching-key recovery or a separately typed unknown-recovery abandonment.
+Neither driver automatically retries uncertain mutation.
+
+All files use private permissions, same-directory atomic replacement,
+file/parent durability and destination-fingerprint conflict detection. Unknown
+versions, symlinks, corrupt identities and uncertain commit state fail closed.
+
+## 5. Execution admission
+
+D3 uses two pure admission phases. Before a lease or any network I/O, the
+bounded source reader enforces total UTF-8/file/stream limits and the
+mode-independent forbidden-comment scan. The service then acquires the exact
+intended MySQL lease and performs only the static typed capability query. Its
+sql_mode drives statement splitting and lexing; the pure mode-aware parser then
+enforces per-target/token/depth limits and produces the complete closed typed
+batch before user-target 1. Redis needs no capability query, so both phases
+finish before its first network I/O.
+
+MySQL P0 first proves an exact official Oracle MySQL 8.4 session with utf8mb4,
+UTC and known sql_mode. The same typed capability result decodes
+`@@GLOBAL.partial_revokes`; typed reads may remain available when it is ON, but
+every mutation requires exact OFF plus complete direct global metadata
+visibility. It admits only:
+
+- SELECT whose recursive AST uses the frozen PureBuiltin table and references
+  only catalog-proven base tables; and
+- single-table INSERT/UPDATE/DELETE proved against trigger-free InnoDB catalog
+  metadata after exact partial_revokes=OFF and direct non-role-only global
+  SELECT/TRIGGER/REFERENCES visibility proof.
+
+Views, raw SHOW/DESCRIBE/EXPLAIN/ANALYZE, REPLACE, raw transaction/session
+controls, executable/hint/MariaDB comments, implicit-commit forms, DDL/admin,
+unsupported functions, stored/loadable/UDF calls, multi-table or unbounded DML
+and ambiguity are denied before user-target I/O. The intended connection's
+exact version/family/charset/time-zone/sql_mode drives the lexer. A Read-only
+profile may acquire that metadata-only lease, but mutation has zero user-target
+dispatch. Run-all is fully parsed/classified and all relations/writable targets
+are metadata-preflighted before target 1. Shared metadata locks are retained by
+the active worker so ALTER or relevant inbound FK/trigger drift cannot
+invalidate the complete proof.
+
+Redis raw execution uses the exact command/arity/option table in DU-03.
+Explorer writes are not raw editor text: they are typed DU-07 operations backed
+by one-key static atomic scripts.
+
+## 6. MySQL data and transaction architecture
+
+D2 extends catalog ownership with index/engine/trigger/identity metadata and a
+typed table-data request:
+
+- identifiers come only from validated catalog identity and are quoted;
+- filter values are typed parameters, never SQL fragments;
+- page tokens bind profile/generation/relation/filter/sort/limit/cursor and
+  catalog fingerprint;
+- a usable key selects keyset paging; bounded keyless fallback is explicitly
+  unstable and stops at its fixed offset cap.
+
+D5 replaces pooled mutation semantics with one serialized connection worker per
+active profile transaction and a stable CSPRNG TransactionId:
+
+```text
+AutoCommit
+  -> ActiveClean
+  -> ActivePending
+  -> Resolving(Commit|Rollback)
+  -> AutoCommit | OutcomeUnknown
 ```
 
-Only Profile scope contains profile/session generations. Runtime uses a
-process-monotonic generation allocator; Delete publishes a tombstone and a
-recreated id receives a greater generation. Cache entries are
-`{profile_generation, session_generation, connection_fingerprint, handle}`.
-Every eviction compare-matches both generations.
+The worker initializes utf8mb4/+00:00 and proves autocommit=1/in_transaction=0
+before Begin. All editor reads/DML, table reads, row Apply and CSV import inside
+an active transaction use that same worker/connection. DDL/session controls
+remain outside the model. No GUI DML reaches an auto-commit connection.
+Terminal requests use explicit AND NO CHAIN NO RELEASE and prove
+in_transaction=0 even after a success response. Results/history distinguish
+statement success from AppliedPendingTransaction. After a proven outcome the
+worker persists TerminalProven, idempotently rewrites/fsyncs the profile shard
+by TransactionId, folds memory, then removes the fence. Startup replays any
+TerminalProven, so separate files are never assumed cross-file atomic; earlier
+Resolving crashes become OutcomeUnknown. That fence similarly replays an
+idempotent TransactionId fanout to durable Unknown plus the live-memory fold;
+status, restart and acknowledgement rerun it, and acknowledgement cannot remove
+the fence until durable agreement. A failure at any conversion, fanout or
+removal phase remains blocking and replayable rather than leaving Pending
+history without an authority.
 
-## Config and secret ownership
+D6 stages row changes locally using the closed lossless MysqlInputCell families
+and applies one reviewed batch inside an internal operation savepoint.
+Update/delete re-read and binary-compare/lock the retained identity/original on
+the transaction connection before typed DML. Add supports only a reviewed
+supplied usable identity or one numeric single-column AUTO_INCREMENT primary
+key recovered from same-connection insert metadata. Generated columns remain
+unwritable and Update cannot change its identity key. Any row-N
+error/conflict/cancel/refresh failure proves rollback to the savepoint or enters
+ApplyOutcomeUnknown; partial Apply is never presented as local/discardable.
+Local/unknown/applied stage surfaces are lifecycle-guarded and non-evictable.
+Apply never commits; only shared controls resolve AppliedPendingTransaction.
 
-`config::load_path(&Path)` is the only lower-level loader. Entrypoints resolve
-the path once using global `--config`, then `DBOTTER_CONFIG`, then the platform
-default.
+D8 parses/maps CSV through the same MysqlInputCell contract on a bounded
+blocking lane and applies parameterized batches only to a completeness-proven,
+trigger-free InnoDB table inside an operation savepoint on the same worker.
+Error/cancel proves rollback to that savepoint or raises OutcomeUnknown; earlier
+profile transaction changes are preserved.
 
-Version 1 is read-only input. Before the first confirmed v1→v2 mutation, the
-writer creates fixed `<config>.v1.bak` with no-replace durability. Each
-Create/Update/Delete then reloads the exact path, applies a typed mutation,
-writes a 0600 same-directory temporary file, file-fsyncs, rechecks the input
-fingerprint, renames at the commit point, parent-fsyncs, reloads, and reconciles
-one of `NotCommitted`, `Committed`, or `CommittedDurabilityUnknown`.
+## 7. Redis mutation architecture
 
-`ConnectionProfile` contains only non-secret fields and persisted
-`CredentialMode`. `SessionSecret` is non-serializable, redacted, and owned by
-`HashMap<ProfileId, Arc<SessionSecret>>`. UI-only
-`SessionCredentialIntent::{KeepCurrent, Replace, Forget}` maps to mutation-only
-`SessionSecretUpdate::{Keep, Replace, Clear}` after the config commit point.
-Environment mode stores a name only and exposes Available/Missing/Empty without
-the value.
+D7 retains raw key/payload bytes only in memory and a Missing-or-present
+inspection revision. Static one-key Lua inspection/mutation scripts run an O(1)
+STRLEN or cardinality<=512 gate before capped exact MEMORY/DUMP proof, then
+recheck revision/old member/value and apply exactly one frozen
+String/Hash/List/Set/Sorted Set/TTL/DeleteKey action. Before target mutation,
+redis.acl_check_cmd validates the exact action and recovery commands without a
+second/probe key. Missing create/add paths use a no-DUMP revision.
 
-## Typed driver and resource seams
+Read-only rejects before dispatch. Review confirmation binds the exact decoded
+payload, key/revision, profile/generation and expiry. The durable RedisApplying
+fence precedes wire dispatch; response/restoration uncertainty becomes
+RedisOutcomeUnknown with only an HMAC key token. Startup keeps all profile
+mutation blocked until matching-key fresh inspection and explicit acknowledgement.
+Lossy rendered text is never write identity.
 
-The target driver boundary is split by semantics:
+## 8. Result, CLI and UI ownership
 
-```rust
-trait ConnectionPing {
-    async fn ping(&self, timeout: Duration) -> Result<(), DriverError>;
-}
+D9 replaces one overwritten result with bounded result tabs that share immutable
+`Arc<ResultSnapshot>` data. Per-result and aggregate caps evict only inactive,
+terminal, unprotected results; active or stage/review/unknown-owning surfaces
+are never silently removed. Grid/record/value detail,
+local filter/sort, copy and export operate only on retained data and disclose
+truncation. Result target metadata is governed by editor-text persistence; when
+that category is off/purged, no result target or rerun placeholder is stored.
 
-trait MySqlPreparedExecution {
-    async fn execute_prepared(
-        &self,
-        request: &PreparedMySqlRequest,
-    ) -> Result<QueryResult, DriverError>;
-}
+D10 keeps profile commands, stdin/file/text target acquisition, output encoding
+and numeric exits as thin adapters over shared model/service contracts. CLI DML
+is one-process only: fully preflight, Begin, execute all, then prove the selected
+whole transaction outcome. A partial failed batch can never Commit.
 
-trait RedisExecution {
-    async fn execute_command(
-        &self,
-        request: &RedisExecuteRequest,
-    ) -> Result<QueryResult, DriverError>;
-}
+D11 uses the named local UI/UX OpenAI reference for visual language: white/black
+opacity hierarchy, black-inverted primary action, square corners, no decorative
+gradients/shadows, stable vector icons and restrained/reduced motion. DBeaver's
+first four GitHub README screenshots provide the separate interaction-structure
+floor: a persistent object navigator, object/editor and result tabs, bounded
+resizable editor/result/detail panes, directly available daily action bars and
+an always-readable connection/transaction/operation status strip. Per-profile
+layout geometry and tab order are bounded durable state; invalid geometry resets
+to safe defaults. Discrete actions retain 44-point targets while dense native
+tree/grid collections use full-row keyboard-accessible selection. The
+user-provided dbotter artwork remains the app/title icon. Every canonical flow
+is operable at 1,440×900 and 840×560, with stable accessibility identity/state,
+correlated background work and exact cancellation where possible. The public
+wide/min screenshot matrix is captured only from the isolated tracked synthetic
+fixture/temp config after AX allowlist/sentinel checks and raster metadata
+stripping. GIS and ERD rendering remain P1 and no fake controls are shown.
 
-trait CatalogBrowser {
-    async fn load_page(
-        &self,
-        request: &CatalogRequest,
-    ) -> Result<CatalogPage, DriverError>;
-}
+## 9. Public error and privacy boundary
 
-trait KeyspaceBrowser {
-    async fn scan_keys(
-        &self,
-        request: &RedisScanRequest,
-    ) -> Result<RedisKeyPage, DriverError>;
-    async fn inspect_key(
-        &self,
-        request: &RedisKeyInspectRequest,
-    ) -> Result<RedisValuePreview, DriverError>;
-}
-```
+Backend prose and user data do not cross the static public-error boundary.
+Sensitive request types have manual redacted `Debug` and no serialization.
+Query/key/cell/CSV content appears only in the intended UI/clipboard/export or
+the disclosed local editor/history store. Public visual evidence is the sole
+exception and contains only exact tracked synthetic fixture values from an
+isolated process; it never reads the user's config.
 
-MySQL user SQL has one entry: `PreparedMySqlRequest` through server
-`COM_STMT_PREPARE` and `COM_STMT_EXECUTE`. SQLx's negotiated
-`CLIENT_MULTI_STATEMENTS` capability is not a safety boundary. Source/trait
-contracts reject user-text use of `sqlx::raw_sql`,
-`Executor::execute(&str)`, `COM_QUERY`, or prepared-unsupported fallback.
-Static/bound catalog statements are prepared too.
+Credential channels are excluded from config/workspace/history/log/error/
+evidence. Valid arbitrary editor/history literals may contain secrets or PII;
+the first-run disclosure, private file boundary and independent per-profile
+editor/history opt-outs are the protection. The exact conservative credential
+form classifier redacts matched and malformed execution attempts.
 
-MySQL `CATALOG` and Redis `KEYSPACE_BROWSE` are independent capability bits.
-`CATALOG` is ready with P4's hermetic and mandatory live proof from
-original implementation `e4599152daf0ca066baf6619048dae89c43cc6e4` plus
-review fixes through `05ad72f20e415b44f2d90ce7d5971c3d7a75b520`;
-`KEYSPACE_BROWSE` remains planned for P5. MongoDB remains a Planned descriptor
-with a future document-native seam; it is never coerced into SQL.
+## 10. Ownership and conformance
 
-## Runtime state and shutdown
+The expected source ownership table is authoritative in
+`docs/daily-use/trace.md` §5; mutable RED/GREEN/live/native status belongs in
+`docs/daily-use/evidence.md`. Cross-layer behavior changes update the frozen
+trace before code. A file's presence never proves a D row.
 
-`active_profiles`, tombstones, session cache, workspaces, secret store, and
-task registry are runtime-owned. UI folds only events whose exact identity is
-still current.
+D12 binds the reviewed source commit to CI, Preview tag/artifacts/checksums, tap
+formula, xbrew install receipt and installed binary/AX identity. Preview is the
+only authorized channel; stable publication requires a separate user approval.
 
-- Reload performs an id-keyed diff. Unchanged retains state; added is fresh;
-  changed/removed fences then cancels, joins, evicts, and clears. An unreadable
-  reload enters Config uncertain and permits only Reload/Shutdown.
-- A runtime-neutral committed Edit may retag an idle proven handle. Active work
-  or connection-affecting edits evict it after the new-generation fence.
-- Cancel/timeout drops client waiting, joins, reports server state Unknown, and
-  evicts only the exact used session generation.
-- Catalog work drops its scoped driver future before exact acquired-session
-  compare-remove/close. One typed `SessionDisposition` and session generation
-  drives cache mutation, terminal event, and UI truth; an old event cannot
-  evict or hide a replacement session, and stale catalog pages remain visible.
-- Async network work has a bounded abort grace. Blocking export checks
-  cancellation per row/chunk and Shutdown waits for actual worker/temp cleanup.
-- Registry/permit/temp cleanup precedes terminal event delivery, including
-  panic/`JoinError` and full/closed event-lane cases.
-
-The P3 source+test review is bound to snapshot
-`599917d1507df767b5b873a6d52d914d9646b9135fa51671282b4f0b884d5ecb`;
-two independent reviewers each reported `NO P3 BLOCKER`. Its reproducible
-production, test, and release-binary SHA-256 values are
-`59a348c8a5e7f4bc63a15631cdac7be14444aebc57c84fb34ebbcb795692fec7`,
-`1b7a9ca40dea4994126f101dfcab1fc33fa6019b773627699c77e24167ac5b95`,
-and `9e43c9732be5a642873063f91a75364f9ad7f310735b17accaa3c24be0f95556`.
-The checkpoint passed 227 regular tests and 18 doctests, strict locked/offline
-Clippy, formatting, diff, release-contract, receipt, all-target/all-feature
-tests, and the release build.
-
-P4's final review input is
-`ac9abfd2b6434fec58e7280d4da958125737a342fed01b7a7db2c190860dc120`.
-Review RED contract commit `31bd052f0d550e8c9e13e4f743f245ee4be6eba2`
-and the later restart-scope RED commits are closed by code commits through
-`05ad72f20e415b44f2d90ce7d5971c3d7a75b520`. The fixed checkpoint passed
-249 regular tests, 19 doctests, the same strict
-gates, and the isolated `dbotter-p4` MySQL live test 1/1 in default and
-all-features configurations. Independent exact-commit reviews reported
-`NO P4 BLOCKER` and `NO P4 SECURITY BLOCKER`; T5 remains Implementing only for
-P6 native/installed accessibility evidence. The production, test, and
-release-binary hashes are recorded in `01-spec.md` and `04-patch-plan.md`.
-
-## UI architecture and accessibility
-
-`UiModel` owns profile-generation workspaces, editor text, pending ids,
-historical/current result snapshots, connection state, and public errors. It
-owns no client or secret value.
-
-The P4 MySQL Explorer adds only generation-keyed display/retention state. It
-submits typed `CatalogRequest` values through the bounded controller, preserves
-stale pages and exact Retry recipes, and inserts quoted `LIMIT 500` templates
-without executing them. A branch retains its exact continuation request, so a
-changed prefix affects Refresh/new expansion but cannot rewrite an existing
-Load more token context. Its local OpenAI component tokens are flat white/black
-with sharp corners, visible focus, textual states, and numerically tested WCAG
-AA ordinary-text contrast; P6 remains responsible for the complete native
-accessibility surface.
-
-The form distinguishes Create from Update and holds a `DraftId`. Test uses
-temporary resources and has no path to config/cache/store/workspace mutation.
-Create conflict recovery uses `ConnectionId`; draft recovery emits
-`EditDraft`, while saved-profile recovery emits only safe ProfileId actions.
-
-The editor exposes `editor.target`, `editor.row_limit`, and `editor.timeout`.
-`FocusExecuteLimits` applies only to Execute. MySQL selection/caret extraction
-and Redis physical-line extraction are pure before typed dispatch.
-
-All P0 widgets have stable author ids, roles, names, focus order, keyboard
-actions, enabled state, and non-color cues. Headless tests use egui 0.35
-`Context::run_ui(RawInput, …)`, call `enable_accesskit()`, and inspect
-`FullOutput.platform_output.accesskit_update`; installed automation verifies
-the same ids as macOS AXIdentifier values.
-
-## Public error and disclosure boundary
-
-Internal errors convert through the exhaustive table in approved trace T8 to:
-
-```rust
-PublicOperationError {
-    operation: OperationKind,
-    category: ErrorCategory,
-    code: PublicCode,
-    summary: PublicSummary,
-    recovery: NonEmpty<RecoveryAction>,
-}
-```
-
-Unknown backend values become static InternalFailure. Backend prose and secrets
-never cross the public boundary. User-owned editor/result/key/path values are
-allowed only in their intended rendered/AX value node and, after explicit user
-action, clipboard/export. Sensitive request types have manual redacted `Debug`
-and no `Serialize`.
-
-## Results, memory, and export
-
-Every result carries `ResultProvenance` with profile/generation/operation.
-Retained snapshot caps apply after driver decoding; transient row/RESP-frame
-allocation is disclosed. The exact `Cell`, clipboard, TSV, CSV, and canonical
-JSON mappings live in approved spec §9.
-
-Export owns `Arc<ResultSnapshot>`, streams without a second whole-result byte
-vector, uses a 0600 same-directory temporary file, file fsync, explicit
-no-overwrite/confirmed-replace commit, and parent fsync. Reveal actions carry
-safe ids, not paths. Runtime receipts contain no result digest or content.
-
-## Distribution architecture
-
-P8/P9 produce per-architecture signed `Dbotter Preview.app` bundles. Identity
-is measured after signing and linked through typed source/build/artifact/release/
-formula/install records. The installed CLI shim and exact launched PID must
-resolve to the manifest's post-sign executable before AX input.
-
-Binary identity and config compatibility are separate commands and schemas as
-specified in `01-spec.md`. Preview and stable workflows share the verification
-gate, but this task invokes preview only.
-
-## Planned file ownership
-
-Files listed below are expected by approved slices; absence before that slice is
-not a deviation and presence in the historical demo is not completion proof.
-
-| Slice | Primary ownership |
-|---|---|
-| P1 | `src/model.rs`, `src/config.rs`, `src/secrets.rs`, `src/public_error.rs`, `src/service.rs` |
-| P2 | `src/service.rs`, `src/ui/{adapter,runtime,model}.rs`, controller/service tests |
-| P3 | typed driver/resource traits, `PreparedMySqlRequest`, CLI/resource contracts |
-| P4 | `src/drivers/mysql_catalog.rs`, catalog service/UI/CLI/live tests |
-| P5 | Redis keyspace/TLS service/UI/CLI/live tests |
-| P6 | native form/editor/explorer/result/recovery UI and RawInput/AccessKit tests |
-| P7 | export encoders/filesystem policy and golden/failpoint tests |
-| P8 | verification scripts/workflows/package/manifest/receipt contracts |
-| P9 | reviewed merge, preview, tap, Brew install, installed proof |
-
-The exact expected file map is maintained per slice in
-`docs/usable-mvp/plan.md`. Do not claim a path exists or a capability is ready
-without checking the tree and its trace evidence.
-
-## Licensing boundary
-
-dbotter is Apache-2.0. DBeaver is behavior/product research only. Do not copy
-DBeaver PRO Redis or MongoDB implementation code.
+dbotter remains Apache-2.0. Competitor products are behavior research only;
+their implementation code is not copied.
