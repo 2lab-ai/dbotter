@@ -11,13 +11,17 @@ use dbotter::config::{
     MigrationConsent, MutationFailpoint, MutationFaultInjector, load_path,
 };
 use dbotter::drivers::{
-    CatalogBrowser, ConnectedResources, ConnectionPing, DriverError, MySqlPreparedExecution,
+    CatalogBrowser, ConnectedResources, ConnectionPing, DriverError, KeyspaceBrowser,
+    MySqlPreparedExecution, RedisExecution,
 };
+use dbotter::execution::{ExecutionLanguage, ExecutionTarget, classify_execution_kind};
 use dbotter::model::{
     CatalogPage, CatalogRequest, ConnectionDraft, CredentialMode, DraftId, DriverKind,
-    ExecuteRequest, MySqlPublicErrorCode, OperationId, OperationKind, PreparedMySqlRequest,
-    ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary, QueryLanguage,
-    QueryResult, TlsMode,
+    ExecuteRequest, LegacyConfigVersion, MySqlPublicErrorCode, OperationId, OperationKind,
+    PreparedMySqlRequest, ProfileAccess, ProfileEnvironment, ProfileFieldId, ProfileGeneration,
+    ProfileId, ProfileSafetyPosture, PublicCode, PublicSummary, QueryLanguage, QueryResult,
+    RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview,
+    TlsMode,
 };
 use dbotter::public_error::{RecoveryAction, SafeContext, recovery_for};
 use dbotter::secrets::{
@@ -514,6 +518,162 @@ impl SessionConnector for FakeConnector {
 }
 
 #[derive(Default)]
+struct AccessAdmissionIo {
+    non_target_session_io: AtomicUsize,
+    user_target_dispatches: AtomicUsize,
+}
+
+struct AccessAdmissionSession {
+    driver: DriverKind,
+    io: Arc<AccessAdmissionIo>,
+}
+
+#[derive(Clone)]
+struct AccessAdmissionResources {
+    driver: DriverKind,
+    io: Arc<AccessAdmissionIo>,
+}
+
+#[async_trait]
+impl ConnectionPing for AccessAdmissionResources {
+    async fn ping(&self, _timeout: Duration) -> Result<(), DriverError> {
+        self.io.non_target_session_io.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MySqlPreparedExecution for AccessAdmissionResources {
+    async fn execute_prepared(
+        &self,
+        _request: &PreparedMySqlRequest,
+    ) -> Result<QueryResult, DriverError> {
+        self.io
+            .user_target_dispatches
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(empty_result())
+    }
+}
+
+#[async_trait]
+impl RedisExecution for AccessAdmissionResources {
+    async fn execute_command(
+        &self,
+        _request: &RedisExecuteRequest,
+    ) -> Result<QueryResult, DriverError> {
+        self.io
+            .user_target_dispatches
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(empty_result())
+    }
+}
+
+#[async_trait]
+impl CatalogBrowser for AccessAdmissionResources {
+    async fn load_page(
+        &self,
+        _request: &CatalogRequest,
+        _token_key: &dbotter::drivers::mysql_catalog::CatalogTokenKey,
+    ) -> Result<CatalogPage, DriverError> {
+        Err(DriverError::Unsupported {
+            driver: self.driver,
+            operation: "access-admission catalog".to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl KeyspaceBrowser for AccessAdmissionResources {
+    async fn scan_keys(&self, _request: &RedisScanRequest) -> Result<RedisKeyPage, DriverError> {
+        Err(DriverError::Unsupported {
+            driver: self.driver,
+            operation: "access-admission key scan".to_owned(),
+        })
+    }
+
+    async fn inspect_key(
+        &self,
+        _request: &RedisKeyInspectRequest,
+    ) -> Result<RedisValuePreview, DriverError> {
+        Err(DriverError::Unsupported {
+            driver: self.driver,
+            operation: "access-admission key inspect".to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl SessionHandle for AccessAdmissionSession {
+    async fn ping(&self, _timeout: Duration) -> Result<(), DriverError> {
+        self.io.non_target_session_io.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn connected_resources(&self) -> Option<ConnectedResources> {
+        let resources = Arc::new(AccessAdmissionResources {
+            driver: self.driver,
+            io: self.io.clone(),
+        });
+        match self.driver {
+            DriverKind::MySql => Some(ConnectedResources::MySql {
+                ping: resources.clone(),
+                execution: resources.clone(),
+                catalog: resources,
+            }),
+            DriverKind::Redis => Some(ConnectedResources::Redis {
+                ping: resources.clone(),
+                execution: resources.clone(),
+                keyspace: resources,
+            }),
+            DriverKind::MongoDb => None,
+        }
+    }
+
+    async fn close(&self) -> Result<(), DriverError> {
+        Ok(())
+    }
+}
+
+struct AccessAdmissionConnector {
+    driver: DriverKind,
+    io: Arc<AccessAdmissionIo>,
+    saw_secret: AtomicBool,
+}
+
+impl AccessAdmissionConnector {
+    fn new(driver: DriverKind) -> Self {
+        Self {
+            driver,
+            io: Arc::new(AccessAdmissionIo::default()),
+            saw_secret: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionConnector for AccessAdmissionConnector {
+    async fn connect(
+        &self,
+        profile: &dbotter::model::ConnectionProfile,
+        secret: Option<&SessionSecret>,
+        _timeout: Duration,
+    ) -> Result<Arc<dyn SessionHandle>, DriverError> {
+        if profile.driver != self.driver {
+            return Err(DriverError::InvalidConfig {
+                driver: profile.driver,
+                message: "access-admission driver mismatch".to_owned(),
+            });
+        }
+        self.io.non_target_session_io.fetch_add(1, Ordering::SeqCst);
+        self.saw_secret.store(secret.is_some(), Ordering::SeqCst);
+        Ok(Arc::new(AccessAdmissionSession {
+            driver: self.driver,
+            io: self.io.clone(),
+        }))
+    }
+}
+
+#[derive(Default)]
 struct MissingEnvironment;
 
 impl SecretResolver for MissingEnvironment {
@@ -548,6 +708,379 @@ impl SecretResolver for FixedEnvironment {
         } else {
             EnvironmentAvailability::Missing
         }
+    }
+}
+
+const DU01_ENDPOINT_SENTINEL: &str = "du01-endpoint-sentinel.invalid";
+const DU01_CREDENTIAL_SENTINEL: &str = "du01-credential-sentinel";
+const DU01_POSTURE_SENTINEL: &str = "DU01 posture sentinel";
+const DU01_MYSQL_READ: &str = "SELECT 7";
+const DU01_MYSQL_MUTATION: &str = "UPDATE widgets SET value = 1 WHERE id = 7 LIMIT 1";
+const DU01_REDIS_READ: &str = "GET du01:key";
+const DU01_REDIS_MUTATION: &str = "SET du01:key du01-value";
+
+struct AccessAdmissionObservation {
+    label: &'static str,
+    operation_id: OperationId,
+    result: Result<ExecuteOutcome, ServiceError>,
+    non_target_session_io: usize,
+    user_target_dispatches: usize,
+    saw_secret: bool,
+    expected_secret: bool,
+    forbidden_error_text: Vec<String>,
+}
+
+async fn observe_classified_access_admission(
+    label: &'static str,
+    operation_id: OperationId,
+    driver: DriverKind,
+    access: ProfileAccess,
+    language: QueryLanguage,
+    source: &'static str,
+) -> AccessAdmissionObservation {
+    let directory = tempfile::tempdir().expect("classified access-admission tempdir");
+    let path = directory.path().join("config.toml");
+    let connector = Arc::new(AccessAdmissionConnector::new(driver));
+    let secrets = Arc::new(SessionSecretStore::default());
+    let service = ApplicationService::with_dependencies(
+        &path,
+        connector.clone(),
+        Arc::new(MissingEnvironment),
+        secrets,
+        ConfigWriter::default(),
+    )
+    .expect("classified access-admission service");
+    let mut profile_draft = named_draft(driver, DU01_POSTURE_SENTINEL);
+    profile_draft.host = DU01_ENDPOINT_SENTINEL.to_owned();
+    profile_draft.environment = ProfileEnvironment::Production;
+    profile_draft.access = access;
+    profile_draft.credential_mode = CredentialMode::Session;
+    let created = service
+        .create_profile(create_request(
+            DraftId(operation_id.0),
+            OperationId(operation_id.0.saturating_sub(1)),
+            Some("du01-profile"),
+            profile_draft,
+            SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(
+                DU01_CREDENTIAL_SENTINEL.to_owned(),
+            ))),
+        ))
+        .await
+        .expect("classified access-admission profile");
+    let profiles = service.profiles_snapshot().await;
+    assert_eq!(profiles.len(), 1, "{label}: exact classified profile");
+    assert!(matches!(
+        profiles[0].safety,
+        ProfileSafetyPosture::Classified {
+            environment: ProfileEnvironment::Production,
+            access: actual,
+            ..
+        } if actual == access
+    ));
+
+    let result = service
+        .execute_at(ExecuteRequest {
+            operation_id,
+            profile_id: created.profile_id,
+            profile_generation: created.profile_generation,
+            language,
+            text: source.to_owned(),
+            row_limit: 7,
+            timeout: Duration::from_secs(1),
+        })
+        .await;
+    AccessAdmissionObservation {
+        label,
+        operation_id,
+        result,
+        non_target_session_io: connector.io.non_target_session_io.load(Ordering::SeqCst),
+        user_target_dispatches: connector.io.user_target_dispatches.load(Ordering::SeqCst),
+        saw_secret: connector.saw_secret.load(Ordering::SeqCst),
+        expected_secret: true,
+        forbidden_error_text: vec![
+            DU01_ENDPOINT_SENTINEL.to_owned(),
+            DU01_CREDENTIAL_SENTINEL.to_owned(),
+            DU01_POSTURE_SENTINEL.to_owned(),
+            source.to_owned(),
+            format!("{access:?}"),
+            "Production".to_owned(),
+        ],
+    }
+}
+
+async fn observe_legacy_access_admission(
+    label: &'static str,
+    operation_id: OperationId,
+    source_version: LegacyConfigVersion,
+    driver: DriverKind,
+    language: QueryLanguage,
+    source: &'static str,
+) -> AccessAdmissionObservation {
+    let directory = tempfile::tempdir().expect("legacy access-admission tempdir");
+    let path = directory.path().join("config.toml");
+    let (version, driver_name, port, tls, credential_mode) = match (source_version, driver) {
+        (LegacyConfigVersion::V1, DriverKind::MySql) => (1, "mysql", 3306, "preferred", ""),
+        (LegacyConfigVersion::V1, DriverKind::Redis) => (1, "redis", 6379, "disabled", ""),
+        (LegacyConfigVersion::V2, DriverKind::MySql) => (
+            2,
+            "mysql",
+            3306,
+            "preferred",
+            "credential_mode = \"none\"\n",
+        ),
+        (LegacyConfigVersion::V2, DriverKind::Redis) => {
+            (2, "redis", 6379, "disabled", "credential_mode = \"none\"\n")
+        }
+        (_, DriverKind::MongoDb) => unreachable!("DU-01 admission covers MySQL and Redis"),
+    };
+    let encoded = format!(
+        "version = {version}\n\n[[profiles]]\nid = \"du01-legacy\"\nname = \"{DU01_POSTURE_SENTINEL}\"\ndriver = \"{driver_name}\"\nhost = \"{DU01_ENDPOINT_SENTINEL}\"\nport = {port}\ntls = \"{tls}\"\n{credential_mode}"
+    );
+    fs::write(&path, encoded).expect("legacy access-admission fixture");
+    let connector = Arc::new(AccessAdmissionConnector::new(driver));
+    let service = ApplicationService::with_dependencies(
+        &path,
+        connector.clone(),
+        Arc::new(MissingEnvironment),
+        Arc::new(SessionSecretStore::default()),
+        ConfigWriter::default(),
+    )
+    .expect("legacy access-admission service");
+    let profiles = service.profiles_snapshot().await;
+    assert_eq!(profiles.len(), 1, "{label}: exact legacy profile");
+    assert!(matches!(
+        profiles[0].safety,
+        ProfileSafetyPosture::UnclassifiedLegacy { source } if source == source_version
+    ));
+    let profile_id = ProfileId("du01-legacy".to_owned());
+    let profile_generation = service
+        .profile_generation(&profile_id)
+        .await
+        .expect("legacy access-admission generation");
+    let result = service
+        .execute_at(ExecuteRequest {
+            operation_id,
+            profile_id,
+            profile_generation,
+            language,
+            text: source.to_owned(),
+            row_limit: 7,
+            timeout: Duration::from_secs(1),
+        })
+        .await;
+    AccessAdmissionObservation {
+        label,
+        operation_id,
+        result,
+        non_target_session_io: connector.io.non_target_session_io.load(Ordering::SeqCst),
+        user_target_dispatches: connector.io.user_target_dispatches.load(Ordering::SeqCst),
+        saw_secret: connector.saw_secret.load(Ordering::SeqCst),
+        expected_secret: false,
+        forbidden_error_text: vec![
+            DU01_ENDPOINT_SENTINEL.to_owned(),
+            DU01_CREDENTIAL_SENTINEL.to_owned(),
+            DU01_POSTURE_SENTINEL.to_owned(),
+            source.to_owned(),
+            "UnclassifiedLegacy".to_owned(),
+            format!("{source_version:?}"),
+        ],
+    }
+}
+
+fn assert_access_admission_error_is_public_safe(
+    label: &str,
+    error: &ServiceError,
+    forbidden: &[String],
+) {
+    assert!(matches!(
+        error,
+        ServiceError::ReadOnlyProfile {
+            code: PublicCode::ReadOnlyProfile,
+        }
+    ));
+    assert_eq!(
+        error.public_error_parts(),
+        (PublicSummary::PermissionDenied, PublicCode::ReadOnlyProfile,),
+        "{label}: stable local access-admission error"
+    );
+    let public_surfaces = format!(
+        "{error:?}\n{error}\n{:?}\n{:?}\n{}",
+        error.public_summary(),
+        error.public_code(),
+        error.public_summary()
+    );
+    for forbidden_value in forbidden {
+        assert!(
+            !public_surfaces.contains(forbidden_value),
+            "{label}: public error leaked forbidden profile, target, endpoint, or credential data"
+        );
+    }
+}
+
+#[tokio::test]
+async fn du01_access_admission_is_effective_read_only_without_blocking_read_paths() {
+    for (language, target, expected) in [
+        (
+            ExecutionLanguage::MySql,
+            ExecutionTarget::MySqlText(DU01_MYSQL_READ.to_owned()),
+            OperationKind::ExecuteRead,
+        ),
+        (
+            ExecutionLanguage::MySql,
+            ExecutionTarget::MySqlText(DU01_MYSQL_MUTATION.to_owned()),
+            OperationKind::ExecuteMutation,
+        ),
+        (
+            ExecutionLanguage::Redis,
+            ExecutionTarget::RedisArgv(vec!["GET".to_owned(), "du01:key".to_owned()]),
+            OperationKind::ExecuteRead,
+        ),
+        (
+            ExecutionLanguage::Redis,
+            ExecutionTarget::RedisArgv(vec![
+                "SET".to_owned(),
+                "du01:key".to_owned(),
+                "du01-value".to_owned(),
+            ]),
+            OperationKind::ExecuteMutation,
+        ),
+    ] {
+        assert_eq!(classify_execution_kind(language, &target), expected);
+    }
+
+    let blocked = vec![
+        observe_classified_access_admission(
+            "classified read-only MySQL mutation",
+            OperationId(701),
+            DriverKind::MySql,
+            ProfileAccess::ReadOnly,
+            QueryLanguage::Sql,
+            DU01_MYSQL_MUTATION,
+        )
+        .await,
+        observe_classified_access_admission(
+            "classified read-only Redis mutation",
+            OperationId(702),
+            DriverKind::Redis,
+            ProfileAccess::ReadOnly,
+            QueryLanguage::RedisCommand,
+            DU01_REDIS_MUTATION,
+        )
+        .await,
+        observe_legacy_access_admission(
+            "unclassified v1 MySQL mutation",
+            OperationId(703),
+            LegacyConfigVersion::V1,
+            DriverKind::MySql,
+            QueryLanguage::Sql,
+            DU01_MYSQL_MUTATION,
+        )
+        .await,
+        observe_legacy_access_admission(
+            "unclassified v2 Redis mutation",
+            OperationId(704),
+            LegacyConfigVersion::V2,
+            DriverKind::Redis,
+            QueryLanguage::RedisCommand,
+            DU01_REDIS_MUTATION,
+        )
+        .await,
+    ];
+    let allowed = vec![
+        observe_classified_access_admission(
+            "classified read-only MySQL read",
+            OperationId(705),
+            DriverKind::MySql,
+            ProfileAccess::ReadOnly,
+            QueryLanguage::Sql,
+            DU01_MYSQL_READ,
+        )
+        .await,
+        observe_classified_access_admission(
+            "classified read-only Redis read",
+            OperationId(706),
+            DriverKind::Redis,
+            ProfileAccess::ReadOnly,
+            QueryLanguage::RedisCommand,
+            DU01_REDIS_READ,
+        )
+        .await,
+        observe_legacy_access_admission(
+            "unclassified v1 MySQL read",
+            OperationId(707),
+            LegacyConfigVersion::V1,
+            DriverKind::MySql,
+            QueryLanguage::Sql,
+            DU01_MYSQL_READ,
+        )
+        .await,
+        observe_legacy_access_admission(
+            "unclassified v2 Redis read",
+            OperationId(708),
+            LegacyConfigVersion::V2,
+            DriverKind::Redis,
+            QueryLanguage::RedisCommand,
+            DU01_REDIS_READ,
+        )
+        .await,
+        observe_classified_access_admission(
+            "classified read-write MySQL mutation",
+            OperationId(709),
+            DriverKind::MySql,
+            ProfileAccess::ReadWrite,
+            QueryLanguage::Sql,
+            DU01_MYSQL_MUTATION,
+        )
+        .await,
+        observe_classified_access_admission(
+            "classified read-write Redis mutation",
+            OperationId(710),
+            DriverKind::Redis,
+            ProfileAccess::ReadWrite,
+            QueryLanguage::RedisCommand,
+            DU01_REDIS_MUTATION,
+        )
+        .await,
+    ];
+
+    for observation in blocked {
+        assert_eq!(
+            observation.user_target_dispatches, 0,
+            "{}: mutation reached a typed user-target driver port after {} permitted non-target session I/O calls",
+            observation.label, observation.non_target_session_io
+        );
+        if observation.non_target_session_io > 0 {
+            assert_eq!(
+                observation.saw_secret, observation.expected_secret,
+                "{}: metadata-only lease used the wrong credential capability",
+                observation.label
+            );
+        }
+        let error = observation
+            .result
+            .expect_err("DU-01 mutation posture must reject locally");
+        assert_access_admission_error_is_public_safe(
+            observation.label,
+            &error,
+            &observation.forbidden_error_text,
+        );
+    }
+
+    for observation in allowed {
+        assert_eq!(
+            observation.user_target_dispatches, 1,
+            "{}: admitted path must dispatch exactly one typed user target",
+            observation.label
+        );
+        assert_eq!(
+            observation.saw_secret, observation.expected_secret,
+            "{}: admitted path used the wrong credential capability",
+            observation.label
+        );
+        let outcome = observation
+            .result
+            .expect("DU-01 effective read-only and classified read-write paths remain available");
+        assert_eq!(outcome.operation_id, observation.operation_id);
     }
 }
 
