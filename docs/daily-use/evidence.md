@@ -24,7 +24,7 @@ v1.1 amendment are marked `deferred` rather than deleted.
 | D8 | — | — | — | — | deferred import (P1, v1.1); export baseline retained |
 | D9 | — | — | — | — | not started |
 | D10 | — | — | — | — | not started |
-| D11 | `96d708f` — `test(d11): require object-to-data execution`; `8ecc0c7` — `test(d11): require selected object editor flow`; `8d297b1` — `test(d11): require result inspection modes` | `3b573a2` — `feat(d11): execute table data action`; `164346b` — `feat(d11): retain selected object context` | Object/editor slices: focused all-features contracts, `just check`, `just check-all`. Result-inspection RED: `cargo test --all-features --test ui_result_contract result_grid_exposes_filter_sort_and_keyboard_record_detail -- --exact --nocapture` fails because the result surface has no stable Grid mode action. | — | RED result-inspection slice; prior object/editor GREENs retained; complete D11 native journeys pending |
+| D11 | `96d708f` — `test(d11): require object-to-data execution`; `8ecc0c7` — `test(d11): require selected object editor flow`; `8d297b1` — `test(d11): require result inspection modes` | `3b573a2` — `feat(d11): execute table data action`; `164346b` — `feat(d11): retain selected object context`; `740e483` — `feat(d11): add result inspection modes` | Object/editor slices: focused all-features contracts, `just check`, `just check-all`. Result inspection: focused `ui::result_view::tests::filter_and_sort_are_local_stable_and_debug_redacts_filter_text` and `result_grid_exposes_filter_sort_and_keyboard_record_detail`, then `just check` and `just check-all`. | — | GREEN result-inspection slice; prior object/editor GREENs retained; complete D11 native journeys pending |
 | D12 | — | — | — | — | not started |
 
 ## v1.1 branch reconciliation
