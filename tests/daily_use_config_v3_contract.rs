@@ -1,6 +1,14 @@
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use dbotter::config::{ConfigError, ConfigSourceVersion, config_contract, load_path};
+use dbotter::config::{
+    ConfigError, ConfigMutation, ConfigSourceVersion, ConfigWriter, MigrationConsent,
+    config_contract, load_path,
+};
+use dbotter::model::{ConnectionDraft, ConnectionProfile, DriverKind};
+
+#[path = "fixtures/c424e4e_v2_reader.rs"]
+mod c424e4e_v2_reader;
 
 const V2_PROFILE: &str = r#"version = 2
 
@@ -108,4 +116,90 @@ fn v3_missing_or_duplicate_instance_identity_fails_closed() {
     let duplicate = format!("{V3_PROFILE}\n{second}");
     fs::write(&path, duplicate).expect("duplicate identity fixture");
     assert!(matches!(load_path(&path), Err(ConfigError::InvalidProfile)));
+}
+
+#[test]
+fn v3_malformed_instance_identity_fails_as_an_invalid_profile() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+
+    for malformed in [
+        "00112233445566778899aabbccddee",
+        "00112233445566778899aabbccddeeff00",
+        "00112233445566778899AABBCCDDEEFF",
+        "00112233445566778899aabbccddeefg",
+    ] {
+        fs::write(
+            &path,
+            V3_PROFILE.replace("00112233445566778899aabbccddeeff", malformed),
+        )
+        .expect("malformed fixture");
+        assert!(
+            matches!(load_path(&path), Err(ConfigError::InvalidProfile)),
+            "malformed instance id must fail at the profile boundary: {malformed}"
+        );
+    }
+}
+
+#[test]
+fn v2_rejects_v3_posture_fields_instead_of_silently_classifying_legacy() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    fs::write(&path, V3_PROFILE.replace("version = 3", "version = 2"))
+        .expect("v2 injection fixture");
+
+    assert!(matches!(load_path(&path), Err(ConfigError::InvalidProfile)));
+}
+
+#[test]
+fn frozen_v2_reader_rejects_v3_before_service_or_network() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    fs::write(&path, V3_PROFILE).expect("v3 fixture");
+    let service_constructions = AtomicUsize::new(0);
+    let network_acquisitions = AtomicUsize::new(0);
+
+    let result = c424e4e_v2_reader::load_before_service_or_network(
+        path,
+        || {
+            service_constructions.fetch_add(1, Ordering::SeqCst);
+        },
+        || {
+            network_acquisitions.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+
+    assert_eq!(
+        result,
+        Err(c424e4e_v2_reader::FrozenReaderError::UnsupportedVersion(3))
+    );
+    assert_eq!(service_constructions.load(Ordering::SeqCst), 0);
+    assert_eq!(network_acquisitions.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn ordinary_legacy_crud_is_rejected_with_zero_filesystem_side_effects() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    fs::write(&path, V2_PROFILE).expect("v2 fixture");
+    let before = fs::read(&path).expect("original bytes");
+    let profile = ConnectionProfile::from_draft(
+        "must-not-exist".to_owned(),
+        ConnectionDraft::for_driver(DriverKind::MySql),
+    );
+
+    let result = ConfigWriter::default().mutate_path(
+        &path,
+        ConfigMutation::Create(profile),
+        MigrationConsent::Confirmed,
+    );
+
+    assert!(matches!(result, Err(ConfigError::MigrationPostureRequired)));
+    assert_eq!(fs::read(&path).expect("main unchanged"), before);
+    let entries = fs::read_dir(directory.path())
+        .expect("directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, vec!["config.toml"]);
 }
