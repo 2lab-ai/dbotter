@@ -30,8 +30,9 @@ pub use layout::{
     WorkspaceGeometry,
 };
 pub use model::{
-    ConfigPresentation, ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot,
-    ProfileWorkspace, UiEvent, UiModel, WorkspaceKey,
+    ConfigPresentation, ConnectionFailureOutcome, ConnectionState, EditorTab, EditorTabError,
+    EditorTabId, PostCloseState, ProfileSnapshot, ProfileWorkspace, ResultAreaTab, UiEvent,
+    UiModel, WorkspaceKey,
 };
 pub use mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 pub use native_harness::NativeUiHarness;

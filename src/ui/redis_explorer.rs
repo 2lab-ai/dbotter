@@ -12,7 +12,7 @@ use crate::model::{
 };
 use crate::public_error::PublicOperationError;
 
-use super::accessibility::named_dynamic_value_author_id;
+use super::accessibility::{named_author_id, named_dynamic_value_author_id};
 use super::model::UiEvent;
 
 const BLACK: egui::Color32 = egui::Color32::BLACK;
@@ -336,11 +336,16 @@ impl RedisExplorer {
                                 );
                             });
                         let filter_width = (ui.available_width() - 96.0).max(160.0);
-                        ui.add(
+                        let filter = ui.add(
                             egui::TextEdit::singleline(&mut self.filter_text)
                                 .id_source("redis.filter")
                                 .hint_text("Filter keys")
                                 .desired_width(filter_width),
+                        );
+                        named_author_id(
+                            filter,
+                            "navigator.object-filter",
+                            "Filter Redis keys",
                         );
                         let refresh_enabled = actions_enabled
                             && self.pending_scan.is_none()

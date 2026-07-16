@@ -274,7 +274,7 @@ const fn tls_label(mode: TlsMode) -> &'static str {
 
 #[derive(Default)]
 pub struct EditorSurface {
-    active_workspace: Option<WorkspaceKey>,
+    active_workspace: Option<(WorkspaceKey, Option<super::model::EditorTabId>)>,
     cursor: Option<EditorCursor>,
     validation_error: Option<EditorValidationError>,
     requested_focus: Option<&'static str>,
@@ -294,9 +294,10 @@ impl EditorSurface {
     ) -> Option<EditorIntent> {
         OpenAiTheme::apply(ui.ctx());
         let workspace_key = WorkspaceKey::new(profile.id.clone(), profile.generation);
-        let editor_id = egui::Id::new(EDITOR_INPUT_ID).with(&workspace_key);
-        if self.active_workspace.as_ref() != Some(&workspace_key) {
-            self.active_workspace = Some(workspace_key);
+        let active_editor = (workspace_key, workspace.selected_editor_tab_id());
+        let editor_id = egui::Id::new(EDITOR_INPUT_ID).with(&active_editor);
+        if self.active_workspace.as_ref() != Some(&active_editor) {
+            self.active_workspace = Some(active_editor);
             let cursor = workspace_cursor(workspace);
             workspace.caret_character_index = cursor.caret_character_index;
             workspace.selection_character_range = cursor.selection_character_range.clone();

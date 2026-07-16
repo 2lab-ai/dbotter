@@ -37,7 +37,10 @@ use super::layout::{
     CompactFallback, FallbackSurface, LayoutMode, NativeLayout, ResolvedLayout, SplitLayout,
     WorkspaceGeometry,
 };
-use super::model::{ConnectionState, ProfileSnapshot, UiEvent, UiModel, WorkspaceKey};
+use super::model::{
+    ConnectionState, EditorTabId, ProfileSnapshot, ProfileWorkspace, ResultAreaTab, UiEvent,
+    UiModel, WorkspaceKey,
+};
 use super::mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 use super::profile_form::{
     DraftTestAttempt, FormAction, ProfileEditor, ProfileEventResult, SaveAttempt,
@@ -56,6 +59,14 @@ struct ActiveOperation {
     operation_id: OperationId,
     profile_generation: ProfileGeneration,
     kind: OperationKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorTabAction {
+    Rename(EditorTabId),
+    New,
+    Duplicate(EditorTabId),
+    Close(EditorTabId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,6 +285,7 @@ pub struct DbotterApp {
     pending_export_destinations: HashMap<OperationId, PendingExportDestination>,
     committed_export_destinations: HashMap<ResultId, PathBuf>,
     result_export_formats: HashMap<ResultId, ExportFormat>,
+    connection_filter: String,
     workspace_geometries: HashMap<WorkspaceKey, WorkspaceGeometry>,
     compact_fallback: CompactFallback,
     compact_restore_focus: Option<egui::Id>,
@@ -303,6 +315,7 @@ impl DbotterApp {
             pending_export_destinations: HashMap::new(),
             committed_export_destinations: HashMap::new(),
             result_export_formats: HashMap::new(),
+            connection_filter: String::new(),
             workspace_geometries: HashMap::new(),
             compact_fallback: CompactFallback::default(),
             compact_restore_focus: None,
@@ -2912,6 +2925,15 @@ impl DbotterApp {
 
     fn connections_contents(&mut self, ui: &mut egui::Ui) {
         ui.heading("Connections");
+        let filter = ui.add_sized(
+            [ui.available_width(), OpenAiTheme::MIN_CONTROL_HEIGHT],
+            egui::TextEdit::singleline(&mut self.connection_filter)
+                .id_salt("navigator.connection-filter")
+                .hint_text("Filter connections")
+                .desired_width(f32::INFINITY),
+        );
+        named_author_id(filter, "navigator.connection-filter", "Filter connections");
+        ui.add_space(8.0);
         let actions_enabled = !self.model.is_config_uncertain();
         let mut new_driver = None;
         let mut reload = false;
@@ -2968,9 +2990,67 @@ impl DbotterApp {
             .max_height(list_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for profile in self.model.profiles.clone() {
+                let normalized_filter = self.connection_filter.trim().to_ascii_lowercase();
+                let profiles = self
+                    .model
+                    .profiles
+                    .iter()
+                    .filter(|profile| {
+                        normalized_filter.is_empty()
+                            || profile
+                                .name
+                                .to_ascii_lowercase()
+                                .contains(&normalized_filter)
+                            || profile
+                                .id
+                                .0
+                                .to_ascii_lowercase()
+                                .contains(&normalized_filter)
+                            || profile
+                                .driver
+                                .to_string()
+                                .to_ascii_lowercase()
+                                .contains(&normalized_filter)
+                            || profile
+                                .endpoint
+                                .to_ascii_lowercase()
+                                .contains(&normalized_filter)
+                            || profile.database.as_ref().is_some_and(|database| {
+                                database.to_ascii_lowercase().contains(&normalized_filter)
+                            })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for profile in profiles {
                     self.profile_card(ui, &profile);
                     ui.add_space(8.0);
+                }
+                if !normalized_filter.is_empty()
+                    && self.model.profiles.iter().all(|profile| {
+                        !profile
+                            .name
+                            .to_ascii_lowercase()
+                            .contains(&normalized_filter)
+                            && !profile
+                                .id
+                                .0
+                                .to_ascii_lowercase()
+                                .contains(&normalized_filter)
+                            && !profile
+                                .driver
+                                .to_string()
+                                .to_ascii_lowercase()
+                                .contains(&normalized_filter)
+                            && !profile
+                                .endpoint
+                                .to_ascii_lowercase()
+                                .contains(&normalized_filter)
+                            && !profile.database.as_ref().is_some_and(|database| {
+                                database.to_ascii_lowercase().contains(&normalized_filter)
+                            })
+                    })
+                {
+                    ui.weak("No matching connections");
                 }
             });
     }
@@ -3227,6 +3307,8 @@ impl DbotterApp {
         if let Some(profile) = self.model.selected_profile_snapshot().cloned() {
             let editor_enabled = !self.model.is_config_uncertain();
             let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+            self.show_editor_tab_strip(ui, &profile, &key, editor_enabled);
+            ui.separator();
             let workspace = self.model.workspace_mut(key);
             editor_intent = self.editor_surface.show(
                 ui,
@@ -3234,6 +3316,7 @@ impl DbotterApp {
                 workspace,
                 editor_enabled && profile.is_ready(),
             );
+            workspace.sync_selected_editor_tab_from_surface();
         } else {
             ui.weak("Select a connection to edit a statement or command.");
         }
@@ -3251,12 +3334,54 @@ impl DbotterApp {
     }
 
     fn show_result_surface(&mut self, ui: &mut egui::Ui) {
-        let tab = ui.selectable_label(true, "Results");
-        named_author_id(tab, "result-history-tabs", "Result tabs");
+        let selected_workspace_key = self.model.selected_workspace_key();
+        let selected_area = selected_workspace_key
+            .as_ref()
+            .and_then(|key| self.model.workspace(key))
+            .map_or(ResultAreaTab::Results, ProfileWorkspace::result_area_tab);
+        let mut next_area = None;
+        ui.horizontal(|ui| {
+            let results = ui.selectable_label(selected_area == ResultAreaTab::Results, "Results");
+            let results = named_author_id(results, "result.tab.results", "Results tab");
+            if results.clicked() {
+                next_area = Some(ResultAreaTab::Results);
+            }
+            let history = ui.selectable_label(selected_area == ResultAreaTab::History, "History");
+            let history = named_author_id(history, "result.tab.history", "History tab");
+            if history.clicked() {
+                next_area = Some(ResultAreaTab::History);
+            }
+        });
+        let region = ui.small("Results and execution history");
+        named_author_id(region, "result-history-tabs", "Result and history tabs");
         ui.separator();
 
+        if let (Some(key), Some(area)) = (selected_workspace_key.clone(), next_area) {
+            self.model.workspace_mut(key).select_result_area_tab(area);
+        }
+        let selected_area = next_area.unwrap_or(selected_area);
+        if selected_area == ResultAreaTab::History {
+            if let Some(result) = selected_workspace_key.and_then(|key| {
+                self.model
+                    .workspace(&key)
+                    .and_then(|workspace| workspace.result.clone())
+            }) {
+                ui.heading("Execution history");
+                ui.label(format!(
+                    "Operation {} · {} ms · {} returned rows · {} affected rows",
+                    result.provenance.operation_id.0,
+                    result.provenance.duration_ms,
+                    result.rows.len(),
+                    result.affected_rows
+                ));
+                ui.small("History metadata is retained in this running workspace.");
+            } else {
+                ui.weak("No execution history yet");
+            }
+            return;
+        }
+
         let mut result_intent = None;
-        let selected_workspace_key = self.model.selected_workspace_key();
         if let Some(result) = selected_workspace_key.and_then(|key| {
             let workspace = self.model.workspace_mut(key);
             workspace
@@ -3273,6 +3398,148 @@ impl DbotterApp {
         }
         if let Some((result, intent)) = result_intent {
             self.handle_result_view_intent(result, intent);
+        }
+    }
+
+    fn show_editor_tab_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        profile: &ProfileSnapshot,
+        key: &WorkspaceKey,
+        enabled: bool,
+    ) {
+        let needs_initial_tab = self
+            .model
+            .workspace(key)
+            .is_none_or(|workspace| workspace.editor_tabs().is_empty());
+        if needs_initial_tab {
+            let initial_text = self
+                .model
+                .workspace(key)
+                .map_or_else(String::new, |workspace| workspace.editor_text.clone());
+            let workspace = self.model.workspace_mut(key.clone());
+            let _ = workspace.create_editor_tab(profile.driver.language(), "Query 1", initial_text);
+        }
+
+        let (tabs, selected) = self.model.workspace(key).map_or_else(
+            || (Vec::new(), None),
+            |workspace| {
+                (
+                    workspace
+                        .editor_tabs()
+                        .iter()
+                        .map(|tab| (tab.id(), tab.title().to_owned()))
+                        .collect::<Vec<_>>(),
+                    workspace.selected_editor_tab_id(),
+                )
+            },
+        );
+
+        let mut select = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("editor.tab-strip")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (tab_id, title) in &tabs {
+                        let response = ui.add_sized(
+                            [132.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                            egui::Button::new(title).selected(selected == Some(*tab_id)),
+                        );
+                        let response = named_dynamic_author_id(
+                            response,
+                            format!("editor.tab.{}", tab_id.0),
+                            "Editor tab",
+                        );
+                        if response.clicked() {
+                            select = Some(*tab_id);
+                        }
+                    }
+                });
+            });
+
+        if let Some(tab_id) = select {
+            if self
+                .model
+                .workspace_mut(key.clone())
+                .select_editor_tab(tab_id)
+                .is_ok()
+            {
+                self.editor_surface = EditorSurface::default();
+            }
+        }
+
+        let selected = self
+            .model
+            .workspace(key)
+            .and_then(ProfileWorkspace::selected_editor_tab_id);
+        let mut title = selected
+            .and_then(|tab_id| {
+                self.model
+                    .workspace(key)
+                    .and_then(|workspace| workspace.editor_tab(tab_id))
+                    .map(|tab| tab.title().to_owned())
+            })
+            .unwrap_or_default();
+        let mut action = None;
+        ui.horizontal_wrapped(|ui| {
+            let rename = ui.add_enabled(
+                enabled && selected.is_some(),
+                egui::TextEdit::singleline(&mut title)
+                    .id_salt("editor.tab.title")
+                    .hint_text("Tab title")
+                    .desired_width(160.0),
+            );
+            let rename = named_author_id(rename, "editor.tab.title", "Rename editor tab");
+            if rename.changed() {
+                action = selected.map(EditorTabAction::Rename);
+            }
+            let new = ui.add_enabled(
+                enabled,
+                egui::Button::new("New")
+                    .min_size(egui::vec2(72.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            if named_author_id(new, "editor.tab.new", "New editor tab").clicked() {
+                action = Some(EditorTabAction::New);
+            }
+            let duplicate = ui.add_enabled(
+                enabled && selected.is_some(),
+                egui::Button::new("Duplicate")
+                    .min_size(egui::vec2(96.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            if named_author_id(duplicate, "editor.tab.duplicate", "Duplicate editor tab").clicked()
+            {
+                action = selected.map(EditorTabAction::Duplicate);
+            }
+            let close = ui.add_enabled(
+                enabled && selected.is_some(),
+                egui::Button::new("Close")
+                    .min_size(egui::vec2(80.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            if named_author_id(close, "editor.tab.close", "Close editor tab").clicked() {
+                action = selected.map(EditorTabAction::Close);
+            }
+        });
+
+        let workspace = self.model.workspace_mut(key.clone());
+        let outcome = match action {
+            Some(EditorTabAction::Rename(tab_id)) => workspace.rename_editor_tab(tab_id, title),
+            Some(EditorTabAction::New) => {
+                let title = format!("Query {}", workspace.editor_tabs().len().saturating_add(1));
+                workspace
+                    .create_editor_tab(profile.driver.language(), title, String::new())
+                    .map(|_| ())
+            }
+            Some(EditorTabAction::Duplicate(tab_id)) => {
+                workspace.duplicate_editor_tab(tab_id).map(|_| ())
+            }
+            Some(EditorTabAction::Close(tab_id)) => workspace.close_editor_tab(tab_id),
+            None => Ok(()),
+        };
+        if let Err(error) = outcome {
+            self.model.status = error.to_string();
+        }
+        if action.is_some() {
+            self.editor_surface = EditorSurface::default();
         }
     }
 

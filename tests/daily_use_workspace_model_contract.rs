@@ -72,10 +72,8 @@ fn editor_tab_strip_supports_create_rename_duplicate_select_and_close() {
 fn switching_selected_profile_preserves_each_exact_editor_workspace() {
     let alpha = profile("alpha", 1);
     let beta = profile("beta", 1);
-    let mut model = UiModel {
-        profiles: vec![alpha.clone(), beta.clone()],
-        ..UiModel::default()
-    };
+    let mut model = UiModel::default();
+    model.profiles = vec![alpha.clone(), beta.clone()];
 
     model.selected_profile = Some(alpha.id.clone());
     let alpha_tab = model

@@ -10,6 +10,7 @@ use crate::model::{
     CatalogRequest, OperationId, PublicSummary,
 };
 
+use super::accessibility::named_author_id;
 use super::theme::OpenAiTheme;
 
 const OPENAI_CANVAS: egui::Color32 = egui::Color32::WHITE;
@@ -600,12 +601,17 @@ fn apply_openai_component_style(ui: &mut egui::Ui) {
 }
 
 fn catalog_prefix_field(ui: &mut egui::Ui, prefix: &mut String) -> egui::Response {
-    ui.add_sized(
+    let response = ui.add_sized(
         [ui.available_width(), OpenAiTheme::MIN_CONTROL_HEIGHT],
         egui::TextEdit::singleline(prefix)
             .id(egui::Id::new("mysql.catalog.prefix"))
-            .hint_text("Optional literal prefix")
+            .hint_text("Filter database objects")
             .desired_width(f32::INFINITY),
+    );
+    named_author_id(
+        response,
+        "navigator.object-filter",
+        "Filter database objects",
     )
 }
 

@@ -6,12 +6,14 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::ConfigSourceVersion;
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionProfile, CredentialMode, DraftId, DriverAvailability,
     DriverKind, ExportFormat, OperationId, OperationKind, OverwritePolicy, ProfileGeneration,
-    ProfileId, PublicSummary, RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest,
-    RedisValuePreview, ResultId, ResultSnapshot, SessionGeneration,
+    ProfileId, PublicSummary, QueryLanguage, RedisKeyInspectRequest, RedisKeyPage,
+    RedisScanRequest, RedisValuePreview, ResultId, ResultSnapshot, SessionGeneration,
 };
 use crate::public_error::PublicOperationError;
 use crate::secrets::EnvironmentAvailability;
@@ -77,7 +79,7 @@ impl fmt::Debug for ConfigPresentation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkspaceKey {
     pub profile_id: ProfileId,
     pub profile_generation: ProfileGeneration,
@@ -92,7 +94,82 @@ impl WorkspaceKey {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+pub const MAX_EDITOR_TABS: usize = 20;
+const MAX_EDITOR_TAB_TITLE_BYTES: usize = 120;
+const MAX_EDITOR_TAB_TEXT_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EditorTabId(pub u64);
+
+#[derive(Clone)]
+pub struct EditorTab {
+    id: EditorTabId,
+    title: String,
+    language: QueryLanguage,
+    text: String,
+}
+
+impl std::fmt::Debug for EditorTab {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EditorTab")
+            .field("id", &self.id)
+            .field("title", &"<redacted>")
+            .field("language", &self.language)
+            .field("text", &"<redacted>")
+            .finish()
+    }
+}
+
+impl EditorTab {
+    pub const fn id(&self) -> EditorTabId {
+        self.id
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub const fn language(&self) -> QueryLanguage {
+        self.language
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorTabError {
+    LimitReached,
+    NotFound,
+    InvalidTitle,
+    TextTooLarge,
+}
+
+impl std::fmt::Display for EditorTabError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::LimitReached => "close a tab before creating another",
+            Self::NotFound => "editor tab is no longer available",
+            Self::InvalidTitle => "tab title must be 1 to 120 UTF-8 bytes",
+            Self::TextTooLarge => "editor tab text exceeds 1 MiB",
+        })
+    }
+}
+
+impl std::error::Error for EditorTabError {}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResultAreaTab {
+    #[default]
+    Results,
+    History,
+}
+
+#[derive(Clone)]
 pub struct ProfileWorkspace {
     pub editor_text: String,
     pub caret_character_index: usize,
@@ -112,11 +189,202 @@ pub struct ProfileWorkspace {
     pub redis_value_preview: Option<RedisValuePreview>,
     pub redis_inspect_retry: Option<RedisKeyInspectRequest>,
     pub redis_inspect_error: Option<PublicOperationError>,
+    editor_tabs: Vec<EditorTab>,
+    selected_editor_tab: Option<EditorTabId>,
+    next_editor_tab_id: u64,
+    result_area_tab: ResultAreaTab,
+}
+
+impl std::fmt::Debug for ProfileWorkspace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProfileWorkspace")
+            .field("editor_text", &"<redacted>")
+            .field("editor_tabs", &self.editor_tabs)
+            .field("selected_editor_tab", &self.selected_editor_tab)
+            .field("result_area_tab", &self.result_area_tab)
+            .field("pending_execute", &self.pending_execute)
+            .field("result", &self.result.as_ref().map(|_| "<retained>"))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ProfileWorkspace {
+    fn default() -> Self {
+        Self {
+            editor_text: String::new(),
+            caret_character_index: 0,
+            selection_character_range: None,
+            row_limit: String::new(),
+            timeout_seconds: String::new(),
+            pending_execute: None,
+            result: None,
+            result_view: ResultViewState::default(),
+            error: None,
+            catalog_page: None,
+            catalog_retry: None,
+            catalog_error: None,
+            redis_key_page: None,
+            redis_scan_retry: None,
+            redis_scan_error: None,
+            redis_value_preview: None,
+            redis_inspect_retry: None,
+            redis_inspect_error: None,
+            editor_tabs: Vec::new(),
+            selected_editor_tab: None,
+            next_editor_tab_id: 1,
+            result_area_tab: ResultAreaTab::Results,
+        }
+    }
 }
 
 impl ProfileWorkspace {
     pub fn has_catalog_retry(&self) -> bool {
         self.catalog_retry.is_some()
+    }
+
+    pub fn editor_tabs(&self) -> &[EditorTab] {
+        &self.editor_tabs
+    }
+
+    pub const fn selected_editor_tab_id(&self) -> Option<EditorTabId> {
+        self.selected_editor_tab
+    }
+
+    pub fn editor_tab(&self, tab_id: EditorTabId) -> Option<&EditorTab> {
+        self.editor_tabs.iter().find(|tab| tab.id == tab_id)
+    }
+
+    pub fn create_editor_tab(
+        &mut self,
+        language: QueryLanguage,
+        title: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<EditorTabId, EditorTabError> {
+        if self.editor_tabs.len() >= MAX_EDITOR_TABS {
+            return Err(EditorTabError::LimitReached);
+        }
+        let title = title.into();
+        validate_editor_tab_title(&title)?;
+        let text = text.into();
+        if text.len() > MAX_EDITOR_TAB_TEXT_BYTES {
+            return Err(EditorTabError::TextTooLarge);
+        }
+        self.sync_selected_editor_tab_from_surface();
+        let id = EditorTabId(self.next_editor_tab_id.max(1));
+        self.next_editor_tab_id = id.0.saturating_add(1);
+        self.editor_tabs.push(EditorTab {
+            id,
+            title,
+            language,
+            text,
+        });
+        self.selected_editor_tab = Some(id);
+        self.load_editor_tab_into_surface(id);
+        Ok(id)
+    }
+
+    pub fn rename_editor_tab(
+        &mut self,
+        tab_id: EditorTabId,
+        title: impl Into<String>,
+    ) -> Result<(), EditorTabError> {
+        let title = title.into();
+        validate_editor_tab_title(&title)?;
+        let Some(tab) = self.editor_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return Err(EditorTabError::NotFound);
+        };
+        tab.title = title;
+        Ok(())
+    }
+
+    pub fn duplicate_editor_tab(
+        &mut self,
+        tab_id: EditorTabId,
+    ) -> Result<EditorTabId, EditorTabError> {
+        self.sync_selected_editor_tab_from_surface();
+        let Some(source) = self.editor_tab(tab_id).cloned() else {
+            return Err(EditorTabError::NotFound);
+        };
+        let mut title = format!("{} copy", source.title);
+        if title.len() > MAX_EDITOR_TAB_TITLE_BYTES {
+            title.truncate(MAX_EDITOR_TAB_TITLE_BYTES);
+            while !title.is_char_boundary(title.len()) {
+                let _ = title.pop();
+            }
+        }
+        self.create_editor_tab(source.language, title, source.text)
+    }
+
+    pub fn select_editor_tab(&mut self, tab_id: EditorTabId) -> Result<(), EditorTabError> {
+        if self.editor_tab(tab_id).is_none() {
+            return Err(EditorTabError::NotFound);
+        }
+        self.sync_selected_editor_tab_from_surface();
+        self.selected_editor_tab = Some(tab_id);
+        self.load_editor_tab_into_surface(tab_id);
+        Ok(())
+    }
+
+    pub fn close_editor_tab(&mut self, tab_id: EditorTabId) -> Result<(), EditorTabError> {
+        let Some(index) = self.editor_tabs.iter().position(|tab| tab.id == tab_id) else {
+            return Err(EditorTabError::NotFound);
+        };
+        self.sync_selected_editor_tab_from_surface();
+        let closing_selected = self.selected_editor_tab == Some(tab_id);
+        self.editor_tabs.remove(index);
+        if closing_selected {
+            self.selected_editor_tab = self
+                .editor_tabs
+                .get(index.min(self.editor_tabs.len().saturating_sub(1)))
+                .map(EditorTab::id);
+            if let Some(selected) = self.selected_editor_tab {
+                self.load_editor_tab_into_surface(selected);
+            } else {
+                self.editor_text.clear();
+                self.caret_character_index = 0;
+                self.selection_character_range = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn sync_selected_editor_tab_from_surface(&mut self) {
+        let Some(selected) = self.selected_editor_tab else {
+            return;
+        };
+        let Some(tab) = self.editor_tabs.iter_mut().find(|tab| tab.id == selected) else {
+            return;
+        };
+        if self.editor_text.len() <= MAX_EDITOR_TAB_TEXT_BYTES {
+            tab.text.clone_from(&self.editor_text);
+        }
+    }
+
+    pub const fn result_area_tab(&self) -> ResultAreaTab {
+        self.result_area_tab
+    }
+
+    pub const fn select_result_area_tab(&mut self, tab: ResultAreaTab) {
+        self.result_area_tab = tab;
+    }
+
+    fn load_editor_tab_into_surface(&mut self, tab_id: EditorTabId) {
+        let Some(tab) = self.editor_tab(tab_id) else {
+            return;
+        };
+        let text = tab.text.clone();
+        self.editor_text = text;
+        self.caret_character_index = self.editor_text.chars().count();
+        self.selection_character_range = None;
+    }
+}
+
+fn validate_editor_tab_title(title: &str) -> Result<(), EditorTabError> {
+    if title.trim().is_empty() || title.len() > MAX_EDITOR_TAB_TITLE_BYTES {
+        Err(EditorTabError::InvalidTitle)
+    } else {
+        Ok(())
     }
 }
 

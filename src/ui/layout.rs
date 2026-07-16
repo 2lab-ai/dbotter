@@ -1,5 +1,7 @@
 use std::ops::RangeInclusive;
 
+use serde::{Deserialize, Serialize};
+
 /// Responsive dimensions and stable region registries for the native workspace.
 pub struct NativeLayout;
 
@@ -93,7 +95,7 @@ pub enum LayoutMode {
     Compact,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceGeometry {
     navigator_width: f32,
     editor_share: f32,
