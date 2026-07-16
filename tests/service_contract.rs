@@ -19,9 +19,9 @@ use dbotter::model::{
     CatalogPage, CatalogRequest, ConnectionDraft, CredentialMode, DraftId, DriverKind,
     ExecuteRequest, LegacyConfigVersion, MySqlPublicErrorCode, OperationId, OperationKind,
     PreparedMySqlRequest, ProfileAccess, ProfileEnvironment, ProfileFieldId, ProfileGeneration,
-    ProfileId, ProfileSafetyPosture, PublicCode, PublicSummary, QueryLanguage, QueryResult,
-    RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview,
-    TlsMode,
+    ProfileId, ProfileInstanceId, ProfileSafetyPosture, PublicCode, PublicSummary, QueryLanguage,
+    QueryResult, RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest,
+    RedisValuePreview, TlsMode,
 };
 use dbotter::public_error::{RecoveryAction, SafeContext, recovery_for};
 use dbotter::secrets::{
@@ -2934,6 +2934,125 @@ async fn unreadable_post_commit_observation_enters_uncertain_until_exact_path_re
 }
 
 #[tokio::test]
+async fn create_profile_posture_rewrite_at_observation_fails_closed() {
+    const PROFILE_ID: &str = "create-posture-observation";
+    const ENDPOINT_SENTINEL: &str = "create-posture-endpoint-sentinel.invalid";
+    const SECRET_SENTINEL: &str = "create-posture-secret-sentinel";
+    const POSTURE_SENTINEL: &str = "create-posture-request-sentinel";
+
+    let directory = tempfile::tempdir().expect("create posture observation tempdir");
+    let path = directory.path().join("config.toml");
+    let connector = Arc::new(FakeConnector::new(false));
+    let store = Arc::new(SessionSecretStore::default());
+    let profile_id = ProfileId(PROFILE_ID.to_owned());
+    store
+        .apply(
+            &profile_id,
+            SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(
+                "preexisting-create-secret".to_owned(),
+            ))),
+        )
+        .expect("seed preexisting secret");
+    let rewrite = Arc::new(RewriteCreatedPostureAtObservation::new(PROFILE_ID));
+    let service = ApplicationService::with_dependencies(
+        &path,
+        connector.clone(),
+        Arc::new(MissingEnvironment),
+        store.clone(),
+        ConfigWriter::with_fault_injector(rewrite.clone()),
+    )
+    .expect("create posture observation service");
+    let before = service.profiles_snapshot().await;
+    assert!(before.is_empty());
+    assert_eq!(service.source_version().await, ConfigSourceVersion::Missing);
+
+    let mut requested = named_draft(DriverKind::MySql, POSTURE_SENTINEL);
+    requested.host = ENDPOINT_SENTINEL.to_owned();
+    requested.environment = ProfileEnvironment::Development;
+    requested.access = ProfileAccess::ReadOnly;
+    requested.credential_mode = CredentialMode::Session;
+    let error = match service
+        .create_profile(create_request(
+            DraftId(923),
+            OperationId(923),
+            Some(PROFILE_ID),
+            requested,
+            SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(SECRET_SENTINEL.to_owned()))),
+        ))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("observed posture rewrite was accepted as the requested posture"),
+    };
+
+    assert!(matches!(&error, ServiceError::ConfigUncertain));
+    assert_eq!(
+        error.public_error_parts(),
+        (
+            PublicSummary::ResourceStale,
+            PublicCode::ConfigExternalChange
+        )
+    );
+    assert!(service.is_config_uncertain());
+    assert_eq!(service.profiles_snapshot().await, before);
+    assert_eq!(service.source_version().await, ConfigSourceVersion::Missing);
+    assert_eq!(service.cached_session_count().await, 0);
+    assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
+    assert!(
+        store
+            .is_empty()
+            .expect("uncertain create clears all secrets")
+    );
+    assert!(
+        !service
+            .has_current_session_secret(&profile_id)
+            .expect("rewritten profile secret remains absent")
+    );
+
+    let disk = load_path(&path).expect("externally rewritten v3 remains valid");
+    assert_eq!(disk.source_version, ConfigSourceVersion::V3);
+    let persisted = disk
+        .config
+        .profiles
+        .iter()
+        .find(|profile| profile.id == PROFILE_ID)
+        .expect("rewritten profile remains on disk");
+    assert_eq!(persisted.host, ENDPOINT_SENTINEL);
+    assert_eq!(persisted.name, POSTURE_SENTINEL);
+    assert_eq!(persisted.credential_mode, CredentialMode::Session);
+    assert!(matches!(
+        persisted.safety,
+        ProfileSafetyPosture::Classified {
+            environment: ProfileEnvironment::Production,
+            access: ProfileAccess::ReadWrite,
+            instance_id,
+        } if instance_id == rewrite.preserved_instance_id()
+    ));
+
+    let public_surfaces = format!(
+        "{error:?}\n{error}\n{:?}\n{:?}\n{}",
+        error.public_summary(),
+        error.public_code(),
+        error.public_summary()
+    );
+    for forbidden in [
+        PROFILE_ID,
+        ENDPOINT_SENTINEL,
+        SECRET_SENTINEL,
+        POSTURE_SENTINEL,
+        "development",
+        "read-only",
+        "production",
+        "read-write",
+    ] {
+        assert!(
+            !public_surfaces.contains(forbidden),
+            "create observation failure leaked a profile, endpoint, secret, or posture sentinel"
+        );
+    }
+}
+
+#[tokio::test]
 async fn identity_or_source_rewrite_during_observation_is_committed_unknown_and_uncertain() {
     for rewrite in [
         ObservationRewrite::DuplicateId,
@@ -4540,6 +4659,75 @@ impl MutationFaultInjector for FailAt {
         } else {
             Ok(())
         }
+    }
+}
+
+struct RewriteCreatedPostureAtObservation {
+    profile_id: String,
+    fired: AtomicBool,
+    preserved_instance_id: Mutex<Option<ProfileInstanceId>>,
+}
+
+impl RewriteCreatedPostureAtObservation {
+    fn new(profile_id: &str) -> Self {
+        Self {
+            profile_id: profile_id.to_owned(),
+            fired: AtomicBool::new(false),
+            preserved_instance_id: Mutex::new(None),
+        }
+    }
+
+    fn preserved_instance_id(&self) -> ProfileInstanceId {
+        (*self
+            .preserved_instance_id
+            .lock()
+            .expect("preserved instance id lock"))
+        .expect("observation rewrite captured an instance id")
+    }
+}
+
+impl MutationFaultInjector for RewriteCreatedPostureAtObservation {
+    fn check(&self, point: MutationFailpoint, path: &Path) -> std::io::Result<()> {
+        if point != MutationFailpoint::MainObservationLoad
+            || self.fired.swap(true, Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let loaded =
+            load_path(path).map_err(|_| std::io::Error::other("new v3 config was not readable"))?;
+        if loaded.source_version != ConfigSourceVersion::V3 {
+            return Err(std::io::Error::other("new config was not version 3"));
+        }
+        let mut config = loaded.config;
+        let profile = config
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == self.profile_id)
+            .ok_or_else(|| std::io::Error::other("created profile was not written"))?;
+        if profile.safety.environment() != Some(ProfileEnvironment::Development)
+            || profile.safety.access() != Some(ProfileAccess::ReadOnly)
+        {
+            return Err(std::io::Error::other(
+                "created profile did not retain the requested posture",
+            ));
+        }
+        let instance_id = profile
+            .safety
+            .instance_id()
+            .ok_or_else(|| std::io::Error::other("created profile has no instance id"))?;
+        profile.safety = ProfileSafetyPosture::classified(
+            ProfileEnvironment::Production,
+            ProfileAccess::ReadWrite,
+            instance_id,
+        );
+        *self
+            .preserved_instance_id
+            .lock()
+            .map_err(|_| std::io::Error::other("preserved instance id lock poisoned"))? =
+            Some(instance_id);
+        let encoded = toml::to_string(&config)
+            .map_err(|_| std::io::Error::other("rewritten v3 config did not serialize"))?;
+        fs::write(path, encoded)
     }
 }
 
