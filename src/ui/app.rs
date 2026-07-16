@@ -35,8 +35,7 @@ use super::editor::{
     EditorSurface, build_execute_intent,
 };
 use super::layout::{
-    CompactFallback, FallbackSurface, LayoutMode, NativeLayout, ResolvedLayout, SplitLayout,
-    WorkspaceGeometry,
+    CompactFallback, FallbackSurface, LayoutMode, NativeLayout, WorkspaceGeometry,
 };
 use super::model::{
     ConnectionState, EditorTabError, EditorTabId, ProfileSnapshot, ProfileWorkspace, ResultAreaTab,
@@ -2845,7 +2844,7 @@ impl DbotterApp {
         }
 
         match layout.mode() {
-            LayoutMode::Wide => self.show_wide_workspace(ui, layout, geometry),
+            LayoutMode::Wide => self.show_wide_workspace(ui, geometry),
             LayoutMode::Compact => self.show_compact_workspace(ui, compact_fallback),
         }
         self.show_delete_confirmation(ui);
@@ -2853,12 +2852,7 @@ impl DbotterApp {
         self.show_credential_prompt(ui);
     }
 
-    fn show_wide_workspace(
-        &mut self,
-        root_ui: &mut egui::Ui,
-        layout: ResolvedLayout,
-        geometry: WorkspaceGeometry,
-    ) {
+    fn show_wide_workspace(&mut self, root_ui: &mut egui::Ui, geometry: WorkspaceGeometry) {
         let navigator = egui::Panel::left("navigator")
             .resizable(true)
             .default_size(if geometry.navigator_width().is_finite() {
@@ -2869,7 +2863,7 @@ impl DbotterApp {
             .size_range(NativeLayout::NAVIGATOR_WIDTH_RANGE.clone())
             .show(root_ui, |ui| self.show_workspace_navigator(ui));
         self.remember_workspace_geometry(Some(navigator.response.rect.width()), None);
-        self.show_editor_result_shell(root_ui, layout);
+        self.show_editor_result_shell(root_ui, geometry);
     }
 
     fn show_compact_workspace(
@@ -3490,36 +3484,38 @@ impl DbotterApp {
         }
     }
 
-    fn show_editor_result_shell(&mut self, root_ui: &mut egui::Ui, layout: ResolvedLayout) {
+    fn show_editor_result_shell(&mut self, root_ui: &mut egui::Ui, geometry: WorkspaceGeometry) {
         let total_extent = root_ui
             .available_height()
             .max(NativeLayout::PANE_MIN_EXTENT * 2.0);
         let maximum_subordinate =
             (total_extent - NativeLayout::PANE_MIN_EXTENT).max(NativeLayout::PANE_MIN_EXTENT);
-        let requested_subordinate = layout
-            .subordinate_extent()
+        let subordinate_extent = (total_extent * (1.0 - geometry.editor_share()))
             .clamp(NativeLayout::PANE_MIN_EXTENT, maximum_subordinate);
-        let split = SplitLayout::from_subordinate_extent(total_extent, requested_subordinate);
-        let subordinate_extent = split
-            .subordinate_extent()
-            .unwrap_or(NativeLayout::PANE_MIN_EXTENT);
+        let editor_extent = total_extent - subordinate_extent;
 
         let result_panel = egui::Panel::bottom("result-history-tabs")
-            .resizable(true)
-            .default_size(subordinate_extent)
-            .size_range(NativeLayout::PANE_MIN_EXTENT..=maximum_subordinate)
-            .show(root_ui, |ui| self.show_result_surface(ui));
-        let rendered_subordinate = result_panel.response.rect.height();
-        let editor_share = ((total_extent - rendered_subordinate) / total_extent).clamp(0.01, 0.99);
-        self.remember_workspace_geometry(None, Some(editor_share));
+            .resizable(false)
+            .show_separator_line(false)
+            .exact_size(subordinate_extent)
+            .show(root_ui, |ui| {
+                let next_editor_extent = show_workspace_splitter(ui, total_extent, editor_extent);
+                self.show_result_surface(ui);
+                next_editor_extent
+            });
+        if let Some(next_editor_extent) = result_panel.inner {
+            self.remember_workspace_geometry(
+                None,
+                Some((next_editor_extent / total_extent).clamp(0.01, 0.99)),
+            );
+        }
 
         egui::CentralPanel::default().show(root_ui, |ui| self.show_editor_surface(ui));
     }
 
     #[cfg(test)]
     fn editor_and_results(&mut self, root_ui: &mut egui::Ui) {
-        let layout = NativeLayout::resolve(1440.0, 900.0, WorkspaceGeometry::default());
-        self.show_editor_result_shell(root_ui, layout);
+        self.show_editor_result_shell(root_ui, WorkspaceGeometry::default());
     }
 
     fn show_editor_surface(&mut self, ui: &mut egui::Ui) {
@@ -3995,6 +3991,107 @@ impl eframe::App for DbotterApp {
             storage.set_string(WORKSPACE_GEOMETRY_STORAGE_KEY, encoded);
         }
     }
+}
+
+fn show_workspace_splitter(
+    ui: &mut egui::Ui,
+    total_extent: f32,
+    editor_extent: f32,
+) -> Option<f32> {
+    let strip_extent = NativeLayout::SPLITTER_ACCESSIBLE_HIT_EXTENT;
+    let reset_width = 112.0;
+    let gap = NativeLayout::ADJACENT_ACTION_GAP;
+    let (strip_rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), strip_extent),
+        egui::Sense::hover(),
+    );
+    let reset_rect = egui::Rect::from_min_max(
+        egui::pos2(strip_rect.max.x - reset_width, strip_rect.min.y),
+        strip_rect.max,
+    );
+    let handle_rect = egui::Rect::from_min_max(
+        strip_rect.min,
+        egui::pos2(
+            (reset_rect.min.x - gap).max(strip_rect.min.x),
+            strip_rect.max.y,
+        ),
+    );
+    let handle = ui
+        .interact(
+            handle_rect,
+            ui.id().with("workspace.splitter"),
+            egui::Sense::click_and_drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+
+    let minimum = NativeLayout::PANE_MIN_EXTENT;
+    let maximum = (total_extent - NativeLayout::PANE_MIN_EXTENT).max(minimum);
+    let mut next_editor_extent = editor_extent.clamp(minimum, maximum);
+    if handle.dragged() {
+        next_editor_extent = (next_editor_extent + ui.input(|input| input.pointer.delta().y))
+            .clamp(minimum, maximum);
+    }
+    if handle.has_focus() {
+        let keyboard_steps = ui.input_mut(|input| {
+            let upward = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp);
+            let downward = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown);
+            i32::from(downward) - i32::from(upward)
+        });
+        if keyboard_steps != 0 {
+            next_editor_extent = (next_editor_extent
+                + keyboard_steps as f32 * NativeLayout::SPLITTER_KEYBOARD_STEP)
+                .clamp(minimum, maximum);
+        }
+    }
+    if handle.double_clicked() {
+        next_editor_extent = total_extent * NativeLayout::DEFAULT_EDITOR_SHARE;
+    }
+
+    let value_for_accessibility = next_editor_extent;
+    handle.widget_info(|| {
+        let mut info = egui::WidgetInfo::labeled(
+            egui::WidgetType::ResizeHandle,
+            true,
+            "Resize editor and results",
+        );
+        info.value = Some(f64::from(value_for_accessibility));
+        info
+    });
+    let handle = named_author_id(handle, "workspace.splitter", "Resize editor and results");
+    handle.ctx.accesskit_node_builder(handle.id, |node| {
+        node.set_min_numeric_value(f64::from(minimum));
+        node.set_max_numeric_value(f64::from(maximum));
+        node.set_numeric_value_step(f64::from(NativeLayout::SPLITTER_KEYBOARD_STEP));
+        node.set_orientation(egui::accesskit::Orientation::Horizontal);
+    });
+    let rule_color = if handle.hovered() || handle.has_focus() {
+        OpenAiTheme::color(OpenAiTheme::INK)
+    } else {
+        OpenAiTheme::color(OpenAiTheme::BOUNDARY)
+    };
+    let rule_y = handle_rect.center().y;
+    ui.painter().line_segment(
+        [
+            egui::pos2(handle_rect.min.x, rule_y),
+            egui::pos2(handle_rect.max.x, rule_y),
+        ],
+        egui::Stroke::new(1.0, rule_color),
+    );
+
+    let reset = ui.put(
+        reset_rect,
+        egui::Button::new("Reset split").min_size(egui::vec2(
+            reset_width,
+            NativeLayout::SPLITTER_ACCESSIBLE_HIT_EXTENT,
+        )),
+    );
+    let reset = named_author_id(reset, "workspace.split.reset", "Reset split to 60/40");
+    if reset.clicked() {
+        next_editor_extent = total_extent * NativeLayout::DEFAULT_EDITOR_SHARE;
+    }
+
+    let changed = (next_editor_extent - editor_extent).abs() > f32::EPSILON;
+    changed.then_some(next_editor_extent)
 }
 
 fn restore_workspace_geometries(
@@ -4852,6 +4949,7 @@ mod tests {
             )
         };
 
+        let _ = render(&mut app, Vec::new());
         let initial = render(&mut app, Vec::new());
         let initial_update = initial
             .platform_output
@@ -4859,6 +4957,15 @@ mod tests {
             .expect("wide splitter frame must emit AccessKit");
         let (splitter_id, splitter) = accesskit_author_node(&initial_update, "workspace.splitter");
         assert_eq!(splitter.role(), accesskit::Role::Splitter);
+        assert_eq!(splitter.label(), Some("Resize editor and results"));
+        assert_eq!(
+            splitter.orientation(),
+            Some(accesskit::Orientation::Horizontal)
+        );
+        assert_eq!(
+            splitter.numeric_value_step(),
+            Some(f64::from(NativeLayout::SPLITTER_KEYBOARD_STEP))
+        );
         assert!(splitter.supports_action(accesskit::Action::Focus));
         let bounds = splitter.bounds().expect("splitter needs native bounds");
         assert!(
@@ -4868,6 +4975,17 @@ mod tests {
         let initial_editor_extent = splitter
             .numeric_value()
             .expect("splitter needs an editor-extent value");
+        let initial_total_extent = splitter
+            .max_numeric_value()
+            .expect("splitter needs a maximum value")
+            + f64::from(NativeLayout::PANE_MIN_EXTENT);
+        assert!(
+            (initial_editor_extent
+                - initial_total_extent * f64::from(NativeLayout::DEFAULT_EDITOR_SHARE))
+            .abs()
+                < 0.01,
+            "the settled native splitter must start at the exact 60/40 geometry"
+        );
         for expected in [
             "navigator",
             "object-editor-tabs",
@@ -4884,7 +5002,7 @@ mod tests {
             );
         }
 
-        let _ = render(
+        let focused = render(
             &mut app,
             vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
                 action: accesskit::Action::Focus,
@@ -4892,6 +5010,21 @@ mod tests {
                 target_node: splitter_id,
                 data: None,
             })],
+        );
+        let focused_update = focused
+            .platform_output
+            .accesskit_update
+            .expect("focused splitter frame must emit AccessKit");
+        assert_eq!(
+            focused_update
+                .nodes
+                .iter()
+                .find_map(|(node_id, node)| {
+                    (*node_id == focused_update.focus).then(|| node.author_id())
+                })
+                .flatten(),
+            Some("workspace.splitter"),
+            "native AX focus must settle on the rendered splitter"
         );
         let adjusted = render(
             &mut app,
@@ -4911,13 +5044,17 @@ mod tests {
         let adjusted_editor_extent = adjusted_splitter
             .numeric_value()
             .expect("adjusted splitter needs a value");
+        let adjusted_total_extent = adjusted_splitter
+            .max_numeric_value()
+            .expect("adjusted splitter needs a maximum value")
+            + f64::from(NativeLayout::PANE_MIN_EXTENT);
         assert!(
             (adjusted_editor_extent
-                - initial_editor_extent
+                - adjusted_total_extent * f64::from(NativeLayout::DEFAULT_EDITOR_SHARE)
                 - f64::from(NativeLayout::SPLITTER_KEYBOARD_STEP))
             .abs()
                 < 0.01,
-            "ArrowDown must move the rendered splitter by exactly five points"
+            "ArrowDown must move the rendered splitter by exactly five points: initial={initial_editor_extent}, adjusted={adjusted_editor_extent}"
         );
         for expected in [
             "navigator",
@@ -4934,7 +5071,10 @@ mod tests {
             );
         }
 
-        let (reset_id, _) = accesskit_author_node(&adjusted_update, "workspace.split.reset");
+        let (reset_id, reset_node) =
+            accesskit_author_node(&adjusted_update, "workspace.split.reset");
+        assert_eq!(reset_node.role(), accesskit::Role::Button);
+        assert_eq!(reset_node.label(), Some("Reset split to 60/40"));
         let _ = render(
             &mut app,
             vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
@@ -4960,14 +5100,25 @@ mod tests {
             .accesskit_update
             .expect("reset splitter frame must emit AccessKit");
         let (_, reset_splitter) = accesskit_author_node(&reset_update, "workspace.splitter");
+        let reset_total_extent = reset_splitter
+            .max_numeric_value()
+            .expect("reset splitter needs a maximum value")
+            + f64::from(NativeLayout::PANE_MIN_EXTENT);
         assert!(
             (reset_splitter
                 .numeric_value()
                 .expect("reset splitter needs a value")
-                - initial_editor_extent)
-                .abs()
+                - reset_total_extent * f64::from(NativeLayout::DEFAULT_EDITOR_SHARE))
+            .abs()
                 < 0.01,
             "Reset split must restore the rendered 60/40 geometry"
+        );
+        assert_eq!(
+            app.workspace_geometries
+                .get(&WorkspaceKey::new(profile.id, profile.generation))
+                .map(|geometry| geometry.editor_share()),
+            Some(NativeLayout::DEFAULT_EDITOR_SHARE),
+            "Reset split must store the exact 60/40 geometry, independent of its initial value"
         );
     }
 

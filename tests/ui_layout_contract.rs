@@ -327,8 +327,10 @@ fn actual_wide_renderer_owns_one_resizable_navigator_center_subordinate_and_stat
         "the renderer needs distinct subordinate result/history and persistent status bottom panels"
     );
     assert!(
-        compact_source.contains("SplitLayout") && compact_source.contains("subordinate_extent"),
-        "the actual editor/result coordinator must consume the pure split layout"
+        compact_source.contains("show_workspace_splitter")
+            && compact_source.contains("SPLITTER_ACCESSIBLE_HIT_EXTENT")
+            && compact_source.contains("exact_size(subordinate_extent)"),
+        "the actual editor/result coordinator must own the explicit accessible splitter and exact retained pane extent"
     );
     assert!(
         show_native.contains("show_status_strip"),
