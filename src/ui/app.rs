@@ -31,7 +31,8 @@ use super::accessibility::{
 };
 use super::adapter::{SubmitError, UiCommand, UiPort};
 use super::editor::{
-    EDITOR_INPUT_ID, EDITOR_ROW_LIMIT_ID, EDITOR_TIMEOUT_ID, EditorIntent, EditorSurface,
+    EDITOR_INPUT_ID, EDITOR_ROW_LIMIT_ID, EDITOR_TIMEOUT_ID, EditorCursor, EditorIntent,
+    EditorSurface, build_execute_intent,
 };
 use super::layout::{
     CompactFallback, FallbackSurface, LayoutMode, NativeLayout, ResolvedLayout, SplitLayout,
@@ -2041,8 +2042,26 @@ impl DbotterApp {
             match outcome {
                 Ok(_) => {
                     self.editor_surface = EditorSurface::default();
-                    self.model.status =
-                        "Bounded SELECT opened in a new tab; it was not executed".to_owned();
+                    let key =
+                        super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+                    let intent = self.model.workspace(&key).map(|workspace| {
+                        let character_count = workspace.editor_text.chars().count();
+                        build_execute_intent(
+                            profile,
+                            workspace,
+                            EditorCursor::with_selection(character_count, 0..character_count),
+                        )
+                    });
+                    match intent {
+                        Some(Ok(intent)) => {
+                            self.submit_editor_intent(EditorIntent::Execute(intent));
+                        }
+                        Some(Err(error)) => self.model.status = error.to_string(),
+                        None => {
+                            self.model.status =
+                                "The bounded table query could not be submitted.".to_owned();
+                        }
+                    }
                 }
                 Err(error) => self.model.status = error.to_string(),
             }
