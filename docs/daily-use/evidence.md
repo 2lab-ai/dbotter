@@ -16,7 +16,7 @@ v1.1 amendment are marked `deferred` rather than deleted.
 |---|---|---|---|---|---|
 | D1 | — | — | — | — | not started |
 | D2 | — | — | — | — | not started |
-| D3 | `4da8a57` — `test(d3): freeze server-enforced MySQL read session`; `9e89fbc` — `test(d3): require editor run all action` | `4f047aa` — `feat(d3): enforce server-proven MySQL reads` | Read admission: `just check`; `just check-all`; exact-source `./scripts/verify-live-contracts.sh --config config/local.example.toml --expected-sha 4f047aa35e1330a6b3173d5fd674c6e3cebfc765` → `live contracts: ok`. Local receipt `artifacts/live-contract-receipt.json`, SHA-256 `66b300cd72b969af059467e57dcfdab213819640fc39294da25e167895b55243`, records all three suites and MySQL safety `statements_executed=8`, `server_side_effect_denied_attempts=1`, `raw_fallback_attempts=0`. Run all RED: the actual editor action-bar contract fails because `editor.execute_all` is absent. | — | RED read-only Run all baseline; prior read-admission GREEN retained; complete D3 journeys pending |
+| D3 | `4da8a57` — `test(d3): freeze server-enforced MySQL read session`; `9e89fbc` — `test(d3): require editor run all action`; `36fbd76` — `docs(d3): record run all RED` | `4f047aa` — `feat(d3): enforce server-proven MySQL reads`; `89a9863` — `feat(d3): preflight and bound run all batches`; `54961eb` — `feat(d3): execute run all as one editor operation` | Read admission: `just check`; `just check-all`; exact-source `./scripts/verify-live-contracts.sh --config config/local.example.toml --expected-sha 4f047aa35e1330a6b3173d5fd674c6e3cebfc765` → `live contracts: ok`. Local receipt `artifacts/live-contract-receipt.json`, SHA-256 `66b300cd72b969af059467e57dcfdab213819640fc39294da25e167895b55243`, records all three suites and MySQL safety `statements_executed=8`, `server_side_effect_denied_attempts=1`, `raw_fallback_attempts=0`. Run all baseline: exact Redis allowlist and raw SCAN reply bound; whole-source/per-target preflight; one session/operation/deadline; ordered results with later-error partial retention; 32 MiB aggregate and 10/editor, 40/profile result bounds; per-editor rendering/close ownership; Cancel/status/AccessKit contracts. Focused contracts: execution 20/20, service 58/58, controller 55/55, editor 11/11 and cross-editor close regression 1/1. Final `just check` and `just check-all` pass; all-features library 174/174. Independent final review: Critical 0, High 0. | — | GREEN common-mode read-only Run all baseline; complete D3 remains pending for DML review/transactions, exact `sql_mode`-before-split availability and installed-native journeys |
 | D4 | — | — | — | — | not started |
 | D5 | — | — | — | — | not started |
 | D6 | — | — | — | — | not started |
@@ -36,9 +36,10 @@ evidence class:
 - D1: config-v3 wire/migration primitives and visible posture controls
   (`c424e4e` through `dc694c1`), while GUI/CLI legacy migration and duplicate
   remain incomplete.
-- D3/D9: session-only editor/result tabs (`5dc4684` through `7c9530e`), while
-  Run all, durable history, per-editor result ownership and the v1.1 read
-  admission path remain incomplete.
+- D3/D9: session-only editor/result tabs (`5dc4684` through `7c9530e`) plus
+  common-mode read-only Run all and per-editor result ownership (`89a9863`,
+  `54961eb`), while durable searchable history, DML review/transactions and the
+  exact mode-aware pre-split path remain incomplete.
 - D11: persistent three-zone shell and geometry (`8341cb0` through `b121ed5`),
   while the canonical native journeys and complete action/recovery surfaces
   remain incomplete.

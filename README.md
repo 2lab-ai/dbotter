@@ -24,23 +24,25 @@ This repository publishes only the Preview channel. It does not publish a stable
 
 - Create, edit, test, connect, reconnect, disconnect and delete local MySQL/Redis profiles in the native app.
 - Use no credential, a process-local Session credential, or an environment-variable credential without persisting the secret value in the profile.
-- Browse MySQL schemas, tables/views and columns with bounded pagination.
+- Browse MySQL schemas, tables/views and columns with bounded pagination, keep the selected object in context and open bounded base-table Data in a new editor tab.
 - Scan/filter Redis keys and inspect bounded type, TTL and value previews, including binary key identity.
-- Execute one selected/current MySQL statement through the server prepared protocol or one policy-checked Redis command.
-- Cancel client waiting, inspect bounded result provenance, copy cells/rows and export retained CSV/TSV/JSON without overwriting an existing file.
+- Run the current selection/statement or a fully preflighted read-only script on one correlated operation and one session. MySQL uses the server prepared protocol and a proven read-only session; Redis admits only the exact bounded read allowlist.
+- Work with multiple session-only editor and result tabs, per-editor results, direct session history, Grid/Record inspection, local filter/sort and closable outputs.
+- Keep navigator, editor, results/history and status context visible in the resizable desktop workspace, with accessible collapse/restore controls and a compact fallback.
+- Cancel the active run, inspect bounded result provenance, copy cells/rows and export retained CSV/TSV/JSON without overwriting an existing file.
 - Use headless `check`, `exec`, MySQL catalog browse and Redis browse/inspect commands when a profile is already configured.
 
 ## Known daily-use gaps
 
 The current Preview is useful for bounded inspection and one-off commands, but it is not yet the Daily-use v1 product:
 
-- the editor and current result are in-memory single-workspace state;
-- there are no persistent query tabs or searchable execution history;
-- MySQL execution currently uses pooled auto-commit connections, with no managed Begin/Commit/Rollback UI;
-- the MySQL explorer does not open/edit table rows; Redis type-aware mutation is deferred to P1 (DUV1 v1.1);
+- editor/result tabs and execution-history metadata are session-only; they are not restart-persistent or searchable yet;
+- Run all is read-only. There is no bounded DML review or managed Begin/Commit/Rollback UI yet;
+- MySQL scripts whose boundaries depend on the exact session `sql_mode` can be rejected conservatively before execution until mode-aware pre-split is complete;
+- the MySQL explorer opens bounded base-table Data but does not edit table rows; Redis type-aware mutation is deferred to P1 (DUV1 v1.1);
 - there is no CSV import flow (deferred to P1 by DUV1 v1.1);
 - the CLI cannot bootstrap profiles or accept a session credential safely from stdin;
-- the long profile form and editor/result layout still lack the persistent navigator, resizable multi-pane context/status density and minimum-window reachability required by the Daily-use contract.
+- the installed-native four-journey evidence set required by the complete Daily-use contract is still pending.
 
 The independently reviewed frozen Daily-use v1 implementation contract is:
 
