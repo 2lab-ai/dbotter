@@ -3506,15 +3506,14 @@ impl DbotterApp {
                 });
             });
 
-        if let Some(tab_id) = select {
-            if self
+        if let Some(tab_id) = select
+            && self
                 .model
                 .workspace_mut(key.clone())
                 .select_editor_tab(tab_id)
                 .is_ok()
-            {
-                self.editor_surface = EditorSurface::default();
-            }
+        {
+            self.editor_surface = EditorSurface::default();
         }
 
         let selected = self
