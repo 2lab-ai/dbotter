@@ -6,6 +6,7 @@ use dbotter::ui::MySqlExplorerState;
 use eframe::egui::{Context, RawInput};
 
 const APP_RENDERER_SOURCE: &str = include_str!("../src/ui/app.rs");
+const UI_ENTRY_SOURCE: &str = include_str!("../src/ui/mod.rs");
 const MYSQL_EXPLORER_SOURCE: &str = include_str!("../src/ui/mysql_explorer.rs");
 const REDIS_EXPLORER_SOURCE: &str = include_str!("../src/ui/redis_explorer.rs");
 
@@ -118,6 +119,53 @@ fn result_area_exposes_distinct_results_and_history_tabs() {
             "result area is missing stable author id `{author_id}`"
         );
     }
+}
+
+#[test]
+fn result_renderer_keeps_multiple_execution_outputs_selectable() {
+    let results = function_body(APP_RENDERER_SOURCE, "show_result_surface");
+    assert!(
+        results.contains("result_tabs()") && results.contains("select_result_tab"),
+        "the actual result surface must render and select retained result tabs"
+    );
+    assert!(
+        results.contains("result.output."),
+        "each retained output needs a stable dynamic author-id prefix"
+    );
+}
+
+#[test]
+fn mysql_relations_expose_structure_and_safe_data_actions() {
+    for (label, author_id) in [
+        ("Structure", "navigator.object.structure"),
+        ("Data", "navigator.object.data"),
+    ] {
+        assert!(
+            MYSQL_EXPLORER_SOURCE.contains(&format!("\"{label}\"")),
+            "relation rows must expose a visible {label} action"
+        );
+        assert!(
+            has_bound_author_id(MYSQL_EXPLORER_SOURCE, author_id),
+            "relation {label} action needs stable author id `{author_id}`"
+        );
+    }
+    assert!(
+        MYSQL_EXPLORER_SOURCE.contains("View data unavailable"),
+        "views must state why Data is unavailable instead of pretending to execute"
+    );
+}
+
+#[test]
+fn actual_app_restores_and_saves_geometry_through_native_storage() {
+    assert!(
+        UI_ENTRY_SOURCE.contains("creation.storage"),
+        "native app creation must restore retained workspace geometry"
+    );
+    assert!(
+        APP_RENDERER_SOURCE.contains("fn save(")
+            && APP_RENDERER_SOURCE.contains("WORKSPACE_GEOMETRY_STORAGE_KEY"),
+        "the native app must save geometry through eframe storage"
+    );
 }
 
 #[test]

@@ -1,8 +1,11 @@
 #![cfg(feature = "desktop")]
 
+use std::sync::Arc;
+
 use dbotter::model::{
-    ConnectionProfile, CredentialMode, DriverKind, ProfileAccess, ProfileEnvironment,
-    ProfileGeneration, ProfileId, ProfileSafetyPosture, QueryLanguage, RedisTlsConfig, TlsMode,
+    ConnectionProfile, CredentialMode, DriverKind, OperationId, ProfileAccess, ProfileEnvironment,
+    ProfileGeneration, ProfileId, ProfileSafetyPosture, QueryLanguage, QueryResult, RedisTlsConfig,
+    ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot, TlsMode,
 };
 use dbotter::ui::{
     ProfileSnapshot, ProfileWorkspace, ResultAreaTab, UiModel, WorkspaceGeometry, WorkspaceKey,
@@ -27,6 +30,30 @@ fn profile(id: &str, generation: u64) -> ProfileSnapshot {
         redis_tls: RedisTlsConfig::default(),
     };
     ProfileSnapshot::from_profile(&persisted, ProfileGeneration(generation), false, None)
+}
+
+fn result(profile: &ProfileSnapshot, result_id: u64) -> ResultSnapshot {
+    ResultSnapshot::retain(
+        QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            affected_rows: 0,
+            last_insert_id: None,
+            elapsed_ms: u128::from(result_id),
+            truncated: false,
+            backend_notices_present: false,
+        },
+        ResultProvenance {
+            result_id: ResultId(result_id),
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            operation_id: OperationId(result_id),
+            driver: profile.driver,
+            completed_at_unix_ms: i64::try_from(result_id).expect("fixture timestamp fits"),
+            duration_ms: u128::from(result_id),
+        },
+        ResultRetentionPolicy::mysql(1),
+    )
 }
 
 #[test]
@@ -118,6 +145,35 @@ fn result_area_selection_is_real_profile_workspace_state() {
     assert_eq!(workspace.result_area_tab(), ResultAreaTab::Results);
     workspace.select_result_area_tab(ResultAreaTab::History);
     assert_eq!(workspace.result_area_tab(), ResultAreaTab::History);
+}
+
+#[test]
+fn successful_executions_append_distinct_selectable_result_tabs() {
+    let profile = profile("alpha", 1);
+    let mut workspace = ProfileWorkspace::default();
+    let first = workspace
+        .append_result_tab(Arc::new(result(&profile, 11)))
+        .expect("first result tab");
+    let second = workspace
+        .append_result_tab(Arc::new(result(&profile, 12)))
+        .expect("second result tab");
+
+    assert_ne!(first, second);
+    assert_eq!(workspace.result_tabs().len(), 2);
+    assert_eq!(workspace.selected_result_tab_id(), Some(second));
+    workspace
+        .select_result_tab(first)
+        .expect("older result remains selectable");
+    assert_eq!(workspace.selected_result_tab_id(), Some(first));
+    assert_eq!(
+        workspace
+            .selected_result_tab()
+            .expect("selected result")
+            .snapshot()
+            .provenance
+            .result_id,
+        ResultId(11)
+    );
 }
 
 #[test]
