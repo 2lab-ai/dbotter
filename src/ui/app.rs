@@ -4770,6 +4770,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn actual_editor_tabs_close_in_place_without_selecting_or_losing_a_dirty_draft() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        let dirty = app
+            .model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Unsaved", "SELECT keep_me")
+            .expect("dirty tab");
+        let selected = app
+            .model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Current", "")
+            .expect("selected clean tab");
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let initial = context.run_ui(RawInput::default(), |ui| {
+            app.show_editor_tab_strip(ui, &profile, &key, true);
+        });
+        let initial = initial
+            .platform_output
+            .accesskit_update
+            .expect("editor tab strip must emit AccessKit");
+        let (close_id, close) =
+            accesskit_author_node(&initial, &format!("editor.tab.close.{}", dirty.0));
+        assert_eq!(close.role(), accesskit::Role::Button);
+        assert_eq!(close.label(), Some("Close editor tab"));
+        assert!(close.supports_action(accesskit::Action::Focus));
+        assert!(close.supports_action(accesskit::Action::Click));
+
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                    action: accesskit::Action::Focus,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: close_id,
+                    data: None,
+                })],
+                ..RawInput::default()
+            },
+            |ui| app.show_editor_tab_strip(ui, &profile, &key, true),
+        );
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![Event::Key {
+                    key: Key::Enter,
+                    physical_key: Some(Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+            |ui| app.show_editor_tab_strip(ui, &profile, &key, true),
+        );
+
+        let confirmation = app
+            .editor_discard_confirmation
+            .as_ref()
+            .expect("dirty tab close must open its discard guard");
+        assert_eq!(confirmation.workspace_key, key);
+        assert_eq!(confirmation.tab_id, dirty);
+        let workspace = app.model.workspace(&key).expect("workspace retained");
+        assert_eq!(workspace.selected_editor_tab_id(), Some(selected));
+        assert_eq!(
+            workspace.editor_tab(dirty).map(|tab| tab.text()),
+            Some("SELECT keep_me")
+        );
+        assert!(service.try_next_command().is_none());
+    }
+
     fn redis_page(request: &RedisScanRequest, raw_key: &[u8]) -> RedisKeyPage {
         RedisKeyPage {
             identity: request.identity.clone(),
