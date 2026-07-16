@@ -152,6 +152,7 @@ fn p3_user_text_and_resource_boundaries_are_structural() {
     for required in [
         "PreparedMySqlRequest",
         "RedisExecuteRequest",
+        "ExecuteBatchRequest",
         "CatalogRequest",
         "RedisScanRequest",
         "RedisKeyInspectRequest",

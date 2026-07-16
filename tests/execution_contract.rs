@@ -1,10 +1,13 @@
 use std::ops::Range;
 
 use dbotter::execution::{
-    ExecutionLanguage, ExecutionTarget, ExecutionTargetError, MAX_EXECUTE_ROW_LIMIT,
-    MAX_EXECUTE_TIMEOUT_SECONDS, MAX_REDIS_TARGET_BYTES, MAX_REDIS_TOKEN_BYTES, MAX_REDIS_TOKENS,
-    ValidatedExecutionTarget, extract_and_validate_target,
+    ExecutionLanguage, ExecutionTarget, ExecutionTargetError, MAX_EXECUTE_BATCH_BYTES,
+    MAX_EXECUTE_BATCH_TARGETS, MAX_EXECUTE_ROW_LIMIT, MAX_EXECUTE_TIMEOUT_SECONDS,
+    MAX_MYSQL_NESTING_DEPTH, MAX_MYSQL_TOKENS, MAX_REDIS_TARGET_BYTES, MAX_REDIS_TOKEN_BYTES,
+    MAX_REDIS_TOKENS, ValidatedExecutionTarget, classify_execution_batch_kind,
+    extract_and_validate_all_targets, extract_and_validate_target,
 };
+use dbotter::model::{MAX_MYSQL_STATEMENT_BYTES, OperationKind};
 
 const ROW_LIMIT: u32 = 500;
 const TIMEOUT_SECONDS: u32 = 30;
@@ -68,6 +71,211 @@ fn redis_selection(
         ROW_LIMIT,
         TIMEOUT_SECONDS,
     )
+}
+
+#[test]
+fn run_all_preflights_the_complete_mysql_batch_in_source_order() {
+    let source = "SELECT 1;\nSELECT ';' AS value;\nSELECT 3";
+    let batch = extract_and_validate_all_targets(
+        source,
+        ExecutionLanguage::MySql,
+        ROW_LIMIT,
+        TIMEOUT_SECONDS,
+    )
+    .expect("the complete read-only batch is valid");
+    let targets = batch.targets();
+    assert_eq!(targets.len(), 3);
+    assert_eq!(targets[0].source_text(), "SELECT 1;");
+    assert_eq!(targets[1].source_text(), "SELECT ';' AS value;");
+    assert_eq!(targets[2].source_text(), "SELECT 3");
+    assert_eq!(
+        classify_execution_batch_kind(ExecutionLanguage::MySql, targets),
+        OperationKind::ExecuteRead
+    );
+
+    let mutation = extract_and_validate_all_targets(
+        "SELECT 1; UPDATE accounts SET enabled = 0;",
+        ExecutionLanguage::MySql,
+        ROW_LIMIT,
+        TIMEOUT_SECONDS,
+    )
+    .expect("classification, not scanning, rejects mutation dispatch");
+    assert_eq!(
+        classify_execution_batch_kind(ExecutionLanguage::MySql, mutation.targets()),
+        OperationKind::ExecuteMutation
+    );
+}
+
+#[test]
+fn run_all_rejects_ambiguous_empty_oversized_and_overcount_mysql_batches() {
+    assert_eq!(
+        extract_and_validate_all_targets(
+            r"SELECT 'a\'b';",
+            ExecutionLanguage::MySql,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::BatchAmbiguousSqlMode
+    );
+    assert_eq!(
+        extract_and_validate_all_targets(
+            "SELECT 1;; SELECT 2;",
+            ExecutionLanguage::MySql,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::EmptyBatchTarget
+    );
+    assert_eq!(
+        extract_and_validate_all_targets(
+            "SELECT 1; /*!40101 SET @unsafe = 1 */;",
+            ExecutionLanguage::MySql,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::ForbiddenExecutableComment
+    );
+
+    let overcount = (0..=MAX_EXECUTE_BATCH_TARGETS)
+        .map(|index| format!("SELECT {index};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        extract_and_validate_all_targets(
+            &overcount,
+            ExecutionLanguage::MySql,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::TooManyBatchTargets
+    );
+
+    let oversized = " ".repeat(MAX_EXECUTE_BATCH_BYTES + 1);
+    assert_eq!(
+        extract_and_validate_all_targets(
+            &oversized,
+            ExecutionLanguage::MySql,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::BatchSourceTooLarge
+    );
+}
+
+#[test]
+fn run_all_enforces_each_mysql_target_parse_token_and_depth_bound() {
+    let oversized_target = format!("SELECT '{}'", "a".repeat(MAX_MYSQL_STATEMENT_BYTES));
+    assert_eq!(
+        extract_and_validate_all_targets(
+            &oversized_target,
+            ExecutionLanguage::MySql,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::MysqlBatchTargetTooLarge
+    );
+
+    let too_many_tokens = format!(
+        "SELECT {}",
+        std::iter::repeat_n("1", MAX_MYSQL_TOKENS)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert_eq!(
+        extract_and_validate_all_targets(
+            &too_many_tokens,
+            ExecutionLanguage::MySql,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::MysqlBatchTooManyTokens
+    );
+
+    let too_deep = format!(
+        "SELECT {}1{}",
+        "(".repeat(MAX_MYSQL_NESTING_DEPTH + 1),
+        ")".repeat(MAX_MYSQL_NESTING_DEPTH + 1)
+    );
+    assert_eq!(
+        extract_and_validate_all_targets(
+            &too_deep,
+            ExecutionLanguage::MySql,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::MysqlBatchNestingTooDeep
+    );
+    assert_eq!(
+        extract_and_validate_all_targets(
+            "SELECT (1;",
+            ExecutionLanguage::MySql,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::MysqlBatchUnbalancedNesting
+    );
+    assert_eq!(
+        extract_and_validate_all_targets(
+            "SELECT 1 +;",
+            ExecutionLanguage::MySql,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::MysqlBatchParseFailed
+    );
+}
+
+#[test]
+fn run_all_preflights_every_redis_line_before_returning_a_batch() {
+    let batch = extract_and_validate_all_targets(
+        "GET first\n\nMGET second third\nPING",
+        ExecutionLanguage::Redis,
+        ROW_LIMIT,
+        TIMEOUT_SECONDS,
+    )
+    .expect("blank lines are skipped and read commands are retained");
+    let targets = batch.targets();
+    assert_eq!(targets.len(), 3);
+    assert_eq!(targets[0].source_text(), "GET first");
+    assert_eq!(targets[1].source_text(), "MGET second third");
+    assert_eq!(targets[2].source_text(), "PING");
+    assert_eq!(
+        classify_execution_batch_kind(ExecutionLanguage::Redis, targets),
+        OperationKind::ExecuteRead
+    );
+
+    assert_eq!(
+        extract_and_validate_all_targets(
+            "GET first\nSET first changed",
+            ExecutionLanguage::Redis,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::RedisCommandDenied,
+        "a command outside the exact read allowlist prevents any batch from being returned"
+    );
+    assert_eq!(
+        extract_and_validate_all_targets(
+            "GET first\nMONITOR",
+            ExecutionLanguage::Redis,
+            ROW_LIMIT,
+            TIMEOUT_SECONDS,
+        )
+        .unwrap_err(),
+        ExecutionTargetError::RedisCommandDenied,
+        "a denied later command prevents any batch from being returned"
+    );
 }
 
 fn mysql_text(result: &ValidatedExecutionTarget) -> &str {
@@ -308,11 +516,11 @@ fn mysql_trailing_terminator_gap_and_consecutive_targets_are_distinct() {
 
 #[test]
 fn redis_without_selection_uses_only_the_caret_physical_line() {
-    let text = "GET first\nSET second value";
+    let text = "GET first\nMGET second value";
     let first = redis(text, character_index(text, "GET")).unwrap();
     assert_eq!(redis_argv(&first), ["GET", "first"]);
-    let second = redis(text, character_index(text, "SET")).unwrap();
-    assert_eq!(redis_argv(&second), ["SET", "second", "value"]);
+    let second = redis(text, character_index(text, "MGET")).unwrap();
+    assert_eq!(redis_argv(&second), ["MGET", "second", "value"]);
 
     assert_eq!(
         redis_selection(text, 0..text.chars().count()).unwrap_err(),
@@ -328,9 +536,9 @@ fn redis_without_selection_uses_only_the_caret_physical_line() {
 
 #[test]
 fn redis_shell_parsing_keeps_semicolons_as_data() {
-    let quoted = "SET key 'a;b'";
+    let quoted = "GET 'a;b'";
     let parsed = redis(quoted, 0).unwrap();
-    assert_eq!(redis_argv(&parsed), ["SET", "key", "a;b"]);
+    assert_eq!(redis_argv(&parsed), ["GET", "a;b"]);
 
     let unquoted = "GET key;SET";
     let parsed = redis(unquoted, 0).unwrap();
@@ -372,53 +580,92 @@ fn redis_input_caps_are_checked_before_dispatch() {
         ExecutionTargetError::RedisTokenTooLarge
     );
 
-    let maximum_token_count = format!("GET {}", vec!["x"; MAX_REDIS_TOKENS - 1].join(" "));
-    assert_eq!(
-        redis_argv(&redis(&maximum_token_count, 0).unwrap()).len(),
-        MAX_REDIS_TOKENS
-    );
-
     let exact_byte_cap = format!(
-        "GET {} {} {} {}",
+        "MGET {} {} {} {}",
         "a".repeat(MAX_REDIS_TOKEN_BYTES),
         "b".repeat(MAX_REDIS_TOKEN_BYTES),
         "c".repeat(MAX_REDIS_TOKEN_BYTES),
-        "d".repeat(MAX_REDIS_TARGET_BYTES - 7 - (MAX_REDIS_TOKEN_BYTES * 3))
+        "d".repeat(MAX_REDIS_TARGET_BYTES - 8 - (MAX_REDIS_TOKEN_BYTES * 3))
     );
     assert_eq!(exact_byte_cap.len(), MAX_REDIS_TARGET_BYTES);
     redis(&exact_byte_cap, 0).unwrap();
 }
 
 #[test]
-fn redis_closed_classifier_denies_every_exact_family_case_insensitively() {
+fn redis_closed_classifier_admits_only_exact_bounded_shapes_case_insensitively() {
     for command in [
-        "SUBSCRIBE",
-        "pSuBsCrIbE",
-        "SSUBSCRIBE",
-        "UNSUBSCRIBE",
-        "PUNSUBSCRIBE",
-        "SUNSUBSCRIBE",
-        "MONITOR",
-        "SYNC",
-        "PSYNC",
-        "REPLCONF",
-        "WAIT",
-        "WAITAOF",
-        "BRPOP",
-        "BRPOPLPUSH",
-        "BZPOPMIN",
-        "BZPOPMAX",
-        "BZMPOP",
-        "\"subscribe\" channel",
+        "PING",
+        "get key",
+        "GETRANGE key 0 1048575",
+        "MGET one two",
+        "EXISTS one two",
+        "TYPE key",
+        "TTL key",
+        "PTTL key",
+        "STRLEN key",
+        "HGET key field",
+        "HEXISTS key field",
+        "HSTRLEN key field",
+        "HMGET key one two",
+        "HLEN key",
+        "HSCAN key 0 COUNT 200",
+        "sscan key 0 match 'item:*' count 1",
+        "ZSCAN key 0 COUNT 1 MATCH '*'",
+        "LLEN key",
+        "LINDEX key -1",
+        "LRANGE key 0 199",
+        "LRANGE key -200 -1",
+        "SCARD key",
+        "SISMEMBER key member",
+        "SMISMEMBER key one two",
+        "ZCARD key",
+        "ZCOUNT key -inf '(+inf'",
+        "ZLEXCOUNT key - '[z'",
+        "ZRANK key member",
+        "ZREVRANK key member",
+        "ZSCORE key member",
+        "ZMSCORE key one two",
+        "ZRANGE key 0 199 WITHSCORES",
+        "SCAN 0 TYPE hash MATCH 'item:*' COUNT 200",
+        "XLEN stream",
+        "XRANGE stream - + COUNT 200",
+        "XREVRANGE stream + - count 1",
     ] {
-        assert_eq!(
-            redis(command, 0).unwrap_err(),
-            ExecutionTargetError::RedisCommandDenied,
-            "case: {command}"
-        );
+        redis(command, 0).unwrap_or_else(|error| panic!("allowed case {command}: {error}"));
     }
 
-    for command in ["BLPOP", "blmove", "BlAnything"] {
+    for command in [
+        "PING payload",
+        "GET key extra",
+        "GETRANGE key 0 1048576",
+        "LRANGE key 0 -1",
+        "LRANGE key 0 200",
+        "HGETALL key",
+        "HKEYS key",
+        "HVALS key",
+        "SMEMBERS key",
+        "ZRANGE key 0 -1",
+        "ZRANGE key 0 10 REV",
+        "SCAN 0",
+        "SCAN 0 COUNT 0",
+        "SCAN 0 COUNT 201",
+        "SCAN 0 COUNT 1 COUNT 2",
+        "SCAN 0 TYPE module COUNT 1",
+        "HSCAN key 0 MATCH '*'",
+        "XRANGE stream - +",
+        "ZCOUNT key NaN +inf",
+        "ZLEXCOUNT key '[' '[z'",
+        "ZLEXCOUNT key '(a' '('",
+        "INFO memory",
+        "TIME",
+        "DBSIZE",
+        "XREAD STREAMS stream 0",
+        "XREAD BLOCK 0 STREAMS stream 0",
+        "SET key value",
+        "MONITOR",
+        "\"subscribe\" channel",
+        "BlAnything",
+    ] {
         assert_eq!(
             redis(command, 0).unwrap_err(),
             ExecutionTargetError::RedisCommandDenied,
@@ -428,31 +675,13 @@ fn redis_closed_classifier_denies_every_exact_family_case_insensitively() {
 }
 
 #[test]
-fn redis_classifier_only_reads_command_and_option_positions() {
+fn redis_classifier_reads_command_and_option_keywords_without_reclassifying_arguments() {
     for allowed in [
         "GET SUBSCRIBE",
         "GET 'MONITOR'",
-        "SET BLOCK value",
-        "BRAND key",
-    ] {
-        redis(allowed, 0).unwrap();
-    }
-
-    for denied in [
-        "XREAD BLOCK 0 STREAMS key 0",
-        "xreadgroup GROUP group consumer COUNT 1 block 0 streams key 0",
-        "XREAD COUNT 1 BLOCK 0",
-    ] {
-        assert_eq!(
-            redis(denied, 0).unwrap_err(),
-            ExecutionTargetError::RedisCommandDenied,
-            "case: {denied}"
-        );
-    }
-
-    for allowed in [
-        "XREAD STREAMS BLOCK 0",
-        "XREADGROUP GROUP group consumer STREAMS BLOCK 0",
+        "MGET BLOCK value",
+        "GET BRAND",
+        "SCAN 0 MATCH BLOCK COUNT 1",
     ] {
         redis(allowed, 0).unwrap();
     }

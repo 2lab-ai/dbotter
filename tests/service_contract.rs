@@ -1,4 +1,5 @@
 use std::fs;
+use std::future::pending;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -17,12 +18,13 @@ use dbotter::drivers::{
 };
 use dbotter::execution::{ExecutionLanguage, ExecutionTarget, classify_execution_kind};
 use dbotter::model::{
-    CatalogPage, CatalogRequest, ConnectionDraft, ConnectionProfile, CredentialMode, DraftId,
-    DriverKind, ExecuteRequest, LegacyConfigVersion, MySqlPublicErrorCode, OperationId,
-    OperationKind, PreparedMySqlRequest, ProfileAccess, ProfileEnvironment, ProfileFieldId,
-    ProfileGeneration, ProfileId, ProfileInstanceId, ProfileSafetyPosture, PublicCode,
-    PublicSummary, QueryLanguage, QueryResult, RedisExecuteRequest, RedisKeyInspectRequest,
-    RedisKeyPage, RedisScanRequest, RedisValuePreview, TlsMode,
+    CatalogPage, CatalogRequest, Column, ConnectionDraft, ConnectionProfile, CredentialMode,
+    DraftId, DriverKind, ExecuteBatchRequest, ExecuteRequest, LegacyConfigVersion,
+    MAX_PROFILE_RESULT_BYTES, MAX_RESULT_BYTES, MAX_RESULT_CELL_BYTES, MySqlPublicErrorCode,
+    OperationId, OperationKind, PreparedMySqlRequest, ProfileAccess, ProfileEnvironment,
+    ProfileFieldId, ProfileGeneration, ProfileId, ProfileInstanceId, ProfileSafetyPosture,
+    PublicCode, PublicSummary, QueryLanguage, QueryResult, RedisExecuteRequest,
+    RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, TlsMode,
 };
 use dbotter::public_error::{RecoveryAction, SafeContext, recovery_for};
 use dbotter::secrets::{
@@ -30,10 +32,10 @@ use dbotter::secrets::{
     SessionSecretStore, SessionSecretUpdate,
 };
 use dbotter::service::{
-    ApplicationService, CheckOutcome, CreateProfileRequest, DeleteProfileRequest, ExecuteOutcome,
-    ProfileMutationOutcome, ProfileValidationError, SecretResolver, ServiceError, SessionConnector,
-    SessionDisposition, SessionHandle, UpdateProfileRequest, validate_config_identity,
-    validate_config_mutation,
+    ApplicationService, CheckOutcome, CreateProfileRequest, DeleteProfileRequest,
+    ExecuteBatchOutcome, ExecuteOutcome, ProfileMutationOutcome, ProfileValidationError,
+    SecretResolver, ServiceError, SessionConnector, SessionDisposition, SessionHandle,
+    UpdateProfileRequest, validate_config_identity, validate_config_mutation,
 };
 
 fn test_mysql_capabilities() -> MySqlCapabilitySnapshot {
@@ -562,7 +564,12 @@ impl SessionConnector for FakeConnector {
 #[derive(Default)]
 struct AccessAdmissionIo {
     non_target_session_io: AtomicUsize,
+    read_admissions: AtomicUsize,
+    read_only_proofs: AtomicUsize,
     user_target_dispatches: AtomicUsize,
+    result_bytes_per_target: AtomicUsize,
+    block_target_execution: AtomicBool,
+    executed_statements: Mutex<Vec<String>>,
 }
 
 struct AccessAdmissionSession {
@@ -594,6 +601,7 @@ impl MySqlReadExecution for AccessAdmissionResources {
         &self,
         _timeout: Duration,
     ) -> Result<MySqlReadAdmission, DriverError> {
+        self.io.read_admissions.fetch_add(1, Ordering::SeqCst);
         Ok(MySqlReadAdmission::new(
             test_mysql_capabilities_with_sql_mode(self.sql_mode),
             Box::new(self.clone()),
@@ -606,6 +614,7 @@ impl MySqlUnprovenReadLease for AccessAdmissionResources {
     async fn prove_read_only(
         self: Box<Self>,
     ) -> Result<Box<dyn MySqlProvenReadLease>, DriverError> {
+        self.io.read_only_proofs.fetch_add(1, Ordering::SeqCst);
         if let Some(reason) = self.proof_failure {
             Err(DriverError::MySqlReadOnlyNotProven { reason })
         } else {
@@ -618,11 +627,16 @@ impl MySqlUnprovenReadLease for AccessAdmissionResources {
 impl MySqlProvenReadLease for AccessAdmissionResources {
     async fn execute_prepared(
         &mut self,
-        _request: &PreparedMySqlRequest,
+        request: &PreparedMySqlRequest,
     ) -> Result<QueryResult, DriverError> {
         self.io
             .user_target_dispatches
             .fetch_add(1, Ordering::SeqCst);
+        self.io
+            .executed_statements
+            .lock()
+            .expect("access-admission statement log")
+            .push(request.statement.clone());
         Ok(empty_result())
     }
 }
@@ -636,7 +650,11 @@ impl RedisExecution for AccessAdmissionResources {
         self.io
             .user_target_dispatches
             .fetch_add(1, Ordering::SeqCst);
-        Ok(empty_result())
+        if self.io.block_target_execution.load(Ordering::SeqCst) {
+            pending::<()>().await;
+        }
+        let retained_bytes = self.io.result_bytes_per_target.load(Ordering::SeqCst);
+        Ok(result_with_retained_bytes(retained_bytes))
     }
 }
 
@@ -825,6 +843,7 @@ const DU01_REDIS_MUTATION: &str = "SET du01:key du01-value";
 struct AccessAdmissionObservation {
     label: &'static str,
     operation_id: OperationId,
+    driver: DriverKind,
     result: Result<ExecuteOutcome, ServiceError>,
     non_target_session_io: usize,
     user_target_dispatches: usize,
@@ -915,6 +934,7 @@ async fn observe_classified_access_admission_with_connector(
     AccessAdmissionObservation {
         label,
         operation_id,
+        driver,
         result,
         non_target_session_io: connector.io.non_target_session_io.load(Ordering::SeqCst),
         user_target_dispatches: connector.io.user_target_dispatches.load(Ordering::SeqCst),
@@ -994,6 +1014,7 @@ async fn observe_legacy_access_admission(
     AccessAdmissionObservation {
         label,
         operation_id,
+        driver,
         result,
         non_target_session_io: connector.io.non_target_session_io.load(Ordering::SeqCst),
         user_target_dispatches: connector.io.user_target_dispatches.load(Ordering::SeqCst),
@@ -1050,6 +1071,36 @@ fn assert_mutation_review_error_is_public_safe(
         error.public_error_parts(),
         (PublicSummary::UnsupportedFeature, PublicCode::None),
         "{label}: stable local mutation-review error"
+    );
+    let public_surfaces = format!(
+        "{error:?}\n{error}\n{:?}\n{:?}\n{}",
+        error.public_summary(),
+        error.public_code(),
+        error.public_summary()
+    );
+    for forbidden_value in forbidden {
+        assert!(
+            !public_surfaces.contains(forbidden_value),
+            "{label}: public error leaked forbidden profile, target, endpoint, or credential data"
+        );
+    }
+}
+
+fn assert_redis_raw_editor_denial_is_public_safe(
+    label: &str,
+    error: &ServiceError,
+    forbidden: &[String],
+) {
+    assert!(matches!(
+        error,
+        ServiceError::InvalidRequest {
+            code: PublicCode::StatementTarget,
+        }
+    ));
+    assert_eq!(
+        error.public_error_parts(),
+        (PublicSummary::InvalidInput, PublicCode::StatementTarget),
+        "{label}: stable exact Redis raw-editor denial"
     );
     let public_surfaces = format!(
         "{error:?}\n{error}\n{:?}\n{:?}\n{}",
@@ -1256,21 +1307,43 @@ async fn du01_access_admission_is_effective_read_only_without_blocking_read_path
             "{}: mutation reached a typed user-target driver port after {} permitted non-target session I/O calls",
             observation.label, observation.non_target_session_io
         );
-        if observation.non_target_session_io > 0 {
-            assert_eq!(
-                observation.saw_secret, observation.expected_secret,
-                "{}: metadata-only lease used the wrong credential capability",
-                observation.label
-            );
-        }
         let error = observation
             .result
             .expect_err("DU-01 mutation posture must reject locally");
-        assert_access_admission_error_is_public_safe(
-            observation.label,
-            &error,
-            &observation.forbidden_error_text,
-        );
+        match observation.driver {
+            DriverKind::Redis => {
+                assert_eq!(
+                    observation.non_target_session_io, 0,
+                    "{}: exact Redis raw-editor denial must happen before session I/O",
+                    observation.label
+                );
+                assert!(
+                    !observation.saw_secret,
+                    "{}: exact Redis raw-editor denial resolved a credential",
+                    observation.label
+                );
+                assert_redis_raw_editor_denial_is_public_safe(
+                    observation.label,
+                    &error,
+                    &observation.forbidden_error_text,
+                );
+            }
+            DriverKind::MySql => {
+                if observation.non_target_session_io > 0 {
+                    assert_eq!(
+                        observation.saw_secret, observation.expected_secret,
+                        "{}: metadata-only lease used the wrong credential capability",
+                        observation.label
+                    );
+                }
+                assert_access_admission_error_is_public_safe(
+                    observation.label,
+                    &error,
+                    &observation.forbidden_error_text,
+                );
+            }
+            DriverKind::MongoDb => unreachable!("DU-01 admission covers MySQL and Redis"),
+        }
     }
 
     for observation in review_blocked {
@@ -1292,11 +1365,19 @@ async fn du01_access_admission_is_effective_read_only_without_blocking_read_path
         let error = observation
             .result
             .expect_err("mutation without a completed review flow must reject locally");
-        assert_mutation_review_error_is_public_safe(
-            observation.label,
-            &error,
-            &observation.forbidden_error_text,
-        );
+        match observation.driver {
+            DriverKind::Redis => assert_redis_raw_editor_denial_is_public_safe(
+                observation.label,
+                &error,
+                &observation.forbidden_error_text,
+            ),
+            DriverKind::MySql => assert_mutation_review_error_is_public_safe(
+                observation.label,
+                &error,
+                &observation.forbidden_error_text,
+            ),
+            DriverKind::MongoDb => unreachable!("DU-01 admission covers MySQL and Redis"),
+        }
     }
 
     for observation in allowed {
@@ -1408,6 +1489,264 @@ async fn mysql_exact_server_sql_mode_admits_a_mode_dependent_read() {
     observation
         .result
         .expect("the exact session mode must admit the prepared read");
+}
+
+async fn execute_mysql_batch_with_connector(
+    source: &str,
+    connector: Arc<AccessAdmissionConnector>,
+) -> Result<ExecuteBatchOutcome, ServiceError> {
+    let directory = tempfile::tempdir().expect("batch access-admission tempdir");
+    let path = directory.path().join("config.toml");
+    let service = ApplicationService::with_dependencies(
+        &path,
+        connector,
+        Arc::new(MissingEnvironment),
+        Arc::new(SessionSecretStore::default()),
+        ConfigWriter::default(),
+    )
+    .expect("batch access-admission service");
+    let mut draft = named_draft(DriverKind::MySql, "Batch admission");
+    draft.access = ProfileAccess::ReadOnly;
+    draft.credential_mode = CredentialMode::None;
+    let created = service
+        .create_profile(create_request(
+            DraftId(750),
+            OperationId(750),
+            Some("mysql-batch-admission"),
+            draft,
+            SessionSecretUpdate::Clear,
+        ))
+        .await
+        .expect("batch access-admission profile");
+    service
+        .execute_batch_at(ExecuteBatchRequest {
+            operation_id: OperationId(751),
+            profile_id: created.profile_id,
+            profile_generation: created.profile_generation,
+            language: QueryLanguage::Sql,
+            text: source.to_owned(),
+            row_limit: 7,
+            timeout: Duration::from_secs(1),
+        })
+        .await
+}
+
+async fn execute_redis_batch_with_connector(
+    source: &str,
+    connector: Arc<AccessAdmissionConnector>,
+) -> Result<ExecuteBatchOutcome, ServiceError> {
+    let directory = tempfile::tempdir().expect("Redis batch access-admission tempdir");
+    let path = directory.path().join("config.toml");
+    let service = ApplicationService::with_dependencies(
+        &path,
+        connector,
+        Arc::new(MissingEnvironment),
+        Arc::new(SessionSecretStore::default()),
+        ConfigWriter::default(),
+    )
+    .expect("Redis batch access-admission service");
+    let mut draft = named_draft(DriverKind::Redis, "Redis batch admission");
+    draft.access = ProfileAccess::ReadOnly;
+    draft.credential_mode = CredentialMode::None;
+    let created = service
+        .create_profile(create_request(
+            DraftId(752),
+            OperationId(752),
+            Some("redis-batch-admission"),
+            draft,
+            SessionSecretUpdate::Clear,
+        ))
+        .await
+        .expect("Redis batch access-admission profile");
+    service
+        .execute_batch_at(ExecuteBatchRequest {
+            operation_id: OperationId(753),
+            profile_id: created.profile_id,
+            profile_generation: created.profile_generation,
+            language: QueryLanguage::RedisCommand,
+            text: source.to_owned(),
+            row_limit: 7,
+            timeout: Duration::from_secs(1),
+        })
+        .await
+}
+
+#[tokio::test]
+async fn mysql_batch_later_invalid_target_rejects_before_session_acquisition() {
+    let connector = Arc::new(AccessAdmissionConnector::new(DriverKind::MySql));
+    let result =
+        execute_mysql_batch_with_connector("SELECT 1; SELECT (2;", connector.clone()).await;
+
+    assert!(matches!(
+        result,
+        Err(ServiceError::InvalidRequest {
+            code: PublicCode::StatementTarget
+        })
+    ));
+    assert_eq!(connector.io.non_target_session_io.load(Ordering::SeqCst), 0);
+    assert_eq!(connector.io.read_admissions.load(Ordering::SeqCst), 0);
+    assert_eq!(connector.io.read_only_proofs.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        connector.io.user_target_dispatches.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn mysql_batch_read_only_proof_failure_dispatches_no_user_target() {
+    const REASON: &str = "batch proof rejected";
+    let connector = Arc::new(AccessAdmissionConnector::with_mysql_proof_failure(REASON));
+    let result = execute_mysql_batch_with_connector("SELECT 1; SELECT 2;", connector.clone()).await;
+
+    assert!(matches!(
+        result,
+        Err(ServiceError::Driver(DriverError::MySqlReadOnlyNotProven {
+            reason: REASON
+        }))
+    ));
+    assert_eq!(connector.io.read_admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(connector.io.read_only_proofs.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        connector.io.user_target_dispatches.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn mysql_batch_executes_in_order_on_one_proven_read_session() {
+    let connector = Arc::new(AccessAdmissionConnector::new(DriverKind::MySql));
+    let outcome = execute_mysql_batch_with_connector("SELECT 1; SELECT 2;", connector.clone())
+        .await
+        .expect("fully preflighted read batch");
+
+    assert_eq!(outcome.results.len(), 2);
+    assert!(
+        outcome
+            .results
+            .iter()
+            .all(|result| result.provenance.operation_id == OperationId(751))
+    );
+    assert_eq!(connector.io.non_target_session_io.load(Ordering::SeqCst), 1);
+    assert_eq!(connector.io.read_admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(connector.io.read_only_proofs.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        connector.io.user_target_dispatches.load(Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        *connector
+            .io
+            .executed_statements
+            .lock()
+            .expect("batch statement order"),
+        vec!["SELECT 1;".to_owned(), "SELECT 2;".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn redis_batch_later_denied_command_rejects_before_session_acquisition() {
+    let connector = Arc::new(AccessAdmissionConnector::new(DriverKind::Redis));
+    let result = execute_redis_batch_with_connector("GET first\nMONITOR", connector.clone()).await;
+
+    assert!(matches!(
+        result,
+        Err(ServiceError::InvalidRequest {
+            code: PublicCode::StatementTarget
+        })
+    ));
+    assert_eq!(connector.io.non_target_session_io.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        connector.io.user_target_dispatches.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn redis_batch_executes_all_preflighted_commands_on_one_session_handle() {
+    let connector = Arc::new(AccessAdmissionConnector::new(DriverKind::Redis));
+    let outcome = execute_redis_batch_with_connector("GET first\nGET second", connector.clone())
+        .await
+        .expect("fully preflighted Redis read batch");
+
+    assert_eq!(outcome.results.len(), 2);
+    assert_eq!(connector.io.non_target_session_io.load(Ordering::SeqCst), 1);
+    assert_eq!(connector.io.read_admissions.load(Ordering::SeqCst), 0);
+    assert_eq!(connector.io.read_only_proofs.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        connector.io.user_target_dispatches.load(Ordering::SeqCst),
+        2
+    );
+}
+
+#[tokio::test]
+async fn redis_batch_retains_no_more_than_the_profile_result_byte_cap() {
+    const TARGET_RESULT_BYTES: usize = 7 * 1024 * 1024;
+
+    let connector = Arc::new(AccessAdmissionConnector::new(DriverKind::Redis));
+    connector
+        .io
+        .result_bytes_per_target
+        .store(TARGET_RESULT_BYTES, Ordering::SeqCst);
+
+    let outcome = execute_redis_batch_with_connector(
+        "GET first\nGET second\nGET third\nGET fourth\nGET fifth",
+        connector.clone(),
+    )
+    .await
+    .expect("bounded Redis batch");
+
+    assert_eq!(outcome.completed_targets, 5);
+    assert!(outcome.discarded_results >= 1);
+    assert!(
+        outcome
+            .results
+            .iter()
+            .all(|result| result.retained_bytes == TARGET_RESULT_BYTES)
+    );
+    assert!(
+        outcome
+            .results
+            .iter()
+            .map(|result| result.retained_bytes)
+            .sum::<usize>()
+            <= MAX_PROFILE_RESULT_BYTES
+    );
+    assert_eq!(
+        connector.io.user_target_dispatches.load(Ordering::SeqCst),
+        5
+    );
+}
+
+#[tokio::test]
+async fn redis_batch_uses_one_deadline_when_target_execution_blocks() {
+    let connector = Arc::new(AccessAdmissionConnector::new(DriverKind::Redis));
+    connector
+        .io
+        .block_target_execution
+        .store(true, Ordering::SeqCst);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        execute_redis_batch_with_connector(
+            "GET first\nGET second\nGET third\nGET fourth\nGET fifth",
+            connector.clone(),
+        ),
+    )
+    .await
+    .expect("the batch must finish under the outer two-second guard");
+
+    assert!(matches!(
+        result,
+        Err(ServiceError::Driver(DriverError::Timeout {
+            driver: DriverKind::Redis,
+            seconds: 1
+        }))
+    ));
+    assert_eq!(
+        connector.io.user_target_dispatches.load(Ordering::SeqCst),
+        1,
+        "a blocked first target must not consume a fresh timeout per later target"
+    );
 }
 
 #[tokio::test]
@@ -6102,5 +6441,23 @@ fn empty_result() -> QueryResult {
         elapsed_ms: 0,
         truncated: false,
         backend_notices_present: false,
+    }
+}
+
+fn result_with_retained_bytes(retained_bytes: usize) -> QueryResult {
+    assert!(retained_bytes <= MAX_RESULT_BYTES);
+    let mut remaining = retained_bytes;
+    let mut columns = Vec::new();
+    while remaining > 0 {
+        let column_bytes = remaining.min(MAX_RESULT_CELL_BYTES);
+        columns.push(Column {
+            name: "x".repeat(column_bytes),
+            type_name: String::new(),
+        });
+        remaining -= column_bytes;
+    }
+    QueryResult {
+        columns,
+        ..empty_result()
     }
 }

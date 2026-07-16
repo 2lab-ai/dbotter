@@ -29,6 +29,7 @@ pub const DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 
 static PLAINTEXT_TRANSPORT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static REQUIRED_TLS_TRANSPORT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+const MAX_RAW_SCAN_RETURNED_ELEMENTS: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedisTransportAttemptCounts {
@@ -204,7 +205,8 @@ impl RedisSession {
                     driver: DriverKind::Redis,
                     seconds: request.timeout().as_secs(),
                 })??;
-        let (rows, truncated) = value_rows(value, request.row_limit() as usize);
+        let (rows, truncated) =
+            command_value_rows(command_name.as_bytes(), value, request.row_limit() as usize);
         Ok(QueryResult {
             columns: vec![Column {
                 name: "value".to_owned(),
@@ -293,6 +295,53 @@ struct DecodedCell {
 struct CompositeMeasure {
     nodes: usize,
     encoded_bytes: usize,
+}
+
+fn command_value_rows(
+    command_name: &[u8],
+    value: ::redis::Value,
+    row_limit: usize,
+) -> (Vec<Vec<Cell>>, bool) {
+    let (value, scan_truncated) = bound_raw_scan_reply(command_name, value);
+    let (rows, value_truncated) = value_rows(value, row_limit);
+    (rows, scan_truncated || value_truncated)
+}
+
+fn bound_raw_scan_reply(command_name: &[u8], value: ::redis::Value) -> (::redis::Value, bool) {
+    let pair_shaped =
+        command_name.eq_ignore_ascii_case(b"HSCAN") || command_name.eq_ignore_ascii_case(b"ZSCAN");
+    let scan_shaped = pair_shaped
+        || command_name.eq_ignore_ascii_case(b"SCAN")
+        || command_name.eq_ignore_ascii_case(b"SSCAN");
+    if !scan_shaped {
+        return (value, false);
+    }
+
+    let ::redis::Value::Array(reply) = value else {
+        return (::redis::Value::Array(Vec::new()), true);
+    };
+    let mut reply = reply.into_iter();
+    let Some(cursor) = reply.next() else {
+        return (::redis::Value::Array(Vec::new()), true);
+    };
+    let Some(::redis::Value::Array(mut returned)) = reply.next() else {
+        return (
+            ::redis::Value::Array(vec![cursor, ::redis::Value::Array(Vec::new())]),
+            true,
+        );
+    };
+
+    let extra_reply_values = reply.next().is_some();
+    let mut retained_len = returned.len().min(MAX_RAW_SCAN_RETURNED_ELEMENTS);
+    if pair_shaped {
+        retained_len -= retained_len % 2;
+    }
+    let truncated = extra_reply_values || retained_len < returned.len();
+    returned.truncate(retained_len);
+    (
+        ::redis::Value::Array(vec![cursor, ::redis::Value::Array(returned)]),
+        truncated,
+    )
 }
 
 fn value_rows(value: ::redis::Value, row_limit: usize) -> (Vec<Vec<Cell>>, bool) {
@@ -740,6 +789,68 @@ mod tests {
             rows,
             vec![vec![Cell::Int(1)], vec![Cell::Text("two".into())]]
         );
+    }
+
+    #[test]
+    fn raw_scan_reply_preserves_cursor_and_at_most_two_hundred_returned_elements() {
+        let returned = (0..205)
+            .map(|index| ::redis::Value::BulkString(format!("key-{index}").into_bytes()))
+            .collect();
+        let (rows, truncated) = command_value_rows(
+            b"SCAN",
+            ::redis::Value::Array(vec![
+                ::redis::Value::BulkString(b"42".to_vec()),
+                ::redis::Value::Array(returned),
+            ]),
+            500,
+        );
+
+        assert!(truncated);
+        assert_eq!(rows.first(), Some(&vec![Cell::Text("42".to_owned())]));
+        let Some(Cell::Json(serde_json::Value::Array(returned))) =
+            rows.get(1).and_then(|row| row.first())
+        else {
+            panic!("bounded SCAN items must retain their nested RESP shape");
+        };
+        assert_eq!(returned.len(), MAX_RAW_SCAN_RETURNED_ELEMENTS);
+    }
+
+    #[test]
+    fn raw_pair_scan_replies_stop_on_an_even_two_hundred_element_boundary() {
+        for command_name in [b"HSCAN".as_slice(), b"ZSCAN"] {
+            let returned = (0..201)
+                .map(|index| ::redis::Value::BulkString(index.to_string().into_bytes()))
+                .collect();
+            let (rows, truncated) = command_value_rows(
+                command_name,
+                ::redis::Value::Array(vec![
+                    ::redis::Value::BulkString(b"17".to_vec()),
+                    ::redis::Value::Array(returned),
+                ]),
+                500,
+            );
+
+            assert!(truncated, "{}", String::from_utf8_lossy(command_name));
+            let Some(Cell::Json(serde_json::Value::Array(returned))) =
+                rows.get(1).and_then(|row| row.first())
+            else {
+                panic!("pair-shaped scan items must retain their nested RESP shape");
+            };
+            assert_eq!(returned.len(), MAX_RAW_SCAN_RETURNED_ELEMENTS);
+            assert_eq!(returned.len() % 2, 0);
+        }
+    }
+
+    #[test]
+    fn non_scan_get_response_keeps_the_existing_conversion_path() {
+        let (rows, truncated) = command_value_rows(
+            b"GET",
+            ::redis::Value::BulkString(b"ordinary-value".to_vec()),
+            1,
+        );
+
+        assert!(!truncated);
+        assert_eq!(rows, vec![vec![Cell::Text("ordinary-value".to_owned())]]);
     }
 
     #[test]

@@ -1,12 +1,20 @@
 use std::fmt;
 use std::ops::Range;
 
-use crate::model::OperationKind;
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::{Token, Tokenizer};
+
+use crate::model::{MAX_MYSQL_STATEMENT_BYTES, OperationKind};
 
 pub const MAX_EXECUTE_ROW_LIMIT: u32 = 10_000;
 pub const MAX_EXECUTE_TIMEOUT_SECONDS: u32 = 300;
+pub const MAX_EXECUTE_BATCH_BYTES: usize = 256 * 1024;
+pub const MAX_EXECUTE_BATCH_TARGETS: usize = 50;
+pub const MAX_MYSQL_TOKENS: usize = 8_192;
+pub const MAX_MYSQL_NESTING_DEPTH: usize = 64;
 pub const MAX_REDIS_TARGET_BYTES: usize = 65_536;
-pub const MAX_REDIS_TOKENS: usize = 1_024;
+pub const MAX_REDIS_TOKENS: usize = 8_192;
 pub const MAX_REDIS_TOKEN_BYTES: usize = 16 * 1_024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +84,40 @@ pub fn classify_mysql_execution_kind_with_sql_mode(
     } else {
         OperationKind::ExecuteMutation
     })
+}
+
+/// Classifies a batch conservatively before any session or target work.
+/// MySQL is read-only only when every target remains read-only under every
+/// lexer mode that can affect statement interpretation.
+#[must_use]
+pub fn classify_execution_batch_kind(
+    language: ExecutionLanguage,
+    targets: &[ValidatedExecutionTarget],
+) -> OperationKind {
+    let all_read = targets
+        .iter()
+        .all(|validated| match (language, validated.target()) {
+            (ExecutionLanguage::MySql, ExecutionTarget::MySqlText(text)) => [
+                "",
+                "ANSI_QUOTES",
+                "NO_BACKSLASH_ESCAPES",
+                "ANSI_QUOTES,NO_BACKSLASH_ESCAPES",
+            ]
+            .into_iter()
+            .all(|sql_mode| {
+                classify_mysql_execution_kind_with_sql_mode(text, sql_mode)
+                    == Some(OperationKind::ExecuteRead)
+            }),
+            (ExecutionLanguage::Redis, ExecutionTarget::RedisArgv(arguments)) => {
+                redis_is_clearly_read_only(arguments)
+            }
+            _ => false,
+        });
+    if all_read {
+        OperationKind::ExecuteRead
+    } else {
+        OperationKind::ExecuteMutation
+    }
 }
 
 /// Rejects executable-comment marker bytes before any session or mode lookup.
@@ -276,56 +318,8 @@ fn mysql_classifier_quote_end(
 }
 
 fn redis_is_clearly_read_only(arguments: &[String]) -> bool {
-    let Some(command) = arguments.first() else {
-        return false;
-    };
-    matches!(
-        command.to_ascii_uppercase().as_str(),
-        "PING"
-            | "ECHO"
-            | "GET"
-            | "MGET"
-            | "EXISTS"
-            | "TYPE"
-            | "TTL"
-            | "PTTL"
-            | "STRLEN"
-            | "GETRANGE"
-            | "BITCOUNT"
-            | "HGET"
-            | "HMGET"
-            | "HGETALL"
-            | "HEXISTS"
-            | "HLEN"
-            | "HKEYS"
-            | "HVALS"
-            | "LLEN"
-            | "LINDEX"
-            | "LRANGE"
-            | "SCARD"
-            | "SISMEMBER"
-            | "SMISMEMBER"
-            | "SMEMBERS"
-            | "ZCARD"
-            | "ZCOUNT"
-            | "ZSCORE"
-            | "ZMSCORE"
-            | "ZRANGE"
-            | "ZRANGEBYSCORE"
-            | "ZREVRANGE"
-            | "ZRANK"
-            | "ZREVRANK"
-            | "XLEN"
-            | "XRANGE"
-            | "XREVRANGE"
-            | "SCAN"
-            | "SSCAN"
-            | "HSCAN"
-            | "ZSCAN"
-            | "DBSIZE"
-            | "INFO"
-            | "TIME"
-    )
+    let bytes = arguments.iter().map(String::as_bytes).collect::<Vec<_>>();
+    redis_bytes_are_allowed(&bytes)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -388,6 +382,33 @@ impl fmt::Debug for ValidatedExecutionTarget {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ValidatedExecutionBatch {
+    targets: Vec<ValidatedExecutionTarget>,
+}
+
+impl ValidatedExecutionBatch {
+    #[must_use]
+    pub fn targets(&self) -> &[ValidatedExecutionTarget] {
+        &self.targets
+    }
+
+    #[must_use]
+    pub fn into_targets(self) -> Vec<ValidatedExecutionTarget> {
+        self.targets
+    }
+}
+
+impl fmt::Debug for ValidatedExecutionBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ValidatedExecutionBatch")
+            .field("target_count", &self.targets.len())
+            .field("targets", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionTargetError {
     InvalidCaretPosition,
@@ -404,6 +425,15 @@ pub enum ExecutionTargetError {
     RedisTargetTooLarge,
     RedisTooManyTokens,
     RedisTokenTooLarge,
+    BatchSourceTooLarge,
+    TooManyBatchTargets,
+    EmptyBatchTarget,
+    BatchAmbiguousSqlMode,
+    MysqlBatchTargetTooLarge,
+    MysqlBatchTooManyTokens,
+    MysqlBatchNestingTooDeep,
+    MysqlBatchUnbalancedNesting,
+    MysqlBatchParseFailed,
 }
 
 impl ExecutionTargetError {
@@ -424,6 +454,15 @@ impl ExecutionTargetError {
             Self::RedisTargetTooLarge => "REDIS_TARGET_TOO_LARGE",
             Self::RedisTooManyTokens => "REDIS_TOO_MANY_TOKENS",
             Self::RedisTokenTooLarge => "REDIS_TOKEN_TOO_LARGE",
+            Self::BatchSourceTooLarge => "BATCH_SOURCE_TOO_LARGE",
+            Self::TooManyBatchTargets => "TOO_MANY_BATCH_TARGETS",
+            Self::EmptyBatchTarget => "EMPTY_BATCH_TARGET",
+            Self::BatchAmbiguousSqlMode => "BATCH_AMBIGUOUS_SQL_MODE",
+            Self::MysqlBatchTargetTooLarge => "MYSQL_BATCH_TARGET_TOO_LARGE",
+            Self::MysqlBatchTooManyTokens => "MYSQL_BATCH_TOO_MANY_TOKENS",
+            Self::MysqlBatchNestingTooDeep => "MYSQL_BATCH_NESTING_TOO_DEEP",
+            Self::MysqlBatchUnbalancedNesting => "MYSQL_BATCH_UNBALANCED_NESTING",
+            Self::MysqlBatchParseFailed => "MYSQL_BATCH_PARSE_FAILED",
         }
     }
 
@@ -448,6 +487,25 @@ impl ExecutionTargetError {
             Self::RedisTargetTooLarge => "The Redis command exceeds the input limit.",
             Self::RedisTooManyTokens => "The Redis command has too many tokens.",
             Self::RedisTokenTooLarge => "A Redis command token exceeds the input limit.",
+            Self::BatchSourceTooLarge => "Run all source is limited to 256 KiB.",
+            Self::TooManyBatchTargets => "Run all accepts at most 50 statements or commands.",
+            Self::EmptyBatchTarget => "Run all does not accept an empty statement target.",
+            Self::BatchAmbiguousSqlMode => {
+                "Run all cannot safely split this SQL-mode-dependent script."
+            }
+            Self::MysqlBatchTargetTooLarge => {
+                "Each MySQL statement in Run all is limited to 64 KiB."
+            }
+            Self::MysqlBatchTooManyTokens => {
+                "A MySQL statement in Run all contains too many tokens."
+            }
+            Self::MysqlBatchNestingTooDeep => "A MySQL statement in Run all is nested too deeply.",
+            Self::MysqlBatchUnbalancedNesting => {
+                "A MySQL statement in Run all has unbalanced nesting."
+            }
+            Self::MysqlBatchParseFailed => {
+                "A MySQL statement in Run all could not be parsed safely."
+            }
         }
     }
 }
@@ -528,6 +586,140 @@ pub fn extract_and_validate_target(
         row_limit,
         timeout_seconds,
     })
+}
+
+pub fn extract_and_validate_all_targets(
+    editor_text: &str,
+    language: ExecutionLanguage,
+    row_limit: u32,
+    timeout_seconds: u32,
+) -> Result<ValidatedExecutionBatch, ExecutionTargetError> {
+    if !(1..=MAX_EXECUTE_ROW_LIMIT).contains(&row_limit) {
+        return Err(ExecutionTargetError::InvalidRowLimit);
+    }
+    if !(1..=MAX_EXECUTE_TIMEOUT_SECONDS).contains(&timeout_seconds) {
+        return Err(ExecutionTargetError::InvalidTimeout);
+    }
+    if editor_text.len() > MAX_EXECUTE_BATCH_BYTES {
+        return Err(ExecutionTargetError::BatchSourceTooLarge);
+    }
+    if language == ExecutionLanguage::MySql && mysql_has_forbidden_executable_comment(editor_text) {
+        return Err(ExecutionTargetError::ForbiddenExecutableComment);
+    }
+
+    let mut targets = Vec::new();
+    match language {
+        ExecutionLanguage::MySql => {
+            let scan = scan_mysql(editor_text);
+            if let Some(issue) = scan.issue {
+                return if issue.ambiguous_sql_mode {
+                    Err(ExecutionTargetError::BatchAmbiguousSqlMode)
+                } else {
+                    Err(ExecutionTargetError::UnterminatedSqlToken)
+                };
+            }
+            if scan.stray_terminator {
+                return Err(ExecutionTargetError::EmptyBatchTarget);
+            }
+            if scan.statements.len() > MAX_EXECUTE_BATCH_TARGETS {
+                return Err(ExecutionTargetError::TooManyBatchTargets);
+            }
+            for statement in scan.statements {
+                if statement.ambiguous_sql_mode {
+                    return Err(ExecutionTargetError::BatchAmbiguousSqlMode);
+                }
+                let text = editor_text
+                    .get(statement.range)
+                    .ok_or(ExecutionTargetError::InvalidSelectionRange)?
+                    .trim();
+                validate_mysql_selection(text)?;
+                validate_mysql_batch_target(text)?;
+                targets.push(ValidatedExecutionTarget {
+                    target: ExecutionTarget::MySqlText(text.to_owned()),
+                    source_text: String::new(),
+                    row_limit,
+                    timeout_seconds,
+                });
+            }
+        }
+        ExecutionLanguage::Redis => {
+            for line in editor_text.lines() {
+                let source = line.trim_end_matches('\r').trim();
+                if source.is_empty() {
+                    continue;
+                }
+                if targets.len() == MAX_EXECUTE_BATCH_TARGETS {
+                    return Err(ExecutionTargetError::TooManyBatchTargets);
+                }
+                targets.push(ValidatedExecutionTarget {
+                    target: ExecutionTarget::RedisArgv(validate_redis_target(source)?),
+                    source_text: source.to_owned(),
+                    row_limit,
+                    timeout_seconds,
+                });
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Err(ExecutionTargetError::NoCurrentStatement);
+    }
+    Ok(ValidatedExecutionBatch { targets })
+}
+
+fn validate_mysql_batch_target(text: &str) -> Result<(), ExecutionTargetError> {
+    if text.len() > MAX_MYSQL_STATEMENT_BYTES {
+        return Err(ExecutionTargetError::MysqlBatchTargetTooLarge);
+    }
+    let dialect = MySqlDialect {};
+    let tokens = Tokenizer::new(&dialect, text)
+        .tokenize()
+        .map_err(|_| ExecutionTargetError::MysqlBatchParseFailed)?;
+    let mut token_count = 0_usize;
+    let mut nesting = 0_usize;
+    for token in &tokens {
+        if matches!(token, Token::Whitespace(_) | Token::EOF) {
+            continue;
+        }
+        token_count = token_count.saturating_add(1);
+        if token_count > MAX_MYSQL_TOKENS {
+            return Err(ExecutionTargetError::MysqlBatchTooManyTokens);
+        }
+        match token {
+            Token::LParen | Token::LBracket | Token::LBrace => {
+                nesting = nesting.saturating_add(1);
+                if nesting > MAX_MYSQL_NESTING_DEPTH {
+                    return Err(ExecutionTargetError::MysqlBatchNestingTooDeep);
+                }
+            }
+            Token::RParen | Token::RBracket | Token::RBrace => {
+                nesting = nesting
+                    .checked_sub(1)
+                    .ok_or(ExecutionTargetError::MysqlBatchUnbalancedNesting)?;
+            }
+            _ => {}
+        }
+    }
+    if nesting != 0 {
+        return Err(ExecutionTargetError::MysqlBatchUnbalancedNesting);
+    }
+    let statements = Parser::new(&dialect)
+        .with_recursion_limit(MAX_MYSQL_NESTING_DEPTH)
+        .try_with_sql(text)
+        .map_err(mysql_batch_parser_error)?
+        .parse_statements()
+        .map_err(mysql_batch_parser_error)?;
+    if statements.len() != 1 {
+        return Err(ExecutionTargetError::MysqlBatchParseFailed);
+    }
+    Ok(())
+}
+
+fn mysql_batch_parser_error(error: ParserError) -> ExecutionTargetError {
+    if matches!(error, ParserError::RecursionLimitExceeded) {
+        ExecutionTargetError::MysqlBatchNestingTooDeep
+    } else {
+        ExecutionTargetError::MysqlBatchParseFailed
+    }
 }
 
 fn char_to_byte(text: &str, character_index: usize) -> Option<usize> {
@@ -884,53 +1076,230 @@ pub(crate) fn redis_argv_is_denied(argv: &[Vec<u8>]) -> bool {
 }
 
 fn redis_bytes_are_denied(argv: &[&[u8]]) -> bool {
+    !redis_bytes_are_allowed(argv)
+}
+
+fn redis_bytes_are_allowed(argv: &[&[u8]]) -> bool {
     let Some(command) = argv.first().copied() else {
         return false;
     };
-    const EXACT_DENY: [&str; 17] = [
-        "SUBSCRIBE",
-        "PSUBSCRIBE",
-        "SSUBSCRIBE",
-        "UNSUBSCRIBE",
-        "PUNSUBSCRIBE",
-        "SUNSUBSCRIBE",
-        "MONITOR",
-        "SYNC",
-        "PSYNC",
-        "REPLCONF",
-        "WAIT",
-        "WAITAOF",
-        "BRPOP",
-        "BRPOPLPUSH",
-        "BZPOPMIN",
-        "BZPOPMAX",
-        "BZMPOP",
-    ];
-
-    let bl_prefix = command
-        .get(..2)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"BL"));
-    if bl_prefix {
-        return true;
+    if command.eq_ignore_ascii_case(b"PING") {
+        return argv.len() == 1;
     }
-
-    if command.eq_ignore_ascii_case(b"XREAD") || command.eq_ignore_ascii_case(b"XREADGROUP") {
-        return block_precedes_streams(argv);
+    if command.eq_ignore_ascii_case(b"GET") {
+        return argv.len() == 2;
     }
-
-    EXACT_DENY
+    if command.eq_ignore_ascii_case(b"GETRANGE") {
+        return argv.len() == 4 && redis_bounded_unsigned_range(argv[2], argv[3], 1024 * 1024);
+    }
+    if command.eq_ignore_ascii_case(b"MGET") || command.eq_ignore_ascii_case(b"EXISTS") {
+        return redis_argument_count(argv, 1, 100);
+    }
+    if [b"TYPE".as_slice(), b"TTL", b"PTTL", b"STRLEN"]
         .iter()
-        .any(|denied| command.eq_ignore_ascii_case(denied.as_bytes()))
-}
-
-fn block_precedes_streams(argv: &[&[u8]]) -> bool {
-    for argument in argv.iter().skip(1) {
-        if argument.eq_ignore_ascii_case(b"STREAMS") {
-            return false;
-        }
-        if argument.eq_ignore_ascii_case(b"BLOCK") {
-            return true;
-        }
+        .any(|allowed| command.eq_ignore_ascii_case(allowed))
+    {
+        return argv.len() == 2;
+    }
+    if [b"HGET".as_slice(), b"HEXISTS", b"HSTRLEN"]
+        .iter()
+        .any(|allowed| command.eq_ignore_ascii_case(allowed))
+    {
+        return argv.len() == 3;
+    }
+    if command.eq_ignore_ascii_case(b"HMGET") {
+        return redis_argument_count(argv, 2, 101);
+    }
+    if command.eq_ignore_ascii_case(b"HLEN") || command.eq_ignore_ascii_case(b"LLEN") {
+        return argv.len() == 2;
+    }
+    if [b"HSCAN".as_slice(), b"SSCAN", b"ZSCAN"]
+        .iter()
+        .any(|allowed| command.eq_ignore_ascii_case(allowed))
+    {
+        return argv.len() >= 5
+            && redis_parse_u64(argv[2]).is_some()
+            && redis_scan_options(argv, 3, false);
+    }
+    if command.eq_ignore_ascii_case(b"LINDEX") {
+        return argv.len() == 3 && redis_parse_i64(argv[2]).is_some();
+    }
+    if command.eq_ignore_ascii_case(b"LRANGE") {
+        return argv.len() == 4 && redis_bounded_signed_range(argv[2], argv[3], 200);
+    }
+    if command.eq_ignore_ascii_case(b"SCARD") || command.eq_ignore_ascii_case(b"ZCARD") {
+        return argv.len() == 2;
+    }
+    if command.eq_ignore_ascii_case(b"SISMEMBER") {
+        return argv.len() == 3;
+    }
+    if command.eq_ignore_ascii_case(b"SMISMEMBER") {
+        return redis_argument_count(argv, 2, 101);
+    }
+    if command.eq_ignore_ascii_case(b"ZCOUNT") {
+        return argv.len() == 4 && redis_score_bound(argv[2]) && redis_score_bound(argv[3]);
+    }
+    if command.eq_ignore_ascii_case(b"ZLEXCOUNT") {
+        return argv.len() == 4 && redis_lex_bound(argv[2]) && redis_lex_bound(argv[3]);
+    }
+    if [b"ZRANK".as_slice(), b"ZREVRANK", b"ZSCORE"]
+        .iter()
+        .any(|allowed| command.eq_ignore_ascii_case(allowed))
+    {
+        return argv.len() == 3;
+    }
+    if command.eq_ignore_ascii_case(b"ZMSCORE") {
+        return redis_argument_count(argv, 2, 101);
+    }
+    if command.eq_ignore_ascii_case(b"ZRANGE") {
+        return matches!(argv.len(), 4 | 5)
+            && redis_bounded_signed_range(argv[2], argv[3], 200)
+            && (argv.len() == 4 || argv[4].eq_ignore_ascii_case(b"WITHSCORES"));
+    }
+    if command.eq_ignore_ascii_case(b"SCAN") {
+        return argv.len() >= 4
+            && redis_parse_u64(argv[1]).is_some()
+            && redis_scan_options(argv, 2, true);
+    }
+    if command.eq_ignore_ascii_case(b"XLEN") {
+        return argv.len() == 2;
+    }
+    if command.eq_ignore_ascii_case(b"XRANGE") || command.eq_ignore_ascii_case(b"XREVRANGE") {
+        return argv.len() == 6
+            && redis_stream_id_bound(argv[2])
+            && redis_stream_id_bound(argv[3])
+            && argv[4].eq_ignore_ascii_case(b"COUNT")
+            && redis_count_1_to_200(argv[5]);
     }
     false
+}
+
+fn redis_argument_count(argv: &[&[u8]], minimum: usize, maximum: usize) -> bool {
+    argv.len()
+        .checked_sub(1)
+        .is_some_and(|count| (minimum..=maximum).contains(&count))
+}
+
+fn redis_parse_u64(value: &[u8]) -> Option<u64> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+fn redis_parse_i64(value: &[u8]) -> Option<i64> {
+    let digits = value
+        .strip_prefix(b"-")
+        .or_else(|| value.strip_prefix(b"+"))
+        .unwrap_or(value);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+fn redis_bounded_unsigned_range(start: &[u8], stop: &[u8], maximum_span: u64) -> bool {
+    let Some(start) = redis_parse_u64(start) else {
+        return false;
+    };
+    let Some(stop) = redis_parse_u64(stop) else {
+        return false;
+    };
+    stop.checked_sub(start)
+        .and_then(|difference| difference.checked_add(1))
+        .is_some_and(|span| span <= maximum_span)
+}
+
+fn redis_bounded_signed_range(start: &[u8], stop: &[u8], maximum_span: u64) -> bool {
+    let Some(start) = redis_parse_i64(start) else {
+        return false;
+    };
+    let Some(stop) = redis_parse_i64(stop) else {
+        return false;
+    };
+    if (start < 0) != (stop < 0) {
+        return false;
+    }
+    stop.checked_sub(start)
+        .and_then(|difference| u64::try_from(difference).ok())
+        .and_then(|difference| difference.checked_add(1))
+        .is_some_and(|span| span <= maximum_span)
+}
+
+fn redis_scan_options(argv: &[&[u8]], start: usize, allow_type: bool) -> bool {
+    let Some(options) = argv.get(start..) else {
+        return false;
+    };
+    if options.len() % 2 != 0 {
+        return false;
+    }
+    let mut match_seen = false;
+    let mut count_seen = false;
+    let mut type_seen = false;
+    for pair in options.chunks_exact(2) {
+        if pair[0].eq_ignore_ascii_case(b"MATCH") && !match_seen {
+            match_seen = true;
+        } else if pair[0].eq_ignore_ascii_case(b"COUNT") && !count_seen {
+            if !redis_count_1_to_200(pair[1]) {
+                return false;
+            }
+            count_seen = true;
+        } else if allow_type && pair[0].eq_ignore_ascii_case(b"TYPE") && !type_seen {
+            if ![
+                b"string".as_slice(),
+                b"hash",
+                b"list",
+                b"set",
+                b"zset",
+                b"stream",
+            ]
+            .iter()
+            .any(|allowed| pair[1].eq_ignore_ascii_case(allowed))
+            {
+                return false;
+            }
+            type_seen = true;
+        } else {
+            return false;
+        }
+    }
+    count_seen
+}
+
+fn redis_count_1_to_200(value: &[u8]) -> bool {
+    redis_parse_u64(value).is_some_and(|count| (1..=200).contains(&count))
+}
+
+fn redis_score_bound(value: &[u8]) -> bool {
+    let value = value.strip_prefix(b"(").unwrap_or(value);
+    if value.eq_ignore_ascii_case(b"-inf") || value.eq_ignore_ascii_case(b"+inf") {
+        return true;
+    }
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .is_some_and(f64::is_finite)
+}
+
+fn redis_lex_bound(value: &[u8]) -> bool {
+    matches!(value, b"-" | b"+")
+        || value
+            .split_first()
+            .is_some_and(|(prefix, bound)| matches!(*prefix, b'[' | b'(') && !bound.is_empty())
+}
+
+fn redis_stream_id_bound(value: &[u8]) -> bool {
+    let value = value.strip_prefix(b"(").unwrap_or(value);
+    if matches!(value, b"-" | b"+") {
+        return true;
+    }
+    let mut parts = value.split(|byte| *byte == b'-');
+    let Some(milliseconds) = parts.next() else {
+        return false;
+    };
+    let sequence = parts.next();
+    if parts.next().is_some() || redis_parse_u64(milliseconds).is_none() {
+        return false;
+    }
+    sequence.is_none_or(|sequence| redis_parse_u64(sequence).is_some())
 }

@@ -23,17 +23,18 @@ use crate::drivers::mysql_catalog::{
 use crate::drivers::{ConnectedResources, DriverError, Session};
 use crate::execution::{
     ExecutionLanguage, ExecutionTarget, ExecutionTargetError, ValidatedExecutionTarget,
-    classify_execution_kind, classify_mysql_execution_kind_with_sql_mode,
+    classify_execution_batch_kind, classify_execution_kind,
+    classify_mysql_execution_kind_with_sql_mode, extract_and_validate_all_targets,
     extract_and_validate_target, mysql_may_be_read_with_session_mode,
 };
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionDraft, ConnectionProfile, CredentialMode, DraftId,
-    DriverAvailability, DriverCapabilities, DriverKind, ExecuteRequest, OperationId, OperationKind,
-    PreparedMySqlRequest, ProfileAccess, ProfileFieldId, ProfileGeneration, ProfileId,
-    ProfileSafetyPosture, PublicCode, PublicSummary, QueryLanguage, QueryResult,
-    RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview,
-    RequestIdentity, RequestValidationError, ResultId, ResultProvenance, ResultRetentionPolicy,
-    ResultSnapshot, SessionGeneration, TlsMode,
+    DriverAvailability, DriverCapabilities, DriverKind, ExecuteBatchRequest, ExecuteRequest,
+    MAX_PROFILE_RESULT_BYTES, OperationId, OperationKind, PreparedMySqlRequest, ProfileAccess,
+    ProfileFieldId, ProfileGeneration, ProfileId, ProfileSafetyPosture, PublicCode, PublicSummary,
+    QueryLanguage, QueryResult, RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage,
+    RedisScanRequest, RedisValuePreview, RequestIdentity, RequestValidationError, ResultId,
+    ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
 };
 use crate::secrets::{
     EnvironmentAvailability, ReplacementSecretBuffer, SecretError, SessionSecret,
@@ -347,6 +348,50 @@ pub struct ExecuteOutcome {
     pub driver: DriverKind,
     pub endpoint: String,
     pub result: ResultSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecuteBatchOutcome {
+    pub operation_id: OperationId,
+    pub profile_id: ProfileId,
+    pub profile_generation: ProfileGeneration,
+    pub session_generation: SessionGeneration,
+    pub driver: DriverKind,
+    pub endpoint: String,
+    pub results: Vec<ResultSnapshot>,
+    pub completed_targets: usize,
+    pub discarded_results: usize,
+}
+
+pub(crate) struct RetainedBatchExecution {
+    pub(crate) results: Vec<ResultSnapshot>,
+    pub(crate) completed_targets: usize,
+    pub(crate) discarded_results: usize,
+    pub(crate) failure: Option<DriverError>,
+    retained_bytes: usize,
+}
+
+impl RetainedBatchExecution {
+    fn new(target_count: usize) -> Self {
+        Self {
+            results: Vec::with_capacity(target_count.min(4)),
+            completed_targets: 0,
+            discarded_results: 0,
+            failure: None,
+            retained_bytes: 0,
+        }
+    }
+
+    fn retain(&mut self, snapshot: ResultSnapshot) {
+        self.completed_targets = self.completed_targets.saturating_add(1);
+        let next_bytes = self.retained_bytes.saturating_add(snapshot.retained_bytes);
+        if next_bytes > MAX_PROFILE_RESULT_BYTES {
+            self.discarded_results = self.discarded_results.saturating_add(1);
+            return;
+        }
+        self.retained_bytes = next_bytes;
+        self.results.push(snapshot);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -954,6 +999,84 @@ impl SessionLease {
             _ => Err(DriverError::Unsupported {
                 driver: self.profile.driver,
                 operation: "mismatched typed execution resource".to_owned(),
+            }),
+        }
+    }
+
+    pub(crate) async fn execute_typed_batch<F>(
+        &self,
+        batch: &TypedExecuteBatch,
+        timeout: Duration,
+        mut retain: F,
+    ) -> Result<RetainedBatchExecution, DriverError>
+    where
+        F: FnMut(
+            &RequestIdentity,
+            DriverKind,
+            ResultRetentionPolicy,
+            QueryResult,
+        ) -> ResultSnapshot,
+    {
+        match (batch, self.connected_resources()?) {
+            (
+                TypedExecuteBatch::MySql { identity, requests },
+                ConnectedResources::MySql { execution, .. },
+            ) => {
+                let admission = execution.begin_read_admission(timeout).await?;
+                for request in requests {
+                    let kind = classify_mysql_execution_kind_with_sql_mode(
+                        &request.statement,
+                        admission.capabilities().sql_mode(),
+                    )
+                    .ok_or(DriverError::MySqlCapabilityDecode { field: "sql_mode" })?;
+                    if kind != OperationKind::ExecuteRead {
+                        return Err(DriverError::MySqlReadOnlyNotProven {
+                            reason: "batch statement classification denied",
+                        });
+                    }
+                }
+                let mut proven = admission.prove_read_only().await?;
+                let mut outcome = RetainedBatchExecution::new(requests.len());
+                for request in requests {
+                    match proven.execute_prepared(request).await {
+                        Ok(result) => outcome.retain(retain(
+                            identity,
+                            DriverKind::MySql,
+                            ResultRetentionPolicy::mysql(request.row_limit as usize),
+                            result,
+                        )),
+                        Err(error) => {
+                            outcome.failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+                Ok(outcome)
+            }
+            (
+                TypedExecuteBatch::Redis { identity, requests },
+                ConnectedResources::Redis { execution, .. },
+            ) => {
+                let mut outcome = RetainedBatchExecution::new(requests.len());
+                for request in requests {
+                    match execution.execute_command(request).await {
+                        Ok(result) => outcome.retain(retain(
+                            identity,
+                            DriverKind::Redis,
+                            ResultRetentionPolicy::redis(request.row_limit() as usize),
+                            result,
+                        )),
+                        Err(error) => {
+                            outcome.failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+                Ok(outcome)
+            }
+            _ => Err(DriverError::Unsupported {
+                driver: self.profile.driver,
+                operation: "mismatched typed batch execution resource".to_owned(),
             }),
         }
     }
@@ -2134,9 +2257,129 @@ impl ApplicationService {
         }
     }
 
+    pub(crate) async fn prepare_execute_batch_request(
+        &self,
+        request: &ExecuteBatchRequest,
+    ) -> Result<TypedExecuteBatch, ServiceError> {
+        self.ensure_config_certain()?;
+        let execution_language = match request.language {
+            QueryLanguage::Sql => ExecutionLanguage::MySql,
+            QueryLanguage::RedisCommand => ExecutionLanguage::Redis,
+            QueryLanguage::MongoDocument => {
+                return Err(ServiceError::Driver(DriverError::Unsupported {
+                    driver: DriverKind::MongoDb,
+                    operation: "document batch execution".to_owned(),
+                }));
+            }
+        };
+        let timeout_seconds =
+            u32::try_from(request.timeout.as_secs()).map_err(|_| ServiceError::InvalidRequest {
+                code: PublicCode::TimeoutInput,
+            })?;
+        let validated = extract_and_validate_all_targets(
+            &request.text,
+            execution_language,
+            request.row_limit,
+            timeout_seconds,
+        )
+        .map_err(execution_target_error)?;
+        let (profile, generation) = self.profile_with_generation(&request.profile_id).await?;
+        if generation != request.profile_generation {
+            return Err(ServiceError::ProfileStale {
+                profile_id: request.profile_id.clone(),
+                operation_id: request.operation_id,
+            });
+        }
+        if profile.driver.language() != request.language {
+            return Err(ServiceError::LanguageMismatch {
+                driver: profile.driver,
+                actual: request.language,
+            });
+        }
+        if classify_execution_batch_kind(execution_language, validated.targets())
+            != OperationKind::ExecuteRead
+        {
+            if profile.safety.effective_access() == ProfileAccess::ReadOnly {
+                return Err(ServiceError::ReadOnlyProfile {
+                    code: PublicCode::ReadOnlyProfile,
+                });
+            }
+            return Err(ServiceError::MutationReviewUnavailable);
+        }
+
+        let identity = RequestIdentity::new(
+            request.profile_id.clone(),
+            request.profile_generation,
+            request.operation_id,
+        );
+        let targets = validated.into_targets();
+        match profile.driver {
+            DriverKind::MySql => {
+                let mut requests = Vec::with_capacity(targets.len());
+                for target in targets {
+                    let ExecutionTarget::MySqlText(statement) = target.into_target() else {
+                        return Err(ServiceError::DriverMismatch {
+                            expected: DriverKind::MySql,
+                            actual: DriverKind::Redis,
+                        });
+                    };
+                    let typed = PreparedMySqlRequest {
+                        identity: identity.clone(),
+                        statement,
+                        row_limit: request.row_limit,
+                        timeout: request.timeout,
+                    };
+                    typed.validate().map_err(service_request_error)?;
+                    requests.push(typed);
+                }
+                Ok(TypedExecuteBatch::MySql { identity, requests })
+            }
+            DriverKind::Redis => {
+                let mut requests = Vec::with_capacity(targets.len());
+                for target in targets {
+                    let ExecutionTarget::RedisArgv(argv) = target.into_target() else {
+                        return Err(ServiceError::DriverMismatch {
+                            expected: DriverKind::Redis,
+                            actual: DriverKind::MySql,
+                        });
+                    };
+                    requests.push(
+                        RedisExecuteRequest::new(
+                            identity.clone(),
+                            argv.into_iter().map(String::into_bytes).collect(),
+                            request.row_limit,
+                            request.timeout,
+                        )
+                        .map_err(service_request_error)?,
+                    );
+                }
+                Ok(TypedExecuteBatch::Redis { identity, requests })
+            }
+            DriverKind::MongoDb => Err(ServiceError::Driver(DriverError::Unsupported {
+                driver: DriverKind::MongoDb,
+                operation: "typed batch execution".to_owned(),
+            })),
+        }
+    }
+
     pub(crate) fn retain_execute_result(
         &self,
         request: &TypedExecuteRequest,
+        result: QueryResult,
+    ) -> ResultSnapshot {
+        self.retain_result(
+            request.identity(),
+            request.driver(),
+            request.retention_policy(),
+            result,
+        )
+    }
+
+    pub(crate) fn retain_result(
+        &self,
+        identity: &RequestIdentity,
+        driver: DriverKind,
+        retention_policy: ResultRetentionPolicy,
         result: QueryResult,
     ) -> ResultSnapshot {
         let duration_ms = result.elapsed_ms;
@@ -2145,17 +2388,16 @@ impl ApplicationService {
             .ok()
             .and_then(|duration| i64::try_from(duration.as_millis()).ok())
             .unwrap_or(i64::MAX);
-        let identity = request.identity();
         let provenance = ResultProvenance {
             result_id: ResultId(self.next_result_id.fetch_add(1, Ordering::SeqCst)),
             profile_id: identity.profile_id.clone(),
             profile_generation: identity.profile_generation,
             operation_id: identity.operation_id,
-            driver: request.driver(),
+            driver,
             completed_at_unix_ms,
             duration_ms,
         };
-        ResultSnapshot::retain(result, provenance, request.retention_policy())
+        ResultSnapshot::retain(result, provenance, retention_policy)
     }
 
     pub async fn execute_at(
@@ -2197,6 +2439,71 @@ impl ApplicationService {
             driver: lease.profile.driver,
             endpoint: lease.profile.redacted_endpoint(),
             result,
+        })
+    }
+
+    pub async fn execute_batch_at(
+        &self,
+        request: ExecuteBatchRequest,
+    ) -> Result<ExecuteBatchOutcome, ServiceError> {
+        let started = Instant::now();
+        let typed_batch = self.prepare_execute_batch_request(&request).await?;
+        let acquire_timeout =
+            remaining_execute_timeout(started, request.timeout, typed_batch.driver())?;
+        let lease = self
+            .acquire_session_at(
+                request.operation_id,
+                request.profile_id.clone(),
+                request.profile_generation,
+                acquire_timeout,
+            )
+            .await?;
+        let results =
+            match remaining_execute_timeout(started, request.timeout, typed_batch.driver()) {
+                Ok(timeout) => {
+                    let execute = lease.execute_typed_batch(
+                        &typed_batch,
+                        timeout,
+                        |identity, driver, retention, result| {
+                            self.retain_result(identity, driver, retention, result)
+                        },
+                    );
+                    match tokio::time::timeout(timeout, execute).await {
+                        Ok(result) => result,
+                        Err(_) => Err(DriverError::Timeout {
+                            driver: typed_batch.driver(),
+                            seconds: request.timeout.as_secs(),
+                        }),
+                    }
+                }
+                Err(error) => Err(error),
+            };
+        let observation = self.observe_session(&lease, request.operation_id).await;
+        let disposition = match &results {
+            Ok(outcome) => outcome.failure.as_ref().map_or(
+                SessionDisposition::Keep,
+                SessionDisposition::for_driver_error,
+            ),
+            Err(error) => SessionDisposition::for_driver_error(error),
+        };
+        if disposition == SessionDisposition::Evict || observation.is_err() {
+            self.evict_session_lease(&lease).await;
+        }
+        observation?;
+        let mut retained = results?;
+        if let Some(error) = retained.failure.take() {
+            return Err(error.into());
+        }
+        Ok(ExecuteBatchOutcome {
+            operation_id: request.operation_id,
+            profile_id: request.profile_id,
+            profile_generation: lease.identity.profile_generation,
+            session_generation: lease.identity.session_generation,
+            driver: lease.profile.driver,
+            endpoint: lease.profile.redacted_endpoint(),
+            results: retained.results,
+            completed_targets: retained.completed_targets,
+            discarded_results: retained.discarded_results,
         })
     }
 
@@ -3129,6 +3436,34 @@ impl TypedExecuteRequest {
     }
 }
 
+pub(crate) enum TypedExecuteBatch {
+    MySql {
+        identity: RequestIdentity,
+        requests: Vec<PreparedMySqlRequest>,
+    },
+    Redis {
+        identity: RequestIdentity,
+        requests: Vec<RedisExecuteRequest>,
+    },
+}
+
+impl TypedExecuteBatch {
+    pub(crate) const fn driver(&self) -> DriverKind {
+        match self {
+            Self::MySql { .. } => DriverKind::MySql,
+            Self::Redis { .. } => DriverKind::Redis,
+        }
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::MySql { requests, .. } => requests.len(),
+            Self::Redis { requests, .. } => requests.len(),
+        }
+    }
+}
+
 fn validate_execute_target(
     request: &ExecuteRequest,
 ) -> Result<(ExecutionLanguage, ExecutionTarget), ServiceError> {
@@ -3174,7 +3509,16 @@ fn execution_target_error(error: ExecutionTargetError) -> ServiceError {
         | ExecutionTargetError::RedisCommandDenied
         | ExecutionTargetError::RedisTargetTooLarge
         | ExecutionTargetError::RedisTooManyTokens
-        | ExecutionTargetError::RedisTokenTooLarge => PublicCode::StatementTarget,
+        | ExecutionTargetError::RedisTokenTooLarge
+        | ExecutionTargetError::BatchSourceTooLarge
+        | ExecutionTargetError::TooManyBatchTargets
+        | ExecutionTargetError::EmptyBatchTarget
+        | ExecutionTargetError::BatchAmbiguousSqlMode
+        | ExecutionTargetError::MysqlBatchTargetTooLarge
+        | ExecutionTargetError::MysqlBatchTooManyTokens
+        | ExecutionTargetError::MysqlBatchNestingTooDeep
+        | ExecutionTargetError::MysqlBatchUnbalancedNesting
+        | ExecutionTargetError::MysqlBatchParseFailed => PublicCode::StatementTarget,
     };
     ServiceError::InvalidRequest { code }
 }

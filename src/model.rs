@@ -937,6 +937,7 @@ pub const DEFAULT_EXECUTE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_EXECUTE_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_RESULT_COLUMNS: usize = 1_024;
 pub const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PROFILE_RESULT_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RESULT_CELL_BYTES: usize = 1024 * 1024;
 pub const MAX_RESULT_NOTICES: usize = 32;
 pub const MAX_RESULT_NOTICE_BYTES: usize = 512;
@@ -956,7 +957,7 @@ pub const MAX_REDIS_SCAN_COUNT: u32 = 1_000;
 pub const MAX_REDIS_FILTER_BYTES: usize = 512;
 pub const MAX_REDIS_COMMAND_BYTES: usize = 65_536;
 pub const MAX_MYSQL_STATEMENT_BYTES: usize = 65_536;
-pub const MAX_REDIS_COMMAND_TOKENS: usize = 1_024;
+pub const MAX_REDIS_COMMAND_TOKENS: usize = 8_192;
 pub const MAX_REDIS_COMMAND_TOKEN_BYTES: usize = 16 * 1024;
 pub const MAX_REDIS_KEYS: usize = 10_000;
 pub const MAX_REDIS_KEY_BYTES: usize = 4 * 1024;
@@ -1784,6 +1785,40 @@ impl fmt::Debug for ExecuteRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ExecuteRequest")
+            .field("operation_id", &self.operation_id)
+            .field("profile_id", &"<redacted>")
+            .field("profile_generation", &self.profile_generation)
+            .field("language", &self.language)
+            .field("text", &"<redacted>")
+            .field("row_limit", &self.row_limit)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+/// A sensitive whole-source batch request. The service repeats every bound,
+/// split, parse, and classification check before acquiring a user-target lease.
+/// It is intentionally not serializable.
+///
+/// ```compile_fail
+/// fn requires_serialize<T: serde::Serialize>() {}
+/// requires_serialize::<dbotter::model::ExecuteBatchRequest>();
+/// ```
+#[derive(Clone)]
+pub struct ExecuteBatchRequest {
+    pub operation_id: OperationId,
+    pub profile_id: ProfileId,
+    pub profile_generation: ProfileGeneration,
+    pub language: QueryLanguage,
+    pub text: String,
+    pub row_limit: u32,
+    pub timeout: Duration,
+}
+
+impl fmt::Debug for ExecuteBatchRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecuteBatchRequest")
             .field("operation_id", &self.operation_id)
             .field("profile_id", &"<redacted>")
             .field("profile_generation", &self.profile_generation)

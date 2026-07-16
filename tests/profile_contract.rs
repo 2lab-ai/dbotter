@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dbotter::model::{
-    ConnectionDraft, CredentialMode, DriverKind, ExecuteRequest, OperationId, ProfileFieldId,
-    ProfileId, QueryLanguage, RedisTlsConfig, SessionCredentialIntent, TlsMode,
+    ConnectionDraft, CredentialMode, DriverKind, ExecuteBatchRequest, ExecuteRequest, OperationId,
+    ProfileFieldId, ProfileId, QueryLanguage, RedisTlsConfig, SessionCredentialIntent, TlsMode,
 };
 use dbotter::secrets::{
     CredentialEditContext, ReplacementSecretBuffer, SecretError, SessionIntentPolicy,
@@ -318,6 +318,20 @@ fn execute_debug_omits_user_text() {
     };
     let debug = format!("{request:?}");
     assert!(!debug.contains("top-secret-sentinel"));
+    assert!(debug.contains("<redacted>"));
+
+    let batch = ExecuteBatchRequest {
+        operation_id: OperationId(8),
+        profile_id: ProfileId("batch-profile-sentinel".to_owned()),
+        profile_generation: dbotter::model::ProfileGeneration(1),
+        language: QueryLanguage::Sql,
+        text: "SELECT 'batch-top-secret-sentinel'".to_owned(),
+        row_limit: 10,
+        timeout: std::time::Duration::from_secs(1),
+    };
+    let debug = format!("{batch:?}");
+    assert!(!debug.contains("batch-top-secret-sentinel"));
+    assert!(!debug.contains("batch-profile-sentinel"));
     assert!(debug.contains("<redacted>"));
 }
 
