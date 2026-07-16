@@ -4285,12 +4285,14 @@ mod tests {
     };
     use crate::config::ConfigSourceVersion;
     use crate::model::{
-        Cell, Column, ConnectionProfile, CredentialMode, DraftId, DriverAvailability, DriverKind,
-        ExportFormat, OperationId, OperationKind, OperationRecipeId, OverwritePolicy,
-        ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary, QueryLanguage,
-        QueryResult, RedisKeyEntry, RedisKeyFilter, RedisKeyId, RedisKeyPage, RedisScanConsistency,
-        RedisScanRequest, RedisTlsConfig, RequestIdentity, ResultId, ResultProvenance,
-        ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
+        CatalogLevel, CatalogNode, CatalogNodeIdentity, CatalogNodeKind, CatalogPage,
+        CatalogRetainedCounts, Cell, Column, ConnectionProfile, CredentialMode, DraftId,
+        DriverAvailability, DriverKind, ExportFormat, OperationId, OperationKind,
+        OperationRecipeId, OverwritePolicy, ProfileFieldId, ProfileGeneration, ProfileId,
+        PublicCode, PublicSummary, QueryLanguage, QueryResult, RedisKeyEntry, RedisKeyFilter,
+        RedisKeyId, RedisKeyPage, RedisScanConsistency, RedisScanRequest, RedisTlsConfig,
+        RequestIdentity, ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
+        SessionGeneration, TlsMode,
     };
     use crate::public_error::{PublicOperationError, RecoveryAction, SafeContext};
     use crate::secrets::EnvironmentAvailability;
@@ -5470,6 +5472,230 @@ mod tests {
             Some(operation_id)
         );
         assert_eq!(app.model.status, "Executing…");
+    }
+
+    #[test]
+    fn mysql_new_editor_preserves_draft_and_selected_object_across_refresh_and_result_switch() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let mut mysql = profile(DriverKind::MySql, DriverAvailability::Ready);
+        mysql.database = Some("app_db".to_owned());
+        mysql.persisted.database = Some("app_db".to_owned());
+        let key = WorkspaceKey::new(mysql.id.clone(), mysql.generation);
+        app.model.profiles = vec![mysql.clone()];
+        app.model.selected_profile = Some(mysql.id.clone());
+        app.model
+            .active_generations
+            .insert(mysql.id.clone(), mysql.generation);
+        let original_tab = app
+            .model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Draft", "SELECT draft_value")
+            .expect("original tab");
+
+        let explorer_key = (mysql.id.clone(), mysql.generation);
+        app.mysql_explorers
+            .entry(explorer_key.clone())
+            .or_default()
+            .handle_loaded(CatalogPage {
+                identity: RequestIdentity::new(mysql.id.clone(), mysql.generation, OperationId(80)),
+                level: CatalogLevel::Schemas,
+                parent: None,
+                nodes: vec![CatalogNode {
+                    identity: CatalogNodeIdentity::Schema {
+                        schema: "app".to_owned(),
+                    },
+                    kind: CatalogNodeKind::Schema,
+                    name: "app".to_owned(),
+                    type_name: None,
+                    nullable: None,
+                    ordinal: None,
+                }],
+                next_token: None,
+                retained_counts: CatalogRetainedCounts::default(),
+                retained_utf8_bytes: 0,
+                truncated: false,
+                stale: false,
+                loaded_at: "2026-07-16T00:00:00Z".to_owned(),
+            });
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let initial = context.run_ui(RawInput::default(), |ui| app.explorer_contents(ui));
+        let initial_update = initial
+            .platform_output
+            .accesskit_update
+            .expect("schema explorer AccessKit tree");
+        let show_relations = initial_update
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| {
+                (node.label() == Some("Show relations")).then_some(*node_id)
+            })
+            .expect("schema row must expose Show relations");
+        let mut focus_relations = RawInput::default();
+        focus_relations
+            .events
+            .push(Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: show_relations,
+                data: None,
+            }));
+        let _ = context.run_ui(focus_relations, |ui| app.explorer_contents(ui));
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![Event::Key {
+                    key: Key::Enter,
+                    physical_key: Some(Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+            |ui| app.explorer_contents(ui),
+        );
+        let relation_request = match service.try_next_command() {
+            Some(UiCommand::BrowseCatalog(request)) => request,
+            other => panic!("Show relations submitted the wrong command: {other:?}"),
+        };
+        assert!(matches!(
+            &relation_request,
+            crate::model::CatalogRequest::Relations { schema, .. } if schema == "app"
+        ));
+
+        let relation_page = |operation_id| CatalogPage {
+            identity: RequestIdentity::new(mysql.id.clone(), mysql.generation, operation_id),
+            level: CatalogLevel::Relations,
+            parent: Some(CatalogNodeIdentity::Schema {
+                schema: "app".to_owned(),
+            }),
+            nodes: vec![CatalogNode {
+                identity: CatalogNodeIdentity::Relation {
+                    schema: "app".to_owned(),
+                    relation: "widgets".to_owned(),
+                },
+                kind: CatalogNodeKind::Table,
+                name: "widgets".to_owned(),
+                type_name: None,
+                nullable: None,
+                ordinal: None,
+            }],
+            next_token: None,
+            retained_counts: CatalogRetainedCounts::default(),
+            retained_utf8_bytes: 0,
+            truncated: false,
+            stale: false,
+            loaded_at: "2026-07-16T00:00:00Z".to_owned(),
+        };
+        app.mysql_explorers
+            .get_mut(&explorer_key)
+            .expect("MySQL explorer")
+            .handle_loaded(relation_page(relation_request.operation_id()));
+
+        let relation_output = context.run_ui(RawInput::default(), |ui| app.explorer_contents(ui));
+        let relation_update = relation_output
+            .platform_output
+            .accesskit_update
+            .expect("relation explorer AccessKit tree");
+        let new_editor = relation_update
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| {
+                node.author_id()
+                    .is_some_and(|id| id.starts_with("navigator.object.new-editor."))
+                    .then_some(*node_id)
+            })
+            .expect("relation row must expose a stable New editor action");
+        let mut focus_new_editor = RawInput::default();
+        focus_new_editor
+            .events
+            .push(Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: new_editor,
+                data: None,
+            }));
+        let _ = context.run_ui(focus_new_editor, |ui| app.explorer_contents(ui));
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![Event::Key {
+                    key: Key::Enter,
+                    physical_key: Some(Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+            |ui| app.explorer_contents(ui),
+        );
+        assert!(
+            service.try_next_command().is_none(),
+            "New editor is local workspace work and must not submit network I/O"
+        );
+
+        let workspace = app.model.workspace(&key).expect("workspace retained");
+        assert_eq!(workspace.editor_tabs().len(), 2);
+        assert_eq!(
+            workspace
+                .editor_tab(original_tab)
+                .expect("original draft retained")
+                .text(),
+            "SELECT draft_value"
+        );
+        let selected_editor = workspace
+            .selected_editor_tab_id()
+            .expect("context editor selected");
+        let selected_editor = workspace
+            .editor_tab(selected_editor)
+            .expect("selected context editor");
+        assert_eq!(selected_editor.title(), "app.widgets");
+        assert_eq!(selected_editor.text(), "");
+
+        let first_result = app
+            .model
+            .workspace_mut(key.clone())
+            .append_result_tab(Arc::new(result_snapshot(&mysql, "first")))
+            .expect("first result");
+        let _second_result = app
+            .model
+            .workspace_mut(key.clone())
+            .append_result_tab(Arc::new(result_snapshot(&mysql, "second")))
+            .expect("second result");
+        app.model
+            .workspace_mut(key.clone())
+            .select_result_tab(first_result)
+            .expect("result switch");
+        app.mysql_explorers
+            .get_mut(&explorer_key)
+            .expect("MySQL explorer")
+            .handle_loaded(relation_page(OperationId(81)));
+
+        let explorer_after = context.run_ui(RawInput::default(), |ui| app.explorer_contents(ui));
+        let explorer_update = explorer_after
+            .platform_output
+            .accesskit_update
+            .expect("refreshed explorer AccessKit tree");
+        let (_, selected_object) =
+            accesskit_author_node(&explorer_update, "navigator.object.selected-context");
+        assert_eq!(selected_object.value(), Some("app.widgets · Table"));
+
+        let workspace_context = Context::default();
+        workspace_context.enable_accesskit();
+        let workspace_output =
+            workspace_context.run_ui(RawInput::default(), |ui| app.editor_and_results(ui));
+        let workspace_update = workspace_output
+            .platform_output
+            .accesskit_update
+            .expect("workspace AccessKit tree");
+        let (_, breadcrumb) = accesskit_author_node(&workspace_update, "workspace.context");
+        assert_eq!(
+            breadcrumb.value(),
+            Some("Profile → app_db → app.widgets · Table")
+        );
     }
 
     #[test]
