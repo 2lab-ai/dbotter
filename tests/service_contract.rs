@@ -16,12 +16,12 @@ use dbotter::drivers::{
 };
 use dbotter::execution::{ExecutionLanguage, ExecutionTarget, classify_execution_kind};
 use dbotter::model::{
-    CatalogPage, CatalogRequest, ConnectionDraft, CredentialMode, DraftId, DriverKind,
-    ExecuteRequest, LegacyConfigVersion, MySqlPublicErrorCode, OperationId, OperationKind,
-    PreparedMySqlRequest, ProfileAccess, ProfileEnvironment, ProfileFieldId, ProfileGeneration,
-    ProfileId, ProfileInstanceId, ProfileSafetyPosture, PublicCode, PublicSummary, QueryLanguage,
-    QueryResult, RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest,
-    RedisValuePreview, TlsMode,
+    CatalogPage, CatalogRequest, ConnectionDraft, ConnectionProfile, CredentialMode, DraftId,
+    DriverKind, ExecuteRequest, LegacyConfigVersion, MySqlPublicErrorCode, OperationId,
+    OperationKind, PreparedMySqlRequest, ProfileAccess, ProfileEnvironment, ProfileFieldId,
+    ProfileGeneration, ProfileId, ProfileInstanceId, ProfileSafetyPosture, PublicCode,
+    PublicSummary, QueryLanguage, QueryResult, RedisExecuteRequest, RedisKeyInspectRequest,
+    RedisKeyPage, RedisScanRequest, RedisValuePreview, TlsMode,
 };
 use dbotter::public_error::{RecoveryAction, SafeContext, recovery_for};
 use dbotter::secrets::{
@@ -30,8 +30,8 @@ use dbotter::secrets::{
 };
 use dbotter::service::{
     ApplicationService, CheckOutcome, CreateProfileRequest, DeleteProfileRequest, ExecuteOutcome,
-    ProfileValidationError, SecretResolver, ServiceError, SessionConnector, SessionDisposition,
-    SessionHandle, UpdateProfileRequest, validate_config_mutation,
+    ProfileMutationOutcome, ProfileValidationError, SecretResolver, ServiceError, SessionConnector,
+    SessionDisposition, SessionHandle, UpdateProfileRequest, validate_config_mutation,
 };
 
 #[async_trait]
@@ -3053,6 +3053,126 @@ async fn create_profile_posture_rewrite_at_observation_fails_closed() {
 }
 
 #[tokio::test]
+async fn create_profile_instance_id_rewrite_at_observation_fails_closed() {
+    const PROFILE_ID: &str = "create-instance-observation";
+    const ENDPOINT_SENTINEL: &str = "create-instance-endpoint-sentinel.invalid";
+    const SECRET_SENTINEL: &str = "create-instance-secret-sentinel";
+    const PROFILE_SENTINEL: &str = "create-instance-request-sentinel";
+
+    let directory = tempfile::tempdir().expect("create instance observation tempdir");
+    let path = directory.path().join("config.toml");
+    let connector = Arc::new(FakeConnector::new(false));
+    let store = Arc::new(SessionSecretStore::default());
+    let profile_id = ProfileId(PROFILE_ID.to_owned());
+    store
+        .apply(
+            &profile_id,
+            SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(
+                "preexisting-instance-secret".to_owned(),
+            ))),
+        )
+        .expect("seed preexisting secret");
+    let rewrite = Arc::new(RewriteCreatedInstanceIdAtObservation::new(PROFILE_ID));
+    let service = ApplicationService::with_dependencies(
+        &path,
+        connector.clone(),
+        Arc::new(MissingEnvironment),
+        store.clone(),
+        ConfigWriter::with_fault_injector(rewrite.clone()),
+    )
+    .expect("create instance observation service");
+    let before = service.profiles_snapshot().await;
+    assert!(before.is_empty());
+    assert_eq!(service.source_version().await, ConfigSourceVersion::Missing);
+
+    let mut requested = named_draft(DriverKind::MySql, PROFILE_SENTINEL);
+    requested.host = ENDPOINT_SENTINEL.to_owned();
+    requested.environment = ProfileEnvironment::Development;
+    requested.access = ProfileAccess::ReadOnly;
+    requested.credential_mode = CredentialMode::Session;
+    let expected_draft = requested.clone();
+    let error = match service
+        .create_profile(create_request(
+            DraftId(924),
+            OperationId(924),
+            Some(PROFILE_ID),
+            requested,
+            SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(SECRET_SENTINEL.to_owned()))),
+        ))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("observed instance id rewrite was accepted as the created identity"),
+    };
+
+    assert!(matches!(&error, ServiceError::ConfigUncertain));
+    assert_eq!(
+        error.public_error_parts(),
+        (
+            PublicSummary::ResourceStale,
+            PublicCode::ConfigExternalChange
+        )
+    );
+    assert!(service.is_config_uncertain());
+    assert_eq!(service.profiles_snapshot().await, before);
+    assert!(matches!(
+        service.profile_generation(&profile_id).await,
+        Err(ServiceError::UnknownProfile(unknown)) if unknown == profile_id
+    ));
+    assert_eq!(service.source_version().await, ConfigSourceVersion::Missing);
+    assert_eq!(service.cached_session_count().await, 0);
+    assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
+    assert!(
+        store
+            .is_empty()
+            .expect("uncertain instance rewrite clears all secrets")
+    );
+    assert!(
+        !service
+            .has_current_session_secret(&profile_id)
+            .expect("substituted profile secret remains absent")
+    );
+
+    let disk = load_path(&path).expect("instance-rewritten v3 remains valid");
+    assert_eq!(disk.source_version, ConfigSourceVersion::V3);
+    let persisted = disk
+        .config
+        .profiles
+        .iter()
+        .find(|profile| profile.id == PROFILE_ID)
+        .expect("instance-rewritten profile remains on disk");
+    assert_eq!(persisted.as_draft(), expected_draft);
+    let persisted_instance_id = persisted
+        .safety
+        .instance_id()
+        .expect("rewritten profile remains classified");
+    assert_eq!(persisted_instance_id, rewrite.substituted_instance_id());
+    assert_ne!(persisted_instance_id, rewrite.original_instance_id());
+    assert_eq!(
+        ProfileInstanceId::parse(&persisted_instance_id.to_string()),
+        Ok(persisted_instance_id)
+    );
+
+    let public_surfaces = format!(
+        "{error:?}\n{error}\n{:?}\n{:?}\n{}",
+        error.public_summary(),
+        error.public_code(),
+        error.public_summary()
+    );
+    for forbidden in [
+        PROFILE_ID,
+        ENDPOINT_SENTINEL,
+        SECRET_SENTINEL,
+        PROFILE_SENTINEL,
+    ] {
+        assert!(
+            !public_surfaces.contains(forbidden),
+            "create instance observation failure leaked a profile, endpoint, or secret sentinel"
+        );
+    }
+}
+
+#[tokio::test]
 async fn identity_or_source_rewrite_during_observation_is_committed_unknown_and_uncertain() {
     for rewrite in [
         ObservationRewrite::DuplicateId,
@@ -3062,19 +3182,12 @@ async fn identity_or_source_rewrite_during_observation_is_committed_unknown_and_
     ] {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("config.toml");
-        let target = dbotter::model::ConnectionProfile::from_draft(
-            "observation-target".to_owned(),
+        let target = classified_profile(
+            "observation-target",
             named_draft(DriverKind::MySql, "Observation target"),
+            1,
         );
-        fs::write(
-            &path,
-            toml::to_string(&Config {
-                version: 2,
-                profiles: vec![target],
-            })
-            .expect("seed config"),
-        )
-        .expect("seed write");
+        write_v3_profiles(&path, vec![target]);
         let target_id = ProfileId("observation-target".to_owned());
         let connector = Arc::new(FakeConnector::new(false));
         let store = Arc::new(SessionSecretStore::default());
@@ -3124,7 +3237,7 @@ async fn identity_or_source_rewrite_during_observation_is_committed_unknown_and_
         );
         assert!(service.is_config_uncertain(), "rewrite={rewrite:?}");
         assert_eq!(service.profiles_snapshot().await, before);
-        assert_eq!(service.source_version().await, ConfigSourceVersion::V2);
+        assert_eq!(service.source_version().await, ConfigSourceVersion::V3);
         assert_eq!(service.cached_session_count().await, 0);
         assert!(store.is_empty().expect("uncertain clears all secrets"));
         assert!(connector.session.closes.load(Ordering::SeqCst) >= 1);
@@ -3132,11 +3245,11 @@ async fn identity_or_source_rewrite_during_observation_is_committed_unknown_and_
         let disk = load_path(&path).expect("rewritten disk remains exact truth");
         match rewrite {
             ObservationRewrite::DuplicateId => {
-                assert_eq!(disk.source_version, ConfigSourceVersion::V2);
+                assert_eq!(disk.source_version, ConfigSourceVersion::V3);
                 assert_eq!(disk.config.profiles[0].id, disk.config.profiles[2].id);
             }
             ObservationRewrite::InvalidId => {
-                assert_eq!(disk.source_version, ConfigSourceVersion::V2);
+                assert_eq!(disk.source_version, ConfigSourceVersion::V3);
                 assert!(
                     disk.config
                         .profiles
@@ -3159,19 +3272,12 @@ async fn identity_or_source_rewrite_during_observation_is_committed_unknown_and_
 async fn semantic_invalid_observation_is_visible_fenced_and_recoverable_without_uncertainty() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");
-    let target = dbotter::model::ConnectionProfile::from_draft(
-        "semantic-target".to_owned(),
+    let target = classified_profile(
+        "semantic-target",
         named_draft(DriverKind::MySql, "Semantic target"),
+        1,
     );
-    fs::write(
-        &path,
-        toml::to_string(&Config {
-            version: 2,
-            profiles: vec![target],
-        })
-        .expect("seed config"),
-    )
-    .expect("seed write");
+    write_v3_profiles(&path, vec![target]);
     let connector = Arc::new(FakeConnector::new(false));
     let service = ApplicationService::with_dependencies(
         &path,
@@ -3204,7 +3310,7 @@ async fn semantic_invalid_observation_is_visible_fenced_and_recoverable_without_
         .await
         .expect("identity-valid semantic observation is accepted");
     assert!(!service.is_config_uncertain());
-    assert_eq!(service.source_version().await, ConfigSourceVersion::V2);
+    assert_eq!(service.source_version().await, ConfigSourceVersion::V3);
     let disk = load_path(&path).expect("disk observation").config;
     assert_eq!(service.profiles_snapshot().await, disk.profiles);
     let invalid_id = ProfileId("semantic-invalid-observed".to_owned());
@@ -3245,19 +3351,13 @@ async fn semantic_invalid_observation_is_visible_fenced_and_recoverable_without_
 async fn observed_profile_generation_snapshot_publishes_only_all_old_or_all_new() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");
-    let old_profile = dbotter::model::ConnectionProfile::from_draft(
-        "atomic-profile".to_owned(),
+    let old_profile = classified_profile(
+        "atomic-profile",
         named_draft(DriverKind::MySql, "All old"),
+        1,
     );
-    fs::write(
-        &path,
-        toml::to_string(&Config {
-            version: 2,
-            profiles: vec![old_profile.clone()],
-        })
-        .expect("seed config"),
-    )
-    .expect("seed write");
+    let persisted = write_v3_profiles(&path, vec![old_profile]);
+    let old_profile = persisted_profile(&persisted, "atomic-profile");
     let observation = Arc::new(MainObservationBarrier::new());
     let service = ApplicationService::with_dependencies(
         &path,
@@ -3359,19 +3459,13 @@ async fn observed_profile_generation_snapshot_publishes_only_all_old_or_all_new(
 async fn connect_result_cannot_insert_an_old_profile_after_update_publish() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");
-    let old_profile = dbotter::model::ConnectionProfile::from_draft(
-        "connect-race".to_owned(),
+    let old_profile = classified_profile(
+        "connect-race",
         named_draft(DriverKind::MySql, "Connect race"),
+        1,
     );
-    fs::write(
-        &path,
-        toml::to_string(&Config {
-            version: 2,
-            profiles: vec![old_profile.clone()],
-        })
-        .expect("seed config"),
-    )
-    .expect("seed write");
+    let persisted = write_v3_profiles(&path, vec![old_profile]);
+    let old_profile = persisted_profile(&persisted, "connect-race");
     let connector = Arc::new(ConnectBarrierConnector::new());
     let service = ApplicationService::with_dependencies(
         &path,
@@ -3432,19 +3526,12 @@ async fn uncertain_epoch_rejects_pending_connect_before_and_after_successful_rel
     for reload_before_release in [false, true] {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("config.toml");
-        let profile = dbotter::model::ConnectionProfile::from_draft(
-            "uncertain-connect".to_owned(),
+        let profile = classified_profile(
+            "uncertain-connect",
             named_draft(DriverKind::MySql, "Uncertain connect"),
+            1,
         );
-        fs::write(
-            &path,
-            toml::to_string(&Config {
-                version: 2,
-                profiles: vec![profile],
-            })
-            .expect("seed config"),
-        )
-        .expect("seed write");
+        write_v3_profiles(&path, vec![profile]);
         let profile_id = ProfileId("uncertain-connect".to_owned());
         let connector = Arc::new(ConnectBarrierConnector::new());
         let store = Arc::new(SessionSecretStore::default());
@@ -3521,19 +3608,10 @@ async fn uncertain_epoch_rejects_pending_connect_before_and_after_successful_rel
 async fn failed_old_ping_cannot_remove_or_close_a_new_generation_session() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");
-    let old_profile = dbotter::model::ConnectionProfile::from_draft(
-        "ping-race".to_owned(),
-        named_draft(DriverKind::MySql, "Ping race"),
-    );
-    fs::write(
-        &path,
-        toml::to_string(&Config {
-            version: 2,
-            profiles: vec![old_profile.clone()],
-        })
-        .expect("seed config"),
-    )
-    .expect("seed write");
+    let old_profile =
+        classified_profile("ping-race", named_draft(DriverKind::MySql, "Ping race"), 1);
+    let persisted = write_v3_profiles(&path, vec![old_profile]);
+    let old_profile = persisted_profile(&persisted, "ping-race");
     let old_ping = Arc::new(AsyncGate::new());
     let old_session = Arc::new(ControlledSession::blocked_failure(old_ping.clone()));
     let new_session = Arc::new(ControlledSession::immediate());
@@ -3719,23 +3797,13 @@ async fn identity_corruption_blocks_but_semantic_invalid_external_profiles_remai
         ] {
             let directory = tempfile::tempdir().expect("tempdir");
             let path = directory.path().join("config.toml");
-            let target_profile = dbotter::model::ConnectionProfile::from_draft(
-                "target".to_owned(),
-                named_draft(DriverKind::Redis, "Target"),
-            );
-            let unrelated_profile = dbotter::model::ConnectionProfile::from_draft(
-                "unrelated".to_owned(),
-                named_draft(DriverKind::Redis, "Unrelated"),
-            );
-            fs::write(
-                &path,
-                toml::to_string(&Config {
-                    version: 2,
-                    profiles: vec![target_profile.clone(), unrelated_profile.clone()],
-                })
-                .expect("initial config"),
-            )
-            .expect("initial write");
+            let target_profile =
+                classified_profile("target", named_draft(DriverKind::Redis, "Target"), 1);
+            let unrelated_profile =
+                classified_profile("unrelated", named_draft(DriverKind::Redis, "Unrelated"), 2);
+            let persisted = write_v3_profiles(&path, vec![target_profile, unrelated_profile]);
+            let target_profile = persisted_profile(&persisted, "target");
+            let unrelated_profile = persisted_profile(&persisted, "unrelated");
             let connector = Arc::new(FakeConnector::new(false));
             let store = Arc::new(SessionSecretStore::default());
             let target = ProfileId("target".to_owned());
@@ -3784,7 +3852,7 @@ async fn identity_corruption_blocks_but_semantic_invalid_external_profiles_remai
                 external_profiles[1].host.clear();
             }
             let external_bytes = toml::to_string(&Config {
-                version: 2,
+                version: 3,
                 profiles: external_profiles,
             })
             .expect("external invalid config")
@@ -3866,20 +3934,14 @@ async fn every_semantic_invalid_profile_can_be_repaired_or_deleted_without_unrel
         for repair in [true, false] {
             let directory = tempfile::tempdir().expect("tempdir");
             let path = directory.path().join("config.toml");
-            let invalid = kind.profile(directory.path());
-            let unrelated = dbotter::model::ConnectionProfile::from_draft(
-                "unrelated-valid".to_owned(),
+            let invalid = classify_profile(kind.profile(directory.path()), 2);
+            let unrelated = classified_profile(
+                "unrelated-valid",
                 named_draft(DriverKind::MySql, "Unrelated valid"),
+                1,
             );
-            fs::write(
-                &path,
-                toml::to_string(&Config {
-                    version: 2,
-                    profiles: vec![unrelated, invalid.clone()],
-                })
-                .expect("semantic-invalid fixture serializes"),
-            )
-            .expect("fixture write");
+            let persisted = write_v3_profiles(&path, vec![unrelated, invalid]);
+            let invalid = persisted_profile(&persisted, "editable-invalid");
             let invalid_id = ProfileId("editable-invalid".to_owned());
             let unrelated_id = ProfileId("unrelated-valid".to_owned());
             let connector = Arc::new(FakeConnector::new(false));
@@ -3968,7 +4030,7 @@ async fn every_semantic_invalid_profile_can_be_repaired_or_deleted_without_unrel
             );
 
             if repair {
-                let outcome = service
+                let result = service
                     .update_profile(UpdateProfileRequest {
                         profile_id: invalid_id.clone(),
                         expected_generation: generation,
@@ -3977,8 +4039,17 @@ async fn every_semantic_invalid_profile_can_be_repaired_or_deleted_without_unrel
                         secret_update: SessionSecretUpdate::Clear,
                         migration_consent: MigrationConsent::Cancelled,
                     })
-                    .await
-                    .expect("invalid row repairs to a strict-valid destination");
+                    .await;
+                let outcome = match result {
+                    Ok(outcome) => outcome,
+                    Err(ServiceError::Config(ConfigError::ExternalChange)) => {
+                        panic!("{kind:?}: repair unexpectedly observed an external change")
+                    }
+                    Err(ServiceError::Config(ConfigError::InvalidProfile)) => {
+                        panic!("{kind:?}: repair unexpectedly failed identity validation")
+                    }
+                    Err(error) => panic!("{kind:?}: repair failed: {error:?}"),
+                };
                 assert_ne!(outcome.profile_generation, generation);
                 assert!(
                     service
@@ -4045,19 +4116,9 @@ async fn editable_missing_ca_is_visible_and_does_not_block_unrelated_mutations_o
         );
         broken.tls = TlsMode::Required;
         broken.redis_tls.ca_file = Some(directory.path().join("missing-ca.pem"));
-        let target = dbotter::model::ConnectionProfile::from_draft(
-            "target".to_owned(),
-            named_draft(DriverKind::Redis, "Target"),
-        );
-        fs::write(
-            &path,
-            toml::to_string(&Config {
-                version: 2,
-                profiles: vec![target, broken],
-            })
-            .expect("editable config"),
-        )
-        .expect("config write");
+        let broken = classify_profile(broken, 2);
+        let target = classified_profile("target", named_draft(DriverKind::Redis, "Target"), 1);
+        write_v3_profiles(&path, vec![target, broken]);
         let connector = Arc::new(FakeConnector::new(true));
         let service = ApplicationService::with_dependencies(
             &path,
@@ -4102,15 +4163,8 @@ async fn editable_missing_ca_is_visible_and_does_not_block_unrelated_mutations_o
         );
         broken.tls = TlsMode::Required;
         broken.redis_tls.ca_file = Some(directory.path().join("missing-ca.pem"));
-        fs::write(
-            &path,
-            toml::to_string(&Config {
-                version: 2,
-                profiles: vec![broken],
-            })
-            .expect("broken config"),
-        )
-        .expect("config write");
+        let broken = classify_profile(broken, 1);
+        write_v3_profiles(&path, vec![broken]);
         let service = service(
             &path,
             Arc::new(FakeConnector::new(true)),
@@ -4390,37 +4444,27 @@ port = 6380
 tls = "disabled"
 "#;
 
+    if is_backup_failpoint(point) {
+        assert!(matches!(expected, MatrixOutcome::PreCommitRetry));
+        assert_backup_failpoint_case(mutation, point, ORIGINAL).await;
+        return;
+    }
+
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");
-    fs::write(&path, ORIGINAL).expect("v1 matrix fixture");
+    let target_profile = classified_profile("target", named_draft(DriverKind::Redis, "Before"), 1);
+    let mut unrelated_draft = named_draft(DriverKind::Redis, "Unrelated");
+    unrelated_draft.port = 6380;
+    let unrelated_profile = classified_profile("unrelated", unrelated_draft, 2);
+    write_v3_profiles(&path, vec![target_profile, unrelated_profile]);
+    let original = fs::read(&path).expect("v3 matrix fixture bytes");
     let target = ProfileId("target".to_owned());
     let unrelated = ProfileId("unrelated".to_owned());
     let orphan = ProfileId("orphan".to_owned());
     let created = ProfileId("created".to_owned());
     let connector = Arc::new(FakeConnector::new(false));
     let store = Arc::new(SessionSecretStore::default());
-    store
-        .apply(
-            &target,
-            SessionSecretUpdate::Replace(Arc::new(SessionSecret::new("target-current".to_owned()))),
-        )
-        .expect("seed target Arc");
-    store
-        .apply(
-            &unrelated,
-            SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(
-                "unrelated-current".to_owned(),
-            ))),
-        )
-        .expect("seed unrelated Arc");
-    store
-        .apply(
-            &orphan,
-            SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(
-                "orphan-must-clear-after-reconcile".to_owned(),
-            ))),
-        )
-        .expect("seed orphan Arc");
+    seed_matrix_secrets(&store);
     let fault = Arc::new(FailOnceAt::new(point));
     let service = ApplicationService::with_dependencies(
         &path,
@@ -4452,7 +4496,7 @@ tls = "disabled"
                 ),
                 "{mutation:?}/{point:?}: {first:?}"
             );
-            assert_eq!(fs::read(&path).expect("main bytes"), ORIGINAL);
+            assert_eq!(fs::read(&path).expect("main bytes"), original);
             assert_eq!(service.profiles_snapshot().await, before_profiles);
             assert_eq!(service.cached_session_count().await, 1);
             assert!(store.has_current(&target).expect("target Arc"));
@@ -4486,6 +4530,98 @@ tls = "disabled"
             assert!(store.is_empty().expect("uncertain clears all Arcs"));
             assert_disk_matrix_mutation(&path, mutation);
         }
+    }
+}
+
+async fn assert_backup_failpoint_case(
+    mutation: MatrixMutation,
+    point: MutationFailpoint,
+    original: &[u8],
+) {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    fs::write(&path, original).expect("v1 matrix fixture");
+    let target = ProfileId("target".to_owned());
+    let unrelated = ProfileId("unrelated".to_owned());
+    let orphan = ProfileId("orphan".to_owned());
+    let created = ProfileId("created".to_owned());
+    let connector = Arc::new(FakeConnector::new(false));
+    let store = Arc::new(SessionSecretStore::default());
+    seed_matrix_secrets(&store);
+    let fault = Arc::new(FailOnceAt::new(point));
+    let service = ApplicationService::with_dependencies(
+        &path,
+        connector,
+        Arc::new(MissingEnvironment),
+        store.clone(),
+        ConfigWriter::with_fault_injector(fault.clone()),
+    )
+    .expect("legacy matrix service");
+    service
+        .check(OperationId(900), target.clone(), Duration::from_secs(1))
+        .await
+        .expect("seed target cache");
+    let before_profiles = service.profiles_snapshot().await;
+    let migration_writer = ConfigWriter::with_fault_injector(fault.clone());
+    let posture_document = explicit_migration_document(&migration_writer, &path);
+
+    let first = migration_writer.migrate_v3(&path, &posture_document);
+    assert!(fault.has_failed(), "{mutation:?}/{point:?} fault must fire");
+    assert!(
+        matches!(
+            first,
+            Err(ConfigError::NotCommitted { stage, .. }) if stage == point
+        ),
+        "{mutation:?}/{point:?}: {first:?}"
+    );
+    assert_eq!(fs::read(&path).expect("main bytes"), original);
+    assert_eq!(service.profiles_snapshot().await, before_profiles);
+    assert_eq!(service.cached_session_count().await, 1);
+    assert!(store.has_current(&target).expect("target Arc"));
+    assert!(store.has_current(&unrelated).expect("unrelated Arc"));
+    assert!(store.has_current(&orphan).expect("orphan before commit"));
+    assert!(!store.has_current(&created).expect("created absent"));
+    assert!(!service.is_config_uncertain());
+
+    let migrated = migration_writer
+        .migrate_v3(&path, &posture_document)
+        .expect("explicit migration can be retried exactly once");
+    assert_eq!(migrated.state, CommitState::Committed);
+    assert!(migrated.migration_backup.is_some());
+    service
+        .reload_configuration()
+        .await
+        .expect("service adopts classified v3 migration");
+    assert_eq!(service.source_version().await, ConfigSourceVersion::V3);
+
+    seed_matrix_secrets(&store);
+    service
+        .check(OperationId(904), target.clone(), Duration::from_secs(1))
+        .await
+        .expect("reseed classified target cache");
+    let generation = service
+        .profile_generation(&target)
+        .await
+        .expect("classified target generation");
+    let committed = run_matrix_mutation(&service, mutation, generation)
+        .await
+        .expect("classified mutation commits after migration retry");
+    assert_eq!(committed, CommitState::Committed, "{mutation:?}/{point:?}");
+    assert_committed_matrix_state(&service, &store, &path, mutation).await;
+}
+
+fn seed_matrix_secrets(store: &SessionSecretStore) {
+    for (profile_id, secret) in [
+        ("target", "target-current"),
+        ("unrelated", "unrelated-current"),
+        ("orphan", "orphan-must-clear-after-reconcile"),
+    ] {
+        store
+            .apply(
+                &ProfileId(profile_id.to_owned()),
+                SessionSecretUpdate::Replace(Arc::new(SessionSecret::new(secret.to_owned()))),
+            )
+            .expect("seed matrix secret Arc");
     }
 }
 
@@ -4628,23 +4764,19 @@ async fn profile_mutation_outcome_debug_redacts_an_available_backup_path() {
         .path()
         .join("sentinel-profile-outcome-config.toml");
     fs::write(&path, b"version = 1\nprofiles = []\n").expect("v1 fixture");
-    let service = service(
-        &path,
-        Arc::new(FakeConnector::new(false)),
-        ConfigWriter::default(),
-    );
-
-    let outcome = service
-        .create_profile(CreateProfileRequest {
-            draft_id: DraftId(87),
-            operation_id: OperationId(87),
-            explicit_id: Some(ProfileId("redacted-outcome".to_owned())),
-            draft: draft(DriverKind::Redis),
-            secret_update: SessionSecretUpdate::Clear,
-            migration_consent: MigrationConsent::Confirmed,
-        })
-        .await
-        .expect("confirmed migration save");
+    let writer = ConfigWriter::default();
+    let posture_document = explicit_migration_document(&writer, &path);
+    let migration = writer
+        .migrate_v3(&path, &posture_document)
+        .expect("explicit migration save");
+    assert_eq!(migration.state, CommitState::Committed);
+    let outcome = ProfileMutationOutcome {
+        operation_id: OperationId(87),
+        profile_id: ProfileId("redacted-outcome".to_owned()),
+        profile_generation: ProfileGeneration(1),
+        commit_state: migration.state,
+        migration_backup: migration.migration_backup,
+    };
 
     assert!(outcome.migration_backup.is_some());
     assert!(!format!("{outcome:?}").contains("sentinel-profile-outcome-config.toml"));
@@ -4725,6 +4857,99 @@ impl MutationFaultInjector for RewriteCreatedPostureAtObservation {
             .lock()
             .map_err(|_| std::io::Error::other("preserved instance id lock poisoned"))? =
             Some(instance_id);
+        let encoded = toml::to_string(&config)
+            .map_err(|_| std::io::Error::other("rewritten v3 config did not serialize"))?;
+        fs::write(path, encoded)
+    }
+}
+
+struct RewriteCreatedInstanceIdAtObservation {
+    profile_id: String,
+    fired: AtomicBool,
+    original_instance_id: Mutex<Option<ProfileInstanceId>>,
+    substituted_instance_id: Mutex<Option<ProfileInstanceId>>,
+}
+
+impl RewriteCreatedInstanceIdAtObservation {
+    fn new(profile_id: &str) -> Self {
+        Self {
+            profile_id: profile_id.to_owned(),
+            fired: AtomicBool::new(false),
+            original_instance_id: Mutex::new(None),
+            substituted_instance_id: Mutex::new(None),
+        }
+    }
+
+    fn original_instance_id(&self) -> ProfileInstanceId {
+        (*self
+            .original_instance_id
+            .lock()
+            .expect("original instance id lock"))
+        .expect("observation rewrite captured the original instance id")
+    }
+
+    fn substituted_instance_id(&self) -> ProfileInstanceId {
+        (*self
+            .substituted_instance_id
+            .lock()
+            .expect("substituted instance id lock"))
+        .expect("observation rewrite captured the substituted instance id")
+    }
+}
+
+impl MutationFaultInjector for RewriteCreatedInstanceIdAtObservation {
+    fn check(&self, point: MutationFailpoint, path: &Path) -> std::io::Result<()> {
+        if point != MutationFailpoint::MainObservationLoad
+            || self.fired.swap(true, Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let loaded =
+            load_path(path).map_err(|_| std::io::Error::other("new v3 config was not readable"))?;
+        if loaded.source_version != ConfigSourceVersion::V3 {
+            return Err(std::io::Error::other("new config was not version 3"));
+        }
+        let mut config = loaded.config;
+        let profile_index = config
+            .profiles
+            .iter()
+            .position(|profile| profile.id == self.profile_id)
+            .ok_or_else(|| std::io::Error::other("created profile was not written"))?;
+        let profile = &config.profiles[profile_index];
+        let environment = profile
+            .safety
+            .environment()
+            .ok_or_else(|| std::io::Error::other("created profile has no environment"))?;
+        let access = profile
+            .safety
+            .access()
+            .ok_or_else(|| std::io::Error::other("created profile has no access"))?;
+        let original_instance_id = profile
+            .safety
+            .instance_id()
+            .ok_or_else(|| std::io::Error::other("created profile has no instance id"))?;
+        let substituted_instance_id = [0xab_u8, 0xcd, 0xef]
+            .into_iter()
+            .map(|byte| ProfileInstanceId::from_bytes([byte; 16]))
+            .find(|candidate| {
+                config
+                    .profiles
+                    .iter()
+                    .all(|profile| profile.safety.instance_id() != Some(*candidate))
+            })
+            .ok_or_else(|| std::io::Error::other("no unique replacement instance id"))?;
+        config.profiles[profile_index].safety =
+            ProfileSafetyPosture::classified(environment, access, substituted_instance_id);
+        *self
+            .original_instance_id
+            .lock()
+            .map_err(|_| std::io::Error::other("original instance id lock poisoned"))? =
+            Some(original_instance_id);
+        *self
+            .substituted_instance_id
+            .lock()
+            .map_err(|_| std::io::Error::other("substituted instance id lock poisoned"))? =
+            Some(substituted_instance_id);
         let encoded = toml::to_string(&config)
             .map_err(|_| std::io::Error::other("rewritten v3 config did not serialize"))?;
         fs::write(path, encoded)
@@ -4826,6 +5051,25 @@ impl MutationFaultInjector for RewriteAtObservation {
                     .first()
                     .cloned()
                     .ok_or_else(|| std::io::Error::other("missing rewrite seed"))?;
+                let environment = injected
+                    .safety
+                    .environment()
+                    .ok_or_else(|| std::io::Error::other("rewrite seed has no environment"))?;
+                let access = injected
+                    .safety
+                    .access()
+                    .ok_or_else(|| std::io::Error::other("rewrite seed has no access"))?;
+                let instance_id = (0_u8..=u8::MAX)
+                    .map(|byte| ProfileInstanceId::from_bytes([byte; 16]))
+                    .find(|candidate| {
+                        config
+                            .profiles
+                            .iter()
+                            .all(|profile| profile.safety.instance_id() != Some(*candidate))
+                    })
+                    .ok_or_else(|| std::io::Error::other("no distinct rewrite identity"))?;
+                injected.safety =
+                    ProfileSafetyPosture::classified(environment, access, instance_id);
                 match rewrite {
                     ObservationRewrite::DuplicateId => {}
                     ObservationRewrite::InvalidId => {
@@ -4981,6 +5225,85 @@ fn named_draft(driver: DriverKind, name: &str) -> ConnectionDraft {
     let mut draft = ConnectionDraft::for_driver(driver);
     draft.name = name.to_owned();
     draft
+}
+
+fn classified_profile(id: &str, draft: ConnectionDraft, identity_byte: u8) -> ConnectionProfile {
+    classify_profile(
+        ConnectionProfile::from_draft(id.to_owned(), draft),
+        identity_byte,
+    )
+}
+
+fn classify_profile(mut profile: ConnectionProfile, identity_byte: u8) -> ConnectionProfile {
+    let environment = profile
+        .safety
+        .environment()
+        .expect("fixture profile starts with an explicit environment");
+    let access = profile
+        .safety
+        .access()
+        .expect("fixture profile starts with explicit access");
+    profile.safety = ProfileSafetyPosture::classified(
+        environment,
+        access,
+        ProfileInstanceId::from_bytes([identity_byte; 16]),
+    );
+    profile
+}
+
+fn write_v3_profiles(path: &Path, profiles: Vec<ConnectionProfile>) -> Vec<ConnectionProfile> {
+    fs::write(
+        path,
+        toml::to_string(&Config {
+            version: 3,
+            profiles,
+        })
+        .expect("classified v3 fixture serializes"),
+    )
+    .expect("classified v3 fixture writes");
+    let loaded = load_path(path).expect("classified v3 fixture reloads");
+    assert_eq!(loaded.source_version, ConfigSourceVersion::V3);
+    loaded.config.profiles
+}
+
+fn persisted_profile(profiles: &[ConnectionProfile], id: &str) -> ConnectionProfile {
+    profiles
+        .iter()
+        .find(|profile| profile.id == id)
+        .expect("persisted fixture profile")
+        .clone()
+}
+
+fn explicit_migration_document(writer: &ConfigWriter, path: &Path) -> Vec<u8> {
+    let plan = writer.migration_plan(path).expect("legacy migration plan");
+    assert!(matches!(plan.source_version, 1 | 2));
+    let assignments = plan
+        .profiles
+        .iter()
+        .map(|profile| {
+            serde_json::json!({
+                "profile_id": profile.profile_id,
+                "environment": "development",
+                "access": "read_write"
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!({
+        "config_fingerprint": plan.config_fingerprint,
+        "profiles": assignments
+    }))
+    .expect("migration posture document")
+}
+
+const fn is_backup_failpoint(point: MutationFailpoint) -> bool {
+    matches!(
+        point,
+        MutationFailpoint::BackupTempCreate
+            | MutationFailpoint::BackupWrite
+            | MutationFailpoint::BackupFileSync
+            | MutationFailpoint::BackupRename
+            | MutationFailpoint::BackupDirectorySync
+    )
 }
 
 fn empty_result() -> QueryResult {
