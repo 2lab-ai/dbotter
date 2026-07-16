@@ -9,11 +9,11 @@ use dbotter::model::{
     QueryLanguage, RedisTlsConfig, TlsMode,
 };
 use dbotter::ui::{
-    EditorCursor, EditorIntent, EditorSurface, EditorValidationError, ProfileSnapshot, UiCommand,
-    UiModel, WorkspaceKey, build_execute_intent, classify_execute_operation, editor_target_label,
-    pending_cancel_intent,
+    EditorCursor, EditorIntent, EditorSurface, EditorValidationError, ProfileSnapshot,
+    ResultAreaTab, UiCommand, UiModel, WorkspaceKey, build_execute_intent,
+    classify_execute_operation, editor_target_label, pending_cancel_intent,
 };
-use eframe::egui::{Context, Event, Key, Modifiers, RawInput};
+use eframe::egui::{Context, Event, Key, Modifiers, RawInput, accesskit};
 
 fn profile(
     id: &str,
@@ -328,6 +328,82 @@ fn raw_input_shortcut_submits_once_and_pending_work_exposes_exact_cancel() {
     let pending_ids = author_ids(&pending_output);
     assert!(pending_ids.contains("editor.execute"));
     assert!(pending_ids.contains("editor.cancel"));
+}
+
+#[test]
+fn editor_action_bar_runs_current_and_opens_history_without_losing_the_draft() {
+    let profile = profile(
+        "mysql-history",
+        8,
+        DriverKind::MySql,
+        Some("app"),
+        TlsMode::Required,
+    );
+    let mut model = UiModel::default();
+    let workspace = model.workspace_mut(WorkspaceKey::new(profile.id.clone(), profile.generation));
+    workspace.editor_text = "SELECT keep_this_draft".to_owned();
+
+    let context = Context::default();
+    context.enable_accesskit();
+    let mut surface = EditorSurface::default();
+    let initial = context.run_ui(RawInput::default(), |ui| {
+        assert!(surface.show(ui, &profile, workspace, true).is_none());
+    });
+    let initial_update = initial
+        .platform_output
+        .accesskit_update
+        .expect("editor action bar must emit AccessKit");
+    let author_node = |author_id: &str| {
+        initial_update
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| {
+                (node.author_id() == Some(author_id)).then_some((*node_id, node))
+            })
+            .unwrap_or_else(|| panic!("missing editor action {author_id}"))
+    };
+    let (_, run_current) = author_node("editor.execute");
+    assert_eq!(run_current.role(), accesskit::Role::Button);
+    assert_eq!(run_current.label(), Some("Run current or selection"));
+    let (history_id, history) = author_node("editor.history");
+    assert_eq!(history.role(), accesskit::Role::Button);
+    assert_eq!(history.label(), Some("Open execution history"));
+    assert!(history.supports_action(accesskit::Action::Focus));
+    assert!(history.supports_action(accesskit::Action::Click));
+
+    let _ = context.run_ui(
+        RawInput {
+            events: vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: history_id,
+                data: None,
+            })],
+            ..RawInput::default()
+        },
+        |ui| {
+            assert!(surface.show(ui, &profile, workspace, true).is_none());
+        },
+    );
+    let _ = context.run_ui(
+        RawInput {
+            events: vec![Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..RawInput::default()
+        },
+        |ui| {
+            assert!(surface.show(ui, &profile, workspace, true).is_none());
+        },
+    );
+
+    assert_eq!(workspace.result_area_tab(), ResultAreaTab::History);
+    assert_eq!(workspace.editor_text, "SELECT keep_this_draft");
+    assert!(workspace.pending_execute.is_none());
 }
 
 #[test]
