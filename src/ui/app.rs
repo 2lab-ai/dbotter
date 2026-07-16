@@ -2983,6 +2983,29 @@ impl DbotterApp {
                 .copied()
                 .filter(|operation| operation.profile_generation == profile.generation)
         });
+        let result_summary = selected
+            .as_ref()
+            .and_then(|profile| {
+                self.model
+                    .workspace(&WorkspaceKey::new(profile.id.clone(), profile.generation))
+            })
+            .and_then(|workspace| workspace.result.as_ref())
+            .map_or_else(
+                || "None".to_owned(),
+                |result| {
+                    format!(
+                        "{} ms · {} returned · {} affected · {}",
+                        result.provenance.duration_ms,
+                        result.rows.len(),
+                        result.affected_rows,
+                        if result.truncated {
+                            "Truncated"
+                        } else {
+                            "Complete"
+                        }
+                    )
+                },
+            );
         let operation_status = self.model.status.clone();
         let mut cancel = None;
 
@@ -3036,6 +3059,13 @@ impl DbotterApp {
                         "status.operation".to_owned(),
                         "Current operation status".to_owned(),
                         operation_status,
+                    );
+                    let result = ui.small(format!("Latest result: {result_summary}"));
+                    named_dynamic_value_author_id(
+                        result,
+                        "status.result".to_owned(),
+                        "Selected result summary".to_owned(),
+                        result_summary.clone(),
                     );
                     if let Some(operation) = active {
                         ui.small(format!("Active: {}", operation_kind_label(operation.kind)));
