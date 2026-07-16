@@ -5,6 +5,61 @@ use dbotter::ui::{
     WorkspaceGeometry,
 };
 
+const APP_RENDERER_SOURCE: &str = include_str!("../src/ui/app.rs");
+const MYSQL_EXPLORER_SOURCE: &str = include_str!("../src/ui/mysql_explorer.rs");
+
+fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let signature = format!("fn {name}(");
+    let function_start = source
+        .find(&signature)
+        .unwrap_or_else(|| panic!("renderer is missing `{signature}`"));
+    let body_start = source[function_start..]
+        .find('{')
+        .map(|offset| function_start + offset)
+        .unwrap_or_else(|| panic!("renderer function `{name}` has no body"));
+
+    let mut depth = 0_usize;
+    for (offset, byte) in source.as_bytes()[body_start..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[body_start..=body_start + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+
+    panic!("renderer function `{name}` has an unterminated body")
+}
+
+fn without_ascii_whitespace(source: &str) -> String {
+    source
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect()
+}
+
+fn has_bound_author_id(source: &str, id: &str) -> bool {
+    let literal = format!("\"{id}\"");
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(&literal))
+        .any(|(line, _)| {
+            let lines = source.lines().collect::<Vec<_>>();
+            let start = line.saturating_sub(8);
+            let end = (line + 9).min(lines.len());
+            lines[start..end].join("\n").contains("author_id")
+        })
+}
+
+fn string_literals(source: &str) -> impl Iterator<Item = &str> {
+    source.split('"').skip(1).step_by(2)
+}
+
 fn assert_monochrome(color: [u8; 4]) {
     assert_eq!(color[0], color[1]);
     assert_eq!(color[1], color[2]);
@@ -170,6 +225,143 @@ fn compact_shell_uses_named_single_surface_fallback_and_restores_focus() {
     assert!(!fallback.covers_status_action_context());
     assert_eq!(fallback.close(), Some("result.tab.current".to_owned()));
     assert_eq!(fallback.visible_surface(), None);
+}
+
+#[test]
+fn actual_renderer_routes_native_layout_geometry_and_compact_fallback() {
+    let show_native = function_body(APP_RENDERER_SOURCE, "show_native");
+
+    assert!(
+        show_native.contains("NativeLayout::resolve"),
+        "show_native must resolve the real 1440x900/840x560 shell, not only test the pure layout API"
+    );
+    assert!(
+        show_native.contains("WorkspaceGeometry"),
+        "show_native must supply the selected workspace geometry to NativeLayout::resolve"
+    );
+    assert!(
+        show_native.contains("CompactFallback"),
+        "show_native must route compact rendering through the one-at-a-time fallback state"
+    );
+    assert!(
+        !show_native.contains("NativeLayout::columns_for_width(ui.available_width())"),
+        "the legacy width-only three-column switch must be removed"
+    );
+    assert!(
+        !show_native.contains("self.narrow_navigation(ui)"),
+        "compact rendering must use the named fallback instead of collapsing headers"
+    );
+}
+
+#[test]
+fn actual_renderer_binds_stable_region_and_compact_control_author_ids() {
+    for id in [
+        "navigator",
+        "object-editor-tabs",
+        "result-history-tabs",
+        "status-action-context",
+        "navigator.open",
+        "inspector.open",
+    ] {
+        assert!(
+            has_bound_author_id(APP_RENDERER_SOURCE, id),
+            "actual renderer must bind stable author id `{id}` to a rendered response"
+        );
+    }
+
+    let has_shared_close = ["compact.close", "fallback.close"]
+        .into_iter()
+        .any(|id| has_bound_author_id(APP_RENDERER_SOURCE, id));
+    let has_surface_closes = has_bound_author_id(APP_RENDERER_SOURCE, "navigator.close")
+        && has_bound_author_id(APP_RENDERER_SOURCE, "inspector.close");
+    assert!(
+        has_shared_close || has_surface_closes,
+        "the one-at-a-time compact surface needs either one stable shared close control or stable close controls for both surfaces"
+    );
+}
+
+#[test]
+fn actual_wide_renderer_owns_one_resizable_navigator_center_subordinate_and_status() {
+    let compact_source = without_ascii_whitespace(APP_RENDERER_SOURCE);
+    let show_native = without_ascii_whitespace(function_body(APP_RENDERER_SOURCE, "show_native"));
+
+    assert!(
+        !compact_source.contains("Panel::left(\"connections\")")
+            && !compact_source.contains("Panel::right(\"explorer\")"),
+        "connections and object explorer must be composed inside one navigator, not fixed sibling side panels"
+    );
+    assert!(
+        !show_native.contains("self.connections(ui);")
+            && !show_native.contains("self.explorer(ui);"),
+        "show_native must not coordinate the legacy fixed connections/explorer pair"
+    );
+
+    let navigator_start = compact_source
+        .find("Panel::left(\"navigator\")")
+        .expect("wide shell must own a left panel with the stable navigator identity");
+    let navigator_builder = compact_source[navigator_start..]
+        .split(".show(")
+        .next()
+        .expect("navigator panel must have a builder before show");
+    assert!(
+        navigator_builder.contains(".resizable(true)"),
+        "the unified navigator must be user-resizable"
+    );
+    assert!(
+        navigator_builder.contains("NativeLayout::NAVIGATOR_DEFAULT_WIDTH")
+            && navigator_builder.contains("NativeLayout::NAVIGATOR_WIDTH_RANGE"),
+        "the actual navigator must use the documented 280 default and 220..=420 range"
+    );
+    assert!(
+        compact_source.contains("connections_contents(ui)")
+            && compact_source.contains("explorer_contents(ui)"),
+        "the unified navigator must retain connection selection and object exploration together"
+    );
+
+    assert!(
+        compact_source.contains("CentralPanel::default()"),
+        "the editor must remain the center workspace"
+    );
+    assert!(
+        compact_source.matches("Panel::bottom(").count() >= 2,
+        "the renderer needs distinct subordinate result/history and persistent status bottom panels"
+    );
+    assert!(
+        compact_source.contains("SplitLayout") && compact_source.contains("subordinate_extent"),
+        "the actual editor/result coordinator must consume the pure split layout"
+    );
+    assert!(
+        show_native.contains("show_status_strip"),
+        "show_native must always coordinate the persistent bottom status/action context"
+    );
+}
+
+#[test]
+fn actual_renderer_removes_mysql_width_overflow_and_forbids_fake_spatial_views() {
+    let compact_mysql = without_ascii_whitespace(MYSQL_EXPLORER_SOURCE);
+    assert!(
+        !compact_mysql.contains("set_min_width(300"),
+        "the MySQL explorer must fit the 280pt unified navigator instead of forcing 300pt content"
+    );
+
+    for literal in
+        string_literals(APP_RENDERER_SOURCE).chain(string_literals(MYSQL_EXPLORER_SOURCE))
+    {
+        let normalized = literal.to_ascii_lowercase();
+        let words = normalized
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .collect::<Vec<_>>();
+        for forbidden in ["gis", "map", "erd"] {
+            assert!(
+                !words.contains(&forbidden),
+                "actual renderer must not advertise fake {forbidden} controls"
+            );
+        }
+        assert!(
+            !normalized.contains("er-diagram"),
+            "actual renderer must not advertise fake ER-diagram controls"
+        );
+    }
 }
 
 #[test]
