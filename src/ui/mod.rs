@@ -25,7 +25,10 @@ pub use editor::{
     EditorValidationError, build_execute_intent, classify_execute_operation, editor_target_label,
     pending_cancel_intent,
 };
-pub use layout::NativeLayout;
+pub use layout::{
+    CompactFallback, FallbackSurface, LayoutMode, NativeLayout, Pane, ResolvedLayout, SplitLayout,
+    WorkspaceGeometry,
+};
 pub use model::{
     ConfigPresentation, ConnectionFailureOutcome, ConnectionState, PostCloseState, ProfileSnapshot,
     ProfileWorkspace, UiEvent, UiModel, WorkspaceKey,

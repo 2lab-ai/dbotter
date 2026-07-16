@@ -9,11 +9,15 @@ impl OpenAiTheme {
     pub const SECONDARY_INK: [u8; 4] = [102, 102, 102, 255];
     pub const DISABLED_INK: [u8; 4] = [145, 145, 145, 255];
     pub const BOUNDARY: [u8; 4] = [145, 145, 145, 255];
+    pub const PRIMARY_FILL: [u8; 4] = Self::INK;
+    pub const PRIMARY_INK: [u8; 4] = Self::CANVAS;
     pub const CORNER_RADIUS: f32 = 0.0;
     pub const FOCUS_STROKE_WIDTH: f32 = 2.0;
     pub const MIN_CONTROL_HEIGHT: f32 = 44.0;
     pub const USES_GRADIENTS: bool = false;
     pub const USES_SHADOWS: bool = false;
+    pub const MOTION_DURATION_RANGE_MS: std::ops::RangeInclusive<u16> = 150..=250;
+    pub const REDUCED_MOTION_DURATION_MS: u16 = 0;
 
     pub fn apply(context: &egui::Context) {
         context.set_theme(egui::Theme::Light);
@@ -31,8 +35,8 @@ impl OpenAiTheme {
         style.visuals.window_fill = Self::color(Self::CANVAS);
         style.visuals.extreme_bg_color = Self::color(Self::CANVAS);
         style.visuals.faint_bg_color = Color32::from_gray(245);
-        style.visuals.selection.bg_fill = Self::color(Self::INK);
-        style.visuals.selection.stroke = Stroke::new(1.0, Self::color(Self::CANVAS));
+        style.visuals.selection.bg_fill = Self::color(Self::PRIMARY_FILL);
+        style.visuals.selection.stroke = Stroke::new(1.0, Self::color(Self::PRIMARY_INK));
         style.visuals.window_corner_radius = CornerRadius::ZERO;
         style.visuals.menu_corner_radius = CornerRadius::ZERO;
         style.visuals.window_shadow = egui::epaint::Shadow::NONE;
@@ -48,10 +52,10 @@ impl OpenAiTheme {
         style.visuals.widgets.hovered.bg_fill = Color32::from_gray(245);
         style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Self::color(Self::INK));
         style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Self::color(Self::INK));
-        style.visuals.widgets.active.bg_fill = Self::color(Self::INK);
+        style.visuals.widgets.active.bg_fill = Self::color(Self::PRIMARY_FILL);
         style.visuals.widgets.active.bg_stroke =
-            Stroke::new(Self::FOCUS_STROKE_WIDTH, Self::color(Self::INK));
-        style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, Self::color(Self::CANVAS));
+            Stroke::new(Self::FOCUS_STROKE_WIDTH, Self::color(Self::PRIMARY_FILL));
+        style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, Self::color(Self::PRIMARY_INK));
         style.visuals.widgets.open = style.visuals.widgets.active;
         for widget in [
             &mut style.visuals.widgets.noninteractive,
