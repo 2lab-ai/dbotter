@@ -272,6 +272,50 @@ fn successful_executions_append_distinct_selectable_result_tabs() {
 }
 
 #[test]
+fn closing_result_tabs_selects_the_adjacent_output_and_clears_the_last_surface() {
+    let profile = profile("alpha", 1);
+    let mut workspace = ProfileWorkspace::default();
+    let first = workspace
+        .append_result_tab(Arc::new(result(&profile, 21)))
+        .expect("first result tab");
+    let second = workspace
+        .append_result_tab(Arc::new(result(&profile, 22)))
+        .expect("second result tab");
+    let third = workspace
+        .append_result_tab(Arc::new(result(&profile, 23)))
+        .expect("third result tab");
+
+    workspace
+        .select_result_tab(second)
+        .expect("middle result remains selectable");
+    workspace
+        .close_result_tab(second)
+        .expect("selected result closes");
+    assert_eq!(workspace.selected_result_tab_id(), Some(third));
+    assert_eq!(workspace.result_tabs().len(), 2);
+    assert_eq!(
+        workspace
+            .selected_result_tab()
+            .expect("right-adjacent result selected")
+            .snapshot()
+            .provenance
+            .result_id,
+        ResultId(23)
+    );
+
+    workspace
+        .close_result_tab(first)
+        .expect("inactive result closes without moving selection");
+    assert_eq!(workspace.selected_result_tab_id(), Some(third));
+    workspace
+        .close_result_tab(third)
+        .expect("last result closes");
+    assert!(workspace.result_tabs().is_empty());
+    assert_eq!(workspace.selected_result_tab_id(), None);
+    assert!(workspace.result.is_none());
+}
+
+#[test]
 fn geometry_round_trips_with_its_workspace_key() {
     let key = WorkspaceKey::new(ProfileId("alpha".to_owned()), ProfileGeneration(7));
     let geometry = WorkspaceGeometry::restore(360.0, 0.70, false);

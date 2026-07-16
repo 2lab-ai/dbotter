@@ -6739,6 +6739,85 @@ mod tests {
     }
 
     #[test]
+    fn actual_result_tabs_expose_close_and_select_the_adjacent_output() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        let first = app
+            .model
+            .workspace_mut(key.clone())
+            .append_result_tab(Arc::new(result_snapshot(&profile, "first")))
+            .expect("first result tab");
+        let second = app
+            .model
+            .workspace_mut(key.clone())
+            .append_result_tab(Arc::new(result_snapshot(&profile, "second")))
+            .expect("second result tab");
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let initial = context.run_ui(RawInput::default(), |ui| app.show_result_surface(ui));
+        let initial_update = initial
+            .platform_output
+            .accesskit_update
+            .expect("actual result tabs must emit AccessKit");
+        let (close_id, close) = accesskit_author_node(
+            &initial_update,
+            &format!("result.output.close.{}", second.0),
+        );
+        assert_eq!(close.role(), accesskit::Role::Button);
+        assert_eq!(close.label(), Some("Close result tab"));
+        assert!(close.supports_action(accesskit::Action::Focus));
+        assert!(close.supports_action(accesskit::Action::Click));
+
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                    action: accesskit::Action::Focus,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: close_id,
+                    data: None,
+                })],
+                ..RawInput::default()
+            },
+            |ui| app.show_result_surface(ui),
+        );
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![Event::Key {
+                    key: Key::Enter,
+                    physical_key: Some(Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+            |ui| app.show_result_surface(ui),
+        );
+
+        let workspace = app.model.workspace(&key).expect("workspace retained");
+        assert_eq!(workspace.result_tabs().len(), 1);
+        assert_eq!(workspace.selected_result_tab_id(), Some(first));
+        assert_eq!(
+            workspace
+                .result
+                .as_ref()
+                .and_then(|result| result.rows.first())
+                .and_then(|row| row.first()),
+            Some(&Cell::Text("first".to_owned()))
+        );
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
     fn result_export_submission_owns_pending_state_and_commits_only_the_correlated_path() {
         let directory = tempfile::tempdir().expect("tempdir");
         let destination = directory.path().join("result.json");

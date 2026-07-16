@@ -139,12 +139,14 @@ fn session_only_workspace_retention_is_explicit_in_the_actual_renderer() {
 fn result_renderer_keeps_multiple_execution_outputs_selectable() {
     let results = function_body(APP_RENDERER_SOURCE, "show_result_surface");
     assert!(
-        results.contains("result_tabs()") && results.contains("select_result_tab"),
-        "the actual result surface must render and select retained result tabs"
+        results.contains("result_tabs()")
+            && results.contains("select_result_tab")
+            && results.contains("close_result_tab"),
+        "the actual result surface must render, select and close retained result tabs"
     );
     assert!(
-        results.contains("result.output."),
-        "each retained output needs a stable dynamic author-id prefix"
+        results.contains("result.output.") && results.contains("result.output.close."),
+        "each retained output and its close action need stable dynamic author-id prefixes"
     );
 }
 
