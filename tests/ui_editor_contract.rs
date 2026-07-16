@@ -365,6 +365,9 @@ fn editor_action_bar_runs_current_and_opens_history_without_losing_the_draft() {
     let (_, run_current) = author_node("editor.execute");
     assert_eq!(run_current.role(), accesskit::Role::Button);
     assert_eq!(run_current.label(), Some("Run current or selection"));
+    let (_, run_all) = author_node("editor.execute_all");
+    assert_eq!(run_all.role(), accesskit::Role::Button);
+    assert_eq!(run_all.label(), Some("Run all statements or commands"));
     let (history_id, history) = author_node("editor.history");
     assert_eq!(history.role(), accesskit::Role::Button);
     assert_eq!(history.label(), Some("Open execution history"));
