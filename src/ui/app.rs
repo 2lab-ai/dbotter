@@ -5183,6 +5183,167 @@ mod tests {
     }
 
     #[test]
+    fn actual_splitter_crossing_collapses_and_named_restore_returns_both_panes() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.model.workspace_mut(key.clone());
+        app.workspace_geometries
+            .insert(key.clone(), WorkspaceGeometry::restore(280.0, 0.30, true));
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let render = |app: &mut DbotterApp, events: Vec<Event>| {
+            let geometry = app
+                .workspace_geometries
+                .get(&key)
+                .copied()
+                .expect("workspace geometry");
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| app.show_editor_result_shell(ui, geometry),
+            )
+        };
+
+        let initial = render(&mut app, Vec::new());
+        let initial_update = initial
+            .platform_output
+            .accesskit_update
+            .expect("initial split frame must emit AccessKit");
+        let (splitter_id, _) = accesskit_author_node(&initial_update, "workspace.splitter");
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: splitter_id,
+                data: None,
+            })],
+        );
+
+        let arrow = |key| Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        let collapse = |app: &mut DbotterApp, key, restore_id: &str| {
+            (0..128).find_map(|_| {
+                let output = render(app, vec![arrow(key)]);
+                let update = output.platform_output.accesskit_update?;
+                update
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.author_id() == Some(restore_id))
+                    .then_some(update)
+            })
+        };
+
+        let editor_collapsed = collapse(&mut app, Key::ArrowUp, "workspace.editor.restore")
+            .expect("crossing 160 points must expose Restore editor");
+        let (restore_editor_id, restore_editor) =
+            accesskit_author_node(&editor_collapsed, "workspace.editor.restore");
+        assert_eq!(restore_editor.role(), accesskit::Role::Button);
+        assert_eq!(restore_editor.label(), Some("Restore editor"));
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: restore_editor_id,
+                data: None,
+            })],
+        );
+        let _ = render(&mut app, vec![arrow(Key::Enter)]);
+        let restored = render(&mut app, Vec::new());
+        let restored = restored
+            .platform_output
+            .accesskit_update
+            .expect("restored split frame must emit AccessKit");
+        let (splitter_id, _) = accesskit_author_node(&restored, "workspace.splitter");
+        for expected in ["object-editor-tabs", "result-history-tabs"] {
+            assert!(
+                restored
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.author_id() == Some(expected)),
+                "restoring editor lost {expected}"
+            );
+        }
+        assert_eq!(
+            app.workspace_geometries
+                .get(&key)
+                .map(|geometry| geometry.editor_share()),
+            Some(NativeLayout::DEFAULT_EDITOR_SHARE)
+        );
+
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: splitter_id,
+                data: None,
+            })],
+        );
+        let results_collapsed = collapse(&mut app, Key::ArrowDown, "workspace.results.restore")
+            .expect("crossing 160 points must expose Restore results/history");
+        let (restore_results_id, restore_results) =
+            accesskit_author_node(&results_collapsed, "workspace.results.restore");
+        assert_eq!(restore_results.role(), accesskit::Role::Button);
+        assert_eq!(restore_results.label(), Some("Restore results/history"));
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: restore_results_id,
+                data: None,
+            })],
+        );
+        let _ = render(&mut app, vec![arrow(Key::Enter)]);
+        let restored = render(&mut app, Vec::new());
+        let restored = restored
+            .platform_output
+            .accesskit_update
+            .expect("second restored frame must emit AccessKit");
+        for expected in [
+            "workspace.splitter",
+            "object-editor-tabs",
+            "result-history-tabs",
+        ] {
+            assert!(
+                restored
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.author_id() == Some(expected)),
+                "restoring results lost {expected}"
+            );
+        }
+        assert_eq!(
+            app.workspace_geometries
+                .get(&key)
+                .map(|geometry| geometry.editor_share()),
+            Some(NativeLayout::DEFAULT_EDITOR_SHARE)
+        );
+    }
+
+    #[test]
     fn actual_compact_shell_exposes_one_named_surface_and_keeps_status_at_840_by_560() {
         let (ui_port, mut service) = bounded_ports(4);
         let mut app = DbotterApp::new(ui_port);
