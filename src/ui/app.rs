@@ -5379,7 +5379,7 @@ mod tests {
     }
 
     #[test]
-    fn mysql_data_template_opens_a_new_tab_without_overwriting_the_current_draft() {
+    fn mysql_data_action_opens_a_new_tab_and_submits_the_exact_bounded_read() {
         let (ui_port, mut service) = bounded_ports(4);
         let mut app = DbotterApp::new(ui_port);
         assert!(service.try_next_command().is_some());
@@ -5420,7 +5420,37 @@ mod tests {
             workspace.editor_tab(selected).expect("data tab").text(),
             "SELECT * FROM `app`.`widgets` LIMIT 200"
         );
-        assert!(service.try_next_command().is_none());
+        let operation_id = match service
+            .try_next_command()
+            .expect("Data must submit the bounded read without a second action")
+        {
+            UiCommand::Execute {
+                operation_id,
+                profile_id,
+                profile_generation,
+                language,
+                text,
+                row_limit,
+                timeout_ms,
+            } => {
+                assert_eq!(profile_id, mysql.id);
+                assert_eq!(profile_generation, mysql.generation);
+                assert_eq!(language, QueryLanguage::Sql);
+                assert_eq!(text, "SELECT * FROM `app`.`widgets` LIMIT 200");
+                assert_eq!(row_limit, 500);
+                assert_eq!(timeout_ms, 30_000);
+                operation_id
+            }
+            other => panic!("Data submitted the wrong command: {other:?}"),
+        };
+        assert_eq!(
+            app.model
+                .workspace(&key)
+                .expect("workspace retained")
+                .pending_execute,
+            Some(operation_id)
+        );
+        assert_eq!(app.model.status, "Executing…");
     }
 
     #[test]
