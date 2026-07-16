@@ -24,8 +24,8 @@ use dbotter::execution::{ExecutionLanguage, ExecutionTargetError, extract_and_va
 use dbotter::model::{
     Cell, ConnectionProfile, CredentialMode, DriverKind, MAX_REDIS_KEY_BYTES, OperationId,
     OperationKind, ProfileAccess, ProfileEnvironment, ProfileFieldId, ProfileGeneration, ProfileId,
-    ProfileSafetyPosture, PublicCode, PublicSummary, RedisExecuteRequest, RedisKeyFilter,
-    RedisKeyId, RedisKeyInspectRequest, RedisScanRequest, RedisTlsConfig, RedisTtl, RedisValueType,
+    ProfileSafetyPosture, PublicCode, PublicSummary, RedisKeyFilter, RedisKeyId,
+    RedisKeyInspectRequest, RedisScanRequest, RedisTlsConfig, RedisTtl, RedisValueType,
     RequestIdentity, TlsMode,
 };
 use dbotter::public_error::{RecoveryAction, SafeContext, recovery_for};
@@ -34,6 +34,7 @@ use dbotter::secrets::{
 };
 use dbotter::service::{ApplicationService, DriverConnector, SecretResolver, ServiceError};
 use live_evidence::LiveEvidence;
+use redis::IntoConnectionInfo as _;
 use secrecy::SecretString;
 
 const CORRECT_PASSWORD: &str = "dbotter-redis-local-only";
@@ -132,18 +133,39 @@ fn identity(profile_id: &str, operation: u64) -> RequestIdentity {
     )
 }
 
-async fn execute(session: &RedisSession, operation: u64, argv: Vec<Vec<u8>>) {
-    let request = RedisExecuteRequest::new(
-        identity("redis-live-direct", operation),
-        argv,
-        1_000,
-        TIMEOUT,
-    )
-    .expect("valid live Redis command");
-    session
-        .execute_command(&request)
+async fn connect_fixture_admin(fixture: &LiveFixture) -> ::redis::aio::ConnectionManager {
+    let redis = ::redis::RedisConnectionInfo::default()
+        .set_db(0)
+        .set_password(CORRECT_PASSWORD);
+    let info = (fixture.plaintext_host.clone(), fixture.plaintext_port)
+        .into_connection_info()
+        .expect("valid fixture endpoint")
+        .set_redis_settings(redis);
+    let client = ::redis::Client::open(info).expect("valid fixture client");
+    let config = ::redis::aio::ConnectionManagerConfig::new()
+        .set_number_of_retries(0)
+        .set_connection_timeout(Some(TIMEOUT))
+        .set_response_timeout(Some(TIMEOUT));
+    tokio::time::timeout(TIMEOUT, client.get_connection_manager_with_config(config))
         .await
-        .expect("live Redis command");
+        .unwrap_or_else(|_| panic!("fixture admin connection timed out"))
+        .unwrap_or_else(|_| panic!("fixture admin connection failed"))
+}
+
+/// Seed/cleanup is test infrastructure, not a dbotter editor command. DUV1
+/// v1.1 keeps the production `RedisExecuteRequest` path read-only, so fixture
+/// mutations use a separately typed, credential-safe connection.
+async fn fixture_execute(connection: &mut ::redis::aio::ConnectionManager, argv: Vec<Vec<u8>>) {
+    let (command_name, arguments) = argv.split_first().expect("fixture command name");
+    let command_name = std::str::from_utf8(command_name).expect("fixture command name is UTF-8");
+    let mut command = ::redis::cmd(command_name);
+    for argument in arguments {
+        command.arg(argument);
+    }
+    let result = tokio::time::timeout(TIMEOUT, command.query_async::<::redis::Value>(connection))
+        .await
+        .unwrap_or_else(|_| panic!("fixture command timed out"));
+    result.unwrap_or_else(|_| panic!("fixture command failed"));
 }
 
 fn argv(parts: &[&str]) -> Vec<Vec<u8>> {
@@ -164,20 +186,21 @@ async fn inspect(
         .await
 }
 
-async fn seed_representative_dataset(session: &RedisSession) -> Vec<u8> {
-    execute(session, 1, argv(&["FLUSHDB"])).await;
+async fn seed_representative_dataset(
+    fixture_admin: &mut ::redis::aio::ConnectionManager,
+) -> Vec<u8> {
+    fixture_execute(fixture_admin, argv(&["FLUSHDB"])).await;
 
     let mut mset = vec![b"MSET".to_vec()];
     for index in 0..160 {
         mset.push(format!("p5:scan:{index:03}").into_bytes());
         mset.push(format!("value-{index:03}").into_bytes());
     }
-    execute(session, 2, mset).await;
+    fixture_execute(fixture_admin, mset).await;
 
     let binary_key = vec![b'p', b'5', b':', b'b', b'i', b'n', b':', 0xff];
-    execute(
-        session,
-        3,
+    fixture_execute(
+        fixture_admin,
         vec![
             b"SET".to_vec(),
             binary_key.clone(),
@@ -190,51 +213,44 @@ async fn seed_representative_dataset(session: &RedisSession) -> Vec<u8> {
         b'x',
         MAX_REDIS_KEY_BYTES + 1 - oversize_key.len(),
     ));
-    execute(
-        session,
-        4,
+    fixture_execute(
+        fixture_admin,
         vec![b"SET".to_vec(), oversize_key, b"not-selectable".to_vec()],
     )
     .await;
 
-    execute(session, 5, argv(&["SET", "p5:string", "hello"])).await;
-    execute(
-        session,
-        6,
+    fixture_execute(fixture_admin, argv(&["SET", "p5:string", "hello"])).await;
+    fixture_execute(
+        fixture_admin,
         argv(&[
             "HSET", "p5:hash", "field-a", "value-a", "field-b", "value-b",
         ]),
     )
     .await;
-    execute(
-        session,
-        7,
+    fixture_execute(
+        fixture_admin,
         argv(&["RPUSH", "p5:list", "alpha", "beta", "gamma"]),
     )
     .await;
-    execute(
-        session,
-        8,
+    fixture_execute(
+        fixture_admin,
         argv(&["SADD", "p5:set", "alpha", "beta", "gamma"]),
     )
     .await;
-    execute(
-        session,
-        9,
+    fixture_execute(
+        fixture_admin,
         argv(&["ZADD", "p5:zset", "1.25", "alpha", "2.5", "beta"]),
     )
     .await;
-    execute(
-        session,
-        10,
+    fixture_execute(
+        fixture_admin,
         argv(&["XADD", "p5:stream", "*", "field", "value"]),
     )
     .await;
-    execute(session, 11, argv(&["SET", "p5:ttl", "expires"])).await;
-    execute(session, 12, argv(&["PEXPIRE", "p5:ttl", "120000"])).await;
-    execute(
-        session,
-        13,
+    fixture_execute(fixture_admin, argv(&["SET", "p5:ttl", "expires"])).await;
+    fixture_execute(fixture_admin, argv(&["PEXPIRE", "p5:ttl", "120000"])).await;
+    fixture_execute(
+        fixture_admin,
         argv(&[
             "EVAL",
             "return redis.call('SET', KEYS[1], string.rep('x', 70000))",
@@ -254,6 +270,7 @@ struct RedisMeasurements {
 
 async fn assert_scan_and_inspection(
     session: &RedisSession,
+    fixture_admin: &mut ::redis::aio::ConnectionManager,
     binary_key: &[u8],
     evidence: &mut LiveEvidence,
 ) -> RedisMeasurements {
@@ -373,13 +390,13 @@ async fn assert_scan_and_inspection(
 
     let mutation_readback = evidence.begin("redis.mutation.readback");
     let mut mutation_readbacks = 0_usize;
-    execute(session, 405, argv(&["SET", "p5:mutation", "before"])).await;
+    fixture_execute(fixture_admin, argv(&["SET", "p5:mutation", "before"])).await;
     let before = inspect(session, 406, b"p5:mutation".to_vec())
         .await
         .expect("mutation before");
     assert!(matches!(&before.items[0], Cell::Text(value) if value == "before"));
     mutation_readbacks += 1;
-    execute(session, 407, argv(&["SET", "p5:mutation", "after"])).await;
+    fixture_execute(fixture_admin, argv(&["SET", "p5:mutation", "after"])).await;
     let after = inspect(session, 408, b"p5:mutation".to_vec())
         .await
         .expect("mutation after");
@@ -405,6 +422,16 @@ fn assert_classifier_without_command(evidence: &mut LiveEvidence) {
         5,
     )
     .expect_err("blocking Redis family must be rejected before session acquisition");
+    assert_eq!(rejected, ExecutionTargetError::RedisCommandDenied);
+    let rejected = extract_and_validate_target(
+        "SET p5:denied value",
+        0,
+        None,
+        ExecutionLanguage::Redis,
+        100,
+        5,
+    )
+    .expect_err("Redis mutation must be rejected before session acquisition");
     assert_eq!(rejected, ExecutionTargetError::RedisCommandDenied);
     let attempts = transport_attempt_counts();
     assert_eq!(attempts.plaintext, 0);
@@ -979,15 +1006,17 @@ async fn redis_live_receipt() {
     let session = RedisSession::connect(&profile, Some(&secret), TIMEOUT)
         .await
         .expect("authenticated plaintext Redis fixture");
-    let binary_key = seed_representative_dataset(&session).await;
-    let measurements = assert_scan_and_inspection(&session, &binary_key, &mut evidence).await;
+    let mut fixture_admin = connect_fixture_admin(&fixture).await;
+    let binary_key = seed_representative_dataset(&mut fixture_admin).await;
+    let measurements =
+        assert_scan_and_inspection(&session, &mut fixture_admin, &binary_key, &mut evidence).await;
 
     let auth_failures = assert_auth_matrix(&fixture, &mut evidence).await;
     let (plaintext_fallback_attempts, required_tls_attempts, tls_recovery_attempts) =
         assert_tls_verification_and_no_fallback(&fixture, &mut evidence).await;
     let cli_operations = assert_cli_round_trip(&fixture, &binary_key, &mut evidence);
 
-    execute(&session, 999, argv(&["FLUSHDB"])).await;
+    fixture_execute(&mut fixture_admin, argv(&["FLUSHDB"])).await;
     evidence
         .measure("auth_failures", auth_failures)
         .expect("Redis auth failure count");
