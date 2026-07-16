@@ -23,15 +23,16 @@ use crate::drivers::mysql_catalog::{
 use crate::drivers::{ConnectedResources, DriverError, Session};
 use crate::execution::{
     ExecutionLanguage, ExecutionTarget, ExecutionTargetError, ValidatedExecutionTarget,
-    extract_and_validate_target,
+    classify_execution_kind, extract_and_validate_target,
 };
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionDraft, ConnectionProfile, CredentialMode, DraftId,
-    DriverAvailability, DriverCapabilities, DriverKind, ExecuteRequest, OperationId,
-    PreparedMySqlRequest, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
-    QueryLanguage, QueryResult, RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage,
-    RedisScanRequest, RedisValuePreview, RequestIdentity, RequestValidationError, ResultId,
-    ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
+    DriverAvailability, DriverCapabilities, DriverKind, ExecuteRequest, OperationId, OperationKind,
+    PreparedMySqlRequest, ProfileAccess, ProfileFieldId, ProfileGeneration, ProfileId,
+    ProfileSafetyPosture, PublicCode, PublicSummary, QueryLanguage, QueryResult,
+    RedisExecuteRequest, RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview,
+    RequestIdentity, RequestValidationError, ResultId, ResultProvenance, ResultRetentionPolicy,
+    ResultSnapshot, SessionGeneration, TlsMode,
 };
 use crate::secrets::{
     EnvironmentAvailability, ReplacementSecretBuffer, SecretError, SessionSecret,
@@ -80,6 +81,8 @@ pub enum ServiceError {
     },
     #[error("the request is invalid")]
     InvalidRequest { code: PublicCode },
+    #[error("profile access does not allow this operation")]
+    ReadOnlyProfile { code: PublicCode },
     #[error("row limit must be between 1 and 10000")]
     InvalidRowLimit,
     #[error(transparent)]
@@ -140,6 +143,10 @@ impl fmt::Debug for ServiceError {
                 .debug_struct("InvalidRequest")
                 .field("code", code)
                 .finish(),
+            Self::ReadOnlyProfile { code } => formatter
+                .debug_struct("AccessAdmissionRejected")
+                .field("code", code)
+                .finish(),
             Self::InvalidRowLimit => formatter.write_str("InvalidRowLimit"),
             Self::InvalidProfile(error) => formatter
                 .debug_tuple("InvalidProfile")
@@ -188,6 +195,7 @@ impl ServiceError {
         let code = match self {
             Self::InvalidProfile(ProfileValidationError::Field { code, .. })
             | Self::InvalidRequest { code }
+            | Self::ReadOnlyProfile { code }
             | Self::DraftCredentialRequired { code, .. } => *code,
             Self::ProfileIdConflict { .. } => PublicCode::ProfileIdConflict,
             Self::ProfileStale { .. } => PublicCode::ProfileStale,
@@ -255,6 +263,7 @@ impl ServiceError {
             Self::Driver(error) if error.is_mysql_permission_denied() => {
                 PublicSummary::PermissionDenied
             }
+            Self::ReadOnlyProfile { .. } => PublicSummary::PermissionDenied,
             Self::Driver(error) if error.is_mysql_authentication_failed() => {
                 PublicSummary::AuthenticationFailed
             }
@@ -973,6 +982,7 @@ struct ObservedMutationOutcome {
     loaded: LoadedConfig,
     migration_backup: Option<PathBuf>,
     affected_profile_id: Option<String>,
+    affected_profile_instance_id: Option<crate::model::ProfileInstanceId>,
 }
 
 impl ApplicationService {
@@ -1210,50 +1220,63 @@ impl ApplicationService {
         let outcome = {
             let state = self.state.read().await;
             let observed = &state.observed;
-            let previous = observed
-                .config
-                .profiles
-                .iter()
-                .map(|profile| (ProfileId(profile.id.clone()), profile))
-                .collect::<HashMap<_, _>>();
-            let next = loaded
-                .config
-                .profiles
-                .iter()
-                .map(|profile| (ProfileId(profile.id.clone()), profile))
-                .collect::<HashMap<_, _>>();
-            let mut outcome = ReloadConfigurationOutcome::default();
-            for (profile_id, profile) in &next {
-                match previous.get(profile_id) {
-                    Some(previous_profile) if *previous_profile == *profile => {
-                        outcome.unchanged.push(profile_id.clone());
-                    }
-                    Some(_) => {
-                        if let Some(generation) = observed.generations.get(profile_id).copied() {
-                            outcome.changed.push((profile_id.clone(), generation));
+            if !preserves_profile_instance_bindings(&observed.config, &loaded.config) {
+                None
+            } else {
+                let previous = observed
+                    .config
+                    .profiles
+                    .iter()
+                    .map(|profile| (ProfileId(profile.id.clone()), profile))
+                    .collect::<HashMap<_, _>>();
+                let next = loaded
+                    .config
+                    .profiles
+                    .iter()
+                    .map(|profile| (ProfileId(profile.id.clone()), profile))
+                    .collect::<HashMap<_, _>>();
+                let mut outcome = ReloadConfigurationOutcome::default();
+                for (profile_id, profile) in &next {
+                    match previous.get(profile_id) {
+                        Some(previous_profile) if *previous_profile == *profile => {
+                            outcome.unchanged.push(profile_id.clone());
                         }
+                        Some(_) => {
+                            if let Some(generation) = observed.generations.get(profile_id).copied()
+                            {
+                                outcome.changed.push((profile_id.clone(), generation));
+                            }
+                        }
+                        None => outcome.added.push(profile_id.clone()),
                     }
-                    None => outcome.added.push(profile_id.clone()),
                 }
-            }
-            for profile_id in previous.keys() {
-                if !next.contains_key(profile_id)
-                    && let Some(generation) = observed.generations.get(profile_id).copied()
-                {
-                    outcome.removed.push((profile_id.clone(), generation));
+                for profile_id in previous.keys() {
+                    if !next.contains_key(profile_id)
+                        && let Some(generation) = observed.generations.get(profile_id).copied()
+                    {
+                        outcome.removed.push((profile_id.clone(), generation));
+                    }
                 }
+                outcome
+                    .unchanged
+                    .sort_by(|left, right| left.0.cmp(&right.0));
+                outcome.added.sort_by(|left, right| left.0.cmp(&right.0));
+                outcome
+                    .changed
+                    .sort_by(|left, right| left.0.0.cmp(&right.0.0));
+                outcome
+                    .removed
+                    .sort_by(|left, right| left.0.0.cmp(&right.0.0));
+                Some(outcome)
             }
-            outcome
-                .unchanged
-                .sort_by(|left, right| left.0.cmp(&right.0));
-            outcome.added.sort_by(|left, right| left.0.cmp(&right.0));
-            outcome
-                .changed
-                .sort_by(|left, right| left.0.0.cmp(&right.0.0));
-            outcome
-                .removed
-                .sort_by(|left, right| left.0.0.cmp(&right.0.0));
-            outcome
+        };
+        let Some(outcome) = outcome else {
+            let cleanup = self.enter_config_uncertain_deferred().await;
+            return Ok(RuntimeReloadOutcome {
+                diff: None,
+                cleanup,
+                config_uncertain: true,
+            });
         };
         let cleanup = self.replace_loaded_config(loaded).await;
         self.config_uncertain.store(false, Ordering::Release);
@@ -1571,8 +1594,29 @@ impl ApplicationService {
                 .await);
         }
         expected_profile.id.clone_from(&affected_profile_id.0);
-        if observed_profile(&outcome.loaded.config, &affected_profile_id) != Some(&expected_profile)
-        {
+        let Some(observed) = observed_profile(&outcome.loaded.config, &affected_profile_id) else {
+            return Err(self
+                .runtime_mutation_failure(ServiceError::ConfigUncertain)
+                .await);
+        };
+        let Some(expected_instance_id) = outcome.affected_profile_instance_id else {
+            return Err(self
+                .runtime_mutation_failure(ServiceError::ConfigUncertain)
+                .await);
+        };
+        let Some(expected_safety) = expected_profile.safety.classify_new(expected_instance_id)
+        else {
+            return Err(self
+                .runtime_mutation_failure(ServiceError::ConfigUncertain)
+                .await);
+        };
+        if observed.safety != expected_safety {
+            return Err(self
+                .runtime_mutation_failure(ServiceError::ConfigUncertain)
+                .await);
+        }
+        expected_profile.safety = expected_safety;
+        if observed != &expected_profile {
             return Err(self
                 .runtime_mutation_failure(ServiceError::ConfigUncertain)
                 .await);
@@ -1668,7 +1712,21 @@ impl ApplicationService {
             self.session_secrets.has_current(&request.profile_id)?,
         )
         .map_err(|_| invalid_session_intent_error())?;
-        let updated = ConnectionProfile::from_draft(request.profile_id.0.clone(), request.draft);
+        let mut updated =
+            ConnectionProfile::from_draft(request.profile_id.0.clone(), request.draft);
+        if matches!(
+            expected_profile.safety,
+            ProfileSafetyPosture::Classified { .. }
+        ) {
+            updated.safety = updated
+                .safety
+                .preserve_classified_identity(expected_profile.safety)
+                .ok_or_else(|| {
+                    ServiceError::InvalidProfile(ProfileValidationError::field(
+                        ProfileFieldId::ConnectionId,
+                    ))
+                })?;
+        }
         let keep_secret = matches!(&request.secret_update, SessionSecretUpdate::Keep);
         let secret_preserves_connection = match updated.credential_mode {
             CredentialMode::Session => keep_secret,
@@ -1991,7 +2049,7 @@ impl ApplicationService {
         request: &ExecuteRequest,
     ) -> Result<TypedExecuteRequest, ServiceError> {
         self.ensure_config_certain()?;
-        let target = validate_execute_target(request)?;
+        let (execution_language, target) = validate_execute_target(request)?;
         let (profile, generation) = self.profile_with_generation(&request.profile_id).await?;
         if generation != request.profile_generation {
             return Err(ServiceError::ProfileStale {
@@ -2003,6 +2061,13 @@ impl ApplicationService {
             return Err(ServiceError::LanguageMismatch {
                 driver: profile.driver,
                 actual: request.language,
+            });
+        }
+        if classify_execution_kind(execution_language, &target) == OperationKind::ExecuteMutation
+            && profile.safety.effective_access() == ProfileAccess::ReadOnly
+        {
+            return Err(ServiceError::ReadOnlyProfile {
+                code: PublicCode::ReadOnlyProfile,
             });
         }
         let identity = RequestIdentity::new(
@@ -2339,6 +2404,7 @@ impl ApplicationService {
             observation,
             migration_backup,
             affected_profile_id,
+            affected_profile_instance_id,
         } = outcome;
         match observation {
             PostCommitObservation::Observed(loaded) => Ok(ObservedMutationOutcome {
@@ -2346,13 +2412,16 @@ impl ApplicationService {
                 loaded,
                 migration_backup,
                 affected_profile_id,
+                affected_profile_instance_id,
             }),
             PostCommitObservation::Failed(error) => {
                 let cleanup = self.enter_config_uncertain_deferred().await;
-                Err(RuntimeMutationFailure {
-                    error: ServiceError::PostCommitObservation(error),
-                    cleanup,
-                })
+                let error = if error.identity_binding_changed() {
+                    ServiceError::ConfigUncertain
+                } else {
+                    ServiceError::PostCommitObservation(error)
+                };
+                Err(RuntimeMutationFailure { error, cleanup })
             }
         }
     }
@@ -2625,6 +2694,9 @@ impl ApplicationService {
         let (previous_profiles, previous_generations, mut tombstones, previous_sessions) = {
             let state = self.state.read().await;
             let observed = &state.observed;
+            if !preserves_profile_instance_bindings(&observed.config, &config) {
+                return Err(ServiceError::ConfigUncertain);
+            }
             (
                 observed
                     .config
@@ -2719,7 +2791,7 @@ impl ApplicationService {
             let mut state = self.state.write().await;
             state.observed = ObservedState {
                 config,
-                source_version: ConfigSourceVersion::V2,
+                source_version: ConfigSourceVersion::V3,
                 generations,
                 tombstones,
             };
@@ -3019,7 +3091,9 @@ impl TypedExecuteRequest {
     }
 }
 
-fn validate_execute_target(request: &ExecuteRequest) -> Result<ExecutionTarget, ServiceError> {
+fn validate_execute_target(
+    request: &ExecuteRequest,
+) -> Result<(ExecutionLanguage, ExecutionTarget), ServiceError> {
     let language = match request.language {
         QueryLanguage::Sql => ExecutionLanguage::MySql,
         QueryLanguage::RedisCommand => ExecutionLanguage::Redis,
@@ -3043,7 +3117,7 @@ fn validate_execute_target(request: &ExecuteRequest) -> Result<ExecutionTarget, 
         request.row_limit,
         timeout_seconds,
     )
-    .map(ValidatedExecutionTarget::into_target)
+    .map(|target| (language, ValidatedExecutionTarget::into_target(target)))
     .map_err(execution_target_error)
 }
 
@@ -3225,10 +3299,22 @@ pub fn validate_persisted_profile(
 
 pub fn validate_config_identity(config: &Config) -> Result<(), ProfileValidationError> {
     let mut profile_ids = HashSet::with_capacity(config.profiles.len());
+    let mut instance_ids = HashSet::with_capacity(config.profiles.len());
     for profile in &config.profiles {
         validate_profile_id(&profile.id)?;
         if !profile_ids.insert(profile.id.as_str()) {
             return Err(ProfileValidationError::field(ProfileFieldId::ConnectionId));
+        }
+        match profile.safety {
+            ProfileSafetyPosture::Classified { instance_id, .. } => {
+                if !instance_ids.insert(instance_id) {
+                    return Err(ProfileValidationError::field(ProfileFieldId::ConnectionId));
+                }
+            }
+            ProfileSafetyPosture::UnclassifiedLegacy { .. } => {}
+            ProfileSafetyPosture::New { .. } => {
+                return Err(ProfileValidationError::field(ProfileFieldId::ConnectionId));
+            }
         }
     }
     Ok(())
@@ -3236,10 +3322,10 @@ pub fn validate_config_identity(config: &Config) -> Result<(), ProfileValidation
 
 pub fn validate_config_mutation(mutation: &ConfigMutation) -> Result<(), ProfileValidationError> {
     match mutation {
-        ConfigMutation::Create(profile) => validate_strict_persisted_profile(profile),
+        ConfigMutation::Create(profile) => validate_new_profile(profile),
         ConfigMutation::CreateAuto { base_id, profile } => {
             validate_profile_id(base_id)?;
-            validate_strict_persisted_profile(profile)
+            validate_new_profile(profile)
         }
         ConfigMutation::UpdateChecked {
             profile_id,
@@ -3250,7 +3336,16 @@ pub fn validate_config_mutation(mutation: &ConfigMutation) -> Result<(), Profile
             if expected_profile.id != *profile_id || profile.id != *profile_id {
                 return Err(ProfileValidationError::field(ProfileFieldId::ConnectionId));
             }
-            validate_strict_persisted_profile(profile)
+            validate_classified_profile_identity(expected_profile)?;
+            validate_connection_draft(&profile.as_draft())?;
+            if profile
+                .safety
+                .preserve_classified_identity(expected_profile.safety)
+                .is_none()
+            {
+                return Err(ProfileValidationError::field(ProfileFieldId::ConnectionId));
+            }
+            Ok(())
         }
         ConfigMutation::DeleteChecked {
             profile_id,
@@ -3260,20 +3355,35 @@ pub fn validate_config_mutation(mutation: &ConfigMutation) -> Result<(), Profile
             if expected_profile.id != *profile_id {
                 return Err(ProfileValidationError::field(ProfileFieldId::ConnectionId));
             }
-            Ok(())
+            validate_classified_profile_identity(expected_profile)
         }
     }
 }
 
-fn validate_strict_persisted_profile(
+fn validate_new_profile(profile: &ConnectionProfile) -> Result<(), ProfileValidationError> {
+    validate_profile_id(&profile.id)?;
+    validate_connection_draft(&profile.as_draft())?;
+    if !matches!(profile.safety, ProfileSafetyPosture::New { .. }) {
+        return Err(ProfileValidationError::field(ProfileFieldId::ConnectionId));
+    }
+    Ok(())
+}
+
+fn validate_classified_profile_identity(
     profile: &ConnectionProfile,
 ) -> Result<(), ProfileValidationError> {
     validate_profile_id(&profile.id)?;
-    validate_connection_draft(&profile.as_draft())
+    if !matches!(profile.safety, ProfileSafetyPosture::Classified { .. }) {
+        return Err(ProfileValidationError::field(ProfileFieldId::ConnectionId));
+    }
+    Ok(())
 }
 
 fn validate_profile_for_network(profile: &ConnectionProfile) -> Result<(), ProfileValidationError> {
     validate_persisted_profile(profile)?;
+    if matches!(profile.safety, ProfileSafetyPosture::New { .. }) {
+        return Err(ProfileValidationError::field(ProfileFieldId::ConnectionId));
+    }
     if profile.driver == DriverKind::Redis && profile.tls == TlsMode::Preferred {
         return Err(ProfileValidationError::Field {
             field: ProfileFieldId::RedisTlsMode,
@@ -3364,6 +3474,35 @@ fn observed_profile<'a>(
         .profiles
         .iter()
         .find(|profile| profile.id == profile_id.as_str())
+}
+
+fn preserves_profile_instance_bindings(previous: &Config, next: &Config) -> bool {
+    let previous_by_profile = previous
+        .profiles
+        .iter()
+        .filter_map(|profile| {
+            profile
+                .safety
+                .instance_id()
+                .map(|instance_id| (profile.id.as_str(), instance_id))
+        })
+        .collect::<HashMap<_, _>>();
+    let previous_by_instance = previous_by_profile
+        .iter()
+        .map(|(profile_id, instance_id)| (*instance_id, *profile_id))
+        .collect::<HashMap<_, _>>();
+
+    next.profiles.iter().all(|profile| {
+        let next_instance = profile.safety.instance_id();
+        !previous_by_profile
+            .get(profile.id.as_str())
+            .is_some_and(|previous_instance| Some(*previous_instance) != next_instance)
+            && next_instance.is_none_or(|instance_id| {
+                previous_by_instance
+                    .get(&instance_id)
+                    .is_none_or(|previous_profile_id| *previous_profile_id == profile.id)
+            })
+    })
 }
 
 fn same_keep_test_connection(profile: &ConnectionProfile, draft: &ConnectionDraft) -> bool {

@@ -187,7 +187,6 @@ impl MySqlExplorerState {
                 .corner_radius(egui::CornerRadius::ZERO)
                 .inner_margin(16)
                 .show(ui, |ui| {
-                    ui.set_min_width(300.0);
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new("MySQL catalog")

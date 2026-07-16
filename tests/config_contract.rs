@@ -597,6 +597,52 @@ fn post_rename_observation_failure_preserves_commit_classification_and_redacts_p
 }
 
 #[test]
+fn create_outcome_debug_redacts_generated_instance_id_and_profile_details() {
+    const CONFIG_PATH_SENTINEL: &str = "create-outcome-config-path-sentinel.toml";
+    const PROFILE_SENTINEL: &str = "create-outcome-profile-sentinel.invalid";
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join(CONFIG_PATH_SENTINEL);
+    assert!(!path.exists(), "create starts from a missing config");
+    let mut created = profile("debug-redaction");
+    created.host = PROFILE_SENTINEL.to_owned();
+
+    let outcome = ConfigWriter::default()
+        .mutate_path(
+            &path,
+            ConfigMutation::Create(created),
+            MigrationConsent::Cancelled,
+        )
+        .expect("missing config create writes v3");
+
+    let instance_id = outcome
+        .affected_profile_instance_id
+        .expect("create outcome carries the generated instance id")
+        .to_string();
+    assert_eq!(instance_id.len(), 32);
+    assert_eq!(instance_id, instance_id.to_ascii_lowercase());
+    assert!(instance_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(
+        load_path(&path)
+            .expect("created config reloads")
+            .source_version,
+        ConfigSourceVersion::V3
+    );
+
+    let debug = format!("{outcome:?}");
+    let config_path = path.display().to_string();
+    for forbidden in [
+        instance_id.as_str(),
+        config_path.as_str(),
+        CONFIG_PATH_SENTINEL,
+        PROFILE_SENTINEL,
+    ] {
+        assert!(!debug.contains(forbidden), "debug leaked {forbidden}");
+    }
+    assert!(debug.contains("<redacted>"), "debug={debug}");
+}
+
+#[test]
 fn migration_observation_rejects_strict_valid_all_profile_posture_and_identity_rewrite() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory

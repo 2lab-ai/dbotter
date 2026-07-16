@@ -19,7 +19,7 @@ fn config_contract_stdout_is_the_exact_three_field_object_and_is_pure() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("UTF-8 stdout"),
-        "{\"read_versions\":[1,2],\"write_version\":2,\"migration_backup_suffix\":\".v1.bak\"}\n"
+        "{\"read_versions\":[1,2,3],\"write_version\":3,\"migration_backup_suffixes\":{\"1\":\".v1.bak\",\"2\":\".v2.bak\"}}\n"
     );
     assert!(output.stderr.is_empty());
 }

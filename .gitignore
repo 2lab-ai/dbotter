@@ -4,3 +4,4 @@
 /artifacts/.receipt*.tmp
 /artifacts/redis-tls/
 .DS_Store
+__pycache__/

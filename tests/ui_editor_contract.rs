@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use dbotter::execution::ExecutionTargetError;
 use dbotter::model::{
     ConnectionProfile, CredentialMode, DriverAvailability, DriverKind, OperationId, OperationKind,
-    ProfileGeneration, ProfileId, QueryLanguage, RedisTlsConfig, TlsMode,
+    ProfileAccess, ProfileEnvironment, ProfileGeneration, ProfileId, ProfileSafetyPosture,
+    QueryLanguage, RedisTlsConfig, TlsMode,
 };
 use dbotter::ui::{
     EditorCursor, EditorIntent, EditorSurface, EditorValidationError, ProfileSnapshot, UiCommand,
@@ -34,6 +35,10 @@ fn profile(
         port,
         database: database.map(str::to_owned),
         username: None,
+        safety: ProfileSafetyPosture::new(
+            ProfileEnvironment::Development,
+            ProfileAccess::ReadWrite,
+        ),
         tls,
         credential_mode: CredentialMode::None,
         secret_env: None,

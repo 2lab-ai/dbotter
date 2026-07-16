@@ -60,29 +60,23 @@ pub fn classify_execution_kind(
 }
 
 fn mysql_is_clearly_read_only(text: &str) -> bool {
-    let uppercase = text.to_ascii_uppercase();
-    let keyword = uppercase
-        .trim_start()
-        .chars()
-        .take_while(|character| character.is_ascii_alphabetic())
-        .collect::<String>();
-    if !matches!(
-        keyword.as_str(),
-        "SELECT" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
-    ) {
+    // D1 has no mode-aware parser or catalog proof yet. Admit only a closed
+    // literal probe that cannot name a table, view, routine, UDF, or loadable
+    // function. D3 replaces this seam with the full capability-backed parser.
+    if !text.is_ascii() {
         return false;
     }
-    ![
-        " INTO OUTFILE",
-        " INTO DUMPFILE",
-        " FOR UPDATE",
-        " LOCK IN SHARE MODE",
-        "GET_LOCK(",
-        "RELEASE_LOCK(",
-        "SLEEP(",
-    ]
-    .iter()
-    .any(|side_effect| uppercase.contains(side_effect))
+    let text = text.trim();
+    let text = text.strip_suffix(';').unwrap_or(text).trim_end();
+    let bytes = text.as_bytes();
+    if bytes.len() <= b"SELECT".len()
+        || !bytes[..b"SELECT".len()].eq_ignore_ascii_case(b"SELECT")
+        || !bytes[b"SELECT".len()].is_ascii_whitespace()
+    {
+        return false;
+    }
+    let literal = text[b"SELECT".len()..].trim();
+    !literal.is_empty() && literal.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn redis_is_clearly_read_only(arguments: &[String]) -> bool {

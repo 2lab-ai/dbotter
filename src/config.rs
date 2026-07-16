@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -6,13 +7,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use serde::{Deserialize, Serialize};
+use serde::ser::Error as _;
+use serde::{Deserialize, Serialize, Serializer};
+use sha2::{Digest as _, Sha256};
 
-use crate::model::{ConnectionProfile, CredentialMode, RedisTlsConfig};
+use crate::model::{
+    ConnectionProfile, CredentialMode, LegacyConfigVersion, ProfileAccess, ProfileEnvironment,
+    ProfileInstanceId, ProfileSafetyPosture, RedisTlsConfig,
+};
 
 pub const CONFIG_ENV: &str = "DBOTTER_CONFIG";
-pub const CURRENT_CONFIG_VERSION: u32 = 2;
-pub const MIGRATION_BACKUP_SUFFIX: &str = ".v1.bak";
+pub const CURRENT_CONFIG_VERSION: u32 = 3;
+pub const V1_MIGRATION_BACKUP_SUFFIX: &str = ".v1.bak";
+pub const V2_MIGRATION_BACKUP_SUFFIX: &str = ".v2.bak";
+pub const MIGRATION_BACKUP_SUFFIX: &str = V1_MIGRATION_BACKUP_SUFFIX;
+
+const MIGRATION_DOCUMENT_MAX_BYTES: usize = 1024 * 1024;
+const PROFILE_INSTANCE_ID_GENERATION_ATTEMPTS: usize = 16;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROCESS_WRITER: OnceLock<Mutex<()>> = OnceLock::new();
@@ -37,6 +48,12 @@ pub enum ConfigError {
     NoConfigPath,
     #[error("version 1 migration must be confirmed")]
     MigrationConfirmationRequired { backup: PathBuf },
+    #[error("legacy profiles require explicit version 3 posture classification")]
+    MigrationPostureRequired,
+    #[error("migration posture document is invalid")]
+    InvalidMigrationDocument,
+    #[error("migration posture document exceeds its byte limit")]
+    MigrationDocumentTooLarge { limit: usize, actual: usize },
     #[error("migration backup already exists with different contents")]
     BackupConflict { path: PathBuf },
     #[error("profile already exists")]
@@ -49,6 +66,8 @@ pub enum ConfigError {
     ExternalChange,
     #[error("configuration contains an invalid profile")]
     InvalidProfile,
+    #[error("secure profile identity generation failed")]
+    EntropyUnavailable,
     #[error("configuration mutation failed before commit at {stage:?}")]
     NotCommitted {
         stage: MutationFailpoint,
@@ -74,6 +93,13 @@ impl fmt::Debug for ConfigError {
             Self::MigrationConfirmationRequired { .. } => {
                 formatter.write_str("MigrationConfirmationRequired(<redacted>)")
             }
+            Self::MigrationPostureRequired => formatter.write_str("MigrationPostureRequired"),
+            Self::InvalidMigrationDocument => formatter.write_str("InvalidMigrationDocument"),
+            Self::MigrationDocumentTooLarge { limit, actual } => formatter
+                .debug_struct("MigrationDocumentTooLarge")
+                .field("limit", limit)
+                .field("actual", actual)
+                .finish(),
             Self::BackupConflict { .. } => formatter.write_str("BackupConflict(<redacted>)"),
             Self::ProfileAlreadyExists(_) => {
                 formatter.write_str("ProfileAlreadyExists(<redacted>)")
@@ -82,6 +108,7 @@ impl fmt::Debug for ConfigError {
             Self::ImmutableProfileId => formatter.write_str("ImmutableProfileId"),
             Self::ExternalChange => formatter.write_str("ExternalChange"),
             Self::InvalidProfile => formatter.write_str("InvalidProfile"),
+            Self::EntropyUnavailable => formatter.write_str("EntropyUnavailable"),
             Self::NotCommitted { stage, .. } => formatter
                 .debug_struct("NotCommitted")
                 .field("stage", stage)
@@ -92,11 +119,27 @@ impl fmt::Debug for ConfigError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub version: u32,
-    #[serde(default)]
     pub profiles: Vec<ConnectionProfile>,
+}
+
+impl Serialize for Config {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.version {
+            2 => ConfigV2Wire::from_config(self).serialize(serializer),
+            CURRENT_CONFIG_VERSION => ConfigV3Wire::try_from_config(self)
+                .map_err(S::Error::custom)?
+                .serialize(serializer),
+            version => Err(S::Error::custom(format_args!(
+                "unsupported config version {version}"
+            ))),
+        }
+    }
 }
 
 impl Default for Config {
@@ -113,6 +156,31 @@ pub enum ConfigSourceVersion {
     Missing,
     V1,
     V2,
+    V3,
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
+pub struct MigrationPlan {
+    pub source_version: u32,
+    pub config_fingerprint: String,
+    pub profiles: Vec<MigrationProfileSummary>,
+}
+
+impl fmt::Debug for MigrationPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MigrationPlan")
+            .field("source_version", &self.source_version)
+            .field("config_fingerprint", &"<redacted>")
+            .field("profile_count", &self.profiles.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
+pub struct MigrationProfileSummary {
+    pub profile_id: String,
+    pub endpoint: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -187,11 +255,16 @@ pub struct PostCommitObservationError {
     commit_state: CommitState,
     #[source]
     source: ConfigError,
+    identity_binding_changed: bool,
 }
 
 impl PostCommitObservationError {
     pub const fn commit_state(&self) -> CommitState {
         self.commit_state
+    }
+
+    pub(crate) const fn identity_binding_changed(&self) -> bool {
+        self.identity_binding_changed
     }
 }
 
@@ -228,6 +301,7 @@ pub struct MutationOutcome {
     pub observation: PostCommitObservation,
     pub migration_backup: Option<PathBuf>,
     pub affected_profile_id: Option<String>,
+    pub affected_profile_instance_id: Option<ProfileInstanceId>,
 }
 
 impl std::fmt::Debug for MutationOutcome {
@@ -241,6 +315,13 @@ impl std::fmt::Debug for MutationOutcome {
                 &self.migration_backup.as_ref().map(|_| "<available>"),
             )
             .field("affected_profile_id", &self.affected_profile_id)
+            .field(
+                "affected_profile_instance_id",
+                &self
+                    .affected_profile_instance_id
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -265,6 +346,19 @@ pub trait MutationFaultInjector: Send + Sync {
     fn check(&self, point: MutationFailpoint, path: &Path) -> std::io::Result<()>;
 }
 
+pub trait ProfileInstanceIdGenerator: Send + Sync {
+    fn generate(&self) -> Option<ProfileInstanceId>;
+}
+
+#[derive(Default)]
+struct SecureProfileInstanceIdGenerator;
+
+impl ProfileInstanceIdGenerator for SecureProfileInstanceIdGenerator {
+    fn generate(&self) -> Option<ProfileInstanceId> {
+        ProfileInstanceId::generate().ok()
+    }
+}
+
 #[derive(Default)]
 struct NoFaults;
 
@@ -281,19 +375,211 @@ impl MutationFaultInjector for NoFaults {
 /// race after the recheck and before rename.
 pub struct ConfigWriter {
     faults: Arc<dyn MutationFaultInjector>,
+    profile_instance_ids: Arc<dyn ProfileInstanceIdGenerator>,
+}
+
+struct ObservationIdentityGuard {
+    stable_bindings: HashMap<ProfileInstanceId, String>,
+    stable_profile_instances: HashMap<String, ProfileInstanceId>,
+    deleted_instance_id: Option<ProfileInstanceId>,
+}
+
+struct MainObservationFailure {
+    source: ConfigError,
+    identity_binding_changed: bool,
+}
+
+impl MainObservationFailure {
+    const fn generic(source: ConfigError) -> Self {
+        Self {
+            source,
+            identity_binding_changed: false,
+        }
+    }
+
+    const fn identity_binding_changed(source: ConfigError) -> Self {
+        Self {
+            source,
+            identity_binding_changed: true,
+        }
+    }
+}
+
+impl ObservationIdentityGuard {
+    fn for_mutation(config: &Config, mutation: &ConfigMutation) -> Self {
+        let stable_bindings = config
+            .profiles
+            .iter()
+            .filter_map(|profile| {
+                profile
+                    .safety
+                    .instance_id()
+                    .map(|instance_id| (instance_id, profile.id.clone()))
+            })
+            .collect();
+        let stable_profile_instances = config
+            .profiles
+            .iter()
+            .filter_map(|profile| {
+                profile
+                    .safety
+                    .instance_id()
+                    .map(|instance_id| (profile.id.clone(), instance_id))
+            })
+            .collect();
+        let deleted_instance_id = match mutation {
+            ConfigMutation::DeleteChecked { profile_id, .. } => config
+                .profiles
+                .iter()
+                .find(|profile| profile.id == *profile_id)
+                .and_then(|profile| profile.safety.instance_id()),
+            ConfigMutation::Create(_)
+            | ConfigMutation::CreateAuto { .. }
+            | ConfigMutation::UpdateChecked { .. } => None,
+        };
+        Self {
+            stable_bindings,
+            stable_profile_instances,
+            deleted_instance_id,
+        }
+    }
+
+    fn validate(&self, observed: &Config) -> Result<(), ConfigError> {
+        for profile in &observed.profiles {
+            let Some(instance_id) = profile.safety.instance_id() else {
+                return Err(ConfigError::ExternalChange);
+            };
+            if self.deleted_instance_id == Some(instance_id)
+                || self
+                    .stable_bindings
+                    .get(&instance_id)
+                    .is_some_and(|profile_id| profile_id != &profile.id)
+                || self
+                    .stable_profile_instances
+                    .get(&profile.id)
+                    .is_some_and(|stable_instance_id| stable_instance_id != &instance_id)
+            {
+                return Err(ConfigError::ExternalChange);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for ConfigWriter {
     fn default() -> Self {
         Self {
             faults: Arc::new(NoFaults),
+            profile_instance_ids: Arc::new(SecureProfileInstanceIdGenerator),
         }
     }
 }
 
 impl ConfigWriter {
     pub fn with_fault_injector(faults: Arc<dyn MutationFaultInjector>) -> Self {
-        Self { faults }
+        Self {
+            faults,
+            profile_instance_ids: Arc::new(SecureProfileInstanceIdGenerator),
+        }
+    }
+
+    pub fn with_profile_instance_id_generator(
+        mut self,
+        generator: Arc<dyn ProfileInstanceIdGenerator>,
+    ) -> Self {
+        self.profile_instance_ids = generator;
+        self
+    }
+
+    pub fn migration_plan(&self, path: &Path) -> Result<MigrationPlan, ConfigError> {
+        let lock = PROCESS_WRITER.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().map_err(|_| ConfigError::WriterUnavailable)?;
+        let loaded = load_path(path)?;
+        validate_legacy_migration_source(&loaded)?;
+        let original = loaded
+            .original_bytes
+            .as_deref()
+            .ok_or(ConfigError::MigrationPostureRequired)?;
+        Ok(MigrationPlan {
+            source_version: migration_source_number(loaded.source_version)
+                .ok_or(ConfigError::MigrationPostureRequired)?,
+            config_fingerprint: migration_config_fingerprint(original),
+            profiles: loaded
+                .config
+                .profiles
+                .iter()
+                .map(|profile| MigrationProfileSummary {
+                    profile_id: profile.id.clone(),
+                    endpoint: profile.redacted_endpoint(),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn migrate_v3(
+        &self,
+        path: &Path,
+        posture_document: &[u8],
+    ) -> Result<MutationOutcome, ConfigError> {
+        let document = parse_migration_posture_document(posture_document)?;
+        let lock = PROCESS_WRITER.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().map_err(|_| ConfigError::WriterUnavailable)?;
+        let loaded = load_path(path)?;
+        validate_legacy_migration_source(&loaded)?;
+        let original = loaded
+            .original_bytes
+            .as_deref()
+            .ok_or(ConfigError::MigrationPostureRequired)?;
+        if migration_config_fingerprint(original) != document.config_fingerprint {
+            return Err(ConfigError::ExternalChange);
+        }
+        let mut assignments = migration_assignments(document, &loaded.config)?;
+        let mut config = loaded.config.clone();
+        let mut instance_ids = HashSet::with_capacity(config.profiles.len());
+        for profile in &mut config.profiles {
+            let assignment = assignments
+                .remove(&profile.id)
+                .ok_or(ConfigError::InvalidMigrationDocument)?;
+            let instance_id = generate_unique_profile_instance_id(
+                self.profile_instance_ids.as_ref(),
+                &mut instance_ids,
+            )?;
+            profile.safety = ProfileSafetyPosture::classified(
+                assignment.environment,
+                assignment.access,
+                instance_id,
+            );
+        }
+        if !assignments.is_empty() {
+            return Err(ConfigError::InvalidMigrationDocument);
+        }
+        config.version = CURRENT_CONFIG_VERSION;
+        validate_v3_profile_identities(&config)?;
+        crate::service::validate_config_identity(&config)
+            .map_err(|_| ConfigError::InvalidProfile)?;
+        let encoded = encode_config(&config)?;
+
+        let backup = migration_backup_path_for_source(path, loaded.source_version);
+        self.write_backup(&backup, original)?;
+        let mut state = self.write_main(path, &encoded, &loaded.fingerprint)?;
+        let observation = match self.observe_main(path, Some(&encoded), None) {
+            Ok(observed) => PostCommitObservation::Observed(observed),
+            Err(source) => {
+                state = CommitState::CommittedDurabilityUnknown;
+                PostCommitObservation::Failed(PostCommitObservationError {
+                    commit_state: state,
+                    source: source.source,
+                    identity_binding_changed: source.identity_binding_changed,
+                })
+            }
+        };
+        Ok(MutationOutcome {
+            state,
+            observation,
+            migration_backup: Some(backup),
+            affected_profile_id: None,
+            affected_profile_instance_id: None,
+        })
     }
 
     pub fn mutate_path(
@@ -305,25 +591,39 @@ impl ConfigWriter {
         let lock = PROCESS_WRITER.get_or_init(|| Mutex::new(()));
         let _guard = lock.lock().map_err(|_| ConfigError::WriterUnavailable)?;
         let loaded = load_path(path)?;
+        if loaded.migration_required {
+            return Err(ConfigError::MigrationPostureRequired);
+        }
         crate::service::validate_config_identity(&loaded.config)
             .map_err(|_| ConfigError::InvalidProfile)?;
         crate::service::validate_config_mutation(&mutation)
             .map_err(|_| ConfigError::InvalidProfile)?;
+        let observation_identity =
+            ObservationIdentityGuard::for_mutation(&loaded.config, &mutation);
         let backup = self.prepare_migration(path, &loaded, consent)?;
         let mut config = loaded.config.clone();
-        let affected_profile_id = apply_mutation(&mut config, mutation)?;
+        let affected_profile_id =
+            apply_mutation(&mut config, mutation, self.profile_instance_ids.as_ref())?;
         config.version = CURRENT_CONFIG_VERSION;
         crate::service::validate_config_identity(&config)
             .map_err(|_| ConfigError::InvalidProfile)?;
+        let affected_profile_instance_id = affected_profile_id.as_deref().and_then(|profile_id| {
+            config
+                .profiles
+                .iter()
+                .find(|profile| profile.id == profile_id)
+                .and_then(|profile| profile.safety.instance_id())
+        });
         let encoded = encode_config(&config)?;
         let mut state = self.write_main(path, &encoded, &loaded.fingerprint)?;
-        let observation = match self.observe_main(path) {
+        let observation = match self.observe_main(path, None, Some(&observation_identity)) {
             Ok(observed) => PostCommitObservation::Observed(observed),
             Err(source) => {
                 state = CommitState::CommittedDurabilityUnknown;
                 PostCommitObservation::Failed(PostCommitObservationError {
                     commit_state: state,
-                    source,
+                    source: source.source,
+                    identity_binding_changed: source.identity_binding_changed,
                 })
             }
         };
@@ -332,21 +632,37 @@ impl ConfigWriter {
             observation,
             migration_backup: backup,
             affected_profile_id,
+            affected_profile_instance_id,
         })
     }
 
-    fn observe_main(&self, path: &Path) -> Result<LoadedConfig, ConfigError> {
+    fn observe_main(
+        &self,
+        path: &Path,
+        expected_bytes: Option<&[u8]>,
+        identity_guard: Option<&ObservationIdentityGuard>,
+    ) -> Result<LoadedConfig, MainObservationFailure> {
         self.faults
             .check(MutationFailpoint::MainObservationLoad, path)
             .map_err(|source| ConfigError::Io {
                 path: path.to_owned(),
                 source,
-            })?;
-        let loaded = load_path(path)?;
+            })
+            .map_err(MainObservationFailure::generic)?;
+        let loaded = load_path(path).map_err(MainObservationFailure::generic)?;
         crate::service::validate_config_identity(&loaded.config)
-            .map_err(|_| ConfigError::InvalidProfile)?;
-        if loaded.source_version != ConfigSourceVersion::V2 {
-            return Err(ConfigError::ExternalChange);
+            .map_err(|_| ConfigError::InvalidProfile)
+            .map_err(MainObservationFailure::generic)?;
+        if loaded.source_version != ConfigSourceVersion::V3
+            || expected_bytes
+                .is_some_and(|expected| loaded.original_bytes.as_deref() != Some(expected))
+        {
+            return Err(MainObservationFailure::generic(ConfigError::ExternalChange));
+        }
+        if let Some(identity_guard) = identity_guard {
+            identity_guard
+                .validate(&loaded.config)
+                .map_err(MainObservationFailure::identity_binding_changed)?;
         }
         Ok(loaded)
     }
@@ -360,7 +676,7 @@ impl ConfigWriter {
         if !loaded.migration_required {
             return Ok(None);
         }
-        let backup = migration_backup_path(path);
+        let backup = migration_backup_path_for_source(path, loaded.source_version);
         if consent != MigrationConsent::Confirmed {
             return Err(ConfigError::MigrationConfirmationRequired { backup });
         }
@@ -559,16 +875,27 @@ fn open_backup_no_follow(path: &Path) -> std::io::Result<fs::File> {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ConfigContract {
-    pub read_versions: [u32; 2],
+    pub read_versions: [u32; 3],
     pub write_version: u32,
-    pub migration_backup_suffix: &'static str,
+    pub migration_backup_suffixes: MigrationBackupSuffixes,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MigrationBackupSuffixes {
+    #[serde(rename = "1")]
+    pub v1: &'static str,
+    #[serde(rename = "2")]
+    pub v2: &'static str,
 }
 
 pub const fn config_contract() -> ConfigContract {
     ConfigContract {
-        read_versions: [1, 2],
+        read_versions: [1, 2, 3],
         write_version: CURRENT_CONFIG_VERSION,
-        migration_backup_suffix: MIGRATION_BACKUP_SUFFIX,
+        migration_backup_suffixes: MigrationBackupSuffixes {
+            v1: V1_MIGRATION_BACKUP_SUFFIX,
+            v2: V2_MIGRATION_BACKUP_SUFFIX,
+        },
     }
 }
 
@@ -620,17 +947,26 @@ pub fn load_path(path: &Path) -> Result<LoadedConfig, ConfigError> {
     };
     let raw = std::str::from_utf8(&bytes).map_err(|_| ConfigError::InvalidUtf8)?;
     let header: VersionHeader = toml::from_str(raw)?;
-    let (config, source_version, migration_required) = match header.version {
+    let (mut config, source_version, migration_required) = match header.version {
         1 => {
             let wire: ConfigV1 = toml::from_str(raw)?;
             (normalize_v1(wire), ConfigSourceVersion::V1, true)
         }
+        2 => {
+            reject_v3_posture_fields_in_v2(raw)?;
+            let wire: ConfigV2Wire = toml::from_str(raw)?;
+            (wire.into_config(), ConfigSourceVersion::V2, true)
+        }
         CURRENT_CONFIG_VERSION => {
-            let config: Config = toml::from_str(raw)?;
-            (config, ConfigSourceVersion::V2, false)
+            validate_v3_document_shape(raw)?;
+            let wire: ConfigV3Wire = toml::from_str(raw)?;
+            let config = wire.into_config()?;
+            validate_v3_profile_identities(&config)?;
+            (config, ConfigSourceVersion::V3, false)
         }
         version => return Err(ConfigError::UnsupportedVersion(version)),
     };
+    config.version = CURRENT_CONFIG_VERSION;
     Ok(LoadedConfig {
         config,
         source_version,
@@ -649,17 +985,39 @@ pub fn mutate_path(
 }
 
 pub fn migration_backup_path(path: &Path) -> PathBuf {
+    migration_backup_path_for_source(path, ConfigSourceVersion::V1)
+}
+
+pub fn migration_backup_path_for_source(path: &Path, source: ConfigSourceVersion) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
-    value.push(MIGRATION_BACKUP_SUFFIX);
+    value.push(match source {
+        ConfigSourceVersion::V1 => V1_MIGRATION_BACKUP_SUFFIX,
+        ConfigSourceVersion::V2 => V2_MIGRATION_BACKUP_SUFFIX,
+        ConfigSourceVersion::Missing | ConfigSourceVersion::V3 => V1_MIGRATION_BACKUP_SUFFIX,
+    });
     PathBuf::from(value)
+}
+
+fn validate_v3_profile_identities(config: &Config) -> Result<(), ConfigError> {
+    let mut instance_ids = HashSet::with_capacity(config.profiles.len());
+    for profile in &config.profiles {
+        let Some(instance_id) = profile.safety.instance_id() else {
+            return Err(ConfigError::InvalidProfile);
+        };
+        if !instance_ids.insert(instance_id) {
+            return Err(ConfigError::InvalidProfile);
+        }
+    }
+    Ok(())
 }
 
 fn apply_mutation(
     config: &mut Config,
     mutation: ConfigMutation,
+    profile_instance_ids: &dyn ProfileInstanceIdGenerator,
 ) -> Result<Option<String>, ConfigError> {
     match mutation {
-        ConfigMutation::Create(profile) => {
+        ConfigMutation::Create(mut profile) => {
             if config
                 .profiles
                 .iter()
@@ -667,6 +1025,7 @@ fn apply_mutation(
             {
                 return Err(ConfigError::ProfileAlreadyExists(profile.id));
             }
+            classify_new_profile(config, &mut profile, profile_instance_ids)?;
             let profile_id = profile.id.clone();
             config.profiles.push(profile);
             Ok(Some(profile_id))
@@ -677,13 +1036,14 @@ fn apply_mutation(
         } => {
             let profile_id = allocate_profile_id(&base_id, &config.profiles);
             profile.id.clone_from(&profile_id);
+            classify_new_profile(config, &mut profile, profile_instance_ids)?;
             config.profiles.push(profile);
             Ok(Some(profile_id))
         }
         ConfigMutation::UpdateChecked {
             profile_id,
             expected_profile,
-            profile,
+            mut profile,
         } => {
             if profile.id != profile_id || expected_profile.id != profile_id {
                 return Err(ConfigError::ImmutableProfileId);
@@ -696,6 +1056,10 @@ fn apply_mutation(
             if *existing != expected_profile {
                 return Err(ConfigError::ExternalChange);
             }
+            profile.safety = profile
+                .safety
+                .preserve_classified_identity(expected_profile.safety)
+                .ok_or(ConfigError::InvalidProfile)?;
             *existing = profile;
             Ok(Some(profile_id))
         }
@@ -717,6 +1081,30 @@ fn apply_mutation(
             Ok(Some(profile_id))
         }
     }
+}
+
+fn classify_new_profile(
+    config: &Config,
+    profile: &mut ConnectionProfile,
+    profile_instance_ids: &dyn ProfileInstanceIdGenerator,
+) -> Result<(), ConfigError> {
+    for _ in 0..PROFILE_INSTANCE_ID_GENERATION_ATTEMPTS {
+        let candidate = profile_instance_ids
+            .generate()
+            .ok_or(ConfigError::EntropyUnavailable)?;
+        if config
+            .profiles
+            .iter()
+            .all(|existing| existing.safety.instance_id() != Some(candidate))
+        {
+            profile.safety = profile
+                .safety
+                .classify_new(candidate)
+                .ok_or(ConfigError::InvalidProfile)?;
+            return Ok(());
+        }
+    }
+    Err(ConfigError::EntropyUnavailable)
 }
 
 fn allocate_profile_id(base_id: &str, profiles: &[ConnectionProfile]) -> String {
@@ -843,6 +1231,454 @@ struct VersionHeader {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationPostureDocument {
+    config_fingerprint: String,
+    profiles: Vec<MigrationPostureAssignment>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationPostureAssignment {
+    profile_id: String,
+    environment: MigrationEnvironment,
+    access: MigrationAccess,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MigrationEnvironment {
+    Development,
+    Production,
+}
+
+impl From<MigrationEnvironment> for ProfileEnvironment {
+    fn from(environment: MigrationEnvironment) -> Self {
+        match environment {
+            MigrationEnvironment::Development => Self::Development,
+            MigrationEnvironment::Production => Self::Production,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MigrationAccess {
+    ReadWrite,
+    ReadOnly,
+}
+
+impl From<MigrationAccess> for ProfileAccess {
+    fn from(access: MigrationAccess) -> Self {
+        match access {
+            MigrationAccess::ReadWrite => Self::ReadWrite,
+            MigrationAccess::ReadOnly => Self::ReadOnly,
+        }
+    }
+}
+
+struct ResolvedMigrationPosture {
+    environment: ProfileEnvironment,
+    access: ProfileAccess,
+}
+
+fn parse_migration_posture_document(bytes: &[u8]) -> Result<MigrationPostureDocument, ConfigError> {
+    if bytes.len() > MIGRATION_DOCUMENT_MAX_BYTES {
+        return Err(ConfigError::MigrationDocumentTooLarge {
+            limit: MIGRATION_DOCUMENT_MAX_BYTES,
+            actual: bytes.len(),
+        });
+    }
+    let document: MigrationPostureDocument =
+        serde_json::from_slice(bytes).map_err(|_| ConfigError::InvalidMigrationDocument)?;
+    if !is_sha256_hex(&document.config_fingerprint) {
+        return Err(ConfigError::InvalidMigrationDocument);
+    }
+    Ok(document)
+}
+
+fn migration_assignments(
+    document: MigrationPostureDocument,
+    config: &Config,
+) -> Result<HashMap<String, ResolvedMigrationPosture>, ConfigError> {
+    let expected = config
+        .profiles
+        .iter()
+        .map(|profile| profile.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut assignments = HashMap::with_capacity(document.profiles.len());
+    for assignment in document.profiles {
+        if !expected.contains(assignment.profile_id.as_str())
+            || assignments
+                .insert(
+                    assignment.profile_id,
+                    ResolvedMigrationPosture {
+                        environment: assignment.environment.into(),
+                        access: assignment.access.into(),
+                    },
+                )
+                .is_some()
+        {
+            return Err(ConfigError::InvalidMigrationDocument);
+        }
+    }
+    if assignments.len() != expected.len() {
+        return Err(ConfigError::InvalidMigrationDocument);
+    }
+    Ok(assignments)
+}
+
+fn validate_legacy_migration_source(loaded: &LoadedConfig) -> Result<(), ConfigError> {
+    let expected_source = match loaded.source_version {
+        ConfigSourceVersion::V1 => LegacyConfigVersion::V1,
+        ConfigSourceVersion::V2 => LegacyConfigVersion::V2,
+        ConfigSourceVersion::Missing | ConfigSourceVersion::V3 => {
+            return Err(ConfigError::MigrationPostureRequired);
+        }
+    };
+    if !loaded.migration_required {
+        return Err(ConfigError::MigrationPostureRequired);
+    }
+    crate::service::validate_config_identity(&loaded.config)
+        .map_err(|_| ConfigError::InvalidProfile)?;
+    for profile in &loaded.config.profiles {
+        if !matches!(
+            profile.safety,
+            ProfileSafetyPosture::UnclassifiedLegacy { source }
+                if source == expected_source
+        ) {
+            return Err(ConfigError::InvalidProfile);
+        }
+    }
+    Ok(())
+}
+
+const fn migration_source_number(source: ConfigSourceVersion) -> Option<u32> {
+    match source {
+        ConfigSourceVersion::V1 => Some(1),
+        ConfigSourceVersion::V2 => Some(2),
+        ConfigSourceVersion::Missing | ConfigSourceVersion::V3 => None,
+    }
+}
+
+fn migration_config_fingerprint(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn generate_unique_profile_instance_id(
+    generator: &dyn ProfileInstanceIdGenerator,
+    used: &mut HashSet<ProfileInstanceId>,
+) -> Result<ProfileInstanceId, ConfigError> {
+    for _ in 0..PROFILE_INSTANCE_ID_GENERATION_ATTEMPTS {
+        let candidate = generator
+            .generate()
+            .ok_or(ConfigError::EntropyUnavailable)?;
+        if used.insert(candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(ConfigError::EntropyUnavailable)
+}
+
+fn reject_v3_posture_fields_in_v2(raw: &str) -> Result<(), ConfigError> {
+    let document: toml::Value = toml::from_str(raw)?;
+    let Some(profiles) = document.get("profiles").and_then(toml::Value::as_array) else {
+        return Ok(());
+    };
+    for profile in profiles {
+        let Some(profile) = profile.as_table() else {
+            continue;
+        };
+        if ["environment", "access", "instance_id"]
+            .into_iter()
+            .any(|field| profile.contains_key(field))
+        {
+            return Err(ConfigError::InvalidProfile);
+        }
+    }
+    Ok(())
+}
+
+fn validate_v3_document_shape(raw: &str) -> Result<(), ConfigError> {
+    const TOP_LEVEL_FIELDS: &[&str] = &["version", "profiles"];
+    const PROFILE_FIELDS: &[&str] = &[
+        "id",
+        "name",
+        "driver",
+        "host",
+        "port",
+        "database",
+        "username",
+        "environment",
+        "access",
+        "instance_id",
+        "tls",
+        "credential_mode",
+        "secret_env",
+        "redis_tls",
+    ];
+    const REDIS_TLS_FIELDS: &[&str] = &["ca_file"];
+
+    let document: toml::Value = toml::from_str(raw)?;
+    let Some(document) = document.as_table() else {
+        return Err(ConfigError::InvalidProfile);
+    };
+    if document
+        .keys()
+        .any(|field| !TOP_LEVEL_FIELDS.contains(&field.as_str()))
+    {
+        return Err(ConfigError::InvalidProfile);
+    }
+
+    let Some(profiles) = document.get("profiles").and_then(toml::Value::as_array) else {
+        return Ok(());
+    };
+    for profile in profiles {
+        let Some(profile) = profile.as_table() else {
+            continue;
+        };
+        if profile
+            .keys()
+            .any(|field| !PROFILE_FIELDS.contains(&field.as_str()))
+        {
+            return Err(ConfigError::InvalidProfile);
+        }
+        if let Some(redis_tls) = profile.get("redis_tls").and_then(toml::Value::as_table)
+            && redis_tls
+                .keys()
+                .any(|field| !REDIS_TLS_FIELDS.contains(&field.as_str()))
+        {
+            return Err(ConfigError::InvalidProfile);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConfigV2Wire {
+    version: u32,
+    #[serde(default)]
+    profiles: Vec<ConnectionProfileV2Wire>,
+}
+
+impl ConfigV2Wire {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            version: 2,
+            profiles: config
+                .profiles
+                .iter()
+                .map(ConnectionProfileV2Wire::from_profile)
+                .collect(),
+        }
+    }
+
+    fn into_config(self) -> Config {
+        Config {
+            version: CURRENT_CONFIG_VERSION,
+            profiles: self
+                .profiles
+                .into_iter()
+                .map(ConnectionProfileV2Wire::into_profile)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConnectionProfileV2Wire {
+    id: String,
+    name: String,
+    driver: crate::model::DriverKind,
+    #[serde(default = "default_host")]
+    host: String,
+    port: u16,
+    #[serde(default)]
+    database: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    tls: crate::model::TlsMode,
+    credential_mode: CredentialMode,
+    #[serde(default)]
+    secret_env: Option<String>,
+    #[serde(default, skip_serializing_if = "RedisTlsConfig::is_empty")]
+    redis_tls: RedisTlsConfig,
+}
+
+impl ConnectionProfileV2Wire {
+    fn from_profile(profile: &ConnectionProfile) -> Self {
+        Self {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            driver: profile.driver,
+            host: profile.host.clone(),
+            port: profile.port,
+            database: profile.database.clone(),
+            username: profile.username.clone(),
+            tls: profile.tls,
+            credential_mode: profile.credential_mode,
+            secret_env: profile.secret_env.clone(),
+            redis_tls: profile.redis_tls.clone(),
+        }
+    }
+
+    fn into_profile(self) -> ConnectionProfile {
+        ConnectionProfile {
+            id: self.id,
+            name: self.name,
+            driver: self.driver,
+            host: self.host,
+            port: self.port,
+            database: self.database,
+            username: self.username,
+            safety: ProfileSafetyPosture::unclassified_legacy(LegacyConfigVersion::V2),
+            tls: self.tls,
+            credential_mode: self.credential_mode,
+            secret_env: self.secret_env,
+            redis_tls: self.redis_tls,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConfigV3Wire {
+    version: u32,
+    #[serde(default)]
+    profiles: Vec<ConnectionProfileV3Wire>,
+}
+
+impl ConfigV3Wire {
+    fn try_from_config(config: &Config) -> Result<Self, &'static str> {
+        Ok(Self {
+            version: CURRENT_CONFIG_VERSION,
+            profiles: config
+                .profiles
+                .iter()
+                .map(ConnectionProfileV3Wire::try_from_profile)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    fn into_config(self) -> Result<Config, ConfigError> {
+        Ok(Config {
+            version: CURRENT_CONFIG_VERSION,
+            profiles: self
+                .profiles
+                .into_iter()
+                .map(ConnectionProfileV3Wire::into_profile)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConnectionProfileV3Wire {
+    id: String,
+    name: String,
+    driver: crate::model::DriverKind,
+    #[serde(default = "default_host")]
+    host: String,
+    port: u16,
+    #[serde(default)]
+    database: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(flatten)]
+    safety: ProfileSafetyPostureV3Wire,
+    #[serde(default)]
+    tls: crate::model::TlsMode,
+    credential_mode: CredentialMode,
+    #[serde(default)]
+    secret_env: Option<String>,
+    #[serde(default, skip_serializing_if = "RedisTlsConfig::is_empty")]
+    redis_tls: RedisTlsConfig,
+}
+
+impl ConnectionProfileV3Wire {
+    fn try_from_profile(profile: &ConnectionProfile) -> Result<Self, &'static str> {
+        let ProfileSafetyPosture::Classified {
+            environment,
+            access,
+            instance_id,
+        } = profile.safety
+        else {
+            return Err("version 3 profiles must have classified safety posture");
+        };
+        Ok(Self {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            driver: profile.driver,
+            host: profile.host.clone(),
+            port: profile.port,
+            database: profile.database.clone(),
+            username: profile.username.clone(),
+            safety: ProfileSafetyPostureV3Wire {
+                environment: Some(environment),
+                access: Some(access),
+                instance_id: Some(instance_id.to_string()),
+            },
+            tls: profile.tls,
+            credential_mode: profile.credential_mode,
+            secret_env: profile.secret_env.clone(),
+            redis_tls: profile.redis_tls.clone(),
+        })
+    }
+
+    fn into_profile(self) -> Result<ConnectionProfile, ConfigError> {
+        let Some(environment) = self.safety.environment else {
+            return Err(ConfigError::InvalidProfile);
+        };
+        let Some(access) = self.safety.access else {
+            return Err(ConfigError::InvalidProfile);
+        };
+        let Some(instance_id) = self.safety.instance_id else {
+            return Err(ConfigError::InvalidProfile);
+        };
+        let instance_id =
+            ProfileInstanceId::parse(&instance_id).map_err(|_| ConfigError::InvalidProfile)?;
+        Ok(ConnectionProfile {
+            id: self.id,
+            name: self.name,
+            driver: self.driver,
+            host: self.host,
+            port: self.port,
+            database: self.database,
+            username: self.username,
+            safety: ProfileSafetyPosture::classified(environment, access, instance_id),
+            tls: self.tls,
+            credential_mode: self.credential_mode,
+            secret_env: self.secret_env,
+            redis_tls: self.redis_tls,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProfileSafetyPostureV3Wire {
+    #[serde(default)]
+    environment: Option<ProfileEnvironment>,
+    #[serde(default)]
+    access: Option<ProfileAccess>,
+    #[serde(default)]
+    instance_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ConfigV1 {
     #[allow(dead_code)]
     version: u32,
@@ -892,6 +1728,7 @@ fn normalize_v1(wire: ConfigV1) -> Config {
                     port: profile.port,
                     database: profile.database,
                     username: profile.username,
+                    safety: ProfileSafetyPosture::unclassified_legacy(LegacyConfigVersion::V1),
                     tls: profile.tls,
                     credential_mode,
                     secret_env: profile.secret_env,
@@ -905,6 +1742,8 @@ fn normalize_v1(wire: ConfigV1) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EMPTY_V3_BYTES: &[u8] = b"version = 3\nprofiles = []\n";
 
     struct OneFault(MutationFailpoint);
 
@@ -928,7 +1767,7 @@ mod tests {
         ] {
             let directory = tempfile::tempdir().expect("tempdir");
             let path = directory.path().join("config.toml");
-            let original = b"version = 2\nprofiles = []\n";
+            let original = EMPTY_V3_BYTES;
             fs::write(&path, original).expect("fixture");
             let writer = ConfigWriter::with_fault_injector(Arc::new(OneFault(point)));
             let result = writer.mutate_path(
@@ -978,11 +1817,8 @@ mod tests {
             let original = b"version = 1\n";
             fs::write(&path, original).expect("fixture");
             let writer = ConfigWriter::with_fault_injector(Arc::new(OneFault(point)));
-            let result = writer.mutate_path(
-                &path,
-                ConfigMutation::Create(fixture_profile("new")),
-                MigrationConsent::Confirmed,
-            );
+            let posture_document = empty_v1_posture_document(&writer, &path, original);
+            let result = writer.migrate_v3(&path, &posture_document);
             assert!(result.is_err(), "{point:?}");
             assert_eq!(fs::read(&path).expect("main"), original, "{point:?}");
             assert_eq!(temp_count(directory.path()), 0, "{point:?}");
@@ -1002,11 +1838,8 @@ mod tests {
             let writer = ConfigWriter::with_fault_injector(Arc::new(BackupRace {
                 bytes: raced_bytes.to_vec(),
             }));
-            let result = writer.mutate_path(
-                &path,
-                ConfigMutation::Create(fixture_profile("new")),
-                MigrationConsent::Confirmed,
-            );
+            let posture_document = empty_v1_posture_document(&writer, &path, original);
+            let result = writer.migrate_v3(&path, &posture_document);
             assert_eq!(result.is_ok(), succeeds);
             assert_eq!(
                 fs::read(migration_backup_path(&path)).expect("raced backup"),
@@ -1023,8 +1856,8 @@ mod tests {
     fn fingerprint_recheck_rejects_injected_external_content() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("config.toml");
-        let original = b"version = 2\nprofiles = []\n";
-        let external = b"version = 2\n# external writer\nprofiles = []\n";
+        let original = EMPTY_V3_BYTES;
+        let external = b"version = 3\n# external writer\nprofiles = []\n";
         fs::write(&path, original).expect("fixture");
         let writer = ConfigWriter::with_fault_injector(Arc::new(ExternalChange {
             bytes: external.to_vec(),
@@ -1081,11 +1914,32 @@ mod tests {
             port: 6379,
             database: None,
             username: None,
+            safety: ProfileSafetyPosture::new(
+                ProfileEnvironment::Development,
+                ProfileAccess::ReadWrite,
+            ),
             tls: crate::model::TlsMode::Disabled,
             credential_mode: CredentialMode::None,
             secret_env: None,
             redis_tls: RedisTlsConfig::default(),
         }
+    }
+
+    fn empty_v1_posture_document(writer: &ConfigWriter, path: &Path, source: &[u8]) -> Vec<u8> {
+        let plan = writer
+            .migration_plan(path)
+            .expect("empty v1 migration plan");
+        assert_eq!(plan.source_version, 1);
+        assert_eq!(
+            plan.config_fingerprint,
+            migration_config_fingerprint(source)
+        );
+        assert!(plan.profiles.is_empty());
+        serde_json::to_vec(&serde_json::json!({
+            "config_fingerprint": plan.config_fingerprint,
+            "profiles": []
+        }))
+        .expect("empty v1 posture document")
     }
 
     fn temp_count(directory: &Path) -> usize {

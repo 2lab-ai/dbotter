@@ -23,9 +23,10 @@ use dbotter::drivers::redis_browser::RedisScanAccumulator;
 use dbotter::execution::{ExecutionLanguage, ExecutionTargetError, extract_and_validate_target};
 use dbotter::model::{
     Cell, ConnectionProfile, CredentialMode, DriverKind, MAX_REDIS_KEY_BYTES, OperationId,
-    OperationKind, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
-    RedisExecuteRequest, RedisKeyFilter, RedisKeyId, RedisKeyInspectRequest, RedisScanRequest,
-    RedisTlsConfig, RedisTtl, RedisValueType, RequestIdentity, TlsMode,
+    OperationKind, ProfileAccess, ProfileEnvironment, ProfileFieldId, ProfileGeneration, ProfileId,
+    ProfileSafetyPosture, PublicCode, PublicSummary, RedisExecuteRequest, RedisKeyFilter,
+    RedisKeyId, RedisKeyInspectRequest, RedisScanRequest, RedisTlsConfig, RedisTtl, RedisValueType,
+    RequestIdentity, TlsMode,
 };
 use dbotter::public_error::{RecoveryAction, SafeContext, recovery_for};
 use dbotter::secrets::{
@@ -96,6 +97,10 @@ impl LiveFixture {
             port,
             database: Some("0".to_owned()),
             username: None,
+            safety: ProfileSafetyPosture::new(
+                ProfileEnvironment::Development,
+                ProfileAccess::ReadWrite,
+            ),
             tls,
             credential_mode,
             secret_env: (credential_mode == CredentialMode::Environment)

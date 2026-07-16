@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::ser::SerializeStruct as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -26,6 +28,291 @@ pub struct ProfileId(pub String);
 impl ProfileId {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProfileEnvironment {
+    Development,
+    Production,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProfileAccess {
+    ReadWrite,
+    ReadOnly,
+}
+
+impl fmt::Debug for ProfileAccess {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ReadWrite => "read-write",
+            Self::ReadOnly => "read-only",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LegacyConfigVersion {
+    V1,
+    V2,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProfileInstanceId([u8; 16]);
+
+impl ProfileInstanceId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn generate() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes)?;
+        Ok(Self(bytes))
+    }
+
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        if value.len() != 32 || value.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
+            return Err("profile instance id must be 32 hexadecimal characters");
+        }
+        if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err("profile instance id must use lowercase hexadecimal");
+        }
+        let mut bytes = [0_u8; 16];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            bytes[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    fn encoded(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(32);
+        for byte in self.0 {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+}
+
+fn hex_nibble(value: u8) -> Result<u8, &'static str> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err("profile instance id contains invalid hexadecimal"),
+    }
+}
+
+impl fmt::Debug for ProfileInstanceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProfileInstanceId(<redacted>)")
+    }
+}
+
+impl fmt::Display for ProfileInstanceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.encoded())
+    }
+}
+
+impl Serialize for ProfileInstanceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.encoded())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfileInstanceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProfileSafetyPosture {
+    New {
+        environment: ProfileEnvironment,
+        access: ProfileAccess,
+    },
+    Classified {
+        environment: ProfileEnvironment,
+        access: ProfileAccess,
+        instance_id: ProfileInstanceId,
+    },
+    UnclassifiedLegacy {
+        source: LegacyConfigVersion,
+    },
+}
+
+impl ProfileSafetyPosture {
+    pub const fn new(environment: ProfileEnvironment, access: ProfileAccess) -> Self {
+        Self::New {
+            environment,
+            access,
+        }
+    }
+
+    pub const fn classified(
+        environment: ProfileEnvironment,
+        access: ProfileAccess,
+        instance_id: ProfileInstanceId,
+    ) -> Self {
+        Self::Classified {
+            environment,
+            access,
+            instance_id,
+        }
+    }
+
+    pub const fn unclassified_legacy(source: LegacyConfigVersion) -> Self {
+        Self::UnclassifiedLegacy { source }
+    }
+
+    pub const fn environment(self) -> Option<ProfileEnvironment> {
+        match self {
+            Self::New { environment, .. } | Self::Classified { environment, .. } => {
+                Some(environment)
+            }
+            Self::UnclassifiedLegacy { .. } => None,
+        }
+    }
+
+    pub const fn access(self) -> Option<ProfileAccess> {
+        match self {
+            Self::New { access, .. } | Self::Classified { access, .. } => Some(access),
+            Self::UnclassifiedLegacy { .. } => None,
+        }
+    }
+
+    pub const fn effective_access(self) -> ProfileAccess {
+        match self {
+            Self::New { access, .. } | Self::Classified { access, .. } => access,
+            Self::UnclassifiedLegacy { .. } => ProfileAccess::ReadOnly,
+        }
+    }
+
+    pub const fn instance_id(self) -> Option<ProfileInstanceId> {
+        match self {
+            Self::Classified { instance_id, .. } => Some(instance_id),
+            Self::New { .. } | Self::UnclassifiedLegacy { .. } => None,
+        }
+    }
+
+    pub(crate) const fn classify_new(self, instance_id: ProfileInstanceId) -> Option<Self> {
+        match self {
+            Self::New {
+                environment,
+                access,
+            } => Some(Self::Classified {
+                environment,
+                access,
+                instance_id,
+            }),
+            Self::Classified { .. } | Self::UnclassifiedLegacy { .. } => None,
+        }
+    }
+
+    pub(crate) fn preserve_classified_identity(self, expected: Self) -> Option<Self> {
+        let expected_instance_id = match expected {
+            Self::Classified { instance_id, .. } => instance_id,
+            Self::New { .. } | Self::UnclassifiedLegacy { .. } => return None,
+        };
+        match self {
+            Self::New {
+                environment,
+                access,
+            } => Some(Self::Classified {
+                environment,
+                access,
+                instance_id: expected_instance_id,
+            }),
+            Self::Classified {
+                environment,
+                access,
+                instance_id,
+            } if instance_id == expected_instance_id => Some(Self::Classified {
+                environment,
+                access,
+                instance_id,
+            }),
+            Self::Classified { .. } | Self::UnclassifiedLegacy { .. } => None,
+        }
+    }
+}
+
+impl fmt::Debug for ProfileSafetyPosture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::New {
+                environment,
+                access,
+            } => formatter
+                .debug_struct("New")
+                .field("environment", environment)
+                .field("access", access)
+                .finish(),
+            Self::Classified {
+                environment,
+                access,
+                ..
+            } => formatter
+                .debug_struct("Classified")
+                .field("environment", environment)
+                .field("access", access)
+                .field("instance_id", &"<redacted>")
+                .finish(),
+            Self::UnclassifiedLegacy { source } => formatter
+                .debug_struct("UnclassifiedLegacy")
+                .field("source", source)
+                .finish(),
+        }
+    }
+}
+
+impl Serialize for ProfileSafetyPosture {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::New {
+                environment,
+                access,
+            } => {
+                let mut state = serializer.serialize_struct("ProfileSafetyPosture", 2)?;
+                state.serialize_field("environment", environment)?;
+                state.serialize_field("access", access)?;
+                state.end()
+            }
+            Self::Classified {
+                environment,
+                access,
+                instance_id,
+            } => {
+                let mut state = serializer.serialize_struct("ProfileSafetyPosture", 3)?;
+                state.serialize_field("environment", environment)?;
+                state.serialize_field("access", access)?;
+                state.serialize_field("instance_id", instance_id)?;
+                state.end()
+            }
+            Self::UnclassifiedLegacy { .. } => serializer
+                .serialize_struct("ProfileSafetyPosture", 0)?
+                .end(),
+        }
     }
 }
 
@@ -132,7 +419,7 @@ fn default_host() -> String {
     "127.0.0.1".to_owned()
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct ConnectionProfile {
     pub id: String,
     pub name: String,
@@ -144,6 +431,8 @@ pub struct ConnectionProfile {
     pub database: Option<String>,
     #[serde(default)]
     pub username: Option<String>,
+    #[serde(flatten)]
+    pub safety: ProfileSafetyPosture,
     #[serde(default)]
     pub tls: TlsMode,
     pub credential_mode: CredentialMode,
@@ -164,6 +453,7 @@ impl fmt::Debug for ConnectionProfile {
             .field("port", &self.port)
             .field("database", &self.database.as_ref().map(|_| "<configured>"))
             .field("username", &self.username.as_ref().map(|_| "<configured>"))
+            .field("safety", &self.safety)
             .field("tls", &self.tls)
             .field("credential_mode", &self.credential_mode)
             .field(
@@ -189,6 +479,7 @@ impl ConnectionProfile {
             port: draft.port,
             database: draft.database,
             username: draft.username,
+            safety: ProfileSafetyPosture::new(draft.environment, draft.access),
             tls: draft.tls,
             credential_mode: draft.credential_mode,
             secret_env: draft.secret_env,
@@ -204,6 +495,11 @@ impl ConnectionProfile {
             port: self.port,
             database: self.database.clone(),
             username: self.username.clone(),
+            environment: self
+                .safety
+                .environment()
+                .unwrap_or(ProfileEnvironment::Development),
+            access: self.safety.access().unwrap_or(ProfileAccess::ReadOnly),
             tls: self.tls,
             credential_mode: self.credential_mode,
             secret_env: self.secret_env.clone(),
@@ -226,6 +522,8 @@ pub struct ConnectionDraft {
     pub port: u16,
     pub database: Option<String>,
     pub username: Option<String>,
+    pub environment: ProfileEnvironment,
+    pub access: ProfileAccess,
     pub tls: TlsMode,
     pub credential_mode: CredentialMode,
     pub secret_env: Option<String>,
@@ -242,6 +540,8 @@ impl fmt::Debug for ConnectionDraft {
             .field("port", &self.port)
             .field("database", &self.database.as_ref().map(|_| "<configured>"))
             .field("username", &self.username.as_ref().map(|_| "<configured>"))
+            .field("environment", &self.environment)
+            .field("access", &self.access)
             .field("tls", &self.tls)
             .field("credential_mode", &self.credential_mode)
             .field(
@@ -267,6 +567,8 @@ impl ConnectionDraft {
             port,
             database: None,
             username: None,
+            environment: ProfileEnvironment::Development,
+            access: ProfileAccess::ReadWrite,
             tls,
             credential_mode: CredentialMode::None,
             secret_env: None,
@@ -577,6 +879,7 @@ pub enum PublicCode {
     Field(ProfileFieldId),
     ProfileIdConflict,
     ProfileStale,
+    ReadOnlyProfile,
     ConfigExternalChange,
     MigrationBackupAvailable,
     SessionCredential,

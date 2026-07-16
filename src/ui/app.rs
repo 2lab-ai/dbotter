@@ -14,9 +14,9 @@ use crate::model::{
     CatalogRequest, CredentialMode, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
     DEFAULT_REDIS_SCAN_COUNT, DraftId, DriverAvailability, DriverCapabilities, DriverKind,
     ExportFormat, ExportResult, OperationId, OperationKind, OperationRecipeId, OverwritePolicy,
-    ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
-    RedisKeyInspectRequest, RedisScanRequest, RequestIdentity, ResultId, ResultSnapshot,
-    SessionGeneration,
+    ProfileAccess, ProfileEnvironment, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode,
+    PublicSummary, RedisKeyInspectRequest, RedisScanRequest, RequestIdentity, ResultId,
+    ResultSnapshot, SessionGeneration,
 };
 use crate::public_error::{
     PublicOperationError, RecoveryAction, RecoveryCommand, RecoveryCommandDispatcher,
@@ -33,7 +33,10 @@ use super::adapter::{SubmitError, UiCommand, UiPort};
 use super::editor::{
     EDITOR_INPUT_ID, EDITOR_ROW_LIMIT_ID, EDITOR_TIMEOUT_ID, EditorIntent, EditorSurface,
 };
-use super::layout::NativeLayout;
+use super::layout::{
+    CompactFallback, FallbackSurface, LayoutMode, NativeLayout, ResolvedLayout, SplitLayout,
+    WorkspaceGeometry,
+};
 use super::model::{ConnectionState, ProfileSnapshot, UiEvent, UiModel, WorkspaceKey};
 use super::mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 use super::profile_form::{
@@ -271,6 +274,10 @@ pub struct DbotterApp {
     pending_export_destinations: HashMap<OperationId, PendingExportDestination>,
     committed_export_destinations: HashMap<ResultId, PathBuf>,
     result_export_formats: HashMap<ResultId, ExportFormat>,
+    workspace_geometries: HashMap<WorkspaceKey, WorkspaceGeometry>,
+    compact_fallback: CompactFallback,
+    compact_restore_focus: Option<egui::Id>,
+    compact_workspace: Option<WorkspaceKey>,
 }
 
 impl DbotterApp {
@@ -296,6 +303,10 @@ impl DbotterApp {
             pending_export_destinations: HashMap::new(),
             committed_export_destinations: HashMap::new(),
             result_export_formats: HashMap::new(),
+            workspace_geometries: HashMap::new(),
+            compact_fallback: CompactFallback::default(),
+            compact_restore_focus: None,
+            compact_workspace: None,
         };
         let operation_id = app.model.next_operation();
         let _ = app
@@ -2553,23 +2564,274 @@ impl DbotterApp {
 
     fn show_native(&mut self, ui: &mut egui::Ui) {
         OpenAiTheme::apply(ui.ctx());
+        let selected_workspace = self.model.selected_workspace_key();
+        if self.compact_workspace != selected_workspace {
+            ui.ctx().data_mut(|data| {
+                data.remove::<egui::PanelState>(egui::Id::new("navigator"));
+                data.remove::<egui::PanelState>(egui::Id::new("result-history-tabs"));
+            });
+            self.compact_workspace = selected_workspace.clone();
+            self.compact_fallback = CompactFallback::default();
+            self.compact_restore_focus = None;
+        }
+        let geometry: WorkspaceGeometry = selected_workspace
+            .as_ref()
+            .and_then(|key| self.workspace_geometries.get(key))
+            .copied()
+            .unwrap_or_else(WorkspaceGeometry::default);
+        let layout = NativeLayout::resolve(ui.available_width(), ui.available_height(), geometry);
+        let compact_fallback: CompactFallback = self.compact_fallback.clone();
+
+        self.show_status_strip(ui);
         if self.model.profile_load_succeeded()
             && self.model.profiles.is_empty()
             && self.profile_editor.is_none()
         {
             egui::CentralPanel::default().show(ui, |ui| self.show_first_run(ui));
+            self.show_delete_confirmation(ui);
+            self.show_credential_prompt(ui);
             return;
         }
 
-        if NativeLayout::columns_for_width(ui.available_width()) == 3 {
-            self.connections(ui);
-            self.explorer(ui);
-        } else {
-            self.narrow_navigation(ui);
+        match layout.mode() {
+            LayoutMode::Wide => self.show_wide_workspace(ui, layout, geometry),
+            LayoutMode::Compact => self.show_compact_workspace(ui, compact_fallback),
         }
-        self.editor_and_results(ui);
         self.show_delete_confirmation(ui);
         self.show_credential_prompt(ui);
+    }
+
+    fn show_wide_workspace(
+        &mut self,
+        root_ui: &mut egui::Ui,
+        layout: ResolvedLayout,
+        geometry: WorkspaceGeometry,
+    ) {
+        let navigator = egui::Panel::left("navigator")
+            .resizable(true)
+            .default_size(if geometry.navigator_width().is_finite() {
+                geometry.navigator_width()
+            } else {
+                NativeLayout::NAVIGATOR_DEFAULT_WIDTH
+            })
+            .size_range(NativeLayout::NAVIGATOR_WIDTH_RANGE.clone())
+            .show(root_ui, |ui| self.show_workspace_navigator(ui));
+        self.remember_workspace_geometry(Some(navigator.response.rect.width()), None);
+        self.show_editor_result_shell(root_ui, layout);
+    }
+
+    fn show_compact_workspace(
+        &mut self,
+        root_ui: &mut egui::Ui,
+        compact_fallback: CompactFallback,
+    ) {
+        let prior_focus = root_ui.ctx().memory(|memory| memory.focused());
+        let mut open_surface = None;
+        let mut navigator_open_id = None;
+        let mut inspector_open_id = None;
+        egui::Panel::top("compact-workspace-actions")
+            .resizable(false)
+            .show(root_ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let navigator = ui.add_sized(
+                        NativeLayout::ACTION_MIN_SIZE,
+                        egui::Button::new("Navigator"),
+                    );
+                    let navigator = named_author_id(navigator, "navigator.open", "Open navigator");
+                    navigator_open_id = Some(navigator.id);
+                    if navigator.clicked() {
+                        open_surface = Some(FallbackSurface::Navigator);
+                    }
+
+                    let inspector =
+                        ui.add_sized(NativeLayout::ACTION_MIN_SIZE, egui::Button::new("Results"));
+                    let inspector =
+                        named_author_id(inspector, "inspector.open", "Open result inspector");
+                    inspector_open_id = Some(inspector.id);
+                    if inspector.clicked() {
+                        open_surface = Some(FallbackSurface::Inspector);
+                    }
+                });
+            });
+
+        if let Some(surface) = open_surface {
+            let (restore_author_id, opener_id) = match surface {
+                FallbackSurface::Navigator => ("navigator.open", navigator_open_id),
+                FallbackSurface::Inspector => ("inspector.open", inspector_open_id),
+            };
+            self.compact_restore_focus = prior_focus.or(opener_id);
+            self.compact_fallback.open(surface, restore_author_id);
+        }
+
+        let visible_surface = self
+            .compact_fallback
+            .visible_surface()
+            .or(compact_fallback.visible_surface());
+        let mut close_fallback = false;
+        egui::CentralPanel::default().show(root_ui, |ui| match visible_surface {
+            Some(FallbackSurface::Navigator) => {
+                close_fallback = self.show_fallback_close(ui, "Close navigator");
+                ui.separator();
+                self.show_workspace_navigator(ui);
+            }
+            Some(FallbackSurface::Inspector) => {
+                close_fallback = self.show_fallback_close(ui, "Close result inspector");
+                ui.separator();
+                self.show_result_surface(ui);
+            }
+            None => self.show_editor_surface(ui),
+        });
+
+        if close_fallback {
+            let _ = self.compact_fallback.close();
+            if let Some(focus) = self.compact_restore_focus.take() {
+                root_ui
+                    .ctx()
+                    .memory_mut(|memory| memory.request_focus(focus));
+            }
+        }
+    }
+
+    fn show_fallback_close(&mut self, ui: &mut egui::Ui, label: &'static str) -> bool {
+        let close = ui.add_sized(
+            [112.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+            egui::Button::new("Close"),
+        );
+        named_author_id(close, "fallback.close", label).clicked()
+    }
+
+    fn remember_workspace_geometry(
+        &mut self,
+        navigator_width: Option<f32>,
+        editor_share: Option<f32>,
+    ) {
+        let Some(key) = self.model.selected_workspace_key() else {
+            return;
+        };
+        let previous = self
+            .workspace_geometries
+            .get(&key)
+            .copied()
+            .unwrap_or_else(WorkspaceGeometry::default);
+        let navigator_width = navigator_width
+            .unwrap_or_else(|| previous.navigator_width())
+            .clamp(
+                *NativeLayout::NAVIGATOR_WIDTH_RANGE.start(),
+                *NativeLayout::NAVIGATOR_WIDTH_RANGE.end(),
+            );
+        let editor_share = editor_share.unwrap_or_else(|| previous.editor_share());
+        let geometry =
+            WorkspaceGeometry::restore(navigator_width, editor_share, previous.inspector_visible());
+        self.workspace_geometries.insert(key, geometry);
+    }
+
+    fn show_status_strip(&mut self, root_ui: &mut egui::Ui) {
+        let selected = self.model.selected_profile_snapshot().cloned();
+        let connection = selected
+            .as_ref()
+            .map(|profile| connection_label(self.model.connection_state(&profile.id)))
+            .unwrap_or_else(|| "No connection selected".to_owned());
+        let active = selected.as_ref().and_then(|profile| {
+            self.active_operations
+                .get(&profile.id)
+                .copied()
+                .filter(|operation| operation.profile_generation == profile.generation)
+        });
+        let operation_status = self.model.status.clone();
+        let mut cancel = None;
+
+        egui::Panel::bottom("status-action-context")
+            .resizable(false)
+            .show(root_ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let status = ui.strong("Status");
+                    named_author_id(status, "status-action-context", "Status and action context");
+                    if let Some(profile) = selected.as_ref() {
+                        let profile_name = profile.name.clone();
+                        let profile_status = ui.small(format!("Profile: {profile_name}"));
+                        named_dynamic_value_author_id(
+                            profile_status,
+                            "status.profile".to_owned(),
+                            "Selected profile".to_owned(),
+                            profile_name,
+                        );
+
+                        let target = match profile.database.as_deref() {
+                            Some(database) => format!("{} / {database}", profile.endpoint),
+                            None => profile.endpoint.clone(),
+                        };
+                        let target_status = ui.small(format!("Target: {target}"));
+                        named_dynamic_value_author_id(
+                            target_status,
+                            "status.target".to_owned(),
+                            "Selected target".to_owned(),
+                            target,
+                        );
+
+                        ui.small(format!(
+                            "Environment: {}",
+                            profile_environment_label(profile.persisted.safety.environment())
+                        ));
+                        ui.small(format!(
+                            "Access: {}",
+                            profile_access_label(profile.persisted.safety.effective_access())
+                        ));
+                    } else {
+                        ui.small("Profile: None");
+                        ui.small("Environment: Unclassified");
+                        ui.small("Access: Read-only");
+                    }
+                    ui.small(format!("Connection: {connection}"));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    let status = ui.small(format!("Operation: {operation_status}"));
+                    named_dynamic_value_author_id(
+                        status,
+                        "status.operation".to_owned(),
+                        "Current operation status".to_owned(),
+                        operation_status,
+                    );
+                    if let Some(operation) = active {
+                        ui.small(format!("Active: {}", operation_kind_label(operation.kind)));
+                        let button = ui.add_sized(
+                            [112.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                            egui::Button::new("Cancel"),
+                        );
+                        if named_author_id(
+                            button,
+                            "status.cancel",
+                            "Cancel current selected operation",
+                        )
+                        .clicked()
+                        {
+                            cancel = Some(operation);
+                        }
+                    }
+                });
+            });
+
+        if let Some(operation) = cancel {
+            let still_current = self
+                .model
+                .selected_profile_snapshot()
+                .is_some_and(|profile| {
+                    operation.profile_generation == profile.generation
+                        && self.active_operations.get(&profile.id) == Some(&operation)
+                });
+            if !still_current {
+                self.model.status = "The selected operation is no longer current.".to_owned();
+            } else {
+                match self.port.try_submit(UiCommand::CancelOperation {
+                    operation_id: operation.operation_id,
+                }) {
+                    Ok(()) => {
+                        self.model.status =
+                            format!("Cancelling operation {}…", operation.operation_id.0);
+                    }
+                    Err(error) => self.report_submit_error(error),
+                }
+            }
+        }
     }
 
     fn show_first_run(&mut self, ui: &mut egui::Ui) {
@@ -2620,83 +2882,96 @@ impl DbotterApp {
         });
     }
 
-    fn narrow_navigation(&mut self, root_ui: &mut egui::Ui) {
-        egui::Panel::top("narrow-navigation").show(root_ui, |ui| {
-            egui::CollapsingHeader::new("Connections")
-                .default_open(false)
-                .show(ui, |ui| self.connections_contents(ui));
-            egui::CollapsingHeader::new("Explorer")
-                .default_open(false)
-                .show(ui, |ui| self.explorer_contents(ui));
-        });
+    fn show_workspace_navigator(&mut self, ui: &mut egui::Ui) {
+        let navigator = ui.heading("Navigator");
+        named_author_id(navigator, "navigator", "Connection and object navigator");
+        ui.separator();
+
+        let available_height = ui.available_height();
+        let connections_height = (available_height * 0.46)
+            .clamp(180.0, 360.0)
+            .min(available_height.max(0.0));
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), connections_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| self.connections_contents(ui),
+        );
+
+        ui.separator();
+        ui.heading("Object explorer");
+        egui::ScrollArea::vertical()
+            .id_salt("navigator.object-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.explorer_contents(ui));
     }
 
+    #[cfg(test)]
     fn connections(&mut self, root_ui: &mut egui::Ui) {
-        egui::Panel::left("connections")
-            .resizable(false)
-            .exact_size(NativeLayout::CONNECTIONS_WIDTH)
-            .show(root_ui, |ui| self.connections_contents(ui));
+        self.connections_contents(root_ui);
     }
 
     fn connections_contents(&mut self, ui: &mut egui::Ui) {
         ui.heading("Connections");
         let actions_enabled = !self.model.is_config_uncertain();
-        let mysql = ui.add_enabled(
-            actions_enabled,
-            egui::Button::new("+ MySQL")
-                .min_size(egui::vec2(104.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
-        );
-        if named_author_id(mysql, "connection.new.mysql", "New MySQL connection").clicked() {
-            let draft_id = self.allocate_draft_id();
-            let editor = ProfileEditor::new(draft_id, DriverKind::MySql);
-            self.profile_editor = Some(self.configured_profile_editor(editor));
-        }
-        let redis = ui.add_enabled(
-            actions_enabled,
-            egui::Button::new("+ Redis")
-                .min_size(egui::vec2(104.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
-        );
-        if named_author_id(redis, "connection.new.redis", "New Redis connection").clicked() {
-            let draft_id = self.allocate_draft_id();
-            let editor = ProfileEditor::new(draft_id, DriverKind::Redis);
-            self.profile_editor = Some(self.configured_profile_editor(editor));
-        }
-        let mongodb = ui.add_enabled(
-            false,
-            egui::Button::new("MongoDB · Planned")
-                .min_size(egui::vec2(160.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
-        );
-        named_author_id(
-            mongodb,
-            "connection.mongodb.planned",
-            "MongoDB planned and unavailable",
-        );
-        if ui
-            .add_sized(
-                [104.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+        let mut new_driver = None;
+        let mut reload = false;
+        ui.horizontal_wrapped(|ui| {
+            let mysql = ui.add_enabled(
+                actions_enabled,
+                egui::Button::new("+ MySQL")
+                    .min_size(egui::vec2(96.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            if named_author_id(mysql, "connection.new.mysql", "New MySQL connection").clicked() {
+                new_driver = Some(DriverKind::MySql);
+            }
+            let redis = ui.add_enabled(
+                actions_enabled,
+                egui::Button::new("+ Redis")
+                    .min_size(egui::vec2(96.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            if named_author_id(redis, "connection.new.redis", "New Redis connection").clicked() {
+                new_driver = Some(DriverKind::Redis);
+            }
+            let mongodb = ui.add_enabled(
+                false,
+                egui::Button::new("MongoDB · Planned")
+                    .min_size(egui::vec2(160.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            named_author_id(
+                mongodb,
+                "connection.mongodb.planned",
+                "MongoDB planned and unavailable",
+            );
+            let reload_button = ui.add_sized(
+                [96.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
                 egui::Button::new("Reload"),
+            );
+            reload = named_author_id(
+                reload_button,
+                "connection.reload",
+                "Reload connection profiles",
             )
-            .clicked()
-        {
+            .clicked();
+        });
+        if let Some(driver) = new_driver {
+            let draft_id = self.allocate_draft_id();
+            let editor = ProfileEditor::new(draft_id, driver);
+            self.profile_editor = Some(self.configured_profile_editor(editor));
+        }
+        if reload {
             self.submit_refresh();
         }
         ui.separator();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for profile in self.model.profiles.clone() {
-                self.profile_card(ui, &profile);
-                ui.add_space(8.0);
-            }
-        });
-    }
-
-    fn explorer(&mut self, root_ui: &mut egui::Ui) {
-        egui::Panel::right("explorer")
-            .resizable(false)
-            .exact_size(NativeLayout::EXPLORER_WIDTH)
-            .show(root_ui, |ui| {
-                ui.heading("Explorer");
-                ui.separator();
-                self.explorer_contents(ui);
+        let list_height = ui.available_height().max(0.0);
+        egui::ScrollArea::vertical()
+            .id_salt("navigator.connections-scroll")
+            .max_height(list_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for profile in self.model.profiles.clone() {
+                    self.profile_card(ui, &profile);
+                    ui.add_space(8.0);
+                }
             });
     }
 
@@ -2896,135 +3171,179 @@ impl DbotterApp {
         }
     }
 
+    fn show_editor_result_shell(&mut self, root_ui: &mut egui::Ui, layout: ResolvedLayout) {
+        let total_extent = root_ui
+            .available_height()
+            .max(NativeLayout::PANE_MIN_EXTENT * 2.0);
+        let maximum_subordinate =
+            (total_extent - NativeLayout::PANE_MIN_EXTENT).max(NativeLayout::PANE_MIN_EXTENT);
+        let requested_subordinate = layout
+            .subordinate_extent()
+            .clamp(NativeLayout::PANE_MIN_EXTENT, maximum_subordinate);
+        let split = SplitLayout::from_subordinate_extent(total_extent, requested_subordinate);
+        let subordinate_extent = split
+            .subordinate_extent()
+            .unwrap_or(NativeLayout::PANE_MIN_EXTENT);
+
+        let result_panel = egui::Panel::bottom("result-history-tabs")
+            .resizable(true)
+            .default_size(subordinate_extent)
+            .size_range(NativeLayout::PANE_MIN_EXTENT..=maximum_subordinate)
+            .show(root_ui, |ui| self.show_result_surface(ui));
+        let rendered_subordinate = result_panel.response.rect.height();
+        let editor_share = ((total_extent - rendered_subordinate) / total_extent).clamp(0.01, 0.99);
+        self.remember_workspace_geometry(None, Some(editor_share));
+
+        egui::CentralPanel::default().show(root_ui, |ui| self.show_editor_surface(ui));
+    }
+
+    #[cfg(test)]
     fn editor_and_results(&mut self, root_ui: &mut egui::Ui) {
+        let layout = NativeLayout::resolve(1440.0, 900.0, WorkspaceGeometry::default());
+        self.show_editor_result_shell(root_ui, layout);
+    }
+
+    fn show_editor_surface(&mut self, ui: &mut egui::Ui) {
+        let tab_title = if self.profile_editor.is_some() {
+            "Connection profile"
+        } else {
+            "Editor"
+        };
+        let tab = ui.selectable_label(true, tab_title);
+        named_author_id(tab, "object-editor-tabs", "Object and editor tabs");
+        ui.separator();
+
         if self.profile_editor.is_some() {
-            let mut action = FormAction::None;
-            egui::CentralPanel::default().show(root_ui, |ui| {
-                if let Some(editor) = self.profile_editor.as_mut() {
-                    action = editor.show(ui);
-                }
-            });
-            match action {
-                FormAction::Save { connect } => {
-                    let operation_id = self.model.next_operation();
-                    if let Some(editor) = self.profile_editor.as_mut() {
-                        match editor.try_save_with_connect(&self.port, operation_id, connect) {
-                            SaveAttempt::Submitted(_) => {
-                                self.model.status = "Saving profile…".to_owned();
-                            }
-                            SaveAttempt::Invalid => {
-                                self.model.status = "Fix the profile form".to_owned();
-                            }
-                            SaveAttempt::Busy => {
-                                self.model.status = "Service is busy".to_owned();
-                            }
-                            SaveAttempt::Disconnected => {
-                                self.model.status = "Service is unavailable".to_owned();
-                            }
-                            SaveAttempt::ConfigUncertain => {
-                                self.model.status = "Reload profiles before saving.".to_owned();
-                            }
-                            SaveAttempt::AlreadyPending(_) => {
-                                self.model.status = "Profile save is already pending".to_owned();
-                            }
-                        }
-                    }
-                }
-                FormAction::TestDraft => {
-                    let operation_id = self.model.next_operation();
-                    if let Some(editor) = self.profile_editor.as_mut() {
-                        match editor.try_test_draft(&self.port, operation_id) {
-                            DraftTestAttempt::Submitted(_) => {
-                                self.model.status = "Testing draft connection…".to_owned();
-                            }
-                            DraftTestAttempt::Invalid | DraftTestAttempt::Unavailable => {
-                                self.model.status = editor.status().to_owned();
-                            }
-                            DraftTestAttempt::Busy => {
-                                self.model.status = "Service is busy".to_owned();
-                            }
-                            DraftTestAttempt::Disconnected => {
-                                self.model.status = "Service is unavailable".to_owned();
-                            }
-                            DraftTestAttempt::ConfigUncertain => {
-                                self.model.status = "Reload profiles before testing.".to_owned();
-                            }
-                            DraftTestAttempt::AlreadyPending(_) => {
-                                self.model.status = "Profile work is already pending".to_owned();
-                            }
-                        }
-                    }
-                }
-                FormAction::ProbeEnvironment => {
-                    if let Some(editor) = self.profile_editor.as_mut() {
-                        let availability = editor.probe_environment_availability();
-                        self.model.status = format!("Environment credential: {availability:?}");
-                    }
-                }
-                FormAction::Cancel => self.profile_editor = None,
-                FormAction::PickRedisCaFile => {
-                    if let Some(path) = native_redis_ca_file_picker()
-                        && let Some(editor) = self.profile_editor.as_mut()
-                    {
-                        editor.bind_redis_ca_file(path);
-                        self.model.status = "Redis CA file selected".to_owned();
-                    }
-                }
-                FormAction::None => {}
-            }
+            let action = self
+                .profile_editor
+                .as_mut()
+                .map_or(FormAction::None, |editor| editor.show(ui));
+            self.apply_profile_form_action(action);
             return;
         }
+
         let mut editor_intent = None;
-        let mut result_intent = None;
         let mut recovery = None;
-        egui::CentralPanel::default().show(root_ui, |ui| {
-            let selected_workspace_key = self.model.selected_workspace_key();
-            if let Some(profile) = self.model.selected_profile_snapshot().cloned() {
-                let editor_enabled = !self.model.is_config_uncertain();
-                let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
-                let workspace = self.model.workspace_mut(key);
-                editor_intent = self.editor_surface.show(
-                    ui,
-                    &profile,
-                    workspace,
-                    editor_enabled && profile.is_ready(),
-                );
-            } else {
-                ui.weak("Select a connection to edit a statement or command.");
-            }
-            ui.horizontal(|ui| {
-                ui.label(&self.model.status);
-            });
-            if let Some(visible) = self.common_error.clone()
-                && let Some(action) = render_recovery_error(ui, "common", &visible)
-            {
-                recovery = Some((visible, action));
-            }
-            ui.separator();
-            ui.heading("Results");
-            if let Some(result) = selected_workspace_key.and_then(|key| {
-                let workspace = self.model.workspace_mut(key);
-                workspace
-                    .result
-                    .clone()
-                    .map(|result| (result, &mut workspace.result_view))
-            }) {
-                let (result, result_view) = result;
-                if let Some(intent) = result_view.show(ui, result.as_ref(), true) {
-                    result_intent = Some((result, intent));
-                }
-            } else {
-                ui.weak("No result yet");
-            }
-        });
+        if let Some(profile) = self.model.selected_profile_snapshot().cloned() {
+            let editor_enabled = !self.model.is_config_uncertain();
+            let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+            let workspace = self.model.workspace_mut(key);
+            editor_intent = self.editor_surface.show(
+                ui,
+                &profile,
+                workspace,
+                editor_enabled && profile.is_ready(),
+            );
+        } else {
+            ui.weak("Select a connection to edit a statement or command.");
+        }
+        if let Some(visible) = self.common_error.clone()
+            && let Some(action) = render_recovery_error(ui, "common", &visible)
+        {
+            recovery = Some((visible, action));
+        }
         if let Some(intent) = editor_intent {
             self.submit_editor_intent(intent);
+        }
+        if let Some((visible, action)) = recovery {
+            self.dispatch_error_recovery(visible.operation_id, &visible.error, action);
+        }
+    }
+
+    fn show_result_surface(&mut self, ui: &mut egui::Ui) {
+        let tab = ui.selectable_label(true, "Results");
+        named_author_id(tab, "result-history-tabs", "Result tabs");
+        ui.separator();
+
+        let mut result_intent = None;
+        let selected_workspace_key = self.model.selected_workspace_key();
+        if let Some(result) = selected_workspace_key.and_then(|key| {
+            let workspace = self.model.workspace_mut(key);
+            workspace
+                .result
+                .clone()
+                .map(|result| (result, &mut workspace.result_view))
+        }) {
+            let (result, result_view) = result;
+            if let Some(intent) = result_view.show(ui, result.as_ref(), true) {
+                result_intent = Some((result, intent));
+            }
+        } else {
+            ui.weak("No result yet");
         }
         if let Some((result, intent)) = result_intent {
             self.handle_result_view_intent(result, intent);
         }
-        if let Some((visible, action)) = recovery {
-            self.dispatch_error_recovery(visible.operation_id, &visible.error, action);
+    }
+
+    fn apply_profile_form_action(&mut self, action: FormAction) {
+        match action {
+            FormAction::Save { connect } => {
+                let operation_id = self.model.next_operation();
+                if let Some(editor) = self.profile_editor.as_mut() {
+                    match editor.try_save_with_connect(&self.port, operation_id, connect) {
+                        SaveAttempt::Submitted(_) => {
+                            self.model.status = "Saving profile…".to_owned();
+                        }
+                        SaveAttempt::Invalid => {
+                            self.model.status = "Fix the profile form".to_owned();
+                        }
+                        SaveAttempt::Busy => {
+                            self.model.status = "Service is busy".to_owned();
+                        }
+                        SaveAttempt::Disconnected => {
+                            self.model.status = "Service is unavailable".to_owned();
+                        }
+                        SaveAttempt::ConfigUncertain => {
+                            self.model.status = "Reload profiles before saving.".to_owned();
+                        }
+                        SaveAttempt::AlreadyPending(_) => {
+                            self.model.status = "Profile save is already pending".to_owned();
+                        }
+                    }
+                }
+            }
+            FormAction::TestDraft => {
+                let operation_id = self.model.next_operation();
+                if let Some(editor) = self.profile_editor.as_mut() {
+                    match editor.try_test_draft(&self.port, operation_id) {
+                        DraftTestAttempt::Submitted(_) => {
+                            self.model.status = "Testing draft connection…".to_owned();
+                        }
+                        DraftTestAttempt::Invalid | DraftTestAttempt::Unavailable => {
+                            self.model.status = editor.status().to_owned();
+                        }
+                        DraftTestAttempt::Busy => {
+                            self.model.status = "Service is busy".to_owned();
+                        }
+                        DraftTestAttempt::Disconnected => {
+                            self.model.status = "Service is unavailable".to_owned();
+                        }
+                        DraftTestAttempt::ConfigUncertain => {
+                            self.model.status = "Reload profiles before testing.".to_owned();
+                        }
+                        DraftTestAttempt::AlreadyPending(_) => {
+                            self.model.status = "Profile work is already pending".to_owned();
+                        }
+                    }
+                }
+            }
+            FormAction::ProbeEnvironment => {
+                if let Some(editor) = self.profile_editor.as_mut() {
+                    let availability = editor.probe_environment_availability();
+                    self.model.status = format!("Environment credential: {availability:?}");
+                }
+            }
+            FormAction::Cancel => self.profile_editor = None,
+            FormAction::PickRedisCaFile => {
+                if let Some(path) = native_redis_ca_file_picker()
+                    && let Some(editor) = self.profile_editor.as_mut()
+                {
+                    editor.bind_redis_ca_file(path);
+                    self.model.status = "Redis CA file selected".to_owned();
+                }
+            }
+            FormAction::None => {}
         }
     }
 }
@@ -3104,16 +3423,53 @@ fn catalog_request_with_identity(
 
 fn connection_label(state: &ConnectionState) -> String {
     match state {
-        ConnectionState::Disconnected => "● Disconnected".to_owned(),
-        ConnectionState::Pending(_) => "◌ Connecting…".to_owned(),
+        ConnectionState::Disconnected => "Disconnected".to_owned(),
+        ConnectionState::Pending(_) => "Connecting…".to_owned(),
         ConnectionState::Connected { elapsed_ms, .. } => {
-            format!("● Connected · {elapsed_ms} ms")
+            format!("Connected · {elapsed_ms} ms")
         }
-        ConnectionState::NeedsCredential => "● Credential required".to_owned(),
+        ConnectionState::NeedsCredential => "Credential required".to_owned(),
         ConnectionState::Failed { summary } => {
-            format!("● Failed · {}", summary.message())
+            format!("Failed · {}", summary.message())
         }
-        ConnectionState::Closing => "◌ Closing…".to_owned(),
+        ConnectionState::Closing => "Closing…".to_owned(),
+    }
+}
+
+const fn profile_environment_label(environment: Option<ProfileEnvironment>) -> &'static str {
+    match environment {
+        Some(ProfileEnvironment::Production) => "PRODUCTION",
+        Some(ProfileEnvironment::Development) => "Development",
+        None => "Unclassified",
+    }
+}
+
+const fn profile_access_label(access: ProfileAccess) -> &'static str {
+    match access {
+        ProfileAccess::ReadOnly => "Read-only",
+        ProfileAccess::ReadWrite => "Read-write",
+    }
+}
+
+const fn operation_kind_label(kind: OperationKind) -> &'static str {
+    match kind {
+        OperationKind::LoadConfiguration => "Load configuration",
+        OperationKind::ReloadConfiguration => "Reload configuration",
+        OperationKind::MigrateConfiguration => "Migrate configuration",
+        OperationKind::CreateProfile => "Create profile",
+        OperationKind::UpdateProfile => "Update profile",
+        OperationKind::DeleteProfile => "Delete profile",
+        OperationKind::TestDraftConnection => "Test draft connection",
+        OperationKind::ConnectProfile => "Connect",
+        OperationKind::DisconnectProfile => "Disconnect",
+        OperationKind::ReconnectProfile => "Reconnect",
+        OperationKind::ExecuteRead => "Execute read",
+        OperationKind::ExecuteMutation => "Execute data change",
+        OperationKind::BrowseMySql => "Browse MySQL",
+        OperationKind::BrowseRedis => "Browse Redis",
+        OperationKind::InspectRedis => "Inspect Redis",
+        OperationKind::ExportResult => "Export result",
+        OperationKind::ShutdownRuntime => "Shut down runtime",
     }
 }
 
@@ -3340,7 +3696,7 @@ mod tests {
     use crate::ui::editor::{EditorCursor, EditorIntent, build_execute_intent};
     use crate::ui::model::{ConfigPresentation, ProfileSnapshot, UiEvent, WorkspaceKey};
     use crate::ui::redis_explorer::RedisExplorerIntent;
-    use eframe::egui::{Context, Event, Key, Modifiers, RawInput, accesskit};
+    use eframe::egui::{self, Context, Event, Key, Modifiers, RawInput, accesskit};
 
     fn profile(driver: DriverKind, availability: DriverAvailability) -> ProfileSnapshot {
         let persisted = ConnectionProfile {
@@ -3355,6 +3711,10 @@ mod tests {
             },
             database: None,
             username: None,
+            safety: crate::model::ProfileSafetyPosture::new(
+                crate::model::ProfileEnvironment::Development,
+                crate::model::ProfileAccess::ReadWrite,
+            ),
             tls: TlsMode::Disabled,
             credential_mode: CredentialMode::None,
             secret_env: None,
@@ -3390,6 +3750,29 @@ mod tests {
         let context = Context::default();
         context.enable_accesskit();
         let _ = context.run_ui(RawInput::default(), |ui| app.explorer_contents(ui));
+    }
+
+    fn shell_author_ids(app: &mut DbotterApp, width: f32, height: f32) -> BTreeSet<String> {
+        let context = Context::default();
+        context.enable_accesskit();
+        context
+            .run_ui(
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, height),
+                    )),
+                    ..RawInput::default()
+                },
+                |ui| app.show_native(ui),
+            )
+            .platform_output
+            .accesskit_update
+            .expect("actual shell frame must emit AccessKit")
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.author_id().map(str::to_owned))
+            .collect()
     }
 
     fn redis_page(request: &RedisScanRequest, raw_key: &[u8]) -> RedisKeyPage {
@@ -3638,6 +4021,95 @@ mod tests {
         let mongodb = node("connection.mongodb.planned");
         assert_eq!(mongodb.role(), accesskit::Role::RadioButton);
         assert!(mongodb.is_disabled());
+    }
+
+    #[test]
+    fn actual_wide_shell_exposes_all_persistent_regions_at_1440_by_900() {
+        assert_eq!(super::NativeLayout::columns_for_width(1180.0), 3);
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.model
+            .workspace_mut(WorkspaceKey::new(profile.id.clone(), profile.generation));
+
+        let ids = shell_author_ids(&mut app, 1440.0, 900.0);
+        for expected in [
+            "navigator",
+            "object-editor-tabs",
+            "result-history-tabs",
+            "status-action-context",
+        ] {
+            assert!(
+                ids.contains(expected),
+                "missing actual wide AX id {expected}"
+            );
+        }
+        assert!(!ids.contains("navigator.open"));
+        assert!(!ids.contains("inspector.open"));
+    }
+
+    #[test]
+    fn actual_compact_shell_exposes_one_named_surface_and_keeps_status_at_840_by_560() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.model
+            .workspace_mut(WorkspaceKey::new(profile.id.clone(), profile.generation));
+
+        let editor = shell_author_ids(&mut app, 840.0, 560.0);
+        for expected in [
+            "navigator.open",
+            "inspector.open",
+            "object-editor-tabs",
+            "status-action-context",
+        ] {
+            assert!(
+                editor.contains(expected),
+                "missing actual compact editor AX id {expected}"
+            );
+        }
+        assert!(!editor.contains("navigator"));
+        assert!(!editor.contains("result-history-tabs"));
+
+        app.compact_fallback
+            .open(super::FallbackSurface::Navigator, "object-editor-tabs");
+        let navigator = shell_author_ids(&mut app, 840.0, 560.0);
+        for expected in ["navigator", "fallback.close", "status-action-context"] {
+            assert!(
+                navigator.contains(expected),
+                "missing compact navigator AX id {expected}"
+            );
+        }
+        assert!(!navigator.contains("object-editor-tabs"));
+        assert!(!navigator.contains("result-history-tabs"));
+
+        app.compact_fallback
+            .open(super::FallbackSurface::Inspector, "object-editor-tabs");
+        let inspector = shell_author_ids(&mut app, 840.0, 560.0);
+        for expected in [
+            "result-history-tabs",
+            "fallback.close",
+            "status-action-context",
+        ] {
+            assert!(
+                inspector.contains(expected),
+                "missing compact inspector AX id {expected}"
+            );
+        }
+        assert!(!inspector.contains("navigator"));
+        assert!(!inspector.contains("object-editor-tabs"));
     }
 
     #[test]

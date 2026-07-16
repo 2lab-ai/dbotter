@@ -10,8 +10,9 @@ use crate::config::{
     CURRENT_CONFIG_VERSION, Config, ConfigSourceVersion, ConfigWriter, migration_backup_path,
 };
 use crate::model::{
-    ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileGeneration,
-    ProfileId, PublicSummary, RedisTlsConfig, ResultId, SessionGeneration, TlsMode,
+    ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileAccess,
+    ProfileEnvironment, ProfileGeneration, ProfileId, ProfileInstanceId, ProfileSafetyPosture,
+    PublicSummary, RedisTlsConfig, ResultId, SessionGeneration, TlsMode,
 };
 use crate::secrets::{EnvironmentAvailability, SecretError, SessionSecret, SessionSecretStore};
 use crate::service::{ApplicationService, DriverConnector, SecretResolver};
@@ -378,6 +379,11 @@ async fn saved_environment_availability_refreshes_on_reload_and_restart_without_
         port: 3306,
         database: None,
         username: None,
+        safety: ProfileSafetyPosture::classified(
+            ProfileEnvironment::Development,
+            ProfileAccess::ReadWrite,
+            ProfileInstanceId::from_bytes([1; 16]),
+        ),
         tls: TlsMode::Disabled,
         credential_mode: CredentialMode::Environment,
         secret_env: Some("DBOTTER_SAVED_ENV".to_owned()),
@@ -392,7 +398,7 @@ async fn saved_environment_availability_refreshes_on_reload_and_restart_without_
     let environment = Arc::new(MutableEnvironment::new(EnvironmentAvailability::Missing));
     let process_a = environment_service(&path, environment.clone());
     let (missing, config) = snapshots(&process_a).await.expect("missing snapshot");
-    assert_eq!(config.source_version(), ConfigSourceVersion::V2);
+    assert_eq!(config.source_version(), ConfigSourceVersion::V3);
     assert_eq!(
         missing[0].environment_availability,
         Some(EnvironmentAvailability::Missing)

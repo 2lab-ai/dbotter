@@ -12,8 +12,9 @@ use dbotter::execution::{
 };
 use dbotter::model::{
     Cell, ConnectionProfile, CredentialMode, DriverKind, OperationId, OperationKind,
-    PreparedMySqlRequest, ProfileFieldId, ProfileGeneration, ProfileId, PublicCode, PublicSummary,
-    RedisTlsConfig, RequestIdentity, TlsMode,
+    PreparedMySqlRequest, ProfileAccess, ProfileEnvironment, ProfileFieldId, ProfileGeneration,
+    ProfileId, ProfileSafetyPosture, PublicCode, PublicSummary, RedisTlsConfig, RequestIdentity,
+    TlsMode,
 };
 use dbotter::public_error::{RecoveryAction, SafeContext, recovery_for};
 use dbotter::secrets::{
@@ -47,6 +48,10 @@ fn profile(id: &str, credential_mode: CredentialMode) -> ConnectionProfile {
         port: live_port(),
         database: Some("dbotter".to_owned()),
         username: Some("dbotter".to_owned()),
+        safety: ProfileSafetyPosture::new(
+            ProfileEnvironment::Development,
+            ProfileAccess::ReadWrite,
+        ),
         tls: TlsMode::Disabled,
         credential_mode,
         secret_env: (credential_mode == CredentialMode::Environment).then(|| ENV_NAME.to_owned()),

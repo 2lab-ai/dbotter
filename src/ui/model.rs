@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::config::{ConfigSourceVersion, migration_backup_path};
+use crate::config::ConfigSourceVersion;
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionProfile, CredentialMode, DraftId, DriverAvailability,
     DriverKind, ExportFormat, OperationId, OperationKind, OverwritePolicy, ProfileGeneration,
@@ -29,8 +29,12 @@ impl ConfigPresentation {
     pub fn for_source(source_version: ConfigSourceVersion, config_path: &Path) -> Self {
         Self {
             source_version,
-            migration_backup: (source_version == ConfigSourceVersion::V1)
-                .then(|| migration_backup_path(config_path)),
+            migration_backup: match source_version {
+                ConfigSourceVersion::V1 | ConfigSourceVersion::V2 => Some(
+                    crate::config::migration_backup_path_for_source(config_path, source_version),
+                ),
+                ConfigSourceVersion::Missing | ConfigSourceVersion::V3 => None,
+            },
         }
     }
 
@@ -39,7 +43,10 @@ impl ConfigPresentation {
     }
 
     pub const fn migration_required(&self) -> bool {
-        matches!(self.source_version, ConfigSourceVersion::V1)
+        matches!(
+            self.source_version,
+            ConfigSourceVersion::V1 | ConfigSourceVersion::V2
+        )
     }
 
     pub fn migration_backup(&self) -> Option<&Path> {
@@ -1158,11 +1165,11 @@ mod tests {
     };
     use crate::model::{
         CatalogLevel, CatalogPage, CatalogRequest, CatalogRetainedCounts, ConnectionProfile,
-        CredentialMode, DriverAvailability, DriverKind, OperationId, OperationKind,
-        ProfileGeneration, ProfileId, PublicCode, PublicSummary, QueryResult, RedisKeyFilter,
-        RedisKeyPage, RedisScanConsistency, RedisScanRequest, RedisTlsConfig, RequestIdentity,
-        ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration,
-        TlsMode,
+        CredentialMode, DriverAvailability, DriverKind, OperationId, OperationKind, ProfileAccess,
+        ProfileEnvironment, ProfileGeneration, ProfileId, ProfileSafetyPosture, PublicCode,
+        PublicSummary, QueryResult, RedisKeyFilter, RedisKeyPage, RedisScanConsistency,
+        RedisScanRequest, RedisTlsConfig, RequestIdentity, ResultId, ResultProvenance,
+        ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
     };
     use crate::public_error::{PublicOperationError, SafeContext};
     use crate::service::SessionDisposition;
@@ -1667,6 +1674,10 @@ mod tests {
             port,
             database: None,
             username: None,
+            safety: ProfileSafetyPosture::new(
+                ProfileEnvironment::Development,
+                ProfileAccess::ReadWrite,
+            ),
             tls: TlsMode::Disabled,
             credential_mode: CredentialMode::None,
             secret_env: None,

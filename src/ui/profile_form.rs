@@ -7,8 +7,9 @@ use eframe::egui;
 
 use crate::config::MigrationConsent;
 use crate::model::{
-    ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileFieldId,
-    ProfileGeneration, ProfileId, RedisTlsConfig, SessionCredentialIntent, TlsMode,
+    ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileAccess,
+    ProfileEnvironment, ProfileFieldId, ProfileGeneration, ProfileId, ProfileSafetyPosture,
+    RedisTlsConfig, SessionCredentialIntent, TlsMode,
 };
 use crate::secrets::{
     CredentialEditContext, EnvironmentAvailability, ReplacementSecretBuffer, probe_environment,
@@ -58,6 +59,8 @@ pub(super) struct ProfileDraft {
     pub port: String,
     pub database: String,
     pub username: String,
+    pub environment: ProfileEnvironment,
+    pub access: ProfileAccess,
     pub tls: TlsMode,
     pub credential_mode: CredentialMode,
     pub secret_env: String,
@@ -75,6 +78,8 @@ impl std::fmt::Debug for ProfileDraft {
             .field("port", &self.port)
             .field("database", &"<redacted>")
             .field("username", &"<redacted>")
+            .field("environment", &self.environment)
+            .field("access", &self.access)
             .field("tls", &self.tls)
             .field("credential_mode", &self.credential_mode)
             .field("secret_env", &"<redacted>")
@@ -93,6 +98,8 @@ impl ProfileDraft {
             port: default_port(driver).to_string(),
             database: String::new(),
             username: String::new(),
+            environment: ProfileEnvironment::Development,
+            access: ProfileAccess::ReadWrite,
             tls: if driver == DriverKind::Redis {
                 TlsMode::Disabled
             } else {
@@ -113,6 +120,11 @@ impl ProfileDraft {
             port: profile.port.to_string(),
             database: profile.database.clone().unwrap_or_default(),
             username: profile.username.clone().unwrap_or_default(),
+            environment: profile
+                .safety
+                .environment()
+                .unwrap_or(ProfileEnvironment::Development),
+            access: profile.safety.access().unwrap_or(ProfileAccess::ReadOnly),
             tls: profile.tls,
             credential_mode: profile.credential_mode,
             secret_env: profile.secret_env.clone().unwrap_or_default(),
@@ -235,6 +247,7 @@ impl ProfileDraft {
             port,
             database,
             username: optional_trimmed(&self.username),
+            safety: ProfileSafetyPosture::new(self.environment, self.access),
             tls: self.tls,
             credential_mode: self.credential_mode,
             secret_env,
@@ -1460,8 +1473,9 @@ mod tests {
     };
     use crate::config::MigrationConsent;
     use crate::model::{
-        ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileGeneration,
-        ProfileId, RedisTlsConfig, SessionCredentialIntent, TlsMode,
+        ConnectionProfile, CredentialMode, DraftId, DriverKind, OperationId, ProfileAccess,
+        ProfileEnvironment, ProfileGeneration, ProfileId, ProfileSafetyPosture, RedisTlsConfig,
+        SessionCredentialIntent, TlsMode,
     };
     use crate::secrets::{EnvironmentAvailability, SessionSecretUpdate};
     use crate::ui::accessibility::{assert_accesskit_omits, assert_accesskit_value_confined};
@@ -1928,6 +1942,10 @@ mod tests {
                     port: 6379,
                     database: None,
                     username: None,
+                    safety: ProfileSafetyPosture::new(
+                        ProfileEnvironment::Development,
+                        ProfileAccess::ReadWrite,
+                    ),
                     tls: TlsMode::Disabled,
                     credential_mode: CredentialMode::None,
                     secret_env: None,
@@ -2044,6 +2062,10 @@ mod tests {
                     port: 3306,
                     database: None,
                     username: None,
+                    safety: ProfileSafetyPosture::new(
+                        ProfileEnvironment::Development,
+                        ProfileAccess::ReadWrite,
+                    ),
                     tls: TlsMode::Preferred,
                     credential_mode: CredentialMode::Session,
                     secret_env: None,
@@ -2191,6 +2213,10 @@ mod tests {
             port: 3307,
             database: Some("app".to_owned()),
             username: Some("developer".to_owned()),
+            safety: ProfileSafetyPosture::new(
+                ProfileEnvironment::Development,
+                ProfileAccess::ReadWrite,
+            ),
             tls: TlsMode::Required,
             credential_mode: CredentialMode::Environment,
             secret_env: Some("MYSQL_PASSWORD".to_owned()),
@@ -2212,6 +2238,10 @@ mod tests {
             port: 6379,
             database: Some("0".to_owned()),
             username: None,
+            safety: ProfileSafetyPosture::new(
+                ProfileEnvironment::Development,
+                ProfileAccess::ReadWrite,
+            ),
             tls: TlsMode::Disabled,
             credential_mode: CredentialMode::None,
             secret_env: None,
@@ -2234,6 +2264,10 @@ mod tests {
             port: 3306,
             database: None,
             username: None,
+            safety: ProfileSafetyPosture::new(
+                ProfileEnvironment::Development,
+                ProfileAccess::ReadWrite,
+            ),
             tls: TlsMode::Preferred,
             credential_mode: CredentialMode::Session,
             secret_env: None,

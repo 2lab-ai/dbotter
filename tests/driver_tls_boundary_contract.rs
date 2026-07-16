@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use dbotter::drivers::{DriverError, connect};
-use dbotter::model::{ConnectionProfile, CredentialMode, DriverKind, RedisTlsConfig, TlsMode};
+use dbotter::model::{
+    ConnectionProfile, CredentialMode, DriverKind, ProfileAccess, ProfileEnvironment,
+    ProfileSafetyPosture, RedisTlsConfig, TlsMode,
+};
 
 #[tokio::test]
 async fn public_driver_connect_rejects_legacy_preferred_before_io() {
@@ -43,6 +46,10 @@ fn redis_profile(tls: TlsMode) -> ConnectionProfile {
         port: 6379,
         database: None,
         username: None,
+        safety: ProfileSafetyPosture::new(
+            ProfileEnvironment::Development,
+            ProfileAccess::ReadWrite,
+        ),
         tls,
         credential_mode: CredentialMode::None,
         secret_env: None,
