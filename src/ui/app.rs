@@ -2032,41 +2032,60 @@ impl DbotterApp {
         profile: &ProfileSnapshot,
         intent: MySqlExplorerIntent,
     ) {
-        if let MySqlExplorerIntent::InsertTemplate(template) = intent {
-            let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
-            let outcome = self.model.workspace_mut(key).create_editor_tab(
-                profile.driver.language(),
-                "Data query",
-                template,
-            );
-            match outcome {
-                Ok(_) => {
-                    self.editor_surface = EditorSurface::default();
-                    let key =
-                        super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
-                    let intent = self.model.workspace(&key).map(|workspace| {
-                        let character_count = workspace.editor_text.chars().count();
-                        build_execute_intent(
-                            profile,
-                            workspace,
-                            EditorCursor::with_selection(character_count, 0..character_count),
-                        )
-                    });
-                    match intent {
-                        Some(Ok(intent)) => {
-                            self.submit_editor_intent(EditorIntent::Execute(intent));
-                        }
-                        Some(Err(error)) => self.model.status = error.to_string(),
-                        None => {
-                            self.model.status =
-                                "The bounded table query could not be submitted.".to_owned();
+        let intent = match intent {
+            MySqlExplorerIntent::NewEditor { schema, relation } => {
+                let title = mysql_context_editor_title(&schema, &relation);
+                let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+                match self.model.workspace_mut(key).create_editor_tab(
+                    profile.driver.language(),
+                    title,
+                    "",
+                ) {
+                    Ok(_) => {
+                        self.editor_surface = EditorSurface::default();
+                        self.model.status = format!("New editor opened for {schema}.{relation}.");
+                    }
+                    Err(error) => self.model.status = error.to_string(),
+                }
+                return;
+            }
+            MySqlExplorerIntent::InsertTemplate(template) => {
+                let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+                let outcome = self.model.workspace_mut(key).create_editor_tab(
+                    profile.driver.language(),
+                    "Data query",
+                    template,
+                );
+                match outcome {
+                    Ok(_) => {
+                        self.editor_surface = EditorSurface::default();
+                        let key =
+                            super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+                        let intent = self.model.workspace(&key).map(|workspace| {
+                            let character_count = workspace.editor_text.chars().count();
+                            build_execute_intent(
+                                profile,
+                                workspace,
+                                EditorCursor::with_selection(character_count, 0..character_count),
+                            )
+                        });
+                        match intent {
+                            Some(Ok(intent)) => {
+                                self.submit_editor_intent(EditorIntent::Execute(intent));
+                            }
+                            Some(Err(error)) => self.model.status = error.to_string(),
+                            None => {
+                                self.model.status =
+                                    "The bounded table query could not be submitted.".to_owned();
+                            }
                         }
                     }
+                    Err(error) => self.model.status = error.to_string(),
                 }
-                Err(error) => self.model.status = error.to_string(),
+                return;
             }
-            return;
-        }
+            intent => intent,
+        };
         if self.model.is_config_uncertain() {
             self.model.status = "Reload profiles before browsing the catalog.".to_owned();
             return;
@@ -2115,7 +2134,9 @@ impl DbotterApp {
                 timeout: DEFAULT_CATALOG_TIMEOUT,
             },
             MySqlExplorerIntent::Retry(request) => catalog_request_with_identity(request, identity),
-            MySqlExplorerIntent::InsertTemplate(_) => return,
+            MySqlExplorerIntent::NewEditor { .. } | MySqlExplorerIntent::InsertTemplate(_) => {
+                return;
+            }
         };
         match self
             .port
@@ -3525,6 +3546,22 @@ impl DbotterApp {
         if let Some(profile) = self.model.selected_profile_snapshot().cloned() {
             let editor_enabled = !self.model.is_config_uncertain();
             let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+            let context_value = self.workspace_context_value(&profile);
+            let context = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&context_value)
+                        .color(egui::Color32::BLACK)
+                        .strong(),
+                )
+                .selectable(false),
+            );
+            named_dynamic_value_author_id(
+                context,
+                "workspace.context".to_owned(),
+                "Workspace context".to_owned(),
+                context_value,
+            );
+            ui.add_space(4.0);
             self.show_editor_tab_strip(ui, &profile, &key, editor_enabled);
             ui.separator();
             let sync_error = {
@@ -3554,6 +3591,22 @@ impl DbotterApp {
         if let Some((visible, action)) = recovery {
             self.dispatch_error_recovery(visible.operation_id, &visible.error, action);
         }
+    }
+
+    fn workspace_context_value(&self, profile: &ProfileSnapshot) -> String {
+        let mut context = vec![profile.name.clone()];
+        if let Some(database) = profile.database.as_ref() {
+            context.push(database.clone());
+        }
+        if profile.driver == DriverKind::MySql
+            && let Some(selected) = self
+                .mysql_explorers
+                .get(&(profile.id.clone(), profile.generation))
+                .and_then(MySqlExplorerState::selected_object_display)
+        {
+            context.push(selected);
+        }
+        context.join(" → ")
     }
 
     fn show_result_surface(&mut self, ui: &mut egui::Ui) {
@@ -3970,6 +4023,23 @@ fn restore_workspace_geometries(
             (key, geometry)
         })
         .collect()
+}
+
+fn mysql_context_editor_title(schema: &str, relation: &str) -> String {
+    const MAX_TITLE_BYTES: usize = 120;
+    const ELLIPSIS: &str = "…";
+
+    let mut title = format!("{schema}.{relation}");
+    if title.len() <= MAX_TITLE_BYTES {
+        return title;
+    }
+    let mut end = MAX_TITLE_BYTES - ELLIPSIS.len();
+    while !title.is_char_boundary(end) {
+        end -= 1;
+    }
+    title.truncate(end);
+    title.push_str(ELLIPSIS);
+    title
 }
 
 fn catalog_request_with_identity(

@@ -1,6 +1,7 @@
 //! Pure MySQL catalog explorer state plus its egui renderer.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use eframe::egui;
 
@@ -10,13 +11,16 @@ use crate::model::{
     CatalogRequest, OperationId, PublicSummary,
 };
 
-use super::accessibility::{named_author_id, named_dynamic_author_id};
+use super::accessibility::{
+    named_author_id, named_dynamic_author_id, named_dynamic_value_author_id,
+};
 use super::theme::OpenAiTheme;
 
 const OPENAI_CANVAS: egui::Color32 = egui::Color32::WHITE;
 const OPENAI_INK: egui::Color32 = egui::Color32::BLACK;
 const OPENAI_INK_60: egui::Color32 = egui::Color32::from_gray(102);
 const OPENAI_HAIRLINE: egui::Color32 = egui::Color32::from_gray(0x91);
+const COLLECTION_ROW_HEIGHT: f32 = 30.0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum BranchKey {
@@ -72,7 +76,43 @@ pub enum MySqlExplorerIntent {
         token: Option<CatalogPageToken>,
     },
     Retry(CatalogRequest),
+    NewEditor {
+        schema: String,
+        relation: String,
+    },
     InsertTemplate(String),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SelectedMySqlObject {
+    schema: String,
+    relation: String,
+    kind: CatalogNodeKind,
+}
+
+impl fmt::Debug for SelectedMySqlObject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SelectedMySqlObject(<redacted>)")
+    }
+}
+
+impl SelectedMySqlObject {
+    fn new(schema: String, relation: String, kind: CatalogNodeKind) -> Self {
+        Self {
+            schema,
+            relation,
+            kind,
+        }
+    }
+
+    fn display_value(&self) -> String {
+        format!(
+            "{}.{} · {}",
+            self.schema,
+            self.relation,
+            catalog_kind_label(self.kind)
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +125,7 @@ pub struct MySqlExplorerState {
     retry: Option<CatalogRequest>,
     last_error: Option<PublicSummary>,
     retention: CatalogRetention,
+    selected_object: Option<SelectedMySqlObject>,
 }
 
 impl MySqlExplorerState {
@@ -150,6 +191,7 @@ impl MySqlExplorerState {
         self.retry = None;
         self.last_error = None;
         self.retention.clear();
+        self.selected_object = None;
     }
 
     pub fn dismiss_error(&mut self) {
@@ -176,6 +218,12 @@ impl MySqlExplorerState {
 
     pub fn retry_request(&self) -> Option<&CatalogRequest> {
         self.retry.as_ref()
+    }
+
+    pub fn selected_object_display(&self) -> Option<String> {
+        self.selected_object
+            .as_ref()
+            .map(SelectedMySqlObject::display_value)
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) -> Vec<MySqlExplorerIntent> {
@@ -252,6 +300,25 @@ impl MySqlExplorerState {
                         ui.label(
                             egui::RichText::new("The previous page is retained and marked stale.")
                                 .color(OPENAI_INK_60),
+                        );
+                    }
+
+                    if let Some(selected) = self.selected_object.as_ref() {
+                        ui.add_space(8.0);
+                        let value = selected.display_value();
+                        let selected = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("Selected object · {value}"))
+                                    .color(OPENAI_INK)
+                                    .strong(),
+                            )
+                            .selectable(false),
+                        );
+                        named_dynamic_value_author_id(
+                            selected,
+                            "navigator.object.selected-context".to_owned(),
+                            "Selected MySQL object".to_owned(),
+                            value,
                         );
                     }
 
@@ -381,33 +448,47 @@ impl MySqlExplorerState {
             if relations.nodes.is_empty() {
                 ui.label(egui::RichText::new("No relations match.").color(OPENAI_INK_60));
             }
-            for (relation_index, relation_node) in relations.nodes.into_iter().enumerate() {
+            for relation_node in relations.nodes {
                 let CatalogNodeIdentity::Relation { relation, .. } = relation_node.identity else {
                     continue;
                 };
                 let relation_kind = relation_node.kind;
                 let relation_key = (schema.to_owned(), relation.clone());
                 let expanded = self.expanded_relations.contains(&relation_key);
-                let author_scope = stable_author_scope(schema);
+                let author_scope = stable_relation_scope(schema, &relation);
+                let selected_object =
+                    SelectedMySqlObject::new(schema.to_owned(), relation.clone(), relation_kind);
+                let selected = self.selected_object.as_ref() == Some(&selected_object);
+                let kind = catalog_kind_label(relation_kind);
                 ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    let kind = match relation_kind {
-                        CatalogNodeKind::View => "View",
-                        CatalogNodeKind::Table => "Table",
-                        CatalogNodeKind::Schema | CatalogNodeKind::Column => "Relation",
-                    };
-                    ui.label(
+                let relation_row = ui.add_sized(
+                    [ui.available_width(), COLLECTION_ROW_HEIGHT],
+                    egui::Button::selectable(
+                        selected,
                         egui::RichText::new(format!("{} · {kind}", relation_node.name))
-                            .color(OPENAI_INK),
-                    );
+                            .color(if selected { OPENAI_CANVAS } else { OPENAI_INK }),
+                    )
+                    .frame(false),
+                );
+                let relation_row = named_dynamic_value_author_id(
+                    relation_row,
+                    format!("navigator.object.relation.{author_scope:x}"),
+                    format!("Select MySQL {kind}"),
+                    selected_object.display_value(),
+                );
+                if relation_row.clicked() {
+                    self.selected_object = Some(selected_object.clone());
+                }
+                ui.horizontal_wrapped(|ui| {
                     let structure_author_id = "navigator.object.structure";
                     let structure = secondary_button(ui, "Structure", !self.is_pending());
                     let structure = named_dynamic_author_id(
                         structure,
-                        format!("{structure_author_id}.{author_scope:x}.{relation_index}"),
+                        format!("{structure_author_id}.{author_scope:x}"),
                         "Open relation structure",
                     );
                     if structure.clicked() {
+                        self.selected_object = Some(selected_object.clone());
                         if expanded {
                             self.expanded_relations.remove(&relation_key);
                         } else {
@@ -425,18 +506,34 @@ impl MySqlExplorerState {
                             }
                         }
                     }
-                    let data_author_id = "navigator.object.data";
-                    let data_available = relation_kind == CatalogNodeKind::Table;
-                    let data = secondary_button(ui, "Data", data_available);
-                    let data = named_dynamic_author_id(
-                        data,
-                        format!("{data_author_id}.{author_scope:x}.{relation_index}"),
-                        "Open bounded table data query",
+                    let new_editor_author_id = "navigator.object.new-editor";
+                    let new_editor = secondary_button(ui, "New editor", true);
+                    let new_editor = named_dynamic_author_id(
+                        new_editor,
+                        format!("{new_editor_author_id}.{author_scope:x}"),
+                        "Open a new editor for this relation",
                     );
-                    if data.clicked() && data_available {
-                        intents.push(MySqlExplorerIntent::InsertTemplate(
-                            bounded_select_template(schema, &relation),
-                        ));
+                    if new_editor.clicked() {
+                        self.selected_object = Some(selected_object.clone());
+                        intents.push(MySqlExplorerIntent::NewEditor {
+                            schema: schema.to_owned(),
+                            relation: relation.clone(),
+                        });
+                    }
+                    if relation_kind == CatalogNodeKind::Table {
+                        let data_author_id = "navigator.object.data";
+                        let data = secondary_button(ui, "Data", !self.is_pending());
+                        let data = named_dynamic_author_id(
+                            data,
+                            format!("{data_author_id}.{author_scope:x}"),
+                            "Open bounded table data query",
+                        );
+                        if data.clicked() {
+                            self.selected_object = Some(selected_object.clone());
+                            intents.push(MySqlExplorerIntent::InsertTemplate(
+                                bounded_select_template(schema, &relation),
+                            ));
+                        }
                     }
                     if relation_kind == CatalogNodeKind::View {
                         ui.small("View data unavailable: nested view safety is not proven.");
@@ -515,6 +612,22 @@ fn stable_author_scope(value: &str) -> u64 {
         .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         })
+}
+
+fn stable_relation_scope(schema: &str, relation: &str) -> u64 {
+    let schema_hash = stable_author_scope(schema);
+    relation.as_bytes().iter().fold(
+        (schema_hash ^ u64::from(0xff_u8)).wrapping_mul(0x0000_0100_0000_01b3),
+        |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3),
+    )
+}
+
+const fn catalog_kind_label(kind: CatalogNodeKind) -> &'static str {
+    match kind {
+        CatalogNodeKind::View => "View",
+        CatalogNodeKind::Table => "Table",
+        CatalogNodeKind::Schema | CatalogNodeKind::Column => "Relation",
+    }
 }
 
 fn branch_for_request(request: &CatalogRequest) -> BranchKey {
