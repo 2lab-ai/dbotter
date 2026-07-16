@@ -24,7 +24,7 @@ v1.1 amendment are marked `deferred` rather than deleted.
 | D8 | — | — | — | — | deferred import (P1, v1.1); export baseline retained |
 | D9 | — | — | — | — | not started |
 | D10 | — | — | — | — | not started |
-| D11 | `96d708f` — `test(d11): require object-to-data execution` | `3b573a2` — `feat(d11): execute table data action` | RED contract failed because `Data` opened a bounded query tab but submitted no execution command. GREEN: `cargo test --all-features ui::app::tests::mysql_data_action_opens_a_new_tab_and_submits_the_exact_bounded_read -- --exact --nocapture`; `just check`; `just check-all`. | — | GREEN object-to-data slice; complete D11 journeys pending |
+| D11 | `96d708f` — `test(d11): require object-to-data execution`; `8ecc0c7` — `test(d11): require selected object editor flow` | `3b573a2` — `feat(d11): execute table data action` | Object-to-data GREEN: focused all-features contract, `just check`, `just check-all`. Selected-object editor RED: `cargo test --all-features ui::app::tests::mysql_new_editor_preserves_draft_and_selected_object_across_refresh_and_result_switch -- --exact --nocapture` fails because a relation row exposes no stable `New editor` action. | — | RED selected-object editor slice; prior object-to-data GREEN retained; complete D11 journeys pending |
 | D12 | — | — | — | — | not started |
 
 ## v1.1 branch reconciliation
