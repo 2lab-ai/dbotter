@@ -12,13 +12,17 @@ use crate::config::ConfigSourceVersion;
 use crate::model::{
     CatalogPage, CatalogRequest, ConnectionProfile, CredentialMode, DraftId, DriverAvailability,
     DriverKind, ExportFormat, MAX_PROFILE_RESULT_BYTES, OperationId, OperationKind,
-    OverwritePolicy, ProfileGeneration, ProfileId, PublicSummary, QueryLanguage,
+    OverwritePolicy, ProfileGeneration, ProfileId, ProfileInstanceId, PublicSummary, QueryLanguage,
     RedisKeyInspectRequest, RedisKeyPage, RedisScanRequest, RedisValuePreview, ResultId,
     ResultSnapshot, SessionGeneration,
 };
 use crate::public_error::PublicOperationError;
 use crate::secrets::EnvironmentAvailability;
 use crate::service::SessionDisposition;
+use crate::workspace::{
+    EditorTabSnapshot, ProfileWorkspaceSnapshot, WorkspaceGeometrySnapshot, WorkspaceHistoryEntry,
+    WorkspaceLanguage, WorkspaceSnapshotError,
+};
 
 use super::result_view::ResultViewState;
 
@@ -99,6 +103,7 @@ pub const MAX_EDITOR_TABS: usize = 20;
 pub const MAX_RESULT_TABS_PER_EDITOR: usize = 10;
 pub const MAX_RESULT_TABS_PER_PROFILE: usize = 40;
 const MAX_EDITOR_TAB_TITLE_BYTES: usize = 120;
+const MAX_EDITOR_TAB_DATABASE_BYTES: usize = 1_024;
 pub const MAX_EDITOR_TAB_TEXT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -111,6 +116,9 @@ pub struct EditorTab {
     title: String,
     language: QueryLanguage,
     text: String,
+    database: Option<String>,
+    cursor_character_index: usize,
+    selection_character_range: Option<Range<usize>>,
     dirty: bool,
 }
 
@@ -122,6 +130,9 @@ impl std::fmt::Debug for EditorTab {
             .field("title", &"<redacted>")
             .field("language", &self.language)
             .field("text", &"<redacted>")
+            .field("database", &self.database.as_ref().map(|_| "<configured>"))
+            .field("cursor_character_index", &self.cursor_character_index)
+            .field("selection_character_range", &self.selection_character_range)
             .field("dirty", &self.dirty)
             .finish()
     }
@@ -144,6 +155,18 @@ impl EditorTab {
         &self.text
     }
 
+    pub fn database(&self) -> Option<&str> {
+        self.database.as_deref()
+    }
+
+    pub const fn cursor_character_index(&self) -> usize {
+        self.cursor_character_index
+    }
+
+    pub fn selection_character_range(&self) -> Option<Range<usize>> {
+        self.selection_character_range.clone()
+    }
+
     pub const fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -155,6 +178,12 @@ pub enum EditorTabError {
     NotFound,
     InvalidTitle,
     TextTooLarge,
+    DatabaseBindingTooLarge,
+    InvalidCursor,
+    InvalidSelection,
+    InvalidPosition,
+    IdExhausted,
+    RevisionExhausted,
     Dirty,
 }
 
@@ -165,12 +194,93 @@ impl std::fmt::Display for EditorTabError {
             Self::NotFound => "editor tab is no longer available",
             Self::InvalidTitle => "tab title must be 1 to 120 UTF-8 bytes",
             Self::TextTooLarge => "editor tab text exceeds 256 KiB",
+            Self::DatabaseBindingTooLarge => "editor database binding exceeds 1024 UTF-8 bytes",
+            Self::InvalidCursor => "editor cursor is outside the tab source",
+            Self::InvalidSelection => "editor selection is outside the tab source",
+            Self::InvalidPosition => "editor tab position is outside the tab strip",
+            Self::IdExhausted => "editor tab identity space is exhausted",
+            Self::RevisionExhausted => "workspace revision space is exhausted",
             Self::Dirty => "discard the unsaved query before closing this tab",
         })
     }
 }
 
 impl std::error::Error for EditorTabError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WorkspaceModelError {
+    #[error("workspace persistence requires a classified version 3 profile")]
+    UnclassifiedProfile,
+    #[error("workspace persistence identity is not configured")]
+    PersistenceNotConfigured,
+    #[error(transparent)]
+    Editor(#[from] EditorTabError),
+    #[error(transparent)]
+    Snapshot(#[from] WorkspaceSnapshotError),
+}
+
+#[derive(Clone, PartialEq)]
+pub struct ProfileWorkspacePersistence {
+    instance_id: ProfileInstanceId,
+    profile_id: ProfileId,
+    persistence_enabled: bool,
+    geometry: WorkspaceGeometrySnapshot,
+    history: Vec<WorkspaceHistoryEntry>,
+}
+
+impl std::fmt::Debug for ProfileWorkspacePersistence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProfileWorkspacePersistence")
+            .field("instance_id", &"<redacted>")
+            .field("profile_id", &"<redacted>")
+            .field("persistence_enabled", &self.persistence_enabled)
+            .field("geometry", &self.geometry)
+            .field("history_count", &self.history.len())
+            .finish()
+    }
+}
+
+impl ProfileWorkspacePersistence {
+    pub fn for_classified_profile(
+        profile: &ConnectionProfile,
+        persistence_enabled: bool,
+        geometry: WorkspaceGeometrySnapshot,
+        history: Vec<WorkspaceHistoryEntry>,
+    ) -> Result<Self, WorkspaceModelError> {
+        let instance_id = profile
+            .safety
+            .instance_id()
+            .ok_or(WorkspaceModelError::UnclassifiedProfile)?;
+        Ok(Self {
+            instance_id,
+            profile_id: ProfileId(profile.id.clone()),
+            persistence_enabled,
+            geometry,
+            history,
+        })
+    }
+
+    pub const fn instance_id(&self) -> ProfileInstanceId {
+        self.instance_id
+    }
+
+    pub fn profile_id(&self) -> &ProfileId {
+        &self.profile_id
+    }
+
+    pub const fn persistence_enabled(&self) -> bool {
+        self.persistence_enabled
+    }
+
+    pub const fn geometry(&self) -> WorkspaceGeometrySnapshot {
+        self.geometry
+    }
+
+    pub fn history(&self) -> &[WorkspaceHistoryEntry] {
+        &self.history
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -248,6 +358,7 @@ impl std::error::Error for ResultTabError {}
 #[derive(Clone)]
 pub struct ProfileWorkspace {
     pub editor_text: String,
+    pub editor_database: Option<String>,
     pub caret_character_index: usize,
     pub selection_character_range: Option<Range<usize>>,
     pub row_limit: String,
@@ -268,6 +379,9 @@ pub struct ProfileWorkspace {
     editor_tabs: Vec<EditorTab>,
     selected_editor_tab: Option<EditorTabId>,
     next_editor_tab_id: u64,
+    persistence: Option<ProfileWorkspacePersistence>,
+    revision: u64,
+    saved_revision: Option<u64>,
     result_area_tab: ResultAreaTab,
     result_tabs: Vec<ResultTab>,
     selected_result_tab: Option<ResultTabId>,
@@ -279,8 +393,15 @@ impl std::fmt::Debug for ProfileWorkspace {
         formatter
             .debug_struct("ProfileWorkspace")
             .field("editor_text", &"<redacted>")
+            .field(
+                "editor_database",
+                &self.editor_database.as_ref().map(|_| "<configured>"),
+            )
             .field("editor_tabs", &self.editor_tabs)
             .field("selected_editor_tab", &self.selected_editor_tab)
+            .field("persistence", &self.persistence)
+            .field("revision", &self.revision)
+            .field("saved_revision", &self.saved_revision)
             .field("result_area_tab", &self.result_area_tab)
             .field("result_tabs", &self.result_tabs)
             .field("selected_result_tab", &self.selected_result_tab)
@@ -294,6 +415,7 @@ impl Default for ProfileWorkspace {
     fn default() -> Self {
         Self {
             editor_text: String::new(),
+            editor_database: None,
             caret_character_index: 0,
             selection_character_range: None,
             row_limit: String::new(),
@@ -314,6 +436,9 @@ impl Default for ProfileWorkspace {
             editor_tabs: Vec::new(),
             selected_editor_tab: None,
             next_editor_tab_id: 1,
+            persistence: None,
+            revision: 0,
+            saved_revision: None,
             result_area_tab: ResultAreaTab::Results,
             result_tabs: Vec::new(),
             selected_result_tab: None,
@@ -323,6 +448,108 @@ impl Default for ProfileWorkspace {
 }
 
 impl ProfileWorkspace {
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub const fn saved_revision(&self) -> Option<u64> {
+        self.saved_revision
+    }
+
+    pub fn is_saved(&self) -> bool {
+        self.saved_revision == Some(self.revision)
+    }
+
+    pub fn mark_saved_if_revision(&mut self, expected_revision: u64) -> bool {
+        if self.persistence.is_none() || self.revision != expected_revision {
+            return false;
+        }
+        self.saved_revision = Some(expected_revision);
+        if self
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| persistence.persistence_enabled)
+        {
+            for tab in &mut self.editor_tabs {
+                tab.dirty = false;
+            }
+        }
+        true
+    }
+
+    pub fn persistence(&self) -> Option<&ProfileWorkspacePersistence> {
+        self.persistence.as_ref()
+    }
+
+    pub fn bind_persistence(
+        &mut self,
+        persistence: ProfileWorkspacePersistence,
+    ) -> Result<(), WorkspaceModelError> {
+        if self.persistence.as_ref() == Some(&persistence) {
+            return Ok(());
+        }
+        self.bump_revision()?;
+        self.persistence = Some(persistence);
+        Ok(())
+    }
+
+    pub fn set_persistence_enabled(
+        &mut self,
+        persistence_enabled: bool,
+    ) -> Result<(), WorkspaceModelError> {
+        let Some(current) = self.persistence.as_ref() else {
+            return Err(WorkspaceModelError::PersistenceNotConfigured);
+        };
+        if current.persistence_enabled == persistence_enabled {
+            return Ok(());
+        }
+        self.bump_revision()?;
+        let Some(persistence) = self.persistence.as_mut() else {
+            return Err(WorkspaceModelError::PersistenceNotConfigured);
+        };
+        persistence.persistence_enabled = persistence_enabled;
+        if !persistence_enabled {
+            persistence.history.clear();
+        }
+        Ok(())
+    }
+
+    pub fn set_persistence_geometry(
+        &mut self,
+        geometry: WorkspaceGeometrySnapshot,
+    ) -> Result<(), WorkspaceModelError> {
+        let Some(current) = self.persistence.as_ref() else {
+            return Err(WorkspaceModelError::PersistenceNotConfigured);
+        };
+        if current.geometry == geometry {
+            return Ok(());
+        }
+        self.bump_revision()?;
+        let Some(persistence) = self.persistence.as_mut() else {
+            return Err(WorkspaceModelError::PersistenceNotConfigured);
+        };
+        persistence.geometry = geometry;
+        Ok(())
+    }
+
+    pub fn replace_persistence_history(
+        &mut self,
+        history: Vec<WorkspaceHistoryEntry>,
+    ) -> Result<(), WorkspaceModelError> {
+        let Some(current) = self.persistence.as_ref() else {
+            return Err(WorkspaceModelError::PersistenceNotConfigured);
+        };
+        if current.history == history {
+            return Ok(());
+        }
+        self.bump_revision()?;
+        let Some(persistence) = self.persistence.as_mut() else {
+            return Err(WorkspaceModelError::PersistenceNotConfigured);
+        };
+        persistence.history = history;
+        Ok(())
+    }
+
     pub fn has_catalog_retry(&self) -> bool {
         self.catalog_retry.is_some()
     }
@@ -339,11 +566,34 @@ impl ProfileWorkspace {
         self.editor_tabs.iter().find(|tab| tab.id == tab_id)
     }
 
+    fn bump_revision(&mut self) -> Result<(), EditorTabError> {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(EditorTabError::RevisionExhausted)?;
+        Ok(())
+    }
+
     pub fn create_editor_tab(
         &mut self,
         language: QueryLanguage,
         title: impl Into<String>,
         text: impl Into<String>,
+    ) -> Result<EditorTabId, EditorTabError> {
+        let text = text.into();
+        let cursor_character_index = text.chars().count();
+        self.create_editor_tab_with_state(language, title, text, None, cursor_character_index, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_editor_tab_with_state(
+        &mut self,
+        language: QueryLanguage,
+        title: impl Into<String>,
+        text: impl Into<String>,
+        database: Option<String>,
+        cursor_character_index: usize,
+        selection_character_range: Option<Range<usize>>,
     ) -> Result<EditorTabId, EditorTabError> {
         if self.editor_tabs.len() >= MAX_EDITOR_TABS {
             return Err(EditorTabError::LimitReached);
@@ -351,19 +601,26 @@ impl ProfileWorkspace {
         let title = title.into();
         validate_editor_tab_title(&title)?;
         let text = text.into();
-        if text.len() > MAX_EDITOR_TAB_TEXT_BYTES {
-            return Err(EditorTabError::TextTooLarge);
-        }
+        validate_editor_tab_state(
+            &text,
+            database.as_deref(),
+            cursor_character_index,
+            selection_character_range.as_ref(),
+        )?;
         self.sync_selected_editor_tab_from_surface()?;
         let had_editor_tabs = !self.editor_tabs.is_empty();
-        let id = EditorTabId(self.next_editor_tab_id.max(1));
-        self.next_editor_tab_id = id.0.saturating_add(1);
+        let id = self.next_editor_tab_id()?;
+        self.bump_revision()?;
+        self.next_editor_tab_id = id.0.checked_add(1).unwrap_or(id.0);
         let dirty = !text.is_empty();
         self.editor_tabs.push(EditorTab {
             id,
             title,
             language,
             text,
+            database,
+            cursor_character_index,
+            selection_character_range,
             dirty,
         });
         self.selected_editor_tab = Some(id);
@@ -381,12 +638,13 @@ impl ProfileWorkspace {
     ) -> Result<(), EditorTabError> {
         let title = title.into();
         validate_editor_tab_title(&title)?;
-        let Some(tab) = self.editor_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+        let Some(index) = self.editor_tabs.iter().position(|tab| tab.id == tab_id) else {
             return Err(EditorTabError::NotFound);
         };
-        if tab.title != title {
-            tab.title = title;
-            tab.dirty = true;
+        if self.editor_tabs[index].title != title {
+            self.bump_revision()?;
+            self.editor_tabs[index].title = title;
+            self.editor_tabs[index].dirty = true;
         }
         Ok(())
     }
@@ -406,7 +664,14 @@ impl ProfileWorkspace {
                 let _ = title.pop();
             }
         }
-        self.create_editor_tab(source.language, title, source.text)
+        self.create_editor_tab_with_state(
+            source.language,
+            title,
+            source.text,
+            source.database,
+            source.cursor_character_index,
+            source.selection_character_range,
+        )
     }
 
     pub fn select_editor_tab(&mut self, tab_id: EditorTabId) -> Result<(), EditorTabError> {
@@ -414,9 +679,32 @@ impl ProfileWorkspace {
             return Err(EditorTabError::NotFound);
         }
         self.sync_selected_editor_tab_from_surface()?;
-        self.selected_editor_tab = Some(tab_id);
-        self.load_editor_tab_into_surface(tab_id);
-        self.activate_result_for_editor(Some(tab_id));
+        if self.selected_editor_tab != Some(tab_id) {
+            self.bump_revision()?;
+            self.selected_editor_tab = Some(tab_id);
+            self.load_editor_tab_into_surface(tab_id);
+            self.activate_result_for_editor(Some(tab_id));
+        }
+        Ok(())
+    }
+
+    pub fn reorder_editor_tab(
+        &mut self,
+        tab_id: EditorTabId,
+        target_index: usize,
+    ) -> Result<(), EditorTabError> {
+        if target_index >= self.editor_tabs.len() {
+            return Err(EditorTabError::InvalidPosition);
+        }
+        let Some(source_index) = self.editor_tabs.iter().position(|tab| tab.id == tab_id) else {
+            return Err(EditorTabError::NotFound);
+        };
+        self.sync_selected_editor_tab_from_surface()?;
+        if source_index != target_index {
+            self.bump_revision()?;
+            let tab = self.editor_tabs.remove(source_index);
+            self.editor_tabs.insert(target_index, tab);
+        }
         Ok(())
     }
 
@@ -428,6 +716,7 @@ impl ProfileWorkspace {
         if self.editor_tabs.get(index).is_some_and(EditorTab::is_dirty) {
             return Err(EditorTabError::Dirty);
         }
+        self.bump_revision()?;
         self.remove_editor_tab(index, tab_id);
         Ok(())
     }
@@ -436,6 +725,7 @@ impl ProfileWorkspace {
         let Some(index) = self.editor_tabs.iter().position(|tab| tab.id == tab_id) else {
             return Err(EditorTabError::NotFound);
         };
+        self.bump_revision()?;
         self.remove_editor_tab(index, tab_id);
         Ok(())
     }
@@ -453,6 +743,7 @@ impl ProfileWorkspace {
                 self.activate_result_for_editor(Some(selected));
             } else {
                 self.editor_text.clear();
+                self.editor_database = None;
                 self.caret_character_index = 0;
                 self.selection_character_range = None;
                 self.activate_result_for_editor(None);
@@ -461,20 +752,139 @@ impl ProfileWorkspace {
     }
 
     pub fn sync_selected_editor_tab_from_surface(&mut self) -> Result<(), EditorTabError> {
-        if self.editor_text.len() > MAX_EDITOR_TAB_TEXT_BYTES {
-            return Err(EditorTabError::TextTooLarge);
-        }
+        validate_editor_tab_state(
+            &self.editor_text,
+            self.editor_database.as_deref(),
+            self.caret_character_index,
+            self.selection_character_range.as_ref(),
+        )?;
         let Some(selected) = self.selected_editor_tab else {
             return Ok(());
         };
-        let Some(tab) = self.editor_tabs.iter_mut().find(|tab| tab.id == selected) else {
+        let Some(index) = self.editor_tabs.iter().position(|tab| tab.id == selected) else {
             return Ok(());
         };
-        if tab.text != self.editor_text {
+        let content_changed = self.editor_tabs[index].text != self.editor_text
+            || self.editor_tabs[index].database != self.editor_database;
+        let durable_changed = content_changed
+            || self.editor_tabs[index].cursor_character_index != self.caret_character_index
+            || self.editor_tabs[index].selection_character_range != self.selection_character_range;
+        if durable_changed {
+            self.bump_revision()?;
+        }
+        let tab = &mut self.editor_tabs[index];
+        if content_changed {
             tab.text.clone_from(&self.editor_text);
+            tab.database.clone_from(&self.editor_database);
             tab.dirty = true;
         }
+        tab.cursor_character_index = self.caret_character_index;
+        tab.selection_character_range = self.selection_character_range.clone();
         Ok(())
+    }
+
+    fn next_editor_tab_id(&self) -> Result<EditorTabId, EditorTabError> {
+        let id = EditorTabId(self.next_editor_tab_id.max(1));
+        if self.editor_tab(id).is_some() {
+            return Err(EditorTabError::IdExhausted);
+        }
+        Ok(id)
+    }
+
+    pub fn to_persistence_snapshot(
+        &mut self,
+    ) -> Result<ProfileWorkspaceSnapshot, WorkspaceModelError> {
+        self.sync_selected_editor_tab_from_surface()?;
+        let persistence = self
+            .persistence
+            .clone()
+            .ok_or(WorkspaceModelError::PersistenceNotConfigured)?;
+        let (editor_tabs, selected_editor_tab_id, history) = if persistence.persistence_enabled {
+            let editor_tabs = self
+                .editor_tabs
+                .iter()
+                .map(|tab| {
+                    EditorTabSnapshot::new(
+                        tab.id.0,
+                        tab.title.clone(),
+                        workspace_language(tab.language),
+                        tab.text.clone(),
+                        tab.database.as_deref(),
+                        tab.cursor_character_index,
+                        tab.selection_character_range.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (
+                editor_tabs,
+                self.selected_editor_tab.map(|tab_id| tab_id.0),
+                persistence.history.clone(),
+            )
+        } else {
+            (Vec::new(), None, Vec::new())
+        };
+        ProfileWorkspaceSnapshot::new(
+            persistence.instance_id,
+            persistence.profile_id.clone(),
+            persistence.persistence_enabled,
+            editor_tabs,
+            selected_editor_tab_id,
+            persistence.geometry,
+            history,
+        )
+        .map_err(WorkspaceModelError::from)
+    }
+
+    pub fn from_persistence_snapshot(
+        snapshot: ProfileWorkspaceSnapshot,
+    ) -> Result<Self, WorkspaceModelError> {
+        let snapshot = ProfileWorkspaceSnapshot::new(
+            snapshot.instance_id(),
+            snapshot.profile_id().clone(),
+            snapshot.persistence_enabled(),
+            snapshot.editor_tabs().to_vec(),
+            snapshot.selected_editor_tab_id(),
+            snapshot.geometry(),
+            snapshot.history().to_vec(),
+        )?;
+        let mut workspace = Self {
+            row_limit: "500".to_owned(),
+            timeout_seconds: "30".to_owned(),
+            ..Self::default()
+        };
+        workspace.editor_tabs = snapshot
+            .editor_tabs()
+            .iter()
+            .map(|tab| EditorTab {
+                id: EditorTabId(tab.id()),
+                title: tab.title().to_owned(),
+                language: query_language(tab.language()),
+                text: tab.source().to_owned(),
+                database: tab.database().map(str::to_owned),
+                cursor_character_index: tab.cursor_character_index(),
+                selection_character_range: tab.selection_character_range(),
+                dirty: false,
+            })
+            .collect();
+        workspace.selected_editor_tab = snapshot.selected_editor_tab_id().map(EditorTabId);
+        workspace.next_editor_tab_id = workspace
+            .editor_tabs
+            .iter()
+            .map(|tab| tab.id.0)
+            .max()
+            .map_or(1, |id| id.checked_add(1).unwrap_or(id));
+        if let Some(selected) = workspace.selected_editor_tab {
+            workspace.load_editor_tab_into_surface(selected);
+        }
+        workspace.persistence = Some(ProfileWorkspacePersistence {
+            instance_id: snapshot.instance_id(),
+            profile_id: snapshot.profile_id().clone(),
+            persistence_enabled: snapshot.persistence_enabled(),
+            geometry: snapshot.geometry(),
+            history: snapshot.history().to_vec(),
+        });
+        workspace.saved_revision = Some(workspace.revision);
+        Ok(workspace)
     }
 
     fn retain_editor_context_for_profile_retag(&mut self) {
@@ -771,9 +1181,13 @@ impl ProfileWorkspace {
             return;
         };
         let text = tab.text.clone();
+        let database = tab.database.clone();
+        let cursor_character_index = tab.cursor_character_index;
+        let selection_character_range = tab.selection_character_range.clone();
         self.editor_text = text;
-        self.caret_character_index = self.editor_text.chars().count();
-        self.selection_character_range = None;
+        self.editor_database = database;
+        self.caret_character_index = cursor_character_index;
+        self.selection_character_range = selection_character_range;
     }
 }
 
@@ -782,6 +1196,46 @@ fn validate_editor_tab_title(title: &str) -> Result<(), EditorTabError> {
         Err(EditorTabError::InvalidTitle)
     } else {
         Ok(())
+    }
+}
+
+fn validate_editor_tab_state(
+    text: &str,
+    database: Option<&str>,
+    cursor_character_index: usize,
+    selection_character_range: Option<&Range<usize>>,
+) -> Result<(), EditorTabError> {
+    if text.len() > MAX_EDITOR_TAB_TEXT_BYTES {
+        return Err(EditorTabError::TextTooLarge);
+    }
+    if database.is_some_and(|database| database.len() > MAX_EDITOR_TAB_DATABASE_BYTES) {
+        return Err(EditorTabError::DatabaseBindingTooLarge);
+    }
+    let character_count = text.chars().count();
+    if cursor_character_index > character_count {
+        return Err(EditorTabError::InvalidCursor);
+    }
+    if selection_character_range
+        .is_some_and(|range| range.start > range.end || range.end > character_count)
+    {
+        return Err(EditorTabError::InvalidSelection);
+    }
+    Ok(())
+}
+
+const fn workspace_language(language: QueryLanguage) -> WorkspaceLanguage {
+    match language {
+        QueryLanguage::Sql => WorkspaceLanguage::Sql,
+        QueryLanguage::RedisCommand => WorkspaceLanguage::RedisCommand,
+        QueryLanguage::MongoDocument => WorkspaceLanguage::MongoDocument,
+    }
+}
+
+const fn query_language(language: WorkspaceLanguage) -> QueryLanguage {
+    match language {
+        WorkspaceLanguage::Sql => QueryLanguage::Sql,
+        WorkspaceLanguage::RedisCommand => QueryLanguage::RedisCommand,
+        WorkspaceLanguage::MongoDocument => QueryLanguage::MongoDocument,
     }
 }
 
@@ -1959,21 +2413,26 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConnectionFailureOutcome, ConnectionState, EditorTabId, MAX_RESULT_TABS_PER_EDITOR,
-        MAX_RESULT_TABS_PER_PROFILE, PostCloseState, ProfileSnapshot, ProfileWorkspace,
-        ResultTabError, UiEvent, UiModel, WorkspaceKey,
+        ConnectionFailureOutcome, ConnectionState, EditorTabError, EditorTabId,
+        MAX_EDITOR_TAB_TEXT_BYTES, MAX_RESULT_TABS_PER_EDITOR, MAX_RESULT_TABS_PER_PROFILE,
+        PostCloseState, ProfileSnapshot, ProfileWorkspace, ProfileWorkspacePersistence,
+        ResultTabError, UiEvent, UiModel, WorkspaceKey, WorkspaceModelError,
     };
     use crate::model::{
         CatalogLevel, CatalogPage, CatalogRequest, CatalogRetainedCounts, ConnectionProfile,
-        CredentialMode, DriverAvailability, DriverKind, MAX_PROFILE_RESULT_BYTES, OperationId,
-        OperationKind, ProfileAccess, ProfileEnvironment, ProfileGeneration, ProfileId,
-        ProfileSafetyPosture, PublicCode, PublicSummary, QueryLanguage, QueryResult,
-        RedisKeyFilter, RedisKeyPage, RedisScanConsistency, RedisScanRequest, RedisTlsConfig,
-        RequestIdentity, ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
-        SessionGeneration, TlsMode,
+        CredentialMode, DriverAvailability, DriverKind, LegacyConfigVersion,
+        MAX_PROFILE_RESULT_BYTES, OperationId, OperationKind, ProfileAccess, ProfileEnvironment,
+        ProfileGeneration, ProfileId, ProfileInstanceId, ProfileSafetyPosture, PublicCode,
+        PublicSummary, QueryLanguage, QueryResult, RedisKeyFilter, RedisKeyPage,
+        RedisScanConsistency, RedisScanRequest, RedisTlsConfig, RequestIdentity, ResultId,
+        ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration, TlsMode,
     };
     use crate::public_error::{PublicOperationError, SafeContext};
     use crate::service::SessionDisposition;
+    use crate::workspace::{
+        ProfileWorkspaceSnapshot, WorkspaceGeometrySnapshot, WorkspaceHistoryEntry,
+        WorkspaceHistoryStatus, WorkspaceRunTarget, WorkspaceSnapshotError,
+    };
 
     fn result(elapsed_ms: u128) -> ResultSnapshot {
         let raw = QueryResult {
@@ -2012,6 +2471,321 @@ mod tests {
         let mut snapshot = result(result_id as u128);
         snapshot.provenance.result_id = ResultId(result_id);
         Arc::new(snapshot)
+    }
+
+    fn classified_workspace_profile() -> ConnectionProfile {
+        ConnectionProfile {
+            id: "workspace-profile".to_owned(),
+            name: "Workspace profile".to_owned(),
+            driver: DriverKind::MySql,
+            host: "127.0.0.1".to_owned(),
+            port: 3306,
+            database: Some("app".to_owned()),
+            username: None,
+            safety: ProfileSafetyPosture::classified(
+                ProfileEnvironment::Development,
+                ProfileAccess::ReadWrite,
+                ProfileInstanceId::from_bytes([0x42; 16]),
+            ),
+            tls: TlsMode::Required,
+            credential_mode: CredentialMode::Environment,
+            secret_env: Some("DBOTTER_WORKSPACE_TEST_PASSWORD".to_owned()),
+            redis_tls: RedisTlsConfig::default(),
+        }
+    }
+
+    fn workspace_history(id: u64, source: &str) -> WorkspaceHistoryEntry {
+        WorkspaceHistoryEntry::new(
+            id,
+            source,
+            WorkspaceRunTarget::Current,
+            1_752_710_400_000,
+            WorkspaceHistoryStatus::Succeeded,
+            17,
+            1,
+            0,
+            false,
+        )
+        .expect("bounded history fixture")
+    }
+
+    fn workspace_geometry(editor_share: f32) -> WorkspaceGeometrySnapshot {
+        WorkspaceGeometrySnapshot::new(320.0, editor_share, true).expect("bounded geometry fixture")
+    }
+
+    #[test]
+    fn editor_tabs_round_trip_exact_persistent_state_order_selection_and_history() {
+        let profile = classified_workspace_profile();
+        let history = vec![workspace_history(91, "SELECT history_value")];
+        let persistence = ProfileWorkspacePersistence::for_classified_profile(
+            &profile,
+            true,
+            workspace_geometry(0.61),
+            history.clone(),
+        )
+        .expect("classified profile persistence");
+        let mut workspace = ProfileWorkspace::default();
+        workspace
+            .bind_persistence(persistence)
+            .expect("bind classified persistence");
+        let first = workspace
+            .create_editor_tab_with_state(
+                QueryLanguage::Sql,
+                "First",
+                "SELECT 1",
+                Some("primary".to_owned()),
+                8,
+                Some(7..8),
+            )
+            .expect("first tab");
+        let second = workspace
+            .create_editor_tab_with_state(
+                QueryLanguage::Sql,
+                "Second",
+                "SELECT 2",
+                Some("warehouse".to_owned()),
+                8,
+                Some(7..8),
+            )
+            .expect("second tab");
+        workspace
+            .select_editor_tab(first)
+            .expect("select first tab");
+        workspace.editor_text = "SELECT 11".to_owned();
+        workspace.editor_database = Some("analytics".to_owned());
+        workspace.caret_character_index = 9;
+        workspace.selection_character_range = Some(7..9);
+        workspace
+            .sync_selected_editor_tab_from_surface()
+            .expect("sync exact selected state");
+        workspace
+            .rename_editor_tab(first, "First renamed")
+            .expect("rename first tab");
+        workspace
+            .reorder_editor_tab(second, 0)
+            .expect("move second tab before first");
+
+        let revision = workspace.revision();
+        let snapshot = workspace
+            .to_persistence_snapshot()
+            .expect("workspace snapshot");
+        assert_eq!(
+            workspace.revision(),
+            revision,
+            "snapshotting is not a change"
+        );
+        assert_eq!(
+            snapshot
+                .editor_tabs()
+                .iter()
+                .map(|tab| tab.id())
+                .collect::<Vec<_>>(),
+            vec![second.0, first.0]
+        );
+        assert_eq!(snapshot.selected_editor_tab_id(), Some(first.0));
+        assert_eq!(snapshot.history(), history);
+
+        let mut restored = ProfileWorkspace::from_persistence_snapshot(snapshot.clone())
+            .expect("restore validated snapshot");
+        assert_eq!(restored.selected_editor_tab_id(), Some(first));
+        assert_eq!(restored.editor_tabs()[0].id(), second);
+        let restored_first = restored.editor_tab(first).expect("restored first tab");
+        assert_eq!(restored_first.title(), "First renamed");
+        assert_eq!(restored_first.text(), "SELECT 11");
+        assert_eq!(restored_first.database(), Some("analytics"));
+        assert_eq!(restored_first.cursor_character_index(), 9);
+        assert_eq!(restored_first.selection_character_range(), Some(7..9));
+        assert_eq!(restored.editor_text, "SELECT 11");
+        assert_eq!(restored.editor_database.as_deref(), Some("analytics"));
+        assert_eq!(restored.caret_character_index, 9);
+        assert_eq!(restored.selection_character_range, Some(7..9));
+        assert!(restored.is_saved());
+        assert_eq!(
+            restored
+                .persistence()
+                .expect("restored persistence")
+                .history(),
+            history
+        );
+        assert_eq!(
+            restored
+                .to_persistence_snapshot()
+                .expect("round-trip snapshot"),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn workspace_revision_rejects_stale_save_and_ignores_result_only_changes() {
+        let profile = classified_workspace_profile();
+        let persistence = ProfileWorkspacePersistence::for_classified_profile(
+            &profile,
+            true,
+            workspace_geometry(0.60),
+            Vec::new(),
+        )
+        .expect("classified profile persistence");
+        let mut workspace = ProfileWorkspace::default();
+        workspace
+            .bind_persistence(persistence)
+            .expect("bind persistence");
+        let first = workspace
+            .create_editor_tab(QueryLanguage::Sql, "First", "SELECT 1")
+            .expect("first tab");
+        let second = workspace
+            .create_editor_tab(QueryLanguage::Sql, "Second", "SELECT 2")
+            .expect("second tab");
+        let save_started_at = workspace.revision();
+
+        workspace
+            .select_editor_tab(first)
+            .expect("selected identity changes");
+        workspace.editor_text = "SELECT 10".to_owned();
+        workspace.editor_database = Some("analytics".to_owned());
+        workspace.caret_character_index = 9;
+        workspace.selection_character_range = Some(7..9);
+        workspace
+            .sync_selected_editor_tab_from_surface()
+            .expect("source and cursor change");
+        workspace
+            .rename_editor_tab(first, "Renamed")
+            .expect("title change");
+        workspace
+            .reorder_editor_tab(second, 0)
+            .expect("order change");
+        workspace
+            .set_persistence_geometry(workspace_geometry(0.65))
+            .expect("geometry change");
+        workspace
+            .replace_persistence_history(vec![workspace_history(92, "SELECT 10")])
+            .expect("history change");
+        assert!(workspace.revision() > save_started_at);
+        assert!(
+            !workspace.mark_saved_if_revision(save_started_at),
+            "an old save completion cannot clean newer durable state"
+        );
+        assert!(
+            workspace
+                .editor_tab(first)
+                .is_some_and(|tab| tab.is_dirty())
+        );
+
+        let current_revision = workspace.revision();
+        assert!(workspace.mark_saved_if_revision(current_revision));
+        assert!(workspace.is_saved());
+        assert!(
+            workspace
+                .editor_tab(first)
+                .is_some_and(|tab| !tab.is_dirty())
+        );
+
+        let before_result = workspace.revision();
+        workspace
+            .append_result_tab(result_with_id(501))
+            .expect("result-only state");
+        workspace.select_result_area_tab(super::ResultAreaTab::History);
+        assert_eq!(
+            workspace.revision(),
+            before_result,
+            "result payload and result/history view selection are not durable draft changes"
+        );
+        assert!(workspace.is_saved());
+    }
+
+    #[test]
+    fn editor_snapshot_conversion_rejects_unclassified_invalid_and_oversize_state() {
+        let mut workspace = ProfileWorkspace::default();
+        assert!(matches!(
+            workspace.to_persistence_snapshot(),
+            Err(WorkspaceModelError::PersistenceNotConfigured)
+        ));
+        assert_eq!(
+            workspace.create_editor_tab_with_state(
+                QueryLanguage::Sql,
+                "Oversize",
+                "x".repeat(MAX_EDITOR_TAB_TEXT_BYTES + 1),
+                None,
+                0,
+                None,
+            ),
+            Err(EditorTabError::TextTooLarge)
+        );
+        assert_eq!(
+            workspace.create_editor_tab_with_state(
+                QueryLanguage::Sql,
+                "Database",
+                "SELECT 1",
+                Some("d".repeat(1_025)),
+                8,
+                None,
+            ),
+            Err(EditorTabError::DatabaseBindingTooLarge)
+        );
+        assert_eq!(
+            workspace.create_editor_tab_with_state(
+                QueryLanguage::Sql,
+                "Cursor",
+                "SELECT 1",
+                None,
+                9,
+                None,
+            ),
+            Err(EditorTabError::InvalidCursor)
+        );
+        assert_eq!(
+            workspace.create_editor_tab_with_state(
+                QueryLanguage::Sql,
+                "Selection",
+                "SELECT 1",
+                None,
+                8,
+                Some(4..9),
+            ),
+            Err(EditorTabError::InvalidSelection)
+        );
+
+        for safety in [
+            ProfileSafetyPosture::new(ProfileEnvironment::Development, ProfileAccess::ReadWrite),
+            ProfileSafetyPosture::unclassified_legacy(LegacyConfigVersion::V2),
+        ] {
+            let mut profile = classified_workspace_profile();
+            profile.safety = safety;
+            assert!(matches!(
+                ProfileWorkspacePersistence::for_classified_profile(
+                    &profile,
+                    true,
+                    workspace_geometry(0.60),
+                    Vec::new(),
+                ),
+                Err(WorkspaceModelError::UnclassifiedProfile)
+            ));
+        }
+
+        let profile = classified_workspace_profile();
+        let persistence = ProfileWorkspacePersistence::for_classified_profile(
+            &profile,
+            true,
+            workspace_geometry(0.60),
+            Vec::new(),
+        )
+        .expect("classified profile");
+        workspace
+            .bind_persistence(persistence)
+            .expect("bind persistence");
+        workspace
+            .create_editor_tab(QueryLanguage::Sql, "Valid", "SELECT 1")
+            .expect("valid tab");
+        let snapshot = workspace.to_persistence_snapshot().expect("valid snapshot");
+        let mut invalid_json = serde_json::to_value(snapshot).expect("snapshot JSON");
+        invalid_json["editor_tabs"][0]["cursor_character_index"] = serde_json::json!(99);
+        let invalid =
+            serde_json::from_value::<ProfileWorkspaceSnapshot>(invalid_json).expect("wire shape");
+        assert!(matches!(
+            ProfileWorkspace::from_persistence_snapshot(invalid),
+            Err(WorkspaceModelError::Snapshot(
+                WorkspaceSnapshotError::InvalidEditorCursor
+            ))
+        ));
     }
 
     #[test]
