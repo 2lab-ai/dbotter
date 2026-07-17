@@ -4,16 +4,17 @@ use std::collections::BTreeSet;
 
 use dbotter::execution::ExecutionTargetError;
 use dbotter::model::{
-    ConnectionProfile, CredentialMode, DriverAvailability, DriverKind, OperationId, OperationKind,
-    ProfileAccess, ProfileEnvironment, ProfileGeneration, ProfileId, ProfileSafetyPosture,
-    QueryLanguage, RedisTlsConfig, TlsMode,
+    CatalogLevel, CatalogNode, CatalogNodeIdentity, CatalogNodeKind, CatalogPage,
+    CatalogRetainedCounts, ConnectionProfile, CredentialMode, DriverAvailability, DriverKind,
+    OperationId, OperationKind, ProfileAccess, ProfileEnvironment, ProfileGeneration, ProfileId,
+    ProfileSafetyPosture, QueryLanguage, RedisTlsConfig, RequestIdentity, TlsMode,
 };
 use dbotter::ui::{
     EditorCursor, EditorIntent, EditorSurface, EditorValidationError, ProfileSnapshot,
-    ResultAreaTab, UiCommand, UiModel, WorkspaceKey, build_execute_all_intent,
+    ProfileWorkspace, ResultAreaTab, UiCommand, UiModel, WorkspaceKey, build_execute_all_intent,
     build_execute_intent, classify_execute_operation, editor_target_label, pending_cancel_intent,
 };
-use eframe::egui::{Context, Event, Key, Modifiers, RawInput, accesskit};
+use eframe::egui::{Context, Event, FullOutput, Key, Modifiers, RawInput, accesskit};
 
 fn profile(
     id: &str,
@@ -57,6 +58,104 @@ fn profile(
         environment_availability: None,
         persisted,
     }
+}
+
+fn catalog_page(profile: &ProfileSnapshot, names: &[&str]) -> CatalogPage {
+    let nodes = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| CatalogNode {
+            identity: CatalogNodeIdentity::Relation {
+                schema: "app".to_owned(),
+                relation: (*name).to_owned(),
+            },
+            kind: if index.is_multiple_of(2) {
+                CatalogNodeKind::Table
+            } else {
+                CatalogNodeKind::View
+            },
+            name: (*name).to_owned(),
+            type_name: Some("BACKEND_PROSE_SENTINEL".to_owned()),
+            nullable: None,
+            ordinal: None,
+        })
+        .collect::<Vec<_>>();
+    CatalogPage {
+        identity: RequestIdentity::new(profile.id.clone(), profile.generation, OperationId(501)),
+        level: CatalogLevel::Relations,
+        parent: Some(CatalogNodeIdentity::Schema {
+            schema: "app".to_owned(),
+        }),
+        retained_counts: CatalogRetainedCounts {
+            relations: nodes.len(),
+            ..CatalogRetainedCounts::default()
+        },
+        retained_utf8_bytes: nodes.iter().map(|node| node.name.len()).sum(),
+        nodes,
+        next_token: None,
+        truncated: false,
+        stale: false,
+        loaded_at: "catalog-load-1".to_owned(),
+    }
+}
+
+fn key_event(key: Key, modifiers: Modifiers) -> Event {
+    Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn autocomplete_shortcut_modifiers() -> Modifiers {
+    Modifiers {
+        mac_cmd: true,
+        command: true,
+        ..Modifiers::default()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn autocomplete_shortcut_modifiers() -> Modifiers {
+    Modifiers {
+        ctrl: true,
+        command: true,
+        ..Modifiers::default()
+    }
+}
+
+fn run_editor_frame(
+    context: &Context,
+    input: RawInput,
+    surface: &mut EditorSurface,
+    profile: &ProfileSnapshot,
+    workspace: &mut ProfileWorkspace,
+) -> (FullOutput, Option<EditorIntent>) {
+    let mut emitted = None;
+    let output = context.run_ui(input, |ui| {
+        emitted = surface.show(ui, profile, workspace, true);
+    });
+    (output, emitted)
+}
+
+fn author_node<'a>(
+    output: &'a FullOutput,
+    author_id: &str,
+) -> (accesskit::NodeId, &'a accesskit::Node) {
+    output
+        .platform_output
+        .accesskit_update
+        .as_ref()
+        .expect("editor frame must emit AccessKit")
+        .nodes
+        .iter()
+        .find_map(|(node_id, node)| {
+            (node.author_id() == Some(author_id)).then_some((*node_id, node))
+        })
+        .unwrap_or_else(|| panic!("missing AccessKit node {author_id}"))
 }
 
 #[test]
@@ -325,6 +424,246 @@ fn author_ids(output: &eframe::egui::FullOutput) -> BTreeSet<String> {
         .iter()
         .filter_map(|(_, node)| node.author_id().map(str::to_owned))
         .collect()
+}
+
+#[test]
+fn catalog_autocomplete_keyboard_updates_ax_selection_and_emits_no_command_intent() {
+    let profile = profile(
+        "mysql-autocomplete",
+        7,
+        DriverKind::MySql,
+        Some("app"),
+        TlsMode::Required,
+    );
+    let mut workspace = ProfileWorkspace::default();
+    workspace.editor_text = "SELECT * FROM acc".to_owned();
+    workspace.caret_character_index = workspace.editor_text.chars().count();
+    workspace.catalog_page = Some(catalog_page(&profile, &["accounts", "account_archive"]));
+    let context = Context::default();
+    context.enable_accesskit();
+    let mut surface = EditorSurface::default();
+    surface.request_focus("editor.input");
+
+    let (_, initial_intent) = run_editor_frame(
+        &context,
+        RawInput::default(),
+        &mut surface,
+        &profile,
+        &mut workspace,
+    );
+    assert!(initial_intent.is_none());
+    let (opened, open_intent) = run_editor_frame(
+        &context,
+        RawInput {
+            events: vec![key_event(Key::Space, autocomplete_shortcut_modifiers())],
+            ..RawInput::default()
+        },
+        &mut surface,
+        &profile,
+        &mut workspace,
+    );
+    assert!(open_intent.is_none());
+    assert_eq!(
+        author_node(&opened, "editor.autocomplete.candidate.0")
+            .1
+            .is_selected(),
+        Some(true)
+    );
+    assert_eq!(
+        author_node(&opened, "editor.autocomplete.candidate.1")
+            .1
+            .is_selected(),
+        Some(false)
+    );
+
+    let (down, down_intent) = run_editor_frame(
+        &context,
+        RawInput {
+            events: vec![key_event(Key::ArrowDown, Modifiers::NONE)],
+            ..RawInput::default()
+        },
+        &mut surface,
+        &profile,
+        &mut workspace,
+    );
+    assert!(down_intent.is_none());
+    assert_eq!(
+        author_node(&down, "editor.autocomplete.candidate.0")
+            .1
+            .is_selected(),
+        Some(false)
+    );
+    assert_eq!(
+        author_node(&down, "editor.autocomplete.candidate.1")
+            .1
+            .is_selected(),
+        Some(true)
+    );
+
+    let (up, up_intent) = run_editor_frame(
+        &context,
+        RawInput {
+            events: vec![key_event(Key::ArrowUp, Modifiers::NONE)],
+            ..RawInput::default()
+        },
+        &mut surface,
+        &profile,
+        &mut workspace,
+    );
+    assert!(up_intent.is_none());
+    assert_eq!(
+        author_node(&up, "editor.autocomplete.candidate.0")
+            .1
+            .is_selected(),
+        Some(true)
+    );
+
+    let (dismissed, dismiss_intent) = run_editor_frame(
+        &context,
+        RawInput {
+            events: vec![key_event(Key::Escape, Modifiers::NONE)],
+            ..RawInput::default()
+        },
+        &mut surface,
+        &profile,
+        &mut workspace,
+    );
+    assert!(dismiss_intent.is_none());
+    assert!(
+        author_ids(&dismissed)
+            .iter()
+            .all(|author_id| !author_id.starts_with("editor.autocomplete.candidate."))
+    );
+    assert_eq!(workspace.editor_text, "SELECT * FROM acc");
+
+    let mut accepted_workspace = ProfileWorkspace::default();
+    accepted_workspace.editor_text = "SELECT * FROM acc".to_owned();
+    accepted_workspace.caret_character_index = accepted_workspace.editor_text.chars().count();
+    accepted_workspace.catalog_page =
+        Some(catalog_page(&profile, &["accounts", "account_archive"]));
+    let accept_context = Context::default();
+    accept_context.enable_accesskit();
+    let mut accept_surface = EditorSurface::default();
+    accept_surface.request_focus("editor.input");
+    let (_, focus_intent) = run_editor_frame(
+        &accept_context,
+        RawInput::default(),
+        &mut accept_surface,
+        &profile,
+        &mut accepted_workspace,
+    );
+    assert!(focus_intent.is_none());
+    let (_, reopen_intent) = run_editor_frame(
+        &accept_context,
+        RawInput {
+            events: vec![key_event(Key::Space, autocomplete_shortcut_modifiers())],
+            ..RawInput::default()
+        },
+        &mut accept_surface,
+        &profile,
+        &mut accepted_workspace,
+    );
+    assert!(reopen_intent.is_none());
+    let (_, select_second_intent) = run_editor_frame(
+        &accept_context,
+        RawInput {
+            events: vec![key_event(Key::ArrowDown, Modifiers::NONE)],
+            ..RawInput::default()
+        },
+        &mut accept_surface,
+        &profile,
+        &mut accepted_workspace,
+    );
+    assert!(select_second_intent.is_none());
+    let (_, accept_intent) = run_editor_frame(
+        &accept_context,
+        RawInput {
+            events: vec![key_event(Key::Enter, Modifiers::NONE)],
+            ..RawInput::default()
+        },
+        &mut accept_surface,
+        &profile,
+        &mut accepted_workspace,
+    );
+
+    assert!(accept_intent.is_none());
+    assert_eq!(
+        accepted_workspace.editor_text,
+        "SELECT * FROM `account_archive`"
+    );
+    assert_eq!(
+        accepted_workspace.caret_character_index,
+        accepted_workspace.editor_text.chars().count()
+    );
+    assert_eq!(accepted_workspace.selection_character_range, None);
+}
+
+#[test]
+fn contextual_catalog_autocomplete_click_inserts_locally_without_backend_prose() {
+    let profile = profile(
+        "mysql-autocomplete-click",
+        9,
+        DriverKind::MySql,
+        Some("app"),
+        TlsMode::Required,
+    );
+    let mut workspace = ProfileWorkspace::default();
+    workspace.editor_text = "SELECT * FROM ac".to_owned();
+    workspace.caret_character_index = workspace.editor_text.chars().count();
+    workspace.catalog_page = Some(catalog_page(&profile, &["accounts"]));
+    let context = Context::default();
+    context.enable_accesskit();
+    let mut surface = EditorSurface::default();
+    surface.request_focus("editor.input");
+    let (_, initial_intent) = run_editor_frame(
+        &context,
+        RawInput::default(),
+        &mut surface,
+        &profile,
+        &mut workspace,
+    );
+    assert!(initial_intent.is_none());
+
+    let (opened, open_intent) = run_editor_frame(
+        &context,
+        RawInput {
+            events: vec![Event::Text("c".to_owned())],
+            ..RawInput::default()
+        },
+        &mut surface,
+        &profile,
+        &mut workspace,
+    );
+    assert!(open_intent.is_none());
+    let (candidate_id, candidate) = author_node(&opened, "editor.autocomplete.candidate.0");
+    assert_eq!(candidate.role(), accesskit::Role::Button);
+    assert_eq!(candidate.value(), Some("accounts"));
+    assert_eq!(candidate.is_selected(), Some(true));
+    assert!(!format!("{candidate:?}").contains("BACKEND_PROSE_SENTINEL"));
+
+    let (_, click_intent) = run_editor_frame(
+        &context,
+        RawInput {
+            events: vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: candidate_id,
+                data: None,
+            })],
+            ..RawInput::default()
+        },
+        &mut surface,
+        &profile,
+        &mut workspace,
+    );
+
+    assert!(click_intent.is_none());
+    assert_eq!(workspace.editor_text, "SELECT * FROM `accounts`");
+    assert_eq!(
+        workspace.caret_character_index,
+        workspace.editor_text.chars().count()
+    );
+    assert_eq!(workspace.selection_character_range, None);
 }
 
 #[test]
