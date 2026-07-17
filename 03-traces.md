@@ -10,7 +10,7 @@ Reset source: `03d6051`
 
 | Order | Trace | Scope | Current state |
 |---|---|---|---|
-| 1 | J2 | durable SQL workspace, results and searchable history | RED |
+| 1 | J2 | durable SQL workspace, results and searchable history | implementing |
 | 2 | J1 | secure MySQL onboarding and typed table/view Data | not started |
 | 3 | J3 | managed typed MySQL row editing | not started |
 | 4 | J4 | bounded export and transaction-safe CSV import | not started |
