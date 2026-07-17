@@ -10,6 +10,7 @@ pub mod model;
 pub mod public_error;
 pub mod secrets;
 pub mod service;
+pub mod workspace;
 
 #[cfg(feature = "desktop")]
 pub mod ui;
