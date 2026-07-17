@@ -12,7 +12,7 @@ without credentials, query values, keys, cell values or imported/exported data.
 
 | Journey | RED commit | GREEN commit(s) | Local/live/native evidence | Preview/xbrew/installed evidence | Status |
 |---|---|---|---|---|---|
-| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` — UI RED; `143167074ed56b47696f11a0e8d52f9207b9b06b` — private store RED; `872b36fce5fb7158d67e6b1535293b21a130cf6c` — store safety RED | — | RED UI contract fails 3/3 at `cargo test --all-features j2_red -- --nocapture`; store contract `cargo test --test daily_use_workspace_store_contract` fails at the absent module until exact manifest/shard reopen, single-writer/read-only reason (including a separate process), private no-follow paths, redacted errors, serialized generations, bounds and isolated corruption quarantine exist | — | implementing |
+| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` — UI RED; `143167074ed56b47696f11a0e8d52f9207b9b06b` — private store RED; `872b36fce5fb7158d67e6b1535293b21a130cf6c` — store safety RED; this commit — clear/quarantine RED | — | RED UI contract fails 3/3 at `cargo test --all-features j2_red -- --nocapture`; store contract `cargo test --test daily_use_workspace_store_contract` fails until exact manifest/shard reopen/checksum, single-writer/read-only reason (including a separate process), exact-profile clear, private no-follow paths, redacted errors, serialized generations, frozen bounds and isolated bounded corruption quarantine exist | — | implementing |
 | J1 secure MySQL connection/Data | — | — | — | — | not started |
 | J3 safe typed MySQL row edit | — | — | — | — | not started |
 | J4 bounded export/CSV import | — | — | — | — | not started |

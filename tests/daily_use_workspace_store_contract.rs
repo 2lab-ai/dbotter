@@ -10,11 +10,12 @@ use std::time::{Duration, Instant};
 use dbotter::model::{ProfileId, ProfileInstanceId};
 use dbotter::workspace::{
     EditorTabSnapshot, MAX_EDITOR_SOURCE_BYTES, MAX_EDITOR_TABS_PER_PROFILE,
-    MAX_HISTORY_SOURCE_BYTES, ProfileWorkspaceSnapshot, WorkspaceCommit, WorkspaceGeometrySnapshot,
-    WorkspaceHistoryEntry, WorkspaceHistoryStatus, WorkspaceLanguage, WorkspaceReadOnlyReason,
-    WorkspaceRunTarget, WorkspaceSnapshotError, WorkspaceStore, WorkspaceStoreError,
-    WorkspaceStoreMode, workspace_root_for_config,
+    MAX_HISTORY_SOURCE_BYTES, MAX_QUARANTINE_BYTES, MAX_QUARANTINE_FILES, ProfileWorkspaceSnapshot,
+    WorkspaceCommit, WorkspaceGeometrySnapshot, WorkspaceHistoryEntry, WorkspaceHistoryStatus,
+    WorkspaceLanguage, WorkspaceReadOnlyReason, WorkspaceRunTarget, WorkspaceSnapshotError,
+    WorkspaceStore, WorkspaceStoreError, WorkspaceStoreMode, workspace_root_for_config,
 };
+use sha2::{Digest as _, Sha256};
 
 const PRIVATE_SQL: &str = "SELECT j2_store_private_source";
 const RESULT_SENTINEL: &str = "j2_result_cell_must_not_persist";
@@ -379,6 +380,134 @@ fn concurrent_commits_are_serialized_into_monotonic_generations() {
 }
 
 #[test]
+fn exact_profile_clear_is_idempotent_and_read_only_observer_cannot_clear() {
+    let temp = tempfile::tempdir().expect("temporary workspace parent");
+    let config = temp.path().join("dbotter.toml");
+    let first = snapshot(0x71, "clear-first", "SELECT clear_only_this_profile");
+    let survivor = snapshot(0x72, "clear-survivor", "SELECT keep_this_profile");
+    let writer = WorkspaceStore::open(&config).expect("workspace writer");
+    writer.commit(&first).expect("first profile commit");
+    writer.commit(&survivor).expect("survivor profile commit");
+    let observer = WorkspaceStore::open(&config).expect("read-only observer");
+
+    assert!(matches!(
+        observer.clear(first.instance_id()),
+        Err(WorkspaceStoreError::ReadOnly)
+    ));
+    writer
+        .clear(first.instance_id())
+        .expect("clear exact profile");
+    writer
+        .clear(first.instance_id())
+        .expect("repeat clear is idempotent");
+    assert_eq!(
+        writer
+            .load(first.instance_id())
+            .expect("load cleared profile"),
+        None
+    );
+    assert_eq!(
+        writer
+            .load(survivor.instance_id())
+            .expect("load surviving profile"),
+        Some(survivor)
+    );
+}
+
+#[test]
+fn manifest_checksum_is_exact_and_unreferenced_generation_is_ignored_then_collected() {
+    let temp = tempfile::tempdir().expect("temporary workspace parent");
+    let config = temp.path().join("dbotter.toml");
+    let expected = snapshot(0x73, "checksum", "SELECT exact_shard_checksum");
+    let store = WorkspaceStore::open(&config).expect("workspace store");
+    let commit = store.commit(&expected).expect("workspace commit");
+    let root = workspace_root_for_config(&config).expect("workspace sibling path");
+    let (profile_directory, _, shard_path, manifest) =
+        current_generation_paths(&root, expected.instance_id());
+    let shard_bytes = fs::read(&shard_path).expect("read manifest-referenced shard");
+    let exact_checksum = lower_hex(&Sha256::digest(&shard_bytes));
+    assert_eq!(manifest["checksum"].as_str(), Some(exact_checksum.as_str()));
+    assert_eq!(commit.checksum(), exact_checksum);
+
+    let orphan = profile_directory.join("shard-00000000000000000000.json");
+    fs::write(&orphan, b"unreferenced corrupt generation").expect("write orphan generation");
+    fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600))
+        .expect("private orphan generation");
+    assert_eq!(
+        store
+            .load(expected.instance_id())
+            .expect("unreferenced shard is ignored"),
+        Some(expected.clone())
+    );
+
+    store.commit(&expected).expect("next generation commit");
+    assert!(
+        !orphan.exists(),
+        "next commit collects unreferenced generation"
+    );
+}
+
+#[test]
+fn symlinked_current_shard_is_removed_without_retaining_or_following_the_link() {
+    let temp = tempfile::tempdir().expect("temporary workspace parent");
+    let config = temp.path().join("dbotter.toml");
+    let expected = snapshot(0x74, "shard-symlink", PRIVATE_SQL);
+    let store = WorkspaceStore::open(&config).expect("workspace store");
+    store.commit(&expected).expect("workspace commit");
+    let root = workspace_root_for_config(&config).expect("workspace sibling path");
+    let (_, _, shard_path, _) = current_generation_paths(&root, expected.instance_id());
+    let outside = temp.path().join("outside-shard-target");
+    fs::write(&outside, CREDENTIAL_SENTINEL).expect("outside symlink target");
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600))
+        .expect("private outside target");
+    fs::remove_file(&shard_path).expect("remove current shard fixture");
+    symlink(&outside, &shard_path).expect("current shard symlink fixture");
+
+    assert!(matches!(
+        store.load(expected.instance_id()),
+        Err(WorkspaceStoreError::CorruptShard)
+    ));
+    assert_eq!(
+        fs::read_to_string(&outside).expect("outside target remains readable"),
+        CREDENTIAL_SENTINEL
+    );
+    assert_private_tree(&root);
+}
+
+#[test]
+fn quarantine_is_bounded_by_frozen_file_and_byte_caps() {
+    let temp = tempfile::tempdir().expect("temporary workspace parent");
+    let config = temp.path().join("dbotter.toml");
+    let root = workspace_root_for_config(&config).expect("workspace sibling path");
+    let store = WorkspaceStore::open(&config).expect("workspace store");
+
+    for index in 0..(MAX_QUARANTINE_FILES + 3) {
+        let expected = snapshot(
+            u8::try_from(0x80 + index).expect("bounded instance byte"),
+            "quarantine-bound",
+            "SELECT bounded_quarantine_fixture",
+        );
+        store.commit(&expected).expect("workspace commit");
+        let (_, _, shard_path, _) = current_generation_paths(&root, expected.instance_id());
+        fs::write(&shard_path, vec![b'x'; 1024]).expect("corrupt bounded shard");
+        fs::set_permissions(&shard_path, fs::Permissions::from_mode(0o600))
+            .expect("private corrupt shard");
+        assert!(matches!(
+            store.load(expected.instance_id()),
+            Err(WorkspaceStoreError::CorruptShard)
+        ));
+    }
+
+    let quarantine = root.join("quarantine");
+    let files = retained_files(&quarantine);
+    let bytes = files.iter().fold(0_u64, |total, path| {
+        total + fs::metadata(path).expect("quarantine metadata").len()
+    });
+    assert!(files.len() <= MAX_QUARANTINE_FILES);
+    assert!(bytes <= MAX_QUARANTINE_BYTES);
+}
+
+#[test]
 fn separate_process_observes_writer_busy_without_mutating_the_store() {
     if std::env::var_os("DBOTTER_J2_LOCK_HOLDER_CONFIG").is_some() {
         return;
@@ -453,4 +582,32 @@ fn assert_error_redacted(error: &WorkspaceStoreError, private_root: &Path) {
         assert!(!debug.contains(forbidden));
     }
     assert!(error.source().is_none());
+}
+
+fn current_generation_paths(
+    root: &Path,
+    instance_id: ProfileInstanceId,
+) -> (PathBuf, PathBuf, PathBuf, serde_json::Value) {
+    let profile_directory = root.join("profiles").join(instance_id.to_string());
+    let manifest_path = profile_directory.join("manifest.json");
+    let manifest = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(&manifest_path).expect("read current manifest"),
+    )
+    .expect("parse current manifest");
+    let shard_path = profile_directory.join(
+        manifest["shard"]
+            .as_str()
+            .expect("manifest shard file name"),
+    );
+    (profile_directory, manifest_path, shard_path, manifest)
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
