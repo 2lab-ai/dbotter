@@ -1,379 +1,422 @@
-# dbotter Daily-use v1 — frozen product specification
+# dbotter Daily-driver v1.2 — product contract
 
-Status: **Frozen — v1.0 independent Critical/High review passed; v1.1 amendment issued under §9 change control**
+Status: **Frozen**
 
-Spec ID: `DUV1`
+Contract ID: `DUV1` v1.2
 
-Version: `1.1`
+Date: `2026-07-17`
 
-Freeze date: `2026-07-16`
+This contract replaces DUV1 v1.1 for new work. Historical evidence remains in
+[`evidence.md`](evidence.md), but cannot complete a v1.2 requirement. Scope is
+based on [`research.md`](research.md). Requirement IDs below are normative and
+map to evidence in [`trace.md`](trace.md).
 
-Target: public Preview channel on macOS, with the same core contracts available to Linux/Windows builds
+## 1. Outcome and completion rule
 
-## 1. Outcome
+dbotter v1.2 is a macOS Preview that can replace a second tool for the supported
+MySQL and Redis work below:
 
-dbotter must support the complete daily loop below without making the user reconstruct lost work or bypass a safety guard:
+> reconnect → find data → query or edit it safely → retain the work → exchange
+> data → quit and continue later
 
-> connect → locate data → inspect it → run work → review the result → make a safe change → commit or discard → find and reuse the work later
+Each journey ships independently. A journey is `Verified` only when the exact
+source commit passes its RED-derived contracts, hermetic gates, required live
+fixtures, independent Critical/High review, Preview publication, xbrew install
+and the complete installed sequence in `trace.md` with independent backend/file
+readback. Screenshots, file-presence tests, unit suites, CI green or package
+receipts alone are not completion.
 
-The current public build already connects to MySQL and Redis, browses MySQL metadata and Redis keys, executes one bounded target, and copies/exports a result. Those capabilities remain, but they do not by themselves satisfy this specification.
+Only Preview releases are authorized. A stable tag or release requires a new,
+explicit user approval.
 
-## 2. Research basis
+## 2. Supported target (`S-*`)
 
-The scope is based on recurring workflows documented by current first-party product documentation. It is not a request to clone any one product.
+- **S-1:** macOS `aarch64-apple-darwin` and `x86_64-apple-darwin`, using the
+  bundle/CLI identity contract published by the Preview workflow.
+- **S-2:** official MySQL 8.0 and 8.4 servers. Every Preview records the exact
+  lowest/highest fixture version and immutable image digest. Compatible forks
+  may work but are not claimed.
+- **S-3:** verified standalone Redis targets are 6.2, 7.4 and the current
+  supported 8.x release. Every Preview records exact endpoint versions and
+  immutable image digests. Other minors may work but are not claimed. Cluster
+  and Sentinel are P1 and must be labelled unsupported.
+- **S-4:** P0 raw MySQL editor execution is read-only: closed `SELECT`, `SHOW`,
+  `DESCRIBE`/`DESC` and `EXPLAIN SELECT`. Raw DML, DDL, administration, stored
+  programs, `LOAD DATA`, raw transaction/session control and implicit-commit
+  forms are P1 or fail closed. P0 writes exist only through reviewed typed row
+  editing and CSV import.
+- **S-5:** P0 Redis structured mutation covers String, Hash, List, Set and
+  Sorted Set plus EXPIRE, PERSIST and whole-key delete. Stream/JSON inspection
+  and mutation are P1; the P0 UI does not advertise them.
 
-| Product | First-party evidence used | Workflow evidenced |
+## 3. Cross-cutting safety, privacy and admission (`X-*`)
+
+### X-1 — persistence/privacy matrix
+
+| Data class | Allowed retention | Forbidden retention |
 |---|---|---|
-| TablePlus | [Connections](https://docs.tableplus.com/gui-tools/manage-connections), [table basics](https://docs.tableplus.com/gui-tools/working-with-table/table), [rows](https://docs.tableplus.com/gui-tools/working-with-table/row), [query editor](https://docs.tableplus.com/query-editor/untitled), [query history](https://docs.tableplus.com/query-editor/query-history), [safe mode](https://docs.tableplus.com/gui-tools/code-review-and-safemode/safe-mode), [import/export](https://docs.tableplus.com/gui-tools/import-and-export), [tabs/workspaces](https://docs.tableplus.com/gui-tools/the-interface/multi-tabs-workspaces-windows) | saved connections, table data, staged edits, execution, history, destructive safeguards, transfer, tabs |
-| DBeaver | [Create Connection](https://dbeaver.com/docs/dbeaver/Create-Connection/), [Database Navigator](https://dbeaver.com/docs/dbeaver/Database-Navigator/), [SQL execution](https://dbeaver.com/docs/dbeaver/SQL-Execution/), [Query Manager](https://dbeaver.com/docs/dbeaver/Query-Manager/), [transaction modes](https://dbeaver.com/docs/dbeaver/Auto-and-Manual-Commit-Modes/), [Data Editor](https://dbeaver.com/docs/dbeaver/Data-Editor/), [data import](https://dbeaver.com/docs/dbeaver/Data-import/), first-page product screenshots for [SQL editor](https://dbeaver.io/product/dbeaver-sql-editor.png), [GIS viewer](https://dbeaver.io/product/dbeaver-gis-viewer.png), [data editor/transfer](https://dbeaver.io/product/dbeaver-data-editor.png) and [ER diagram](https://dbeaver.io/product/dbeaver-erd.png) | persistent navigator/context, multi-pane scripts/results/history, explicit transaction state, identifiable-row editing, transfer, coherent alternate data views |
-| MySQL Workbench / MySQL | [connections](https://dev.mysql.com/doc/workbench/en/wb-mysql-connections.html), [object browser](https://dev.mysql.com/doc/workbench/en/wb-sql-editor-navigator.html), [query panel](https://dev.mysql.com/doc/workbench/en/wb-sql-editor-query-panel.html), [SQL toolbar](https://dev.mysql.com/doc/workbench/en/wb-sql-editor-toolbar.html), [result grid](https://dev.mysql.com/doc/workbench/en/wb-develop-sql-editor-results.html), [history files](https://dev.mysql.com/doc/workbench/en/wb-configuring-files.html), [export/import](https://dev.mysql.com/doc/workbench/en/wb-admin-export-import.html), [MySQL 8.4 SQL modes](https://dev.mysql.com/doc/refman/8.4/en/server-options.html#option_mysqld_sql-mode), [executable comments](https://dev.mysql.com/doc/refman/8.4/en/comments.html) | object-to-data navigation, current/selection/all execution, commit/rollback, editable result grid, persistent SQL history, data transfer, server-matched lexical safety |
-| Redis Insight | [overview, Browser and Workbench](https://redis.io/docs/latest/develop/tools/insight/), [production safeguards and bulk import](https://redis.io/docs/latest/develop/tools/insight/release-notes/v.3.6.0/) | connection/key browsing, type-aware value work, TTL, command workbench, production confirmation |
+| credential-channel value from Keychain/session/environment field | Keychain or process memory only | config, workspace/history, log, public error, capture, receipt, evidence |
+| environment variable name, Keychain item reference, TLS/SSH public settings | profile config | public capture/receipt when it identifies a user's environment |
+| persistable SQL/Redis source text intentionally typed by the user | private draft/history after visible disclosure and per-profile opt-in/default setting | logs, public errors, receipts, public evidence/capture |
+| result cell, Redis key/value and backend prose | bounded memory; explicit user export destination | workspace/history, logs, public errors, receipts, public evidence/capture |
+| safe metadata: opaque IDs, typed code/status, timestamp, duration, row count, bounds | private history and sanitized receipts as specified | raw profile/query/key/value/path strings in public evidence |
 
-Safety semantics are additionally grounded in the primary references for [MySQL views and `SQL SECURITY`](https://dev.mysql.com/doc/refman/8.4/en/create-view.html), [`REPLACE`](https://dev.mysql.com/doc/refman/8.4/en/replace.html), [trigger visibility](https://dev.mysql.com/doc/refman/8.4/en/information-schema-triggers-table.html), [global privilege visibility](https://dev.mysql.com/doc/refman/8.4/en/information-schema-user-privileges-table.html), [partial revokes](https://dev.mysql.com/doc/refman/8.4/en/partial-revokes.html), [transaction completion](https://dev.mysql.com/doc/refman/8.4/en/commit.html), [MariaDB executable comments](https://mariadb.com/docs/server/reference/sql-statements/comment-syntax), and Redis [`MEMORY USAGE`](https://redis.io/docs/latest/commands/memory-usage/), [`DUMP`](https://redis.io/docs/latest/commands/dump/) and [`RESTORE`](https://redis.io/docs/latest/commands/restore/). These links explain why Daily-use v1 uses narrower closed admission than the servers' full grammar.
+Arbitrary source text can itself contain sensitive literals. The app does not
+claim reliable content scanning; it discloses persistence and provides
+per-profile disable/clear. Tests use distinct sentinels for each row rather than
+calling all source text a credential.
 
-Research interpretation rules:
+### X-2 — posture and production
 
-- SQL transaction semantics apply only to MySQL. dbotter must not present fake commit/rollback controls for Redis.
-- Redis history, generic key backup, and multi-tab restoration are not claimed as Redis Insight parity; dbotter includes command tabs/history because a single coherent local workspace is a product requirement.
-- DBeaver Community Query Manager is not evidence for restart-persistent history. Persistence is supported by the TablePlus and MySQL Workbench evidence and is an explicit dbotter requirement.
-- DBeaver's first four GitHub README screenshots set the P0 interaction-density and context-preservation floor, not a pixel, branding or feature-parity target. SQL/data journeys must provide the same continuously visible navigator, tabs, editor/result/detail composition and operation status. GIS and ER diagram rendering remain P1; their screenshots evidence how an alternate view belongs inside the same stable workspace rather than justifying fake or disabled controls.
-- Advanced features observed in only one product are P1 unless they are required to complete the loop above.
+Read-only rejects every MySQL/Redis mutation before user-target dispatch.
+Development/Production and Read-only/Read-write are always visible in text.
+Production destructive actions require an action-specific review; Redis
+overwrite/delete additionally requires the exact current key display token.
 
-## 3. Users and operating assumptions
+### X-3 — identity, cancellation and terminal truth
 
-- One local user operates the native app.
-- MySQL and Redis are the ready drivers. MongoDB remains visibly `Planned`.
-- A profile targets one environment and is either writable or read-only.
-- App-requested/retained result and transfer work remains bounded, and every write has a syntactic/typed row or item cap. A backend driver may still receive one transient protocol frame before retained caps apply; Redis SCAN-family COUNT is explicitly only a server hint and is covered by the disclosed transient-frame exception.
-- Credential-channel values remain outside profile/workspace/history files. Arbitrary editor/history text is user data and can contain literals that dbotter cannot reliably classify; persistence disclosure and opt-outs are mandatory.
-- Development/Production and Read-only are local safety guardrails for accidental operation, not an authorization boundary. Production servers should still use least-privilege/read-only database accounts where required.
+Every request, completion, tab, result, transaction, stage, transfer and Redis
+review has explicit profile-instance/generation and operation identity.
+Cancelled, stale or mismatched work cannot overwrite newer state. `Cancel
+requested` is distinct from driver-confirmed cancellation; cancellation never
+implies rollback or a known write outcome.
 
-## 4. P0 contracts
+### X-4 — bounds
 
-Every `DU-*` requirement is release-blocking for Daily-use v1.
+Every list, source, result, history, scan, file and retained surface has both
+count and byte limits. Reaching a limit is visible; omitted/truncated content is
+never presented as complete or safely replayable. Active drafts, transactions,
+unknown outcomes and in-progress transfers are never silently evicted.
 
-### DU-01 — connection identity and safety posture
+### X-5 — private durability
 
-1. Existing create, edit, delete, test, connect, reconnect and disconnect flows remain available for MySQL and Redis.
-2. A profile can be duplicated without copying a session credential.
-3. Every profile has:
-   - environment: `Development` or `Production`; a new-profile form visibly defaults to Development;
-   - access: `Read/write` or `Read-only`; a new-profile form visibly defaults to Read/write;
-   - immutable internal `ProfileInstanceId`: exactly 16 CSPRNG bytes encoded as 32 lowercase hex characters, distinct from the stable user-facing ProfileId that may be reused only after deletion.
-4. These fields are written only in config version 3. Version 1 and 2 profiles load as visibly `Unclassified legacy` with an effective Read-only fence; there is no inferred Development/Read-write posture. Daily-use workspace persistence and every mutation remain disabled until an upgrade review explicitly assigns Development/Production and Read/write/Read-only to every legacy profile. That one confirmed atomic upgrade creates the exact source-version backup, generates a unique ProfileInstanceId for every legacy profile and writes v3. A frozen v2 reader rejects v3 before service/network construction; a v3 reader rejects missing, malformed or duplicate instance IDs before service/network construction.
-5. The selected profile name, driver, endpoint/database, connection state, environment and access mode remain visible in the workspace.
-6. Read-only blocks every operation classified as a mutation before any user-target or typed-mutation driver dispatch. After the source byte/forbidden-comment gate, dbotter may acquire a bounded metadata-only lease to read the exact server/session capability needed to classify the target; that static query contains no target text and cannot mutate server state. A Read-only rejection therefore has zero user-target dispatch, not necessarily zero capability-query I/O.
-7. Production is textually identified as `PRODUCTION`; state is never communicated by color alone.
-8. The GUI v3 upgrade review lists every legacy ProfileId/endpoint and requires both posture choices. The CLI equivalent is `profiles migration-plan --format json` followed by `profiles migrate-v3 --posture-file PATH`; the bounded JSON file carries the exact plan config fingerprint and every current ProfileId exactly once with `development|production` and `read_write|read_only`. Missing/extra/duplicate IDs, extra fields, stale fingerprint or a file over 1 MiB reject before mutation. ProfileInstanceIds are generated internally, never accepted from that file.
+Local state uses restrictive permissions, same-directory temporary files,
+file fsync, atomic rename/no-replace as applicable and parent-directory fsync.
+Unknown versions, symlinks, corrupt identity/checksum and uncertain durability
+fail closed. Corrupt content is quarantined only within a bounded private area
+and surfaced without destroying valid profiles or other workspaces.
 
-### DU-02 — object-to-data navigation
+### X-6 — mutation intent/fence
 
-1. MySQL navigation is `schema → table/view → columns + indexes`; a catalog-proven base table additionally exposes `Data`.
-2. Opening base-table `Data` performs a bounded first-page read without requiring the user to hand-write `SELECT *`.
-3. Table data supports next/previous paging, an exact 1…200 row page limit, an explicitly applied typed filter, and one server-side sort column/direction.
-   - A filter is an AND-list of at most eight clauses: a catalog column, a type-compatible operator (`=`, `!=`, `<`, `<=`, `>`, `>=`, `contains`, `prefix`, `is null`, `is not null`) and a typed value where required. It is not free-form SQL.
-   - `is null`/`is not null` accept no value; `=`/`!=` accept any retained scalar type; ordered comparison accepts numeric, date/time and text types; `contains`/`prefix` accept text only and escape `%`, `_` and the escape character. NULL is never encoded as an ordinary comparison value.
-   - A usable primary/non-null unique key uses deterministic keyset paging. A table without one uses offset paging with an exact maximum offset of 10,000 rows and an explicit `Unstable order` warning; concurrent inserts/deletes may shift rows. Advancing past that offset is rejected before I/O and offers refresh, a narrower filter or explicit SQL instead.
-   - User sort is followed by the usable identity columns as a deterministic tie-breaker. Without usable identity, sort is best-effort only and the offset warning remains visible.
-   - Page tokens bind profile/generation, schema/table, selected columns, filter, sort, limit, cursor/offset and a catalog fingerprint. Schema drift invalidates the token and offers refresh.
-4. View structure and canonical identity are inspectable. P0 does not offer one-click `Data` for views — that surface states `View data unavailable: use a read-only editor query` — but a raw-SQL SELECT that references a view is admissible through DU-03's proven server-enforced read-only session, whose server-side enforcement (not a client relation proof) prevents a nested view/routine or `SQL SECURITY DEFINER` body from producing a write. Recursive safe-view proof for one-click view Data remains P1.
-5. Redis retains bounded `SCAN`, name/type filtering, refresh, TTL/type/size/value inspection and missing/type-changed recovery. A request uses `COUNT 1…1,000`. One user Scan/Refresh/Load-more operation automatically follows at most 64 SCAN replies or 5 seconds of driver elapsed time, whichever occurs first; one retained cycle stops at cursor 0, 512 replies, 30 seconds of cumulative driver time, 10,000 keys or 8 MiB of raw key bytes. A cursor repeated without progress twice stops with a recoverable error. Every stop reports whether results are complete/truncated and requires an explicit next user action; MATCH/TYPE sparsity or a growing keyspace can never cause an unbounded loop.
-6. All loading states name the target and expose retry or cancel where the operation can still be cancelled.
+Before MySQL Begin/terminal dispatch or any Redis immediate mutation, a
+payload-free intent containing opaque identity, operation kind and request HMAC
+is fsynced. Its durable state is:
 
-### DU-03 — reusable query and command workspace
+```text
+Prepared -> Dispatched -> Confirmed
+                       \-> OutcomeUnknown
+```
 
-1. Each profile has independent editor tabs. At most 20 tabs per profile are retained; creating tab 21 requires closing one.
-2. A tab has a stable local ID, editable title, language, text, dirty/saved state and its own result-tab list.
-3. New, rename, duplicate and close are visible controls. Close means removing the local draft from the retained workspace, not merely hiding it.
-4. `Run current/selection` executes the selected target or the target at the caret.
-5. `Run all` executes at most 50 parsed SQL statements or non-empty Redis command lines, in order, stopping on the first error by default.
-6. Each execution appends a result tab instead of replacing unrelated prior results. Result tabs expose statement order, statement status, duration and affected/returned rows. A read result is labelled `Not transactional`. Every successful DML result is labelled `Statement succeeded · AppliedPendingTransaction` with its stable TransactionId; it never uses bare `Success` to imply commit and later follows DU-05 item 23 to Committed, RolledBack or OutcomeUnknown.
-7. Execution can be cancelled. Cancellation continues to state that server outcome may be unknown.
-8. Keyboard contracts:
-   - `Cmd/Ctrl+Enter`: current or selection;
-   - `Shift+Cmd/Ctrl+Enter`: all;
-   - `Cmd/Ctrl+T`: new editor tab;
-   - `Cmd/Ctrl+S`: save current workspace state;
-   - `Escape`: cancel or close the active transient surface.
-9. Raw transaction/session-control statements are not editor escape hatches: MySQL `BEGIN`/`START TRANSACTION`/`COMMIT`/`ROLLBACK`/autocommit or lock/session controls and Redis `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` are rejected before user-target I/O, after only any static capability metadata explicitly allowed by item 10. MySQL DDL and administration statements that can implicitly commit are rejected on the same boundary; only the managed controls own transaction state.
-10. `Run all` byte-bounds the complete source and performs a mode-independent byte scan that rejects MySQL executable/version comments `/*!` and MariaDB executable comments `/*M!`/`/*m!` before any lease or network I/O; optimizer-hint comments `/*+` are admitted only inside statements that later classify ReadOnly and are denied in any batch containing TransactionalDml. It then acquires the exact intended MySQL session (active worker or read lease) and executes one static typed capability query for `@@version`, `@@version_comment`, `@@SESSION.character_set_client`, `@@SESSION.character_set_connection`, `@@SESSION.character_set_results`, `@@SESSION.collation_connection`, `@@SESSION.time_zone`, `@@SESSION.sql_mode` and `@@GLOBAL.partial_revokes` before statement splitting/parsing; Redis needs no session-mode query. Driver connection initialization sets the three character sets to `utf8mb4` and time zone to `+00:00` through typed internal configuration, never user text. **Read admission (v1.1)**: a ReadOnly batch may execute on any MySQL-wire server for which (a) the capability query succeeded and `@@SESSION.sql_mode` decodes into comma-separated mode tokens — the lexer consumes `ANSI`, `ANSI_QUOTES`, `NO_BACKSLASH_ESCAPES` and `IGNORE_SPACE` exactly and ignores other tokens for splitting/classification — and (b) the dedicated read lease has proven server-enforced read-only state via `SET SESSION TRANSACTION READ ONLY` followed by a static typed check of `@@SESSION.transaction_read_only = 1` on the same connection before user-target dispatch. The proven read-only session, not a client-side expression/relation proof, is the safety authority for reads: a write attempted by a view, stored routine or loadable function inside the read lease fails server-side. A server that cannot prove the read-only session has zero ReadOnly user-target dispatch. **In-transaction reads (v1.1)**: while the profile transaction state is ActiveClean or ActivePending (DU-05 item 11), reads route through the read-write worker connection to preserve read-your-writes and therefore cannot use the read-only-session authority; on that path a ReadOnly statement is additionally admitted only when every referenced relation is a catalog-proven `BASE TABLE` and the complete AST contains no function invocation and no view reference, and a violation is denied before user-target I/O with `Function calls and views are unavailable inside an active transaction; commit or roll back first`. Servers outside the verified write matrix carry a persistent visible `Unverified server: reads only` state; charset/collation/time-zone values other than the utf8mb4/+00:00 targets downgrade to a visible warning for reads. **Write admission (unchanged from v1.0)**: every mutation path — editor TransactionalDml, row Apply and (P1) import — additionally requires an ASCII `8.4.<decimal-patch>` version with no suffix, a version comment exactly `MySQL Community Server - GPL` or `MySQL Enterprise Server - Commercial`, all three character sets exactly `utf8mb4`, a collation whose name begins `utf8mb4_`, time zone exactly `+00:00`, and the exact closed sql_mode name list in item 11. MariaDB, Percona, TiDB, unknown/forked/version-suffixed servers or a required capability type/value mismatch have zero mutation dispatch with an exact unsupported-server error. `partial_revokes` is decoded separately as an exact typed Boolean: `OFF` is mandatory for any TransactionalDml or row Apply; a successfully returned `ON`, unknown or type-mismatched field leaves reads available while disabling every mutation before user-target DML. Failure of the whole static capability query disables editor execution entirely because sql_mode is unavailable. This metadata I/O is allowed for Read-only because it contains no target text and cannot mutate. Every target is then split, parsed, bounded and classified, and every TransactionalDml target's referenced relation is proved before user-target 1. One rejected, oversized, unsupported or unprovable target yields zero user-target dispatch; an earlier statement can never run before a later safety violation is discovered.
-11. MySQL uses one closed top-level classifier:
-    - `ReadOnly`: only `SELECT`, including a CTE whose final operation is SELECT. `INTO OUTFILE`/`DUMPFILE`, row-locking clauses (`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`) and variable assignment are denied before I/O. v1.1 removes the recursive base-table relation proof and the closed PureBuiltin function allowlist for out-of-transaction reads: views, expressions and function calls are admissible because execution occurs only inside the proven server-enforced read-only session from item 10, which is the read-safety authority. In-transaction reads on the read-write worker instead use item 10's strict structural rule (catalog-proven base tables only, zero function invocations, zero view references). Classification remains a routing/UX gate;
-    - `TransactionalDml`: single-writable-target `INSERT`, `UPDATE` or `DELETE` whose target is a catalog-proven InnoDB base table with no trigger or operation-relevant inbound `CASCADE`/`SET NULL` foreign key, and whose complete AST contains no function call or subquery. INSERT admits only an explicit VALUES form with at most 1,000 rows; UPDATE/DELETE requires a syntactic WHERE plus a literal `LIMIT 1…1000`. `IGNORE`, `ON DUPLICATE KEY UPDATE`, INSERT…SELECT, missing/nonliteral/out-of-range LIMIT and every unbounded update/delete are denied;
-    - `DeniedSessionControl`: raw transaction, autocommit, variable/session, lock and prepared-statement controls;
-    - `DeniedImplicitCommit`: DDL, account/privilege/administration, `LOAD DATA`, maintenance and every form documented by MySQL as implicit commit;
-    - `DeniedUnknown`: `SHOW`, `DESCRIBE`/`DESC`, every `EXPLAIN`/`ANALYZE` form, `REPLACE`, `CALL`, multi-table DML and anything not positively admitted above. Typed navigator/catalog operations use separate static plans and are not raw editor text.
-    Only ReadOnly and TransactionalDml can reach the driver. Classification ambiguity fails closed as DeniedUnknown. For any batch containing TransactionalDml, the exact accepted MySQL 8.4 session-mode names are `ALLOW_INVALID_DATES`, `ANSI`, `ANSI_QUOTES`, `ERROR_FOR_DIVISION_BY_ZERO`, `HIGH_NOT_PRECEDENCE`, `IGNORE_SPACE`, `NO_AUTO_VALUE_ON_ZERO`, `NO_BACKSLASH_ESCAPES`, `NO_DIR_IN_CREATE`, `NO_ENGINE_SUBSTITUTION`, `NO_UNSIGNED_SUBTRACTION`, `NO_ZERO_DATE`, `NO_ZERO_IN_DATE`, `ONLY_FULL_GROUP_BY`, `PAD_CHAR_TO_FULL_LENGTH`, `PIPES_AS_CONCAT`, `REAL_AS_FLOAT`, `STRICT_ALL_TABLES`, `STRICT_TRANS_TABLES`, `TIME_TRUNCATE_FRACTIONAL` and `TRADITIONAL`; an unknown/malformed mode disables mutation execution with zero user-target dispatch (reads follow item 10's read admission). The lexer applies `ANSI_QUOTES` and `NO_BACKSLASH_ESCAPES` exactly, treats identifier-plus-parentheses as a function regardless of `IGNORE_SPACE`, and uses MySQL's whitespace-required `-- `, `#` and ordinary `/*…*/` comment rules. `/*!` and `/*M!`/`/*m!` are always denied rather than stripped; `/*+` follows item 10. (v1.1 removes the PureBuiltin function allowlist; the v1.0 list remains in git history as the reference baseline if a client-side allowlist ever returns.)
-12. Redis uses separate closed read and mutation command allowlists. Command names and option keywords are ASCII case-insensitive after parsing; arguments remain exact bytes. The P0 raw-editor read allowlist is exactly the table below. An omitted option is allowed only where shown, integer operands must parse without overflow, every multi-key/member form admits 1…100 items, every range/scan count admits 1…200 items, and the shared target/result byte bounds still apply.
+The `Dispatched` transition is durable before the first mutation byte is sent.
+On startup, any non-terminal intent is conservatively folded to
+`OutcomeUnknown`; it blocks further mutation and is never automatically
+retried. The original payload is not persisted. Acknowledgement clears only the
+local block after explicit user verification and never rewrites history as
+Committed/RolledBack/Applied.
 
-    | Command | Exact admitted shape |
-    |---|---|
-    | `PING` | no argument |
-    | `GET` | one key |
-    | `GETRANGE` | key + non-negative start/end whose inclusive span is at most 1 MiB |
-    | `MGET`, `EXISTS` | 1…100 keys |
-    | `TYPE`, `TTL`, `PTTL`, `STRLEN` | one key |
-    | `HGET`, `HEXISTS`, `HSTRLEN` | key + one field |
-    | `HMGET` | key + 1…100 fields |
-    | `HLEN` | one key |
-    | `HSCAN`, `SSCAN`, `ZSCAN` | key + non-negative cursor, then optional `MATCH pattern` and required `COUNT 1…200`, each option at most once |
-    | `LLEN` | one key |
-    | `LINDEX` | key + one signed index |
-    | `LRANGE` | key + start/stop that are both non-negative or both negative, with start ≤ stop and inclusive span at most 200; mixed-sign and open-ended forms are denied |
-    | `SCARD` | one key |
-    | `SISMEMBER` | key + one member |
-    | `SMISMEMBER` | key + 1…100 members |
-    | `ZCARD` | one key |
-    | `ZCOUNT` | key + two finite decimal or `-inf`/`+inf` score bounds, each optionally exclusive with `(` |
-    | `ZLEXCOUNT` | key + two `-`/`+` or byte-string lex bounds prefixed by `[`/`(` |
-    | `ZRANK`, `ZREVRANK`, `ZSCORE` | key + one member; no options |
-    | `ZMSCORE` | key + 1…100 members |
-    | `ZRANGE` | key + start/stop that are both non-negative or both negative, with start ≤ stop and inclusive span at most 200, followed only by optional `WITHSCORES`; mixed-sign/open-ended forms and `BYSCORE`/`BYLEX`/`REV` are denied |
-    | `SCAN` | non-negative cursor, then optional `MATCH pattern`, optional `TYPE string|hash|list|set|zset|stream`, and required `COUNT 1…200`, each option at most once |
-    | `XLEN` | one key |
-    | `XRANGE`, `XREVRANGE` | key + start/end IDs and required `COUNT 1…200`; no blocking form |
+For MySQL Begin, `Confirmed` atomically becomes a durable `Active` transaction
+fence rather than clearing the record. It remains non-terminal through every
+applied DML/savepoint state and is cleared only by a confirmed Commit/Rollback.
+Startup with Active/Resolving is therefore OutcomeUnknown even when the last
+individual statement had a successful response.
 
-    `KEYS`, `SORT`/`SORT_RO`, `HGETALL`, `HKEYS`, `HVALS`, `SMEMBERS`, unbounded range/scan variants, `XREAD`, blocking commands and option-sensitive forms not positively described above are denied before I/O. SCAN-family COUNT is a hint: a compact/server reply may exceed it in one transient RESP frame, but raw-editor retention stops at 200 returned items and the result byte cap, reports truncation and never issues an automatic follow-up. Every other admitted reply stops retention at the result row/byte cap and reports truncation; the disclosed driver-frame transient allocation caveat still applies. Redis mutation admission is deferred with DU-07 to P1 (v1.1); the raw editor admits the read allowlist only. User `EVAL`/`EVALSHA`/`FCALL`, script/module/config/ACL/flush/migrate/restore controls, transaction controls and every unknown command are denied before I/O. Internal static scripts are typed driver operations and are not editor text.
-13. Every editor, CLI text, file or stdin target first uses one shared bounded source reader: it admits at most 256 KiB total UTF-8, rejects an oversized regular file from metadata and reads streams into a fixed capped accumulator with one-byte overflow detection. That total bound and item 10's mode-independent forbidden-comment scan finish before any lease or network I/O. Redis then enforces its 64-KiB per non-empty command line, 8,192-token and depth-64 limits before any network I/O. MySQL must first obtain item 10's exact session sql_mode because it changes splitting and lexing; only then does the pure mode-aware parser enforce 64 KiB per parsed statement, 8,192 lexical tokens per target and nesting depth 64 across the complete batch. Those MySQL per-target checks and all classification/catalog proof finish after only the permitted static capability query and before user-target 1. No oversized prefix or earlier batch member is executed.
+### X-7 — generated mutation
 
-### DU-04 — restart-persistent workspace and history
+Generated SQL uses quoted catalog-derived identifiers and typed bound values.
+Editable MySQL rows require a primary key or non-null unique identity. An
+unidentifiable row is visibly read-only.
 
-1. When editor-text persistence is enabled, tabs, titles, text, active tab and non-secret editor settings survive a normal app restart and an unclean process exit after the last completed autosave. With it off, no editor text, tab title, selection or result target is newly serialized.
-2. Workspace writes are local, permission-restricted, versioned and atomic. A corrupt file is quarantined and surfaced; it is never silently overwritten.
-3. History retains the most recent 500 executions per profile and records timestamp, language, profile/database identity, target text or redacted marker, statement-success/error status, duration, returned/affected rows and truncation. Read entries are `NotTransactional`. A successful DML entry also binds the stable TransactionId and starts at `AppliedPendingTransaction`; it is never called committed until DU-05 item 23 proves Commit.
-4. Every non-empty Run request records a history outcome even when preflight rejects it. Target text is replaced in the in-memory event and durable history by `[credential-bearing target redacted]` when the closed lexical classifier matches any of:
-   - MySQL top-level `CREATE USER`, `ALTER USER`, `SET PASSWORD`, `GRANT`, `CREATE SERVER`, `ALTER SERVER`, `CHANGE MASTER TO`, `CHANGE REPLICATION SOURCE TO`, `START SLAVE` or `START REPLICA`; or any unquoted assignment key `IDENTIFIED`, `PASSWORD`, `MASTER_PASSWORD` or `SOURCE_PASSWORD`;
-   - Redis `AUTH`; `HELLO` containing its `AUTH` option; any `ACL`; `CONFIG GET|SET` for `requirepass`, `masterauth` or `masteruser`; or `MIGRATE` containing `AUTH`/`AUTH2`.
-   Matching is ASCII case-insensitive after skipping only leading ordinary comments under the server-matched lexer and never inspects quoted-string contents as keywords. Any target containing `/*!`, `/*M!` or `/*m!`, and any tokenizer/parser failure, stores the same redacted marker rather than source text (v1.1: admissible `/*+` optimizer hints no longer trigger redaction by themselves). The marker, class and static rejection reason may be persisted; no matched target bytes are copied into Debug, errors, telemetry or evidence.
-5. History can be searched, reopened in the current tab, opened in a new tab, rerun and cleared with confirmation.
-6. Debug output and public errors never include tab text, history text or cell values.
-7. Result rows and cell values are never persisted. Result-tab metadata/target is part of editor-text persistence, not history: when enabled, a restored result tab is visibly unavailable and may rerun its bounded retained target through the normal safety flow; when disabled/purged, result tabs and their target bytes are not serialized or restored, even if history is enabled. History can independently reopen only entries allowed by the history setting.
-8. `Dirty` means the in-memory tab is newer than the last durable workspace snapshot. Autosave is debounced for 500 ms; `Cmd/Ctrl+S` requests immediate durability.
-9. The first-run disclosure states that arbitrary valid editor/history text is stored locally and may itself contain application secrets. Only values supplied through dbotter's credential channels are guaranteed excluded. Users can disable editor-text persistence and history independently per profile. The exact conservative classifier in item 4 redacts credential-bearing and all malformed targets; this is not advertised as general literal/PII detection.
-10. Autosaved tabs are drafts, not a separate saved-query library. Their durability state is exactly `Persistence off`, `Dirty`, `Saving`, `Saved` or `Save failed`. Autosave starts 500 ms after the latest edit and no later than 2 seconds after the first unsaved edit; `Cmd/Ctrl+S` waits for a terminal Saved/Failed event or explains that persistence is off.
-11. Closing a Saved tab asks once because it deletes the local draft, persists the removal, and offers Undo until the next workspace mutation or app exit. Closing Dirty/Saving/Save failed offers `Retry save`, `Delete draft without latest save`, or `Cancel`; it never labels deletion as saving. With Persistence off, close/app-exit warns that editor text will be lost.
-12. Tabs/history are keyed by immutable ProfileInstanceId, not user-facing ProfileId or profile generation. Profile edit preserves the instance and its workspace. A connection-identity edit is admitted only after DU-05 item 20 has resolved every LocalStaged/Conflict and active/applied transaction guard; it never silently invalidates a stage. Redis mutation fences (RedisApplying/RedisOutcomeUnknown) and their matching-key/`ABANDON <profile-id>` recovery are deferred with DU-07 to P1; v1.1 creates no Redis fence class. Config edit commit is the authority: a crash before commit retains the old config/workspace binding and stages, while a committed edit advances generation, discards only the explicitly confirmed local stages, and invalidates in-memory results before work resumes. Duplicate receives a new instance, one empty tab and no copied history only after all source safety fences are resolved/abandoned. Confirmed profile delete uses the same local/transaction guard, then purges local workspace/history by default; the dialog can retain an explicitly labelled orphan archive. Purge runs only after config delete commits, and purge failure is surfaced without resurrecting the deleted profile.
-13. Turning editor persistence or history off asks `Purge stored data now` (default) or `Retain existing snapshot`. Purge durably removes that category's target/text bytes before the control reports Off. Retained data is visibly labelled and receives no new text; this explicit choice may keep old rerunnable targets until the storage view's later purge. The four editor/history on/off combinations and both transition choices never cross-write one category through the other.
-14. An orphan archive receives a random `OrphanId` plus source ProfileInstanceId. It never auto-binds to a new profile even if the user-facing ProfileId is reused; restoring/rebinding an orphan is outside P0.
-15. Workspace lifecycle operations that touch config plus multiple shards use the durable single-intent journal defined in the storage contract. The journal, validated shards and current config are recovery authority; `index.json` is a rebuildable cache, never sole ownership evidence.
-16. MySQL transaction terminal intent is mandatory safety metadata even when editor/history persistence is off. It lives in the dedicated per-profile safety fence defined in DU-05 and cannot be cleared by the general workspace/history clear action. (Redis mutation fences return with P1 DU-07.)
-17. LocalStaged and Conflict row values are deliberately memory-only and never serialize with results/workspace/history. The first staged edit says that an unclean process loss can discard it. Every orderly close, reconnect, disconnect, profile edit/delete and app quit must use the exact DU-05 item-20 guard; persistence opt-out never weakens that guard.
+### X-8 — closed raw read admission
 
-### DU-05 — real MySQL transaction control
+MySQL source is bounded and fully parsed before user-target I/O. P0 admits only
+the S-4 statement families. It explicitly denies executable comments,
+multi-statement ambiguity, `INTO OUTFILE`/`DUMPFILE`, locking clauses,
+`EXPLAIN ANALYZE`, user/session-variable assignment, advisory/sleep/file
+functions and stored/UDF calls. A versioned built-in read-function allowlist
+contains the supported aggregate/string/date/math/JSON functions; an unknown
+function is locally denied. Execution also uses a server-proven read-only
+session.
 
-1. MySQL exposes one unambiguous profile-scoped state:
-   - `AutoCommit`: no dedicated transaction; ReadOnly may run;
-   - `ActiveClean`: dedicated connection, no successful DML yet;
-   - `ActivePending`: dedicated connection with changes requiring Commit/Rollback;
-   - `Resolving(Commit|Rollback)`: terminal action in flight; no other work admitted;
-   - `OutcomeUnknown`: terminal outcome cannot be proven; no database work admitted.
-2. `Begin`, `Commit` and `Rollback` operate on one dedicated connection owned by the connected profile. A Begin attempt generates one stable TransactionId from exactly 16 CSPRNG bytes encoded as 32 lowercase hex; every fence, DML result/history entry and stage/import terminal transition for that transaction carries it. All tabs for that profile share the state and say so.
-3. Safe writes is mandatory in Daily-use v1: a MySQL mutation cannot execute until a transaction is active. There is no GUI one-shot auto-commit mutation override.
-4. Production additionally requires its exact review/confirmation contract; neither environment can bypass the managed transaction for DML.
-5. A successful mutation in a transaction sets a visible `Pending changes` indicator until commit or rollback.
-6. A transaction is never implicitly committed. User-initiated disconnect, reconnect, connection-identity edit or normal app shutdown follows item 20; selecting another profile leaves the originating profile transaction visible and active. Unavoidable connection loss, forced process exit or stale generation follows the proof/fence rules and never claims rollback without evidence.
-7. A failed or cancelled commit/rollback reports the outcome as unknown when the server state cannot be proven.
-8. No mutex or read/write lock is held across an async driver operation; the dedicated connection is owned by a serialized async worker.
-9. Daily-use v1's managed transaction accepts read statements and transactional DML only. DDL, account/privilege administration, table locks, autocommit/session changes and raw transaction controls are rejected before I/O.
-10. `Transaction outcome unknown` blocks further work for that profile and requires reconnect. Reconnect drops the old connection but does not retroactively claim whether an uncertain commit succeeded; history and UI preserve the unknown outcome.
-11. While ActiveClean or ActivePending, editor execution, table-data reads and row Apply for the profile all route through the same serialized worker/connection (CSV import: P1), preserving read-your-writes across tabs. Because that connection is read-write, ReadOnly statements on it are admitted only under DU-03 item 10's strict in-transaction structural rule (base tables only, no function invocation, no view reference); typed table-data reads remain typed static plans and are unaffected. Catalog metadata may use its typed read resource but cannot substitute for transaction data reads.
-12. The state machine is closed: Begin is admitted only from AutoCommit after item 22's clean-session proof; successful TransactionalDml moves ActiveClean/ActivePending to ActivePending; Commit/Rollback move an active state to Resolving and then AutoCommit only after item 22's explicit terminal command, post-response proof and item-23 fold; failure with a proven-open transaction returns to the prior active state; a server-proven whole-transaction rollback completes item 23's proven-terminal fold (RolledBack) before AutoCommit; unprovable connection/statement/terminal failure moves to OutcomeUnknown. Automatic terminal retry is forbidden.
-13. Reconnect from OutcomeUnknown creates a fresh AutoCommit connection and retains an `Uncertain prior outcome` banner. TransactionalDml remains blocked until the user explicitly acknowledges that the prior commit may or may not have succeeded.
-14. Mutation capability first proves, on the same current principal and intended connection, that item 10's successful static capability query decoded `@@GLOBAL.partial_revokes` as exact typed `OFF` and that one static typed privilege query shows direct non-role-only global `SELECT`, `TRIGGER` and `REFERENCES` privileges. P0 does not infer completeness from an empty `INFORMATION_SCHEMA` result and does not accept a successfully returned `partial_revokes=ON`/unknown/type-mismatched field, partial/table/schema grants or role-only grants for this proof. Without every part of this proof, every editor DML and row Apply (and P1 import) is unavailable before user-target DML, with `Complete trigger/foreign-key metadata visibility is not proven`. Eligible typed editor base-table reads remain available only when item 10's whole capability query succeeded and all non-mutation fields are valid; failure/inaccessibility of that whole query disables editor execution because sql_mode is unavailable, while separately typed navigator reads follow DU-02. With the mutation proof, the active worker acquires and retains shared metadata locks for every writable target and re-reads the authoritative complete catalog fingerprint on that same connection: exact InnoDB engine, table identity, all columns/order/types/unsigned/charset/collation/null/default/generated/auto-increment flags, every primary/unique index including nullable keys, all triggers and every inbound foreign-key action. UPDATE checks inbound ON UPDATE and DELETE checks inbound ON DELETE. The fingerprint must equal the parsed batch/stage/import plan and confirmation binding. A concurrent ALTER cannot change those facts between proof and DML; hidden/denied/partial metadata or mismatch dispatches no user target.
-15. Every editor DML opens a review showing profile/endpoint/database, environment/access posture, parsed class, writable table, statement count, per-statement maximum row scope and exact local statement text. Development requires clicking `Run in transaction`; Production additionally requires typing `RUN <profile-id>`. Confirmation is bound to the batch hash, profile/generation and active transaction, expires after 60 seconds, and is invalidated by any text/selection/tab/profile/transaction change.
-16. Before sending Begin, dbotter atomically writes and parent-fsyncs `Active { operation_id, transaction_id, profile_instance_id, generation }`; persistence failure prevents Begin. Before sending Commit or Rollback it atomically replaces that fence with `Resolving { operation_id, transaction_id, profile_instance_id, generation, action }`. A terminal failure proven to leave the transaction open must durably replace Resolving with Active before work resumes; failure to persist that transition leaves all work blocked. Any non-terminal or terminal outcome that cannot be proven leaves the existing fence or durably replaces it with `OutcomeUnknown { transaction_id, ... }`; thus savepoint and ordinary execution uncertainty are covered even if the final fence update fails. Once OutcomeUnknown is durable, item 23's Unknown fold must reach durable shard agreement before acknowledgement can remove it. A retained Active/Resolving fence after an OutcomeUnknown-write failure remains blocking and is not acknowledgeable until a later replay can durably convert it. A proven terminal server outcome removes Resolving only through item 23's fold-then-remove sequence.
-17. Startup/restart conservatively converts any retained `Active` or `Resolving` fence to OutcomeUnknown before connection or DML admission, then replays item 23's Unknown fold for that or an already retained OutcomeUnknown fence. (v1.1 has no TerminalProven fence: a crash between a proven terminal outcome and fence removal conservatively surfaces as OutcomeUnknown, and acknowledgement resolves it without claiming the outcome.) The fence is independent of workspace/history opt-outs and binds ProfileInstanceId, so user-facing ProfileId reuse never clears or inherits it. Explicit acknowledgement states the uncertainty, reruns and verifies the Unknown fold, and must durably remove the OutcomeUnknown fence before DML is enabled; fold or removal failure retains the fence and global block. Profile deletion is unavailable while a transaction is active/resolving or an unknown fence is unacknowledged.
-18. After an uncertain/error response from Begin, DML, row Apply, import savepoint work, Commit or Rollback, dbotter probes `@@SESSION.in_transaction` through a static typed query on the same still-owned connection before admitting more work. `1` proves a transaction remains open; `0` proves no transaction. After DML/savepoint error, `0` is a whole server rollback because implicit commit paths are denied. For a failed Commit with `0`, commit-versus-rollback remains OutcomeUnknown. Probe error/connection loss is OutcomeUnknown. A proven whole server rollback must complete item 23's fold (RolledBack) across every prior pending history/stage entry before its fence is removed or AutoCommit exposed; fold/cleanup failure keeps work blocked.
-19. Begin transition is exact. The Active fence is durable before `START TRANSACTION`. A success response enters ActiveClean. On rejection/uncertain response, same-connection `in_transaction=0` proves Begin did not remain active and the fence must be durably removed before the Begin error/AutoCommit state is exposed; `1` proves Begin active and enters ActiveClean with a `Begin response was uncertain; transaction presence was verified` notice while retaining Active. Probe loss leaves the fence and enters OutcomeUnknown. Fence removal failure blocks all work and never reports ordinary AutoCommit.
-20. Any LocalStaged/Conflict row stage, ActivePending transaction, AppliedPending stage or ApplyOutcomeUnknown intercepts user Disconnect/Reconnect/connection edit/profile delete/window quit with a modal naming the profile and separate local/server/unknown counts. With local stages only it offers exactly `Discard local staged changes and continue` or `Cancel`. With server-pending work it offers `Rollback pending changes, discard local stages, and continue` or `Cancel`; Continue first proves item-22 Rollback and completes item 23's terminal fold and fence cleanup, then discards the local stages and performs the requested action. ApplyOutcomeUnknown cannot offer Continue until reconnect, durable acknowledgement and forced refresh resolve it. Rollback error preserves the local stages, cancels the requested lifecycle action and follows items 18–19. ActiveClean may be rolled back automatically through item 22 with visible status because it has no successful DML; local stages still require confirmation. Forced termination/connection loss cannot show a modal and relies on the durable fence, while the disclosed memory-only local stages may be lost. Switching workspaces never discards another profile's stages/transaction and exposes a global pending indicator.
-21. Before writing Active, a synchronous lock-owner component acquires a nonblocking OS advisory lock at `safety/<sha256-profile-instance-id>.lock` and retains its owned file descriptor for the full Active/Resolving/OutcomeUnknown lifetime through fence cleanup while that process owns the unresolved transaction. Another GUI/CLI process cannot Begin, alter or acknowledge that instance fence while the lock is held. This process-lifetime advisory lease is the sole stated exception to the `await` wording: no Rust mutex/RwLock guard or borrowed in-process lock guard crosses an `await`, and no async task performs a blocking wait for the advisory lock. After a crash, startup/status acquires the unowned lock and durably converts Active/Resolving to OutcomeUnknown before acknowledgement is offered; acknowledgement accepts only the durable OutcomeUnknown kind, completes item 23's Unknown fold and releases/removes it under the same lock.
-22. Driver initialization sets the dedicated lease's character sets to `utf8mb4` and time zone to `+00:00` through typed internal configuration. Before the Active fence or Begin, the lease must then prove all DU-03 item-10 capability values, including exact typed `@@GLOBAL.partial_revokes=OFF`, plus `@@SESSION.autocommit = 1` and `@@SESSION.in_transaction = 0`; mismatch discards the lease and reports a static clean-session failure. Managed terminal commands are exactly `COMMIT AND NO CHAIN NO RELEASE` and `ROLLBACK AND NO CHAIN NO RELEASE`, never bare COMMIT/ROLLBACK. A success response is still non-terminal locally until the same connection proves `@@SESSION.in_transaction = 0`; only then does item 23's terminal fold begin. A `1` or failed probe after a success response is handled as proven-open or OutcomeUnknown under items 16–18, so server `completion_type` cannot create a chained transaction or released-session ambiguity.
-23. Every successful DML result, history entry and row stage carries the TransactionId and a transaction disposition. Statement completion creates `AppliedPendingTransaction`, not generic success. After item 22 proves Commit or Rollback, dbotter folds the proven outcome into every live result/stage state for that TransactionId, rewrites the retained profile workspace/history shard entries for that TransactionId with one atomic fsynced write, and only then atomically removes/parent-fsyncs the Resolving fence and exposes AutoCommit. Failure at any step retains the Resolving fence and keeps work blocked; because a retained Active/Resolving fence conservatively converts to OutcomeUnknown on startup (item 17), a crash inside this window surfaces as an acknowledgeable Unknown rather than a silent claim (v1.1 removes v1.0's separate TerminalProven replay fence). An unprovable outcome first atomically writes/parent-fsyncs `OutcomeUnknown`, folds the Unknown disposition into live result/stage state, and idempotently rewrites the retained shard entries for that TransactionId to `OutcomeUnknown`; the fence remains and all work stays blocked until explicit acknowledgement. Acknowledgement reruns the idempotent shard rewrite, verifies durable agreement, and only then atomically removes/parent-fsyncs the fence; any storage failure retains the fence. Failure before OutcomeUnknown can be written leaves Active/Resolving as a non-acknowledgeable blocking precursor. Evicted result payloads do not remove the bounded history/transaction terminal record. Fence-driven idempotent retry, not cross-file atomicity or a second fence kind, keeps server disposition, shard and safety file consistent.
+Redis raw execution uses a versioned exact command/arity/option allowlist.
+Unknown/module commands and mutating variants such as `SORT ... STORE` are
+denied before driver dispatch.
 
-### DU-06 — staged MySQL row editing
+Typed View Data additionally requires `SafeViewProof`: recursively inspect at
+most 8 nested views/128 relation nodes; require every view to be `SQL SECURITY
+INVOKER`; parse each definition with the same sql_mode/read/function allowlist;
+and reject missing definition privilege, stored/UDF call, unknown dependency or
+bound overflow. On the exact read lease, acquire shared metadata locks for the
+view/dependency set, re-read and fingerprint every definition under those locks,
+then hold them through prepared execution. Drift, lock failure or unproved view
+keeps Structure available but disables Data with an exact reason before user
+query dispatch.
 
-1. Table data editing is enabled only for a base table with a usable primary or non-null unique key.
-2. When identity is absent or ambiguous, the surface is read-only and states the exact reason.
-3. Add, update and delete use the closed states `LocalStaged`, `Applying`, `AppliedPendingTransaction`, `Conflict`, `ApplyOutcomeUnknown`, `Committed` and `RolledBack`. The successful path is `LocalStaged → Applying → AppliedPendingTransaction → Committed|RolledBack`; a pre-write compare failure enters Conflict only after the operation savepoint is proven rolled back, while an unprovable apply/savepoint outcome enters ApplyOutcomeUnknown. No LocalStaged action reaches the server.
-4. The review surface shows operation, schema/table, changed columns, identity columns and total staged row count. Values remain local and are not placed in logs.
-5. Apply uses typed parameters and quoted identifiers, requires an active InnoDB transaction whose session sql_mode contains `STRICT_ALL_TABLES` or `STRICT_TRANS_TABLES`, and verifies the affected-row expectation. Immediately after every generated DML, the same worker executes static `SHOW COUNT(*) WARNINGS`; any nonzero warning count is an Apply error and triggers the operation-savepoint rollback before another row. It never builds SQL by concatenating cell values.
-6. Discard is admitted only from LocalStaged. Once the whole Apply succeeds, every included stage remains visibly AppliedPendingTransaction and can be resolved only by profile-scoped Commit or Rollback; hiding/discarding it cannot imply a rollback. Conflict returns to LocalStaged only after refresh/review. ApplyOutcomeUnknown disables discard/reapply/Commit until DU-05 reconnect, durable acknowledgement and a forced table refresh clear the uncertain stages.
-7. A concurrent-change mismatch leaves the stage visible with a recoverable conflict; it is not reported as success.
-8. Browse captures a bounded lossless `ConcurrencyCell` for every editable row value: `Null` or `Bytes { mysql_type, unsigned, charset_id, binary_projection }`, where the binary projection is fetched from MySQL rather than produced by locale/display formatting. Update/delete bind the usable key plus all retained ConcurrencyCells. Add is enabled only when row identity is recoverable in one of two closed forms: every column of one selected usable key is supplied as a non-NULL typed value, or the table has exactly one numeric single-column `AUTO_INCREMENT` primary key and that column is omitted. The latter uses the insert result's same-connection `last_insert_id`; every other default/generated identity shape disables Add with an exact reason. After insert, the resolved identity must reselect exactly one row before the batch can succeed; missing/ambiguous identity or refresh error forces item 13 rollback.
-9. Update/delete Apply first selects and locks the target row on the same transaction connection (`SELECT … FOR UPDATE`), re-fetches the same binary projections and compares every ConcurrencyCell byte-for-byte in Rust before DML. SQL collation equality/`<=>` is never accepted as original-value proof; case-only, accent-only and trailing-space/PAD SPACE changes conflict. Add with a supplied identity first proves the unique identity absent on the same connection and relies on the rechecked unique constraint for the final race. A row with any truncated/unretained original needed for comparison is not editable.
-10. Generated columns are never writable. Update cannot stage any column of its selected usable identity key, while Add may supply non-generated writable columns of exactly one reviewed usable key as the creation identity described in item 8; an omitted supported AUTO_INCREMENT primary key remains the other closed Add path. Reapply from Applying/AppliedPendingTransaction is rejected. Zero/multiple matches, duplicate insert, binary-original mismatch, generated-column attempt or Update identity-change attempt preserves a recoverable local stage only after proven savepoint rollback and never reports Applied.
-11. Row editing (and CSV import when it returns in P1) is available only for an InnoDB base table with zero triggers after DU-05 item-14 catalog-completeness proof. Any trigger, `partial_revokes` value other than exact typed `OFF`, hidden/partial metadata or missing global visibility capability disables Apply before DML. Row Update is additionally unavailable when the target has an inbound ON UPDATE CASCADE/SET NULL foreign key; Row Delete is unavailable for inbound ON DELETE CASCADE/SET NULL. The full item-14 catalog fingerprint is captured by stage/import plan, bound into confirmation and rechecked under the transaction metadata lock immediately before apply. (P1) Trigger-free CSV INSERT remains eligible because it cannot invoke an inbound update/delete action.
-12. Production row Apply review additionally shows stage count, operation mix, schema/table and identity/changed columns and requires `APPLY <profile-id>`. It is one-Apply only, expires after 60 seconds and is invalidated by any stage/profile/generation/transaction change.
-13. One Apply validates every staged value and bound locally, then creates an internal operation savepoint before row 1. It processes at most 1,000 reviewed rows serially on the transaction worker. Any row-N conflict, server error, cancellation, affected-row mismatch or insert-refresh failure stops admission. DU-05 first distinguishes a still-open transaction from a server-proven whole rollback; the latter follows item 23's proven-rollback fold for every profile-pending history/stage entry before AutoCommit. When still open, Apply rolls back to and releases its savepoint: proven rollback leaves zero Apply DML pending, with the mismatched row Conflict when applicable and every other included row LocalStaged with the exact error. An unprovable transaction/savepoint outcome moves the profile to OutcomeUnknown and every included row to ApplyOutcomeUnknown.
-14. Only after all reviewed rows and insert identity refreshes succeed does Apply release the savepoint and atomically mark the included stages AppliedPendingTransaction. Commit/Rollback controls are disabled while Apply is in flight. Successful savepoint release never commits the profile transaction.
-15. Row Add/Update uses one shared closed `MysqlInputCell` conversion contract, also used by DU-08. `NULL` is an explicit mode available only for nullable columns and is never the text `NULL`; binary columns require RFC 4648 padded Base64; character/text/ENUM/SET input is UTF-8; signed/unsigned integer input enforces the catalog range; decimal preserves an exact validated lexical value and precision/scale; float accepts finite values only; BOOLEAN/TINYINT(1) accepts only `0`, `1`, `true`, `false`; BIT(n) accepts exactly `0b` followed by n bits; DATE is `YYYY-MM-DD`; TIME is `[-]HHH:MM:SS[.1…6 digits]`; DATETIME/TIMESTAMP is `YYYY-MM-DDTHH:MM:SS[.1…6 digits]` with no offset and TIMESTAMP uses the verified `+00:00` session; YEAR is four decimal digits; JSON must parse before I/O. Spatial/geometry and unknown types are read-only in P0. Conversion never passes through display formatting or a lossy string, and every family has exact round-trip/bound tests.
-16. A data/result tab or inspector attached to any LocalStaged, Conflict, Applying, AppliedPendingTransaction or ApplyOutcomeUnknown row is protected from automatic result eviction and ordinary close. Close invokes the applicable DU-05 item-20 guard; Applying cannot close, and unknown remains until its forced-refresh recovery. If protected surfaces alone occupy a tab/byte cap, new execution is rejected before dispatch when the tab cap is already known, or its newly returned read result is discarded with an explicit non-retained status when only the post-fetch byte size reveals the conflict; no protected stage surface is removed.
+### X-9 — terminal outcome and implementation quality
 
-### DU-07 — type-aware Redis changes (deferred to P1 by v1.1)
+Commit, rollback or immediate mutation is terminal only after server
+confirmation. Lost/ambiguous response becomes `OutcomeUnknown`; no terminal
+operation is automatically retried. Public errors are typed, bounded and redact
+backend/user payloads. No production `unwrap`, `expect`, `panic!` or `todo!`.
 
-Daily-use v1 ships Redis read/browse/inspect only (DU-02 item 5 and the DU-03 item-12 read allowlist are unaffected). The complete v1.0 DU-07 contract — typed String/Hash/List/Set/Sorted-Set mutations, TTL/persist/delete, revision-checked one-key atomic scripts, production confirmation tokens and RedisApplying/RedisOutcomeUnknown recovery — is deferred unchanged to P1; the v1.0 text (git history of this file) is the P1 baseline. In v1.1 no Redis mutation surface and no Redis safety-fence class exists: explorer/editor mutation controls are absent or visibly `Planned` per DU-11 item 5, never inert.
+## 4. J1 — secure MySQL connection to useful Data
 
-### DU-08 — bounded result export (CSV import deferred to P1 by v1.1)
+- **J1-1:** From a clean install, create, edit, duplicate and delete a MySQL
+  profile and choose Development/Production plus Read-only/Read-write posture.
+  Delete is blocked by J3 transaction state, discloses retained draft/history
+  counts and, after confirmation, durably purges that profile-instance workspace
+  rather than leaving inaccessible source text.
+- **J1-2:** Credential modes are None, Session, Environment-name-only and macOS
+  Keychain. A Keychain item uses immutable profile-instance identity and a
+  product-scoped service name. Rename preserves it; Duplicate never copies a
+  secret and creates an independent item only after new input; Delete asks Keep
+  or Remove. Config/Keychain partial failure is journaled without secret values,
+  compensated when provable, otherwise blocks that profile with a repair action.
 
-1. Existing result CSV/TSV/JSON export remains bounded, no-clobber and provenance-preserving.
-2. Bounded relational CSV import — the complete v1.0 DU-08 contract (file select, header mapping, 20-row preview, 10,000-row cap, 500-row batches, typed `MysqlInputCell` parameters, active strict-mode InnoDB transaction, `IMPORT <profile-id>` production review and operation-savepoint semantics) — is deferred unchanged to P1; the v1.0 text (git history of this file) is the P1 baseline. No import surface exists in v1.1; table-data action bars omit Import per DU-11.
-3. SQL dump, XLSX/XML, cross-database migration and scheduled transfer remain P1.
+Profile Delete uses one payload-free journal containing immutable instance ID,
+Keychain Keep/Remove decision and phase. It is fsynced before the first change
+and advances idempotently through `Prepared → WorkspaceTombstoned →
+ConfigDeleted → WorkspacePurged → KeychainResolved → Complete`. `ConfigDeleted`
+is the user-visible commit point; the exact private tombstone makes source text
+inaccessible first and is purged before completion. Startup resumes the recorded
+phase, verifies an uncertain config commit by reload/fingerprint and never
+guesses or deletes another instance. The journal is removed only after config,
+workspace and Keychain decision are durably reconciled.
+- **J1-3:** MySQL TLS defaults to verify-identity using OS roots or an explicit
+  custom CA and the original database hostname. Encryption-only/Preferred and
+  plaintext downgrade are not P0 connection modes. Wrong CA or hostname fails
+  without fallback.
+- **J1-4:** Optional SSH binds an ephemeral loopback port and connects only to
+  the reviewed final database destination. Host identity uses strict
+  `known_hosts` or an explicitly reviewed SHA-256 fingerprint; unknown keys
+  require one-time review before saving and mismatches always fail. Private-key
+  passphrases use a credential channel, never argv/environment/log. Database
+  TLS still verifies the original database hostname/SNI through the tunnel.
+- **J1-5:** Test and Connect share the ordered SSH → TCP → TLS → authentication
+  → database pipeline and expose only a typed failed stage, safe recovery and
+  zero secret/backend prose.
+- **J1-6:** A saved Keychain profile reconnects after app restart without
+  re-entering the password.
+- **J1-7:** Search and refresh `schema → table/view → columns, primary/unique
+  keys, indexes and foreign keys` while retaining selected object context.
+- **J1-8:** Open table Data/Structure and view Structure in one action. View Data
+  opens only after X-8 SafeViewProof; an unproved view has a truthful disabled
+  Data action and exact reason rather than an unsafe fallback.
+- **J1-9:** Data uses a typed request with explicit scope, limit, truncation,
+  server filter, catalog-derived sort and page state. Stable keys use keyset
+  paging; bounded keyless fallback is labelled unstable.
+- **J1-10:** Data supports refresh, Grid/Record/full-value detail and cell/row
+  copy without losing navigator/editor/result context.
 
-### DU-09 — useful result inspection
+## 5. J2 — durable SQL workspace/history with in-session multi-results
 
-1. Every result tab exposes grid and single-record/value detail modes.
-2. The retained bounded result can be filtered and sorted locally without rerunning the query; UI labels make the local scope explicit.
-3. Null, text, JSON, binary and truncated values are visually and semantically distinct.
-4. The value detail shows the full retained value. If the backend value exceeded the retention bound, the UI says it is truncated and does not imply that it is complete.
-5. Copy cell, selected rows and all retained rows remain available.
-6. Result status includes success/error, driver, profile, operation, completion time, duration, returned/affected rows, last insert ID when present and truncation.
-7. Automatic result eviction never removes a tab/surface protected by DU-06 item 16 or an active review. Eviction considers only inactive, terminal, unprotected results oldest-first. If protected results alone consume the count cap, execution that would require another tab rejects before user-target dispatch. If only the returned byte size makes the aggregate cap unsatisfiable, the new read result is not retained and the UI reports why; a DML transaction/history terminal record remains, but no older protected work disappears.
+- **J2-1:** Per profile, create, rename, reorder, select, save and close multiple
+  SQL tabs. Persistence is available only for classified v3 profiles with an
+  immutable instance ID; a legacy profile explains and links to migration.
+- **J2-2:** Editor has syntax highlighting and bounded catalog autocomplete.
+- **J2-3:** Persist tab ID/title/text/language, profile/database binding,
+  order/selection, cursor/selection and split geometry across quit/crash.
+- **J2-4:** Execute non-empty selection, otherwise caret statement, or explicit
+  whole script; display the target before dispatch.
+- **J2-5:** Cancel active work and distinguish requested, cancelled, failed,
+  successful and outcome-unknown operations.
+- **J2-6:** During the current session retain every statement result or typed
+  error in order with time, duration, returned/affected rows and truncation,
+  without overwriting another editor/result.
+- **J2-7:** Inspect Grid, Record and full Value; locally filter/sort retained
+  rows; copy cells/rows; compare several result tabs.
+- **J2-8:** Search private per-profile history by source/status/date and open an
+  entry in a new editor with zero automatic network dispatch.
+- **J2-9:** After quit or forced termination, relaunch, reconnect, reopen a
+  history entry, explicitly Run it and obtain the expected new result.
+- **J2-10:** Disable or clear draft/history persistence per profile. Clear never
+  deletes profiles, Keychain items or mutation fences.
 
-### DU-10 — installed CLI bootstrap and automation
+### J2 storage bounds and failure semantics
 
-1. A clean installation can complete `profiles list/create/update/delete/duplicate` without first opening the GUI; a legacy installation can complete DU-01 `profiles migration-plan/migrate-v3` without the GUI.
-2. Profile commands expose the same validation, Development/Production and Read/write/Read-only semantics as the GUI.
-3. A one-process CLI invocation can receive a UTF-8 session credential through `--credential-stdin`. It reads into a fixed 16-KiB-plus-one overflow buffer, removes at most one terminal CRLF or LF, rejects empty/over-16-KiB input with code 2 before config/service/network work, and zeroizes the temporary buffer after constructing the redacted session-secret type. Credential values are never accepted in argv, debug output or command receipts.
-4. `exec` accepts exactly one target source: existing `--text`, `--stdin`, or `--file`. `--credential-stdin` is mutually exclusive with target `--stdin`; when it is used, the target must come from `--text` or `--file`. EOF removes no content except one optional terminal line ending from credential input; target stdin is preserved byte-for-byte after UTF-8 validation.
-5. CLI query output supports `table`, `json`, `csv` and `tsv`; diagnostics remain on stderr and data remains on stdout.
-6. CLI exit codes are stable:
+- editor source: 256 KiB/tab; 20 tabs/profile; 100 tabs total;
+- history source: 64 KiB/entry; oversize source becomes visible non-reopenable
+  metadata, never a truncated query; 2,000 entries/profile; 10,000 total;
+- committed profile shard: 32 MiB; committed total store: 128 MiB;
+- count and bytes are enforced together, evicting oldest terminal history first.
 
-   | Code | Meaning |
-   |---:|---|
-   | 0 | success |
-   | 2 | CLI usage, invalid input or missing confirmation |
-   | 10 | credential required or authentication rejected |
-   | 11 | network/TLS/connection unavailable |
-   | 12 | server permission, syntax or constraint rejection |
-   | 13 | cancelled or timed out; server outcome may be unknown |
-   | 14 | read-only, production-safety, stale generation or conflict rejection |
-   | 70 | internal invariant/I/O failure |
+Result rows/cells and result tabs do not persist across restart. History stores
+only source plus safe typed status/error code and metrics, never backend prose.
 
-7. Mutation posture matches the GUI: Read-only rejects before user-target dispatch after any permitted static capability query; Production requires `--confirm-production <exact-profile-id>` (a non-secret argv confirmation); unsupported DDL and transaction/session-control text is rejected before user-target I/O. No second stdin consumer is used.
-8. Help and README quickstart prove a clean path from profile creation through check, bounded read and export without exposing a credential.
-9. CLI read targets run normally. A TransactionalDml target requires exactly one `--transaction commit|rollback` choice: the process opens one managed transaction and executes the fully preflighted target/batch. `commit` is attempted only after every target succeeds. Any target error or cancellation after Begin admits no Commit: if DU-05 proves the server already rolled back, or a still-open transaction is then proven RolledBack, stdout remains empty and the original classified error is emitted on stderr with its exit code; an unprovable rollback/outcome exits 13. The explicit `rollback` choice always proves whole-transaction Rollback after a successful batch. Mutation-batch stdout is retained within the aggregate result bound and emitted only after the selected terminal outcome and DU-05 item-23 fold is durably completed, with that outcome labelled. Mutation without the option rejects with code 2. There is no live transaction shared across CLI processes.
-10. Commit/Rollback use exactly DU-05's NO CHAIN NO RELEASE command plus same-connection `@@SESSION.in_transaction` proof. Failed Commit + proven-open transaction attempts exactly one explicit Rollback; proven Rollback returns the original Commit error, while failed/unprovable Rollback exits 13. Failed Commit + no transaction or failed probe exits 13 because commit-versus-rollback is unknown. Failed Rollback + no transaction is proven rolled back; + proven-open returns the rollback error with the durable Active fence; failed probe exits 13. A successful terminal server response with fold/fence-cleanup failure exits 70 and states the proven server outcome without emitting credential/target/result data; replay remains mandatory before later work.
-11. The installed CLI provides `transaction status --profile <id>` and `transaction acknowledge-unknown --profile <id> --confirm-profile <exact-id>`. Status first acquires the per-instance transaction lock; a live owner makes both commands reject with code 14 and no fence mutation. With no owner, Status durably converts an orphaned Active/Resolving fence to OutcomeUnknown and reruns the TransactionId-based Unknown shard fold before showing action/time/generation without target data. An already retained OutcomeUnknown receives the same idempotent fold. Acknowledge accepts only an already durable OutcomeUnknown fence, acquires the same lock, reruns and fsync-verifies the Unknown shard fold, folds any live state, and only then removes/parent-fsyncs that ProfileInstanceId fence. Missing/mismatched confirmation or wrong fence kind exits 2; any conversion/fold/removal storage failure exits 70 with the fence retained. This is acknowledgement of uncertainty, never a claim that Commit or Rollback occurred.
-12. CLI delete is exactly `profiles delete --profile <id> --workspace purge|retain-orphan --confirm-profile <exact-id>`; no workspace choice/default or mismatched confirmation exits 2 before mutation. Active/Resolving or unacknowledged MySQL Unknown state exits 14. It uses DU-04's journal and config-first ordering. Failure before config commit exits 70 with the profile intact; failure after committed config deletion exits 70 with `profile deleted; workspace cleanup pending`, and valid journal replay finishes only the selected purge/orphan action.
+Autosave starts within 2 seconds of a change. `Unsaved`, `Saving`, `Saved` or
+`Save failed` is visible. `Saved` means the profile manifest pointer, referenced
+shard and parent directory are durable. `⌘S` flushes the current draft only.
+Voluntary quit with pending/failed save is blocked until Retry or an explicit
+Discard-local-changes confirmation. Forced termination after visible `Saved`
+must restore that exact snapshot; visibly unsaved edits may be lost.
 
-### DU-11 — coherent native interface and accessibility
+The store is single-writer. A second app instance opens workspace persistence
+read-only and explains why. Each shard generation is written/fsynced under an
+immutable generation name; an atomic fsynced manifest pointer plus checksum
+chooses the committed generation. Orphan generations are bounded cleanup, not
+implicit commits.
 
-1. The visual reference is the local `ui-ux` skill's `openai` design: white canvas, black ink, opacity tiers, black inversion for the primary action, square corners, no gradients/shadows/decorative color.
-2. DBeaver's first four GitHub README screenshots are the minimum interaction-structure reference. dbotter keeps the OpenAI visual language, but a wide SQL/data workspace must simultaneously preserve the selected connection/object, open work, subordinate result/detail and operation status; switching a result or object must not erase the editor, navigator selection or transaction context.
-3. At 1,180×720 points or wider, the workspace has a persistent three-zone composition:
-   - a left connection/object navigator, initially 280 points wide and user-resizable from 220 through 420 points or explicitly collapsible;
-   - a center object/editor surface with at least 520 points of usable width;
-   - a subordinate result/history/record/review surface, either below the center or as a right inspector, with at least 240 points in its active dimension.
-   Opening a transient review or import flow does not replace the underlying object/editor context. The app remembers valid navigator width, active split ratio, inspector visibility and tab order per profile; corrupt or out-of-range geometry resets to the documented defaults rather than hiding content.
-4. The editor/result splitter is directly draggable, keyboard-adjustable in 5-point increments, has a 44-point accessibility hit region around its visible rule, and resets to 60/40 on double-click or the accessible `Reset split` action. Neither visible editor nor result pane can be resized below 160 points; crossing that boundary explicitly collapses the pane and leaves a named restore control.
-5. The navigator includes one visible search/filter field, expandable connection/schema/relation/column/index nodes, connection-state and posture text, refresh, and direct `Data`, `Structure` and `New editor` actions for supported objects. Selection and expansion survive result switches and bounded refresh; unavailable capabilities are omitted or labelled `Planned`, never rendered as inert working controls.
-6. Object/editor and result tabs are distinct. Open tabs expose title, dirty/running/error state, close and keyboard focus; editor tabs can be reordered and their order persists. Closing a dirty editor or a result that owns uncommitted staged work invokes the exact discard guard instead of silently losing it. A breadcrumb or context line names profile → database → schema/object above data and edit surfaces.
-7. Wide-layout action bars keep the daily actions visible without an overflow-menu-only path:
-   - editor: Run current/selection, Run all, Cancel when active, History, Begin/Commit/Rollback when MySQL-capable, limit and timeout;
-   - table data: Refresh, Add/Delete row, Apply/Discard staged changes, Export, page controls and pending-change count;
-   - result: Grid/Record, local filter/sort, Copy, Export, row/byte/truncation provenance;
-   - Redis value: Refresh and bounded value inspection (typed mutation actions are P1 and never render as inert controls).
-   Narrow layout may group secondary actions, but the active operation, its Cancel action, pending count and transaction terminal actions remain one reachable focus step from the surface.
-8. A persistent context/status strip names profile, endpoint/database, `PRODUCTION` or Development, Read-only or Read/write, connection state, transaction state, pending-change count, active operation and its latest duration plus affected/returned row count. Unknown and truncated outcomes are textual. Status updates are scoped to the originating tab/result and never overwrite unrelated status.
-9. Information hierarchy, not decoration, separates connection/object navigation, object/editor and result tabs, and history/record/review inspection. `PRODUCTION`, `Read-only`, `Transaction active`, `Pending changes`, error and destructive states always include text/iconography; color is supplementary at most.
-10. Discrete toolbar, form, dialog and status actions are at least 44×44 points with 8-point separation where adjacent. Dense tree and grid collections may use 28–32-point visual rows only when the entire row is the target, selection is unambiguous, keyboard traversal/editing is complete, and any inline destructive action retains a 44-point target.
-11. Every control has a stable accessibility ID, role/name, enabled state and value where applicable. Focus order follows visual order; panes, splitters, tabs, grids and status changes expose their native semantic roles.
-12. Empty, loading, disabled, error, confirmation and completed states are explicit and actionable. Work unrelated to the correlated operation stays usable; a background refresh cannot globally freeze the workspace.
-13. Layout remains operable at the existing 840×560 minimum with a named navigator drawer and one-at-a-time inspector fallback instead of horizontal overflow. The profile form scrolls with a reachable action footer; editor, result and inspector content scroll independently; opening and closing the fallback restores the previous focus and never covers the primary/Cancel action.
-14. Motion is functional, 150–250 ms when used, and dispensable under reduced-motion settings.
-15. Every long-running connection, draft test, browse, execute, import and export operation exposes an exact-operation Cancel action while cancellation can still be requested.
-16. The user-provided dbotter artwork remains the application/title icon; structural controls use one consistent vector/icon language and never substitute emoji. Icon-only secondary actions have a visible tooltip and accessible name; primary, destructive and transaction-terminal actions retain text in the wide layout.
-17. Release evidence contains native screenshots at 1,440×900 and 840×560 for exactly four canonical journeys: MySQL object-to-data browse, SQL editor with multiple results and history, staged row edit with transaction/review state, and Redis key browse with bounded value inspection. Capture launches a separate installed-app process with a fresh temporary config containing only tracked `dbotter-visual-fixture` profiles against disposable local Docker data; it never opens the user's config. The fixed fixture query/key/cells are synthetic and non-secret, an exact text allowlist plus injected forbidden sentinel is verified from the native accessibility snapshot before capture, raster metadata is stripped, and only the cropped app window is retained in public evidence. Any non-fixture endpoint, path, profile, query, key, cell, CSV value, username or sentinel fails the gate and deletes the candidate images. An external visual/UX review rejects overlap, clipping, unreachable actions, ambiguous selection/status, lost navigator/editor context, fake controls, or a journey whose primary action/result requires opening an unrelated settings surface. GIS and ER diagram views are not required screenshots or P0 features.
+### J2 keyboard contract
 
-## 5. Storage and privacy contract
+`⌘Enter` current/selection, `⌘⇧Enter` all, `⌘T` new editor, `⌘S` flush draft,
+`⌘W` close, `⌘F` context find/filter, `⌘⇧F` history search and `Esc`
+cancel/dismiss. `⌘S` never applies a database mutation.
 
-- Profile configuration remains the source of connection identity. Environment/access fields are versioned v3 data, not fields that an older v2 writer may round-trip.
-- Config version 3 is the write schema and read compatibility is versions 1, 2 and 3. Version 1 and 2 migration is confirmed, atomic and source-version backed up (`.v1.bak` or `.v2.bak`); neither legacy file is silently rewritten at startup.
-- The published config compatibility contract and release/tap/install validators change in the same slice. A frozen v2 reader must reject v3 before constructing service or network state.
-- Its exact JSON compatibility object is `{"read_versions":[1,2,3],"write_version":3,"migration_backup_suffixes":{"1":".v1.bak","2":".v2.bak"}}`; type-confused, missing or extra fields fail release/install validation.
-- Workspace/history data is stored in a sharded directory made by appending `.workspace-v1` to the complete config path: a bounded rebuildable `index.json`, optional `journal.json`, `profiles/<sha256-profile-instance-id>.json`, `orphans/<orphan-id>.json`, and `safety/<sha256-profile-instance-id>.json|.lock`. Each shard/fence contains and verifies its ProfileInstanceId (and current user-facing ProfileId only as non-authoritative display metadata); a filename alone is never identity. A safety JSON contains exactly one closed MySQL fence: Active, Resolving or OutcomeUnknown. (Redis fence classes RedisApplying/RedisOutcomeUnknown are P1 with DU-07.)
-- The directory is user-only (`0700` on Unix) and files are `0600`, written with atomic replace and parent-directory durability handling consistent with the configuration writer.
-- A workspace process lock is held across synchronous load/mutation/journal replay but not idle UI lifetime; per-shard destination fingerprint/reload then prevents silent overwrite. Lock/fingerprint conflict surfaces `Workspace changed externally`; the app reloads/merges by stable IDs only after user confirmation. The separate per-instance advisory safety lock is held for DU-05's full live transaction lifetime and is owned by the synchronous lock component. (DU-07's per-operation Redis lease is P1.)
-- `index.json` is a cache derived from validated shard scans. A multi-file duplicate/delete→purge-or-orphan/clear operation admits only while no other lifecycle operation is journaled: under the process lock it writes and fsyncs one intent containing operation ID/type, source/destination IDs, pre/post fingerprints and expected config presence; commits the required config mutation; applies idempotent shard create/rename/delete; rebuilds and atomically commits the index; then atomically removes and parent-fsyncs the journal.
-- Startup acquires the process lock and resolves a valid journal before normal load. If a duplicate's config profile exists it finishes an empty shard/index, otherwise it removes only the journal-created empty shard. If a deleted profile is absent it finishes the confirmed purge or atomic orphan move, while a still-present profile cancels the delete intent and preserves its shard. A confirmed clear finishes deleting only the IDs named by its intent. A corrupt/unknown journal blocks destructive recovery and is surfaced; it is never guessed or discarded.
-- Without a journal, validated profile/orphan/safety shards are authoritative and the index is rebuilt. A profile instance absent from current config is quarantined and surfaced, never auto-bound or deleted; a missing shard becomes an explicit empty workspace only for an extant config ProfileInstanceId. Corrupt, duplicate-instance or instance-mismatched shards fail closed. File-content fingerprints remain optimistic-concurrency data only, never profile identity. These rules make every replay idempotent and prevent a torn index/config/shard sequence from silently losing, rebinding or resurrecting drafts.
-- Workspace/history serialization is versioned. Unknown future versions are read-only errors, not reset instructions.
-- No saved session credential, environment credential value, TLS private material or catalog token key appears in the workspace file.
-- Arbitrary persisted editor/history text may contain user-entered secrets or PII. The permission boundary, disclosure, per-profile opt-outs and clear action are the protection; automatic literal detection is not a security guarantee.
-- The UI exposes the storage location and a confirmed `Clear local workspace and history` action.
+## 6. J3 — safe identifiable MySQL row editing
 
-## 6. Limits
+- **J3-1:** Begin one profile-scoped managed transaction on one physical
+  connection/session ID. Raw transaction commands remain blocked.
+- **J3-2:** Stage typed Add, Update and Delete locally with zero network write;
+  show changed cells/rows and parameterized generated SQL; Discard is local.
+- **J3-3:** Apply at most 100 reviewed rows through the transaction connection
+  under one internal savepoint. Error, Conflict or cancel at the first, middle or
+  last row requests rollback of the whole Apply. Only confirmed savepoint
+  rollback returns every batch row to local-staged state; an ambiguous rollback
+  becomes OutcomeUnknown and no row is shown as locally discardable. Partial
+  Applied state is impossible. Apply never commits.
+- **J3-4:** Update/Delete re-read and lock stable identity plus original values;
+  any mismatch or affected-row count other than one is Conflict. Generated and
+  read-only columns are not editable.
+- **J3-5:** Rollback returns the separately observed original value; Commit makes
+  the separately observed reviewed value durable.
+- **J3-6:** Read-only has zero mutation dispatch. Production requires an exact
+  change-scope confirmation before Apply and again before Commit.
+- **J3-7:** Disconnect, profile edit/delete, update and voluntary quit are blocked
+  while server transaction state is Active/Resolving/Unknown. Local-only stages
+  may persist; a live server transaction is never claimed to survive restart.
+- **J3-8:** Connection loss, forced termination, unproven cancel or unproven
+  savepoint/terminal response enters Unknown and blocks further mutation.
+- **J3-9:** Unknown UI shows opaque transaction ID and intended terminal action,
+  supports read-only inspection and explicit acknowledge-after-external-check;
+  acknowledgement does not rewrite the historical outcome.
 
-| Resource | P0 bound |
-|---|---:|
-| config file / profiles | 4 MiB before decode / 100 |
-| legacy posture migration file | 1 MiB before decode / every current profile exactly once |
-| editor tabs retained per profile | 20 |
-| history entries retained per profile | 500 |
-| statements in Run all | 50 |
-| editor/CLI target bytes | 256 KiB total before parse / 64 KiB per parsed target |
-| CLI credential stdin | 16 KiB after one optional terminal line ending |
-| parsed target tokens / nesting depth | 8,192 / 64 |
-| result rows per execution | existing user limit, hard max 10,000 |
-| retained result bytes per execution | 8 MiB |
-| result tabs | 10 per editor tab, 40 per profile; oldest inactive first |
-| aggregate retained result bytes | 32 MiB per profile; oldest inactive first |
-| editor title / editor text | 128 UTF-8 bytes / 256 KiB per tab |
-| stored history target / serialized history bytes | 64 KiB per entry / 8 MiB per profile |
-| workspace index / profile-or-orphan shard | 1 MiB / 48 MiB before decode |
-| workspace lifecycle journal / safety fence | 1 MiB / 64 KiB before decode |
-| retained orphan archives | 20; retain is denied until one is purged at the cap |
-| CSV preview rows (P1 import) | 20 |
-| CSV import rows (P1 import) | 10,000 |
-| CSV insert batch (P1 import) | 500 |
-| CSV file / decoded field / columns (P1 import) | 64 MiB / 1 MiB / 512 |
-| MySQL table-data page | 1…200 rows |
-| Redis explorer scan operation / retained cycle | COUNT 1…1,000; 64 replies or 5 s / 512 replies, 30 s, 10,000 keys or 8 MiB |
-| keyless MySQL page offset | 10,000 rows maximum |
-| staged row changes / retained staged bytes | 1,000 / 8 MiB per transaction |
+Transaction state:
 
-Crossing a bound produces a specific recoverable error before dbotter retains unbounded data or starts the associated server write. Driver frames/rows may transiently allocate before dbotter applies retained caps, matching the existing allocation disclosure. Automatic result eviction never removes the active result and announces what was evicted; if no inactive result can satisfy the byte cap, the new result is rejected before retention rather than growing without bound.
+| State | Server resource | Allowed actions |
+|---|---|---|
+| AutoCommit | no owned transaction | Begin, reads, local stage |
+| ActiveClean | owned physical session, no applied changes | reads, Apply, Commit, Rollback |
+| ActivePending | same session, applied uncommitted changes | reads, Apply, Commit, Rollback |
+| ResolvingCommit / ResolvingRollback | same session, terminal request in progress | wait/cancel-request only; no new work |
+| OutcomeUnknown | session/outcome not safely known | read-only inspection, external verification, acknowledge; no mutation |
 
-Count and byte limits are both maxima. History evicts oldest entries first. Before a workspace write, history/result metadata is evicted before any open editor draft; open drafts are never silently truncated or evicted. Admission accounts for serialized size before accepting an edit that would make its profile shard impossible to save; the edit remains rejected with a specific bound error instead of creating a legal-but-undurable state. A history target over 64 KiB stores an explicit omitted marker and cannot be rerun from history.
+Begin, the persistent Active transaction and terminal requests use X-6 fences. Driver cancellation is not reported
+Cancelled until server/session disposition and transaction state are known.
+Forced process death with any nonterminal fence recovers as OutcomeUnknown.
+Raw editor `INSERT`/`UPDATE`/`DELETE` remains P1.
 
-## 7. P1/non-goals
+## 7. J4 — bounded export and transaction-safe CSV import
 
-- MongoDB readiness.
-- SSH tunnels, proxies, cloud discovery and connection groups.
-- OS keychain credential persistence.
-- SQL autocomplete, formatter, snippets, AI generation, visual explain and profiler.
-- User-facing transaction isolation editor, user savepoints and smart-commit heuristics. Internal row-Apply and import operation savepoints in DU-06/DU-08 are required.
-- Development one-shot GUI auto-commit mutation override.
-- Stream/RedisJSON mutation, Redis Search lifecycle and generic Redis backup/restore.
-- Typed Redis mutations, TTL/persist/delete review and unknown-outcome recovery (v1.0 DU-07; deferred by v1.1).
-- Bounded relational CSV import (v1.0 DU-08; deferred by v1.1).
-- SQL dump, XLSX/XML, cross-database migration and scheduled transfers.
-- Safe recursive view execution and raw SHOW/DESCRIBE/EXPLAIN statement shapes. P0 still provides typed navigator metadata and structure inspection.
-- GIS/maps, ER diagrams, charts, detached/pinned windows and arbitrary dock/reparent layouts. DU-11's fixed resizable navigator/editor/result/inspector composition is P0.
-- Unlimited/full backend value retrieval without an explicit bounded request.
+- **J4-1:** Export exact current query result, current filtered table page or
+  selected rows; name scope, included count/bound and truncation before path.
+- **J4-2:** CSV/TSV/JSON are streamed with progress/cancel. A sibling private
+  temp is fsynced and no-replace-renamed only when complete; destination is
+  never overwritten and crash/cancel never leaves a normal-name partial file.
+- **J4-3:** CSV exposes header, UTF-8, delimiter and NULL representation.
+- **J4-4:** Import selects one table, parses configurable UTF-8 CSV and previews
+  at least 20 data rows before dispatch.
+- **J4-5:** Explicit column mapping validates required columns and every value
+  against catalog types; error identifies source row without echoing payload.
+- **J4-6:** Cap one import at 10,000 rows/32 MiB; show progress and cancel between
+  bounded parameterized batches.
+- **J4-7:** Execute on the J3 transaction connection under one savepoint. Parse,
+  validation, server or cancel failure requests savepoint rollback. Report
+  `Rolled back` only after confirmation; connection loss during batch/cancel/
+  rollback becomes OutcomeUnknown and activates the mutation fence. Successful
+  Apply still requires explicit Commit/Rollback.
 
-## 8. Release acceptance
+## 8. J5 — Redis browse, inspect and structured edits
 
-Daily-use v1 is complete only when all of the following are true:
+- **J5-1:** Test, save and reconnect a standalone Redis profile using J1's
+  Keychain lifecycle and verify-identity/no-downgrade TLS contract.
+- **J5-2:** Browse only by cursor SCAN with pattern/type filter, Load more,
+  progress/cancel and explicit bounds — never `KEYS *`.
+- **J5-3:** Show binary-safe key identity, type, TTL and bounded size/value;
+  inspect String, Hash, List, Set and Sorted Set with typed pagination/search and
+  Text/JSON/HEX presentation where applicable.
+- **J5-4:** Structured operation matrix is fixed: String `SET`; Hash `HSET/HDEL`;
+  List `LPUSH/RPUSH/LSET/LREM`; Set `SADD/SREM`; Sorted Set `ZADD/ZREM`; key
+  create/delete; `EXPIRE/PERSIST`. Installed proof covers add/update/remove for
+  every applicable type.
+- **J5-5:** Apply uses one dedicated connection and `WATCH` plus operation-specific
+  bounded read/compare, `MULTI` and `EXEC` so a concurrent key change yields
+  Conflict. Raw key bytes, expected type and expected field/index/member/value
+  are the identity. Whole-key overwrite/delete additionally compares an
+  `ExpiryToken` and a `DUMP` digest capped at exactly 1 MiB. `ExpiryToken` is
+  `Missing`, `Persistent` or `ExpiresAtUnixMs(i64)`. One embedded, static,
+  read-only, O(1) Lua script atomically returns Redis server `TIME` and `PTTL`
+  for exactly `KEYS[1]`; it accepts no user script or command and returns a fixed,
+  bounded tuple. For `PTTL >= 0`, the token is
+  `floor(seconds * 1000 + microseconds / 1000) + PTTL`; `-2` maps to Missing and
+  `-1` to Persistent. The same script runs after `WATCH` on the apply connection
+  and the exact token must match, so natural TTL passage does not conflict while
+  competing `EXPIRE`/`PEXPIRE`/`PERSIST` does. A bounded RESP decoder rejects a
+  declared DUMP bulk length over 1 MiB before body allocation, UNWATCHes and
+  disables the action; exact-limit and limit+1 are tested. An indistinguishable
+  delete/recreate cannot be called a distinct incarnation and is not claimed.
+- **J5-6:** Redis changes are immediate and never show MySQL Commit/Rollback.
+  X-6 Prepared is fsynced before WATCH and Dispatched before `MULTI` or a queued
+  mutation command; lost `EXEC` response becomes OutcomeUnknown and never
+  auto-retries.
+- **J5-7:** Read-only and Production guards apply before WATCH/dispatch; missing,
+  type-changed or concurrently changed keys recover without applying to another
+  visible selection.
+- **J5-8:** Closed read command editor uses X-8 allowlist, typed replies,
+  multi-command results and J2 durable source/history. Arbitrary raw mutation
+  commands remain blocked.
 
-1. Every trace row in `trace.md` has a source path, RED contract, GREEN unit/integration proof and a user-observable CLI or native proof.
-2. `just check` and `just check-all` pass at the exact release commit.
-3. Live MySQL proves browse, begin → update → rollback, begin → update → commit, conflict handling and reconnect rollback behavior.
-4. Live Redis proves browse and bounded inspect for the five P0 types.
-5. Workspace/history restart, corrupt-file quarantine, bounds, credential-channel exclusion, enumerated-form redaction and arbitrary-literal disclosure tests pass.
-6. Native accessibility verification proves the tab, history, transaction, edit review and result-detail journeys; DU-11's exact wide/minimum screenshot matrix passes external visual/UX review.
-7. An independent review finds no unresolved Critical or High issue and no spec/trace/code divergence.
-8. Changes are merged to `main`, pushed, published only to Preview, installed through xbrew, launched locally and verified from the installed artifact.
+## 9. Interaction and visual contract (`UX-*`)
 
-## 9. Change control
+- **UX-1:** Use `assets/dbotter-icon.png` as product title/app icon.
+- **UX-2:** Keep a DBeaver-density searchable navigator, multi-tab editor,
+  multi-tab result/detail and operation/transaction status visible together;
+  result/pane switching preserves context. Controls without a real effect path
+  are absent.
+- **UX-3:** Follow the named local OpenAI reference: true white/black,
+  opacity hierarchy, inverted primary emphasis, square corners, no decorative
+  gradients/shadows/chromatic state accent, readable sans/monospace typography.
+- **UX-4:** Motion is restrained to 150–250 ms, interruptible and disabled by
+  reduced motion. Every status also has text/icon, never color alone.
+- **UX-5:** Full-row tree/grid selection may be dense; discrete targets are at
+  least 44 points. All actions have visible focus, programmatic name/state/value
+  and logical keyboard traversal. Primary journeys are mouse-free.
+- **UX-6:** At 840×560 no required action is clipped/unreachable. A collapsed
+  pane has a named restore action; wide layout keeps all four regions.
+- **UX-7:** Mutation review traps focus. Its explicit Apply is activated by
+  focused button or `⌘Enter` only while that modal is open; `⌘S` remains draft
+  save and can never cause a database write.
 
-This document is the frozen Daily-use v1 product contract. Implementation may split rows into smaller traces but may not weaken a `DU-*` acceptance criterion. Any scope removal or semantic change requires a new spec version, an explicit rationale in the commit message and a corresponding trace update before code changes.
+## 10. Evidence contract (`E-*`)
 
-### Amendment log
+- **E-1:** Before production code, commit/push the failing user-boundary and
+  required safety tests; record the full RED SHA in `evidence.md`.
+- **E-2:** Local GREEN requires focused tests, `git diff --check`, `just check`
+  and `just check-all` at the exact SHA.
+- **E-3:** Driver/filesystem changes require live fixtures and kill/failpoint
+  evidence named in `trace.md`; UI changes require actual rendered frame plus
+  keyboard/AX activation, not static label search.
+- **E-4:** Independent review is Critical 0 and High 0 before publication.
+- **E-5:** Preview source/artifacts/manifest/checksums/tap/xbrew executable all
+  bind the same SHA; installed actions and independent backend/file readback
+  complete every requirement mapped to that journey.
+- **E-6:** Public proof uses only the tracked synthetic fixture and passes
+  forbidden-sentinel, AX allowlist and metadata-strip gates.
 
-- **v1.1 (2026-07-16)** — issued under this section with a rerun independent contract review; the three-file freeze tuple in `04-patch-plan.md` was recomputed.
-  1. **DU-03 read admission**: the closed PureBuiltin function allowlist and the recursive base-table relation proof are removed for reads. A ReadOnly batch now executes only inside a proven server-enforced read-only session (`SET SESSION TRANSACTION READ ONLY` + typed `@@SESSION.transaction_read_only = 1`), which is the read-safety authority. The MySQL 8.4-only capability gate now applies to mutations only; other MySQL-wire servers get reads with a visible `Unverified server: reads only` state. `/*+` optimizer hints are admitted for reads. Rationale: a client-side function allowlist re-implements — and permanently drifts from — enforcement the server provides exactly; it rejected legitimate daily read queries (window functions, JSON, new 8.4 builtins) while adding maximal spec and maintenance surface. The strictness is kept where the risk is: every write path is unchanged.
-  2. **DU-07 typed Redis mutations and DU-08 CSV import deferred to P1** unchanged; the v1.0 text is the P1 baseline. v1.1 ships Redis read/browse/inspect and the existing bounded export. Rationale: neither is on the highest-frequency daily loop; deferral shrinks Stage 3 and removes the Redis fence classes and import savepoint machinery from v1.
-  3. **In-transaction reads keep a structural client proof**: while a transaction is active, reads run on the read-write worker (read-your-writes) where a read-only session is impossible, so on that path only, ReadOnly admission requires catalog-proven base tables with zero function invocations and zero view references; outside a transaction the server-enforced read-only session is the sole authority. This closes the gap between item 10's read authority and DU-05 item 11's worker routing.
-  4. **DU-05 terminal persistence simplified**: the TerminalProven fence kind and its replay protocol are removed. A proven terminal outcome folds live state, rewrites the profile shard once, then removes Resolving; a crash inside that window conservatively surfaces as OutcomeUnknown for explicit acknowledgement. Disclosed weakening: after such a crash the app asks the user to acknowledge an outcome the server had actually proven; it never claims an unproven outcome.
-  No `DU-*` acceptance row was silently weakened: every change is listed here, `trace.md`/`plan.md` were updated in the same commit, and D7/D8 are marked Deferred rather than deleted.
+## 11. P1/P2 exclusions
+
+P1: raw DML and reviewed raw mutation batches, saved-query library/parameters/
+snippets, DDL/schema UI, plan visualization, connection import/export/groups,
+XLSX/multi-table transfer, Redis Stream/JSON, cluster/sentinel, shortcut
+customization and detached result comparison.
+
+P2: ERD/GIS/charts, schema compare/migration generation, backup/scheduler,
+profiler/slow-log dashboards, Redis module-specific workspaces, AI/plugins and
+additional database engines.
+
+## 12. Change control
+
+The frozen tuple is `research.md`, `spec.md`, `trace.md` and `plan.md`, with
+SHA-256 values in [`../../04-patch-plan.md`](../../04-patch-plan.md). A semantic
+change requires version bump, synchronized trace/plan, new tuple and independent
+review before code proceeds. Implementation may choose internals but cannot
+replace an installed observable with a proxy or weaken safety/privacy to make a
+test pass.

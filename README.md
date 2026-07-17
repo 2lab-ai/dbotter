@@ -34,22 +34,24 @@ This repository publishes only the Preview channel. It does not publish a stable
 
 ## Known daily-use gaps
 
-The current Preview is useful for bounded inspection and one-off commands, but it is not yet the Daily-use v1 product:
+The current Preview is useful for bounded inspection and one-off commands, but it is not yet the Daily-driver v1.2 product:
 
-- editor/result tabs and execution-history metadata are session-only; they are not restart-persistent or searchable yet;
-- Run all is read-only. There is no bounded DML review or managed Begin/Commit/Rollback UI yet;
+- editor/result tabs and execution-history metadata are session-only; they are not restart-persistent or searchable yet (J2 is first);
+- Run all is read-only. There is no typed row-change review or managed Begin/Commit/Rollback UI yet;
 - MySQL scripts whose boundaries depend on the exact session `sql_mode` can be rejected conservatively before execution until mode-aware pre-split is complete;
-- the MySQL explorer opens bounded base-table Data but does not edit table rows; Redis type-aware mutation is deferred to P1 (DUV1 v1.1);
-- there is no CSV import flow (deferred to P1 by DUV1 v1.1);
+- the MySQL explorer opens bounded generated base-table Data but does not provide typed paging/filter/sort or edit rows;
+- there is no CSV import flow or structured Redis core-type mutation;
 - the CLI cannot bootstrap profiles or accept a session credential safely from stdin;
-- the installed-native four-journey evidence set required by the complete Daily-use contract is still pending.
+- secure Keychain credentials and SSH tunnelling are not implemented;
+- the installed J1–J5 evidence required by the v1.2 contract is still pending.
 
-The independently reviewed frozen Daily-use v1 implementation contract is:
+The Daily-driver v1.2 contract is under independent freeze review:
 
+- [`docs/daily-use/research.md`](docs/daily-use/research.md) — first-party feature research and priority basis;
 - [`docs/daily-use/spec.md`](docs/daily-use/spec.md) — product and safety contract;
-- [`docs/daily-use/trace.md`](docs/daily-use/trace.md) — hash-frozen D1–D12 vertical trace;
+- [`docs/daily-use/trace.md`](docs/daily-use/trace.md) — J1–J5 vertical trace and installed acceptance;
 - [`docs/daily-use/evidence.md`](docs/daily-use/evidence.md) — mutable implementation/live/native evidence ledger;
-- [`docs/daily-use/plan.md`](docs/daily-use/plan.md) — staged RED/GREEN/Preview delivery plan.
+- [`docs/daily-use/plan.md`](docs/daily-use/plan.md) — per-journey RED/GREEN/Preview/xbrew plan.
 
 ## Run from source
 
@@ -92,14 +94,14 @@ dbotter --config PATH browse redis keys --profile ID --format json
 dbotter --config PATH inspect redis key --profile ID --key-base64 BASE64 --format json
 ```
 
-Profile bootstrap, stdin credentials/targets and table/CSV/TSV output are frozen Daily-use v1 requirements under implementation, not current-release claims.
+These commands describe the released read/inspect baseline, not unimplemented v1.2 write, persistence or import claims.
 
 ## Contracts
 
-- [`01-spec.md`](01-spec.md) — current Daily-use v1 authority router and delivered-baseline summary.
+- [`01-spec.md`](01-spec.md) — current Daily-driver v1.2 authority router and delivered-baseline summary.
 - [`02-architecture.md`](02-architecture.md) — current ownership, typed seams and safety architecture.
-- [`03-traces.md`](03-traces.md) — current D1–D12 status ledger and mapping from delivered T0–T10 evidence.
-- [`04-patch-plan.md`](04-patch-plan.md) — current staged delivery/freeze gate and exact Daily-use artifact hashes.
+- [`03-traces.md`](03-traces.md) — current J1–J5 status router.
+- [`04-patch-plan.md`](04-patch-plan.md) — current journey delivery/freeze gate and exact tuple hashes.
 - [`docs/release/spec.md`](docs/release/spec.md) and [`docs/release/trace.md`](docs/release/trace.md) — Preview packaging, tap and installed-evidence contracts.
 
 ## Security invariants

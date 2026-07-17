@@ -1,241 +1,218 @@
-# dbotter — architecture
+# dbotter — Daily-driver v1.2 architecture
 
-Status: **delivered usable-MVP baseline; Daily-use v1 extension is governed by D1–D12**
+Status: **Frozen-aligned architecture; delivered baseline plus J1–J5 seams**
 
-Current normative behavior lives in `docs/daily-use/{spec,trace,plan}.md`.
-`docs/usable-mvp/` preserves the old P/T checkpoint evidence and hashes; it is
-historical, not current scope or status authority.
+Normative behavior lives in `docs/daily-use/{research,spec,trace,plan}.md`.
+Architecture can refine implementation but cannot replace installed acceptance
+or weaken product invariants.
 
-## 1. Architectural decision
+## 1. Ownership model
 
-dbotter remains one Rust package with one library and one binary. The native UI
-and headless CLI share `ApplicationService`; neither duplicates profile lookup,
-credential resolution, capability validation, connection lifecycle, resource
-browsing, execution classification or public-error conversion.
-
-```text
-native UI commands ----+
-                        +-> bounded runtime/controller -> ApplicationService
-installed CLI ----------+             |                       |
-                                      |                       +-> config/secrets
-                                      |                       +-> workspace store
-                                      |                       +-> session resources
-                                      +<- correlated events <-+-> MySQL / Redis
-```
-
-The UI owns display and input state. Live sessions, the transaction worker, task
-registry, config/workspace writers, secret resolution and filesystem workers
-stay behind typed service/runtime boundaries. No Rust mutex/RwLock or borrowed
-in-process guard crosses `.await`. A synchronous component may retain the owned
-file descriptor for the nonblocking OS advisory safety lease; it guards
-cross-process ownership, not in-memory state awaited by a task.
-
-## 2. Delivered baseline
-
-At baseline commit `340133dca652a7bf51d652f06cdb7436b42bbc58` the
-integrated source already provides:
-
-- atomic v1/v2-era profile configuration and non-persisted
-  None/Session/Environment credential modes;
-- native MySQL/Redis profile lifecycle, connection recovery and exact
-  operation correlation;
-- prepared-protocol MySQL execution and policy-checked Redis command execution;
-- lazy bounded MySQL schema/relation/column browsing and Redis SCAN/inspect;
-- bounded result snapshots, copy and no-clobber CSV/TSV/JSON export;
-- native accessibility identifiers plus Preview/package/tap/install
-  verification machinery.
-
-Those are foundations, not proof of Daily-use completion. In particular, the
-baseline has a pooled MySQL auto-commit execution path, one memory-only
-editor/result per profile, no table-row/Redis explorer mutations, no import and
-no clean-install CLI profile bootstrap.
-
-## 3. Identity and async ownership
-
-Identity domains remain distinct:
-
-- saved-profile work: `(ProfileId, ProfileInstanceId, ProfileGeneration, OperationId)`;
-- draft profile work: `(DraftId, OperationId)`;
-- editor/result work: `(ProfileInstanceId, EditorTabId, ResultTabId, OperationId)`;
-- transaction work: `(ProfileInstanceId, ProfileGeneration, TransactionId, TransactionOperationId)`;
-- staged/import/Redis reviews: their typed local ID plus profile generation and
-  operation ID;
-- Redis uncertain-mutation recovery: `(ProfileInstanceId, OperationId,
-  HmacKeyToken)` without raw key/payload bytes;
-- export: `(ResultId, OperationId)`.
-
-Runtime uses monotonic generations and compare-matched session eviction. Every
-completion is folded only when its complete identity is still current. A stale
-or cancelled event cannot replace a newer tab, result, transaction, stage,
-review or connection state.
-
-The bounded task registry owns cancellation and joins. Control work remains
-independent from ordinary network admission so Cancel/Disconnect/Shutdown can
-make progress. A blocking file/parser worker checks cancellation at bounded
-chunks and is joined before cleanup is reported complete.
-
-## 4. Configuration, credentials and local durability
-
-The config path is resolved once by the existing global precedence. Daily-use
-D1 extends the writer to config v3:
-
-- reads versions 1, 2 and 3, writes only version 3;
-- legacy data normalizes in memory without startup mutation;
-- first confirmed legacy mutation creates the exact source-version backup and
-  uses the existing atomic/no-clobber durability boundary;
-- environment/access posture is non-secret profile data;
-- credential values remain only in credential channels and never serialize.
-
-D4 owns `<full-config-path>.workspace-v1/`. Config v3 gives every profile an
-immutable CSPRNG `ProfileInstanceId`; legacy profiles are Unclassified/read-only
-until explicit migration assigns posture and instance IDs. Profile and orphan
-shards are validated by embedded instance identity. `index.json` is a
-derived cache. A single durable lifecycle journal orders duplicate,
-delete→purge-or-orphan and clear operations across config/shards/index; startup
-replays a valid intent idempotently and blocks destructive guesses for a corrupt
-intent.
-
-The per-instance safety fence is MySQL-only in v1.1. Begin writes Active, terminal intent writes Resolving, and uncertainty writes OutcomeUnknown, all with the stable TransactionId. A proven terminal outcome folds live state, rewrites the profile shard for its TransactionId with one atomic fsynced write, then removes the Resolving fence; a crash inside that window conservatively converts to OutcomeUnknown at startup. OutcomeUnknown is the Unknown shard/history/result/stage replay authority and cannot be acknowledged or removed until its idempotent TransactionId fold is fsynced and any live state is folded. These fences survive editor/history opt-out and general workspace clearing; acknowledgement must be durable. (Redis mutation fences RedisApplying/RedisOutcomeUnknown are deferred to P1 with DU-07.) No uncertain mutation is automatically retried.
-
-All files use private permissions, same-directory atomic replacement,
-file/parent durability and destination-fingerprint conflict detection. Unknown
-versions, symlinks, corrupt identities and uncertain commit state fail closed.
-
-## 5. Execution admission
-
-D3 uses two pure admission phases. Before a lease or any network I/O, the
-bounded source reader enforces total UTF-8/file/stream limits and the
-mode-independent forbidden-comment scan. The service then acquires the exact
-intended MySQL lease and performs only the static typed capability query. Its
-sql_mode drives statement splitting and lexing; the pure mode-aware parser then
-enforces per-target/token/depth limits and produces the complete closed typed
-batch before user-target 1. Redis needs no capability query, so both phases
-finish before its first network I/O.
-
-MySQL P0 splits admission by direction (v1.1). Reads: a ReadOnly batch may execute on any MySQL-wire server whose typed capability query succeeded and whose dedicated read lease proves server-enforced read-only state (`SET SESSION TRANSACTION READ ONLY` plus typed `@@SESSION.transaction_read_only = 1`) before user-target dispatch; the proven read-only session — not a client AST/function/relation proof — is the read-safety authority for out-of-transaction reads (v1.1 removed the PureBuiltin allowlist and base-table-only relation proof on that path; views are readable there). While a profile transaction is ActiveClean or ActivePending, reads route through the read-write worker where no read-only session is possible; ReadOnly admission on that path is DU-03 item 10's strict structural rule — catalog-proven base tables only, zero function invocations, zero view references — denied before user-target I/O. Writes: unchanged from v1.0 — an exact official Oracle MySQL 8.4 session with utf8mb4, UTC and the closed sql_mode list, typed `@@GLOBAL.partial_revokes=OFF` and complete direct global metadata visibility; single-table INSERT/UPDATE/DELETE proved against trigger-free InnoDB catalog metadata. Raw SHOW/DESCRIBE/EXPLAIN/ANALYZE, REPLACE, raw transaction/session controls, executable/MariaDB comments, implicit-commit forms, DDL/admin, multi-table or unbounded DML and ambiguity are denied before user-target I/O; optimizer-hint comments are admitted for reads only. The intended connection's sql_mode drives the lexer for splitting/classification. A Read-only profile may acquire the metadata-only lease, but mutation has zero user-target dispatch. Run-all is fully parsed/classified and all writable targets are metadata-preflighted before target 1. Shared metadata locks are retained by the active worker so ALTER or relevant inbound FK/trigger drift cannot invalidate the write proof.
-
-Redis raw execution uses the exact read command/arity/option table in DU-03.
-Explorer mutation (typed DU-07 operations) is deferred to P1; v1.1 ships Redis
-read/browse/inspect only.
-
-## 6. MySQL data and transaction architecture
-
-D2 extends catalog ownership with index/engine/trigger/identity metadata and a
-typed table-data request:
-
-- identifiers come only from validated catalog identity and are quoted;
-- filter values are typed parameters, never SQL fragments;
-- page tokens bind profile/generation/relation/filter/sort/limit/cursor and
-  catalog fingerprint;
-- a usable key selects keyset paging; bounded keyless fallback is explicitly
-  unstable and stops at its fixed offset cap.
-
-D5 replaces pooled mutation semantics with one serialized connection worker per
-active profile transaction and a stable CSPRNG TransactionId:
+dbotter remains one Rust package with one library and binary. Native UI and CLI
+share `ApplicationService`; neither implements profile lookup, credential
+resolution, admission, driver lifecycle, catalog, execution or error conversion
+independently.
 
 ```text
-AutoCommit
-  -> ActiveClean
-  -> ActivePending
-  -> Resolving(Commit|Rollback)
-  -> AutoCommit | OutcomeUnknown
+native commands -----+                         +-- config / Keychain
+                     +-> runtime/controller -->+-- workspace / mutation fence
+CLI -----------------+          ^              +-- MySQL session/transaction
+                                |              +-- Redis session/review
+                                +-- typed, correlated events
 ```
 
-The worker initializes utf8mb4/+00:00 and proves autocommit=1/in_transaction=0
-before Begin. All editor reads/DML, table reads and row Apply (CSV import: P1) inside
-an active transaction use that same worker/connection. Worker-routed ReadOnly
-statements follow DU-03 item 10's in-transaction structural rule (base tables
-only, no function invocation, no view reference); typed table-data reads remain
-typed static plans. DDL/session controls
-remain outside the model. No GUI DML reaches an auto-commit connection.
-Terminal requests use explicit AND NO CHAIN NO RELEASE and prove
-in_transaction=0 even after a success response. Results/history distinguish
-statement success from AppliedPendingTransaction. After a proven outcome the
-worker folds memory, idempotently rewrites/fsyncs the profile shard by
-TransactionId, then removes the Resolving fence; separate files are never
-assumed cross-file atomic, and a crash before removal conservatively becomes
-OutcomeUnknown at startup (v1.1 removed the TerminalProven fence kind). The OutcomeUnknown fence replays an
-idempotent TransactionId fold to durable Unknown plus the live-memory fold;
-status, restart and acknowledgement rerun it, and acknowledgement cannot remove
-the fence until durable agreement. A failure at any conversion, fold or
-removal phase remains blocking and replayable rather than leaving Pending
-history without an authority.
+UI owns text, selection, layout and render models, never live clients. Driver
+resources and blocking filesystem/CSV/SSH work stay behind typed service
+boundaries. No mutex/RwLock or borrowed guard crosses `.await`. Long work is
+registered, cancellable, bounded and joined before cleanup is complete.
 
-D6 stages row changes locally using the closed lossless MysqlInputCell families
-and applies one reviewed batch inside an internal operation savepoint.
-Update/delete re-read and binary-compare/lock the retained identity/original on
-the transaction connection before typed DML. Add supports only a reviewed
-supplied usable identity or one numeric single-column AUTO_INCREMENT primary
-key recovered from same-connection insert metadata. Generated columns remain
-unwritable and Update cannot change its identity key. Any row-N
-error/conflict/cancel/refresh failure proves rollback to the savepoint or enters
-ApplyOutcomeUnknown; partial Apply is never presented as local/discardable.
-Local/unknown/applied stage surfaces are lifecycle-guarded and non-evictable.
-Apply never commits; only shared controls resolve AppliedPendingTransaction.
+## 2. Identity and state fold
 
-D8 in v1.1 retains only the existing bounded no-clobber result export. The v1.0 CSV-import architecture (MysqlInputCell parse/map on a bounded blocking lane, savepoint-scoped parameterized batches on the transaction worker) is deferred to P1 unchanged.
+Saved-profile work binds profile ID, immutable instance ID, generation and
+operation ID. Editor, result, history, physical MySQL session, transaction,
+stage, transfer and Redis review add opaque IDs. Events fold only when every
+relevant identity is current; close, profile mutation, reconnect and cancel
+invalidate predecessors.
 
-## 7. Redis mutation architecture (P1)
+The controller is the sole fold point into UI state. Persistence receives
+immutable snapshots, never driver objects. A stale save cannot mark a newer
+snapshot Saved; it schedules a new bounded save.
 
-Deferred to P1 by DUV1 v1.1. The v1.0 architecture — memory-only raw bytes, revision-checked one-key static Lua inspect/mutate scripts with O(1) cardinality and capped MEMORY/DUMP gates, `redis.acl_check_cmd` preflight, RedisApplying/RedisOutcomeUnknown fences and matching-key recovery — remains in git history as the P1 baseline. v1.1 ships Redis read/browse/inspect only.
+## 3. J2 workspace/history durability
 
-## 8. Result, CLI and UI ownership
+The resolved config has a private sibling workspace root. One nonblocking
+single-writer lease spans the app lifetime. A second process may read the last
+committed snapshot but cannot save/clear and receives an explicit status.
 
-D9 replaces one overwritten result with bounded result tabs that share immutable
-`Arc<ResultSnapshot>` data. Per-result and aggregate caps evict only inactive,
-terminal, unprotected results; active or stage/review/unknown-owning surfaces
-are never silently removed. Grid/record/value detail,
-local filter/sort, copy and export operate only on retained data and disclose
-truncation. Result target metadata is governed by editor-text persistence; when
-that category is off/purged, no result target or rerun placeholder is stored.
+Each classified profile-instance shard is an envelope with schema version,
+instance ID, monotonic generation, payload length and checksum. Commit is:
 
-D10 keeps profile commands, stdin/file/text target acquisition, output encoding
-and numeric exits as thin adapters over shared model/service contracts. CLI DML
-is one-process only: fully preflight, Begin, execute all, then prove the selected
-whole transaction outcome. A partial failed batch can never Commit.
+```text
+encode bounded shard
+  -> create private sibling generation temp
+  -> write + fsync
+  -> rename to immutable generation + fsync directory
+  -> write/fsync atomic manifest pointer {generation, checksum}
+  -> rename manifest + fsync directory
+```
 
-D11 uses the named local UI/UX OpenAI reference for visual language: white/black
-opacity hierarchy, black-inverted primary action, square corners, no decorative
-gradients/shadows, stable vector icons and restrained/reduced motion. DBeaver's
-first four GitHub README screenshots provide the separate interaction-structure
-floor: a persistent object navigator, object/editor and result tabs, bounded
-resizable editor/result/detail panes, directly available daily action bars and
-an always-readable connection/transaction/operation status strip. Per-profile
-layout geometry and tab order are bounded durable state; invalid geometry resets
-to safe defaults. Discrete actions retain 44-point targets while dense native
-tree/grid collections use full-row keyboard-accessible selection. The
-user-provided dbotter artwork remains the app/title icon. Every canonical flow
-is operable at 1,440×900 and 840×560, with stable accessibility identity/state,
-correlated background work and exact cancellation where possible. The public
-wide/min screenshot matrix is captured only from the isolated tracked synthetic
-fixture/temp config after AX allowlist/sentinel checks and raster metadata
-stripping. GIS and ERD rendering remain P1 and no fake controls are shown.
+Load trusts only the manifest-referenced generation and checksum. A crash before
+manifest replacement leaves the previous generation; after replacement it
+loads the new one. Orphan generations are bounded garbage. Oversize, unknown
+version, symlink or corrupt identity/checksum is moved only into a bounded
+private quarantine; other shards remain available. Destination fingerprints
+detect external rewrite.
 
-## 9. Public error and privacy boundary
+Editor snapshots contain only contract fields. History contains source, target
+kind, timestamp, typed status/code, duration and row metrics. Result rows/cells,
+backend prose, credential-channel values, live handles and replay-on-open flags
+cannot serialize. Distinct sentinel tests enforce the privacy matrix. SQL/Redis
+source persistence is disclosed and has per-profile opt-out/clear.
 
-Backend prose and user data do not cross the static public-error boundary.
-Sensitive request types have manual redacted `Debug` and no serialization.
-Query/key/cell/CSV content appears only in the intended UI/clipboard/export or
-the disclosed local editor/history store. Public visual evidence is the sole
-exception and contains only exact tracked synthetic fixture values from an
-isolated process; it never reads the user's config.
+Domain code enforces all count/byte/store limits before encoding and evicts only
+oldest terminal history. Autosave is debounced no longer than two seconds;
+explicit Save/close/quit flushes. `Saved` is emitted only after manifest and
+directory durability. Failed voluntary quit is intercepted for Retry or an
+explicit discard-local-changes decision.
 
-Credential channels are excluded from config/workspace/history/log/error/
-evidence. Valid arbitrary editor/history literals may contain secrets or PII;
-the first-run disclosure, private file boundary and independent per-profile
-editor/history opt-outs are the protection. The exact conservative credential
-form classifier redacts matched and malformed execution attempts.
+## 4. J1 Keychain, TLS and SSH
 
-## 10. Ownership and conformance
+Profile config stores no credential. Keychain service name is product/channel
+scoped; item account derives from immutable instance ID and credential slot.
+Rename does not change identity. Duplicate creates a new instance and never
+copies a secret. Delete explicitly keeps or removes its item.
 
-The expected source ownership table is authoritative in
-`docs/daily-use/trace.md` §5; mutable RED/GREEN/live/native status belongs in
-`docs/daily-use/evidence.md`. Cross-layer behavior changes update the frozen
-trace before code. A file's presence never proves a D row.
+A payload-free profile-mutation journal orders Keychain, config and confirmed
+profile-workspace purge. Delete fsyncs immutable instance ID, Keep/Remove choice
+and phase before change, then idempotently advances WorkspaceTombstoned,
+ConfigDeleted, WorkspacePurged, KeychainResolved and Complete. Startup reloads
+and fingerprint-checks an uncertain config phase before resuming; the exact
+instance tombstone prevents inaccessible source from being forgotten or another
+instance from being purged. The operation holds prior/new secret capabilities only in memory, compensates a
+provable partial failure, and leaves a blocking repair state if compensation or
+observation is uncertain. Startup replays safe cleanup without ever serializing
+a secret. Environment mode stores only a variable name.
 
-D12 binds the reviewed source commit to CI, Preview tag/artifacts/checksums, tap
-formula, xbrew install receipt and installed binary/AX identity. Preview is the
-only authorized channel; stable publication requires a separate user approval.
+Test and Connect share one pipeline. TLS uses verify-identity, OS/custom CA and
+the original database hostname; no encryption-only or plaintext fallback path
+exists. SSH uses strict known_hosts or an explicitly saved SHA-256 fingerprint,
+an ephemeral loopback listener and the exact reviewed destination. Unknown keys
+require review; mismatch fails. Passphrases flow directly from Keychain/session
+memory to the SSH library, never argv/environment. DB TLS preserves original
+hostname/SNI through the tunnel. Tunnel and child resources are session-owned,
+cancelled/joined on failure, disconnect and shutdown.
 
-dbotter remains Apache-2.0. Competitor products are behavior research only;
-their implementation code is not copied.
+## 5. Read admission and typed Data
+
+Bounded source is fully split and parsed before user-target I/O. The MySQL
+classifier accepts only the S-4 AST shapes and a versioned common built-in
+read-function allowlist, explicitly denying file output, locking, analyze,
+variable assignment, advisory/sleep/file and stored/UDF calls. It then executes
+on a server-proven read-only session. Redis uses an exact read command/arity/
+option table; mutating options are separate enum variants that P0 cannot build.
+
+Catalog identity owns schema/relation/column/key/index/FK metadata. Typed Data
+requests accept catalog identity, bound filters, catalog-derived sort and opaque
+page tokens. Stable identity uses keyset paging; bounded keyless fallback is
+explicitly unstable. View reads require bounded recursive definitions and
+dependencies that are all INVOKER, closed-read/function proven, then shared
+metadata-locked and fingerprint-rechecked on the exact read lease before locks
+remain held through prepared execution. Failure disables view Data without
+blocking Structure. View editing is not supported.
+
+## 6. Durable mutation intent
+
+The mutation store is separate from optional workspace/history and cannot be
+cleared by their controls. Before MySQL Begin/terminal or Redis immediate EXEC,
+it atomically fsyncs a payload-free Prepared intent. It then fsyncs Dispatched
+before the driver is permitted to send the first mutation byte. Confirmation
+atomically replaces the intent with terminal metadata; any ambiguous observation
+becomes Unknown. A process death at any nonterminal point recovers as Unknown.
+
+For MySQL, confirmed Begin transforms the intent into a durable Active fence
+that remains through clean/pending/savepoint states. A confirmed terminal
+operation clears it; startup Active/Resolving becomes Unknown. The request HMAC
+is keyed by a private local key and supports correlation only;
+it cannot recover or replay payload. Acknowledgement records that the user
+cleared the local block after external verification and never changes historical
+terminal truth.
+
+## 7. J3 MySQL transaction and row stage
+
+One serialized physical connection/session worker owns the profile transaction:
+
+```text
+AutoCommit -> ActiveClean -> ActivePending -> ResolvingCommit/Rollback
+                                      \------> OutcomeUnknown
+```
+
+The worker records physical session ID and initializes/proves the required state.
+All transaction reads, table reads and typed Apply use it. Voluntary lifecycle
+operations block until confirmed terminal resolution. Cancel remains Requested
+until the driver proves query/session/transaction disposition; connection loss
+is Unknown. A live transaction is never represented as restart-persistent.
+
+Row edits are local typed stages. Catalog identity and original values are
+re-read/locked/compared before generated parameterized DML. One Apply uses an
+internal savepoint and at most the frozen row bound. First/middle/last row error,
+conflict or cancel requests whole-savepoint rollback; only proof restores every
+row to local-staged state, otherwise the transaction becomes Unknown. Partial
+Applied state cannot exist. Apply never commits. Raw editor DML does
+not have a P0 command variant.
+
+## 8. J4 transfer pipeline
+
+Export owns an immutable retained scope and creates a private sibling temp.
+Encoding runs on a bounded blocking worker with progress/cancel checkpoints.
+Only a complete fsynced temp is no-replace-renamed and followed by directory
+fsync; exact-operation cleanup never deletes a pre-existing destination.
+
+Import separates bounded parse/preview/mapping from dispatch and converts cells
+to the row editor's typed model. Reviewed batches run through the transaction
+worker under one savepoint. Failure/cancel requests rollback and reports Rolled
+back only after proof; any batch/cancel/rollback connection loss uses the same
+Unknown fence. Success remains pending until explicit terminal resolution.
+
+## 9. J5 Redis structured mutation
+
+Browse uses cursor SCAN only. Binary keys remain opaque bytes; display text is
+never identity. A review binds profile generation, raw key, observed type,
+operation-specific expected value and operation ID.
+
+Apply owns one dedicated connection:
+
+```text
+durable Prepared intent -> WATCH raw-key
+  -> read/compare expected type and field/index/member/value
+  -> durable Dispatched intent
+  -> MULTI + one closed typed operation -> EXEC (nil => Conflict)
+```
+
+Whole-key overwrite/delete additionally compares an `ExpiryToken` and a DUMP
+digest capped at exactly 1 MiB. The token is Missing, Persistent or an absolute
+Redis-server expiry millisecond. One embedded static read-only O(1) Lua script,
+with only `KEYS[1]` and a fixed bounded response, atomically samples `TIME` and
+`PTTL`; non-negative PTTL becomes
+`floor(seconds * 1000 + microseconds / 1000) + PTTL`. The review and watched
+apply connection run that same script and require exact token equality. Natural
+TTL decay therefore preserves identity, while a concurrent EXPIRE/PEXPIRE/
+PERSIST changes it. No user script or arbitrary command reaches this path.
+
+The DUMP RESP decoder rejects an oversized declared bulk before body allocation
+and UNWATCHes. Oversize disables the action. This prevents an observable
+concurrent change between review and apply. It does not claim to distinguish
+delete/recreate with identical observable bytes and expiry. Lost EXEC response
+becomes Unknown, never a retry. UI says immediate apply and never displays MySQL
+transaction controls.
+
+## 10. UI and evidence ownership
+
+The native shell keeps navigator, editor, result/detail and status regions alive.
+Render code consumes state and emits typed commands; a visible control without a
+command/service/effect path is a defect. Shortcut/AX tests activate the actual
+rendered control. `⌘S` maps only to draft flush; mutation Apply requires the
+focus-trapped review.
+
+Each journey owns its source→artifact→tap→xbrew chain. Installed action/AX logs
+pair with independent backend/file/Keychain-metadata readback. Screenshots are
+supplementary and use only the tracked synthetic fixture.

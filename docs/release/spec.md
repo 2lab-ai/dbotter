@@ -1,21 +1,23 @@
 # dbotter — approved preview release contract
 
-Status: **The source-bound daily-use Preview candidate is published and installed
-through xbrew; the complete installed AX journey and final typed receipt remain
-pending.** No stable release is authorized.
+Status: **The v1.1 source-bound Preview checkpoint is published and installed
+through xbrew; every DUV1 v1.2 J journey requires a new exact-source Preview and
+installed acceptance.** No stable release is authorized.
 
 The baseline normative sources are `docs/usable-mvp/spec.md` D1/§10,
 `docs/usable-mvp/trace.md` T10, and `docs/usable-mvp/plan.md` P8/P9/§5–§7.
-The daily-use overlay is `docs/daily-use/spec.md` §5,
-`docs/daily-use/trace.md` D1/D11, and `docs/daily-use/plan.md` D1/D11; where the
-overlay tightens compatibility or installed evidence, it governs the next
-Preview.
+The current daily-driver overlay is `docs/daily-use/spec.md` §10,
+`docs/daily-use/trace.md` (the active J row), and the per-journey release loop in
+`docs/daily-use/plan.md`. Where that overlay tightens compatibility or installed
+evidence, it governs every new v1.2 Preview. The T10 trace remains historical
+baseline packaging evidence, not v1.2 product completion.
 
 ## Objective and scope
 
-Publish one source-bound daily-use preview, update the Homebrew preview formula
-with explicit immutable inputs, install it, and prove the exact installed app,
-CLI, native accessibility journey, and safe receipt.
+For each verified J stage, publish one source-bound daily-driver Preview, update
+the Homebrew preview formula with explicit immutable inputs, install it, and
+prove the exact installed app, CLI, owning accessibility journey, independent
+backend/file readback and safe receipt.
 
 This task does **not** create a stable tag or stable release. Stable workflow
 code may share the same reusable verification gate, but stable invocation
@@ -153,11 +155,10 @@ executable realpath, device, inode, SHA-256, and bundle id against the installed
 manifest entry.
 
 The same post-sign executable must pass identity, config-contract, check, exec,
-MySQL browse, Redis browse, and Redis inspect. The installed AX journey then
-proves T0–T10 behavior, including Create/credential/restart, prepared-only
-MySQL marker safety, Execute-limit ids, catalog/keyspace, split TLS recovery,
-total error recovery, Delete warning, exact clipboard/export, disclosure, and
-stable AXIdentifier readback.
+MySQL browse, Redis browse, and Redis inspect. The installed AX journey retains
+the historical T0–T10 release-safety checks and then performs the active J row's
+exact acceptance from `docs/daily-use/trace.md`. A J row is not verified when
+only the baseline checks pass.
 
 ## Receipt boundary
 

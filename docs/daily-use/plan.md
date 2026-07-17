@@ -1,79 +1,118 @@
-# dbotter Daily-use v1 — delivery plan
+# dbotter Daily-driver v1.2 — execution plan
 
-The frozen product contract is [`spec.md`](spec.md) (v1.1 — the 2026-07-16 amendment defers D7/D8 to P1 and moves read admission to server-enforced read-only sessions; see spec §9), with [`trace.md`](trace.md) as the vertical source of truth. Work proceeds as reviewable, pushed slices. A green unit is not a release: integration continues through Preview installation and installed-app proof.
+Status: **Frozen**
 
-## Stage 0 — research and freeze
+Normative tuple: [`research.md`](research.md), [`spec.md`](spec.md),
+[`trace.md`](trace.md), this file.
 
-- Audit current code against daily-use workflows.
-- Retain first-party research links and interpretation limits.
-- Reconcile the root capability ledger and README with the already-integrated native UI/export/release work.
-- Freeze `DUV1` spec and D1–D11 traces.
-- Obtain an independent spec/trace review.
-- Commit and push the documentation-only freeze.
+## Stage 0 — freeze the useful product
 
-Exit: no unresolved Critical/High ambiguity; spec and trace cross-reference exactly.
+- Reconcile code, installed binary and evidence truth.
+- Record first-party research without claiming measured frequency.
+- Freeze requirement IDs S/X/J/UX/E and their focused/live/installed mapping.
+- Resolve independent reviews to Critical 0 and High 0 twice.
+- Check links/paths, `git diff --check`, `just check`, `just check-all`.
+- Compute the four-file SHA-256 tuple in `04-patch-plan.md`, commit and push.
 
-## Stage 1 — durable safe workspace and CLI bootstrap (D1, D3, D4, D9 foundation, D10, D11)
+Exit: frozen tuple and clean branch equals origin.
 
-- Start from RED contracts for backward-compatible profile posture, read-only rejection, tabs, batch parsing and workspace/history durability.
-- Add profile duplicate/environment/access state.
-- Add versioned atomic workspace/history storage and bounds/redaction.
-- Replace the single editor/result state with retained editor and result tabs.
-- Add current/selection/all execution and history reopen/rerun.
-- Add clean-install profile CLI, stdin credential/target input, structured output and stable exits.
-- Build the DBeaver-reference persistent navigator/editor/result/status composition with bounded split geometry, tab ordering and the 840×560 named-drawer fallback; apply OpenAI-reference layout/accessibility contracts to every control.
-- Commit/push RED and GREEN checkpoints separately.
+## Stage J2 — durable work before more surface area
 
-Exit: restart proof retains multiple tabs and searchable history; after only the permitted bounded static capability reads, read-only has zero user-target or typed-mutation dispatch.
+1. RED: exact Saved → force-kill → restore → reconnect → zero-run history open
+   → explicit rerun journey; store privacy/bounds/corruption/single-writer and
+   session-only result disclosure.
+2. GREEN A: profile-instance snapshot types and generation/checksum manifest
+   store with private atomic durability, 2-second RPO, opt-out/clear/quarantine.
+3. GREEN B: editor create/rename/reorder/save state, syntax highlighting and
+   bounded catalog autocomplete.
+4. GREEN C: durable bounded status/code history, search/date/status filters and
+   reopen-as-new-draft with zero dispatch.
+5. GREEN D: persistence/status/shortcut/recovery UI and actual-frame/AX journey.
+6. Full gates, independent review, Preview, xbrew install and all six installed
+   J2 trace steps.
 
-## Stage 2 — data navigation and transaction safety (D2, D5, D9, D11)
+Exit: the installed app can be force-killed, reopened and explicitly used again
+without losing the last visibly Saved SQL work.
 
-- Start from RED table-data, statement identity and transaction state-machine contracts.
-- Add index/identity metadata and bounded table data paging/filter/sort.
-- Add serialized MySQL connection worker with begin/commit/rollback and rollback-on-close semantics.
-- Add fail-closed `partial_revokes=OFF` plus direct global metadata-visibility proof and live restricted-schema negative fixtures.
-- Enforce Safe writes and production posture before driver work.
-- Add pending-change and OutcomeUnknown UI states with a durable Unknown fence and idempotent fold/retry before acknowledgement.
-- Commit/push RED and GREEN checkpoints separately.
+## Stage J1 — verified connection to typed Data
 
-Exit: live MySQL proves rollback and commit across tabs, plus disconnect rollback; an in-transaction ReadOnly statement with a function call or view reference is denied before I/O.
+1. RED: Keychain lifecycle/partial failure, TLS verify-identity/no-downgrade,
+   strict SSH host key and full installed navigator/Data sequence.
+2. GREEN A: immutable profile-instance Keychain adapter and nonsecret mutation
+   journal/repair.
+3. GREEN B: verify-identity TLS plus strict host-key loopback SSH pipeline and
+   typed test stages.
+4. GREEN C: searchable structure metadata, SafeViewProof/locked fingerprint and
+   typed proven-view/table page/filter/sort.
+5. GREEN D: Grid/Record/value/copy/context UI and actual-frame/AX flow.
+6. MySQL 8.0/8.4 live matrix, review, Preview, xbrew and full installed J1 trace.
 
-## Stage 3 — safe MySQL edits and result detail (D6, D9, D10, D11 — D7/D8 deferred to P1 by v1.1)
+Exit: a clean installed app securely reaches, explores and revisits real data.
 
-- Start from RED typed mutation, conflict and confirmation contracts.
-- Add staged identifiable MySQL row add/update/delete and review/apply/discard.
-- Complete record/value detail and explicit local filter/sort.
-- Commit/push each driver slice and the integrated UI slice.
+## Stage J3 — one trustworthy MySQL write loop
 
-Exit: live MySQL matrices pass; no stage auto-commits.
+1. RED: Add/Update/Delete stage/review/rollback/commit/conflict/lifecycle guards
+   plus every durable fence kill point.
+2. GREEN A: payload-free Prepared/Dispatched/Confirmed/Unknown fence and startup
+   fold/acknowledgement.
+3. GREEN B: serialized physical-session transaction worker and full state/loss/
+   cancel/lifecycle behavior.
+4. GREEN C: stable-identity typed row stage, parameterized review, savepoint
+   Apply/Discard and conflict detection.
+5. GREEN D: focus-trapped review, transaction status and keyboard/AX surfaces.
+6. Live independent readback, review, Preview, xbrew and installed J3 trace.
 
-## Stage 4 — independent review and full gates (D1–D11)
+Exit: identifiable rows can be changed and resolved without raw DML or guessed
+terminal state.
 
-- Run format, lint, unit, contract, controller and full checks.
-- Run live MySQL and Redis tests with retained receipts.
-- Run native accessibility/keyboard/copy/export journeys at wide and minimum window sizes.
-- Launch the installed app with only the disposable synthetic visual fixture, verify the AX allowlist/forbidden sentinel, strip raster metadata, then retain the exact DU-11 four-journey screenshot matrix at 1,440×900 and 840×560; have an external visual/UX reviewer check context preservation, density, overlap, clipping, status clarity and action reachability.
-- Assign an independent senior review for safety, privacy, UX and spec/trace/code conformance.
-- Fix all Critical/High findings and rerun affected plus full gates.
-- Commit/push review fixes and mutable `evidence.md` updates.
+## Stage J4 — data handoff
 
-Exit: D1–D11 evidence rows are green, exact branch HEAD is clean and matches origin.
+1. RED: all scope/format export, no-clobber/crash cleanup and previewed mapped
+   all-or-nothing CSV import including connection-loss Unknown.
+2. GREEN A: exact export scope UX and sibling-temp streaming worker.
+3. GREEN B: bounded CSV parser, 20-row preview, mapping and typed validation.
+4. GREEN C: parameterized batch/savepoint import with progress/cancel and
+   confirmed-rollback-or-Unknown truth.
+5. Full live/file/failpoint/AX gates, review, Preview, xbrew and installed J4.
 
-## Stage 5 — merge, Preview, xbrew and installed proof (D12)
+Exit: data enters/leaves the installed app with exact scope and outcome.
 
-- Integrate the reviewed branch to `main` without losing unrelated work.
-- Push exact `main` commit.
-- Publish only the Preview channel and wait for CI/release/tap completion.
-- Verify public source, tag, assets, checksums and tap formula point at the same commit/artifact.
-- Reinstall/upgrade with xbrew.
-- Launch the installed app and run the selected MySQL/Redis native smoke journeys.
-- Append the release/install receipt to the release docs and zbrain workflow log.
+## Stage J5 — Redis daily driver
 
-Exit: installed artifact evidence proves D12 and all required work is complete.
+1. RED: TLS/SCAN, five-type operation matrix, competing-client conflict,
+   posture guards and every immediate-mutation fence kill point.
+2. GREEN A: bounded filter/paging and typed five-type details.
+3. GREEN B: payload-free Redis intent store and startup Unknown fold.
+4. GREEN C: dedicated `WATCH`/compare/`MULTI`/`EXEC` structured mutation,
+   server-absolute expiry token, bounded whole-key digest and typed
+   Conflict/Unknown.
+5. GREEN D: immediate-apply review/status, production token and read-history UI.
+6. Redis 6.2/7.4/current-8.x live matrix, review, Preview, xbrew and installed J5.
 
-## Stop conditions
+Exit: Redis is truthfully a structured daily driver, not a read-only demo.
 
-- Never create a stable tag/release without a separate explicit user instruction.
-- Never weaken a frozen `DU-*` row to make a test pass.
-- Stop before a destructive external action not already authorized by the task.
-- If a credential or service is unavailable, continue every offline and local proof first; report the exact remaining live gate rather than claiming completion.
+## Per-slice gate
+
+```sh
+git diff --check
+just check
+just check-all
+```
+
+Run the mapped live/failpoint/actual-frame checks for the owning requirement.
+Commits stay reviewable (roughly 300 changed lines where practical), RED and
+GREEN are pushed stepwise, and unrelated user-owned changes are preserved.
+
+## Release loop for every J stage
+
+1. branch HEAD is clean, equals origin and all gates pass at that SHA;
+2. independent review reports Critical 0 and High 0;
+3. dispatch Preview and wait for hermetic/live/build/publish/tap terminal success;
+4. verify artifact manifest/checksums/source SHA/tap version;
+5. xbrew install/update, verify CLI/bundle/code-sign identity and launch exact
+   Cellar app;
+6. perform every installed step mapped to the active J row with sanitized
+   action/AX log and independent backend/file/Keychain metadata readback;
+7. update evidence and README claims only after the complete sequence passes.
+
+Stable remains forbidden without separate explicit approval.

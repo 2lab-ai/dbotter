@@ -1,56 +1,48 @@
-# dbotter — current implementation and conformance plan
+# dbotter — Daily-driver v1.2 freeze and patch gate
 
-Status: **Stage 0 frozen; production implementation admitted only through trace-derived RED**
+Status: **Frozen — Stage J2 RED next**
 
-Branch: `feat/daily-use-v1`
+Reset source commit: `03d6051`
 
-Worktree: `.worktrees/feat-daily-use-v1`
+## Normative tuple
 
-Baseline: `340133dca652a7bf51d652f06cdb7436b42bbc58`
+| File | SHA-256 |
+|---|---|
+| `docs/daily-use/research.md` | `d57917b25279cb392edbdc53ed897726e6bd16a752711d73c7091a78b19bc9f1` |
+| `docs/daily-use/spec.md` | `88613020c6ddee095831a9d87ea10d12d26ad778b74a7899c2887aec0b039819` |
+| `docs/daily-use/trace.md` | `ba08fcbc8867cb11a06c007f6f7661c256a43982a29c3993a755ca7d0ae581e6` |
+| `docs/daily-use/plan.md` | `a7f04079daebd4a09276d1d040567df1248892cf958d8e85ced1ff52133f3a0b` |
 
-The detailed ordered plan is [`docs/daily-use/plan.md`](docs/daily-use/plan.md). The authoritative requirements and vertical traces are [`docs/daily-use/spec.md`](docs/daily-use/spec.md) and [`docs/daily-use/trace.md`](docs/daily-use/trace.md).
+The tuple becomes frozen only after two independent reviews report Critical 0
+and High 0, findings are resolved, links/path checks pass and the final hashes
+replace all pending values. `docs/daily-use/evidence.md` is mutable and excluded.
 
-## Contract freeze gate
+Final review record (`2026-07-17`):
 
-No production code starts until:
+- product-contract review: Critical 0 / High 0;
+- safety-contract review: Critical 0 / High 0.
 
-1. root `01-spec.md`, `02-architecture.md`, `03-traces.md`, this file and README route consistently to DUV1;
-2. independent review reports no unresolved Critical/High finding;
-3. `git diff --check` and documentation link/path checks pass;
-4. the exact three-file SHA-256 tuple below replaces `PENDING` and is committed/pushed as the Stage 0 freeze.
+## Patch order
 
-```text
-b14c7828c4ec2633c93e7b2773b00cdeca4519df4b0328842e5e3a1bdafd4b54  docs/daily-use/spec.md
-e99d4d1346f305f6769ba2fef013e9a2cd5f5dd8af3f5571e5140a4cb2f806d6  docs/daily-use/trace.md
-13c3f84849b7c916b1211b637b36aba50b5b5314f9d4815610a2a156978ad575  docs/daily-use/plan.md
-```
-
-Changing any frozen artifact invalidates the tuple and requires a new independent contract review before implementation resumes.
-
-v1.1 amendment (2026-07-16): spec/trace/plan revised under spec §9 — DU-07/DU-08 deferred to P1; read admission moved to server-enforced read-only sessions (PureBuiltin allowlist removed; the MySQL 8.4-only gate now applies to writes only); DU-05 terminal persistence simplified (TerminalProven fence removed; crash ⇒ conservative Unknown). The tuple above is the v1.1 freeze; the v1.0 tuple remains in git history. The independent contract review was rerun for v1.1 per this gate.
-
-`docs/daily-use/evidence.md` is deliberately outside this tuple. Evidence-only
-status/receipt updates there do not invalidate the normative hashes; any change
-to spec, trace requirements or plan still does.
-
-The old frozen usable-MVP hash set remains historical and unchanged under `docs/usable-mvp/`; it is not the current approval gate.
-
-## Ordered delivery ledger
-
-| Stage | Traces | Required checkpoint | Status |
+| Stage | Trace | Deliverable | Status |
 |---|---|---|---|
-| 0 | all routing | research/gap audit, closed spec/trace, independent review, exact hashes | Complete |
-| 1 | D1, D3, D4, D9 foundation, D10, D11 | RED then GREEN durable safe workspace and CLI bootstrap | Not started |
-| 2 | D2, D5, D9, D11 | RED then GREEN typed table data and real MySQL transaction worker | Not started |
-| 3 | D6, D9, D10, D11 | RED/GREEN safe MySQL row edits and result detail (D7/D8 deferred to P1 by v1.1) | Not started |
-| 4 | D1–D11 | full/live/native gates, independent conformance review and fixes | Not started |
-| 5 | D12 | merge, Preview, public/tap proof, xbrew reinstall and installed use | Not started |
+| 0 | tuple | research/spec/trace/plan review and freeze | completed |
+| 1 | J2 | durable SQL workspace/history/restart | RED next |
+| 2 | J1 | Keychain/TLS/SSH connection and typed Data | not started |
+| 3 | J3 | managed MySQL transaction/typed row edit | not started |
+| 4 | J4 | exact export and transactional CSV import | not started |
+| 5 | J5 | Redis structured daily-driver loop | not started |
 
-Each independently reviewable RED/GREEN unit is committed and pushed before the next unit. GREEN is not a stopping point: Stage 5 follows automatically after Stage 4 unless an external credential/authority gate is genuinely required.
+Every stage is independently usable and follows:
 
-## Fixed verification interfaces
+1. user-boundary and safety RED committed/pushed;
+2. small GREEN slices with evidence-ledger updates;
+3. focused/hermetic/live/native gates;
+4. independent Critical/High review and fixes;
+5. Preview at exact SHA, xbrew install/update, installed black-box acceptance;
+6. only then `verified` and the next stage.
 
-Hermetic gates:
+## Fixed gates
 
 ```sh
 git diff --check
@@ -58,45 +50,13 @@ just check
 just check-all
 ```
 
-Existing live foundations, extended by the owning D row rather than replaced:
+Driver/filesystem/UI slices additionally run their owning live, receipt and
+actual-frame/AX checks. A missing fixture or installed observation is a failed
+evidence class, not a waiver.
 
-```sh
-./scripts/verify-live-redis.sh
-./scripts/verify-live-contracts.sh --config config/local.example.toml
-./scripts/verify-local.sh --config config/local.example.toml
-```
+## Change gate
 
-Release/install foundations:
-
-```sh
-./scripts/check-release-contract.sh
-sh scripts/test-receipt-contract.sh
-sh scripts/test-installed-verifier-contract.sh
-```
-
-Every command runs at the exact candidate commit. A missing fixture, environment value, named assertion, platform artifact or native observation is a failed gate, not a waiver.
-
-## Worktree and integration policy
-
-- Reuse the current Daily-use integration worktree; use smaller trace worktrees only when ownership is independent and merge order is explicit.
-- Preserve user-owned dirty changes and old worktree artifacts; do not clean/reset them to make a gate pass.
-- Update `docs/daily-use/trace.md` before a cross-layer behavior change.
-- RED and GREEN commits name the D trace they advance and are pushed stepwise.
-- Before integration, prove branch HEAD is clean and equals its origin.
-- Merge reviewed work to `main`, rerun required gates at the exact merge commit and push.
-
-## Release policy
-
-- Publish Preview only.
-- Never create or move a stable tag/release without separate explicit user approval.
-- The Preview tag, source archive, per-architecture artifacts, manifest, checksums, tap formula and installed executable must all bind the same source commit.
-- Wait for CI, Preview and tap completion; do not treat dispatch as success.
-- Reinstall/update through xbrew, launch the installed app and retain CLI plus native proof from that artifact.
-- Append the final receipt to the release evidence and zbrain workflow log without credentials or user data. Public screenshots are limited to the isolated tracked synthetic visual fixture after the AX allowlist/forbidden-sentinel and metadata-strip gate.
-
-## Stop conditions
-
-- A frozen requirement cannot be weakened to satisfy implementation.
-- Read-only, transaction, production confirmation, privacy, bounds or identity uncertainty fails closed.
-- Destructive external operations outside the authorized repository/release/install scope require a new user decision.
-- A blocked live service does not erase completed local proof; report the exact missing gate and continue all safe independent work first.
+After freeze, a semantic edit to any tuple file requires DUV1 version bump,
+synchronized tuple updates, new independent reviews and new hashes before
+production work continues. Stable release creation remains forbidden without a
+separate explicit user approval.
