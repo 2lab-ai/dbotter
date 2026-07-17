@@ -3,7 +3,7 @@
 ## Current phase pointer
 
 - Active phase: `DUV1` v1.2 on `feat/daily-use-v1`.
-- Active stage: Stage J2 RED; implementation order remains
+- Active stage: Stage J2 GREEN A; implementation order remains
   `J2 → J1 → J3 → J4 → J5`.
 - v1.1 D1–D12 and usable-MVP T0–T10 are historical foundations. Current status
   comes only from `docs/daily-use/evidence.md`.

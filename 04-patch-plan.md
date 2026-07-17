@@ -27,7 +27,7 @@ Final review record (`2026-07-17`):
 | Stage | Trace | Deliverable | Status |
 |---|---|---|---|
 | 0 | tuple | research/spec/trace/plan review and freeze | completed |
-| 1 | J2 | durable SQL workspace/history/restart | RED next |
+| 1 | J2 | durable SQL workspace/history/restart | RED |
 | 2 | J1 | Keychain/TLS/SSH connection and typed Data | not started |
 | 3 | J3 | managed MySQL transaction/typed row edit | not started |
 | 4 | J4 | exact export and transactional CSV import | not started |

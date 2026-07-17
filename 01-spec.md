@@ -1,6 +1,6 @@
 # dbotter — current product contract router
 
-Status: **Daily-driver v1.2 frozen — J2 RED next**
+Status: **Daily-driver v1.2 frozen — J2 RED pushed, GREEN A next**
 
 Reset source commit: `03d6051`
 
