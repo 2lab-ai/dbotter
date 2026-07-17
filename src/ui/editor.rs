@@ -23,6 +23,7 @@ use super::model::{
     WorkspaceKey,
 };
 use super::theme::OpenAiTheme;
+use crate::workspace::WorkspaceRunTarget;
 
 pub const EDITOR_TARGET_ID: &str = "editor.target";
 pub const EDITOR_INPUT_ID: &str = "editor.input";
@@ -124,6 +125,7 @@ pub struct EditorExecuteIntent {
     row_limit: u32,
     timeout_ms: u64,
     operation_kind: OperationKind,
+    run_target: WorkspaceRunTarget,
 }
 
 impl EditorExecuteIntent {
@@ -159,6 +161,10 @@ impl EditorExecuteIntent {
         self.operation_kind
     }
 
+    pub const fn run_target(&self) -> WorkspaceRunTarget {
+        self.run_target
+    }
+
     pub fn into_ui_command(self, operation_id: OperationId) -> UiCommand {
         UiCommand::Execute {
             operation_id,
@@ -185,6 +191,7 @@ impl fmt::Debug for EditorExecuteIntent {
             .field("row_limit", &self.row_limit)
             .field("timeout_ms", &self.timeout_ms)
             .field("operation_kind", &self.operation_kind)
+            .field("run_target", &self.run_target)
             .finish()
     }
 }
@@ -200,6 +207,7 @@ pub struct EditorExecuteBatchIntent {
     row_limit: u32,
     timeout_ms: u64,
     operation_kind: OperationKind,
+    run_target: WorkspaceRunTarget,
 }
 
 impl EditorExecuteBatchIntent {
@@ -239,6 +247,10 @@ impl EditorExecuteBatchIntent {
         self.operation_kind
     }
 
+    pub const fn run_target(&self) -> WorkspaceRunTarget {
+        self.run_target
+    }
+
     pub fn into_ui_command(self, operation_id: OperationId) -> UiCommand {
         UiCommand::ExecuteBatch {
             operation_id,
@@ -266,6 +278,7 @@ impl fmt::Debug for EditorExecuteBatchIntent {
             .field("row_limit", &self.row_limit)
             .field("timeout_ms", &self.timeout_ms)
             .field("operation_kind", &self.operation_kind)
+            .field("run_target", &self.run_target)
             .finish()
     }
 }
@@ -295,6 +308,7 @@ pub fn build_execute_intent(
         DriverKind::Redis => (ExecutionLanguage::Redis, QueryLanguage::RedisCommand),
         DriverKind::MongoDb => return Err(EditorValidationError::UnsupportedDriver),
     };
+    let run_target = run_target_for_cursor(&cursor);
     let validated = extract_and_validate_target(
         &workspace.editor_text,
         cursor.caret_character_index,
@@ -315,6 +329,7 @@ pub fn build_execute_intent(
         row_limit,
         timeout_ms: u64::from(timeout_seconds) * 1_000,
         operation_kind,
+        run_target,
     })
 }
 
@@ -351,7 +366,20 @@ pub fn build_execute_all_intent(
         row_limit,
         timeout_ms: u64::from(timeout_seconds) * 1_000,
         operation_kind: OperationKind::ExecuteRead,
+        run_target: WorkspaceRunTarget::All,
     })
+}
+
+fn run_target_for_cursor(cursor: &EditorCursor) -> WorkspaceRunTarget {
+    if cursor
+        .selection_character_range
+        .as_ref()
+        .is_some_and(|selection| !selection.is_empty())
+    {
+        WorkspaceRunTarget::Selection
+    } else {
+        WorkspaceRunTarget::Current
+    }
 }
 
 fn parse_row_limit(value: &str) -> Result<u32, EditorValidationError> {
@@ -1943,6 +1971,38 @@ mod tests {
         assert_eq!(
             workspace_query_language(&workspace, DriverKind::MySql),
             QueryLanguage::MongoDocument
+        );
+    }
+
+    #[test]
+    fn history_run_target_preserves_current_selection_and_all_intent_shapes() {
+        assert_eq!(
+            run_target_for_cursor(&EditorCursor::caret(3)),
+            WorkspaceRunTarget::Current
+        );
+        assert_eq!(
+            run_target_for_cursor(&EditorCursor::with_selection(7, 2..7)),
+            WorkspaceRunTarget::Selection
+        );
+        assert_eq!(
+            run_target_for_cursor(&EditorCursor::with_selection(7, 7..7)),
+            WorkspaceRunTarget::Current
+        );
+        assert_eq!(
+            WorkspaceRunTarget::All,
+            EditorExecuteBatchIntent {
+                profile_id: ProfileId("typed-target".to_owned()),
+                profile_generation: ProfileGeneration(1),
+                editor_tab_id: None,
+                language: QueryLanguage::Sql,
+                text: "SELECT 1".to_owned(),
+                target_count: 1,
+                row_limit: 1,
+                timeout_ms: 1_000,
+                operation_kind: OperationKind::ExecuteRead,
+                run_target: WorkspaceRunTarget::All,
+            }
+            .run_target()
         );
     }
 

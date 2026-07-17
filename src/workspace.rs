@@ -260,6 +260,10 @@ impl WorkspaceHistoryEntry {
         self.source.as_deref()
     }
 
+    pub const fn source_omitted(&self) -> bool {
+        self.source_omitted
+    }
+
     pub const fn is_reopenable(&self) -> bool {
         self.source.is_some() && !self.source_omitted
     }
@@ -274,6 +278,22 @@ impl WorkspaceHistoryEntry {
 
     pub const fn completed_at_unix_ms(&self) -> i64 {
         self.completed_at_unix_ms
+    }
+
+    pub const fn duration_ms(&self) -> u64 {
+        self.duration_ms
+    }
+
+    pub const fn returned_rows(&self) -> u64 {
+        self.returned_rows
+    }
+
+    pub const fn affected_rows(&self) -> u64 {
+        self.affected_rows
+    }
+
+    pub const fn truncated(&self) -> bool {
+        self.truncated
     }
 
     fn validate(&self) -> Result<(), WorkspaceSnapshotError> {
