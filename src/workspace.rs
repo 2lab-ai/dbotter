@@ -1151,6 +1151,14 @@ fn conservative_encoded_profile_size(
     ProfileEncodedAccounting::new(snapshot)?.encoded_size()
 }
 
+#[cfg(test)]
+pub(crate) fn conservative_encoded_profile_bytes_for_test(
+    snapshot: &ProfileWorkspaceSnapshot,
+) -> Result<(u64, u64), WorkspaceRetentionError> {
+    let size = conservative_encoded_profile_size(snapshot)?;
+    Ok((size.shard_bytes, size.committed_bytes))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WorkspaceSnapshotError {
     #[error("editor id is invalid")]

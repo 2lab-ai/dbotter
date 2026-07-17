@@ -26,9 +26,10 @@ use crate::public_error::{
 use crate::secrets::{EnvironmentAvailability, ReplacementSecretBuffer};
 use crate::service::DeleteProfileRequest;
 use crate::workspace::{
-    MAX_HISTORY_ENTRIES_PER_PROFILE, WorkspaceGeometrySnapshot, WorkspaceHistoryCode,
-    WorkspaceHistoryEntry, WorkspaceHistoryStatus, WorkspaceReadOnlyReason, WorkspaceRunTarget,
-    WorkspaceStoreMode,
+    MAX_HISTORY_ENTRIES_PER_PROFILE, MAX_HISTORY_ENTRIES_TOTAL, ProfileWorkspaceSnapshot,
+    WorkspaceGeometrySnapshot, WorkspaceHistoryCode, WorkspaceHistoryEntry, WorkspaceHistoryStatus,
+    WorkspaceReadOnlyReason, WorkspaceRetentionError, WorkspaceRetentionLimit, WorkspaceRunTarget,
+    WorkspaceSnapshotSet, WorkspaceStoreMode,
 };
 
 use super::accessibility::{
@@ -69,6 +70,7 @@ const WORKSPACE_AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(750);
 const WORKSPACE_SAVE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const WORKSPACE_EDITOR_COLLAPSED_SHARE: f32 = 0.1;
 const WORKSPACE_RESULTS_COLLAPSED_SHARE: f32 = 0.9;
+const MAX_RETENTION_COMMIT_QUEUE: usize = MAX_HISTORY_ENTRIES_TOTAL + 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveOperation {
@@ -183,9 +185,120 @@ impl WorkspacePersistenceState {
 #[derive(Clone)]
 struct PendingWorkspaceHistory {
     workspace_key: WorkspaceKey,
+    history_id: u64,
     source: String,
     target: WorkspaceRunTarget,
     started_at: Instant,
+}
+
+struct RetentionCommitRequest {
+    workspace_key: WorkspaceKey,
+    identity: WorkspaceIdentity,
+    revision: u64,
+    snapshot: Box<ProfileWorkspaceSnapshot>,
+}
+
+impl std::fmt::Debug for RetentionCommitRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetentionCommitRequest")
+            .field("workspace_key", &self.workspace_key)
+            .field("identity", &self.identity)
+            .field("revision", &self.revision)
+            .field("history_count", &self.snapshot.history().len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveRetentionCommit {
+    workspace_key: WorkspaceKey,
+    operation_id: OperationId,
+    revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetentionBarrierFailure {
+    Submit(SubmitError),
+    Operation(WorkspaceFailureCode),
+    IdentityChanged,
+    QueueLimit,
+    Planning,
+}
+
+#[derive(Default)]
+struct RetentionCommitBarrier {
+    queue: VecDeque<RetentionCommitRequest>,
+    active: Option<ActiveRetentionCommit>,
+    failure: Option<RetentionBarrierFailure>,
+}
+
+impl std::fmt::Debug for RetentionCommitBarrier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetentionCommitBarrier")
+            .field("queued", &self.queue.len())
+            .field("active", &self.active)
+            .field("failure", &self.failure)
+            .finish()
+    }
+}
+
+impl RetentionCommitBarrier {
+    fn is_active(&self) -> bool {
+        self.active.is_some() || !self.queue.is_empty()
+    }
+
+    fn is_pending_or_failed(&self) -> bool {
+        self.is_active() || self.failure.is_some()
+    }
+}
+
+struct WorkspaceRetentionPlan {
+    workspaces: Vec<(WorkspaceKey, ProfileWorkspace)>,
+    commit_requests: Vec<RetentionCommitRequest>,
+    reserved_history_id: Option<u64>,
+    local_only: bool,
+}
+
+impl std::fmt::Debug for WorkspaceRetentionPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceRetentionPlan")
+            .field("workspace_updates", &self.workspaces.len())
+            .field("commit_requests", &self.commit_requests.len())
+            .field("reserved_history_id", &self.reserved_history_id)
+            .field("local_only", &self.local_only)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetentionPlanFailure {
+    RestoreUnresolved,
+    PersistenceTransition,
+    SaveInFlight,
+    BarrierActive,
+    MissingWorkspace,
+    InvalidSnapshot,
+    Retention(WorkspaceRetentionError),
+}
+
+enum RetentionHistoryChange {
+    Reserve {
+        workspace_key: WorkspaceKey,
+        seed: u64,
+        source: String,
+        target: WorkspaceRunTarget,
+        started_at_unix_ms: i64,
+    },
+    Terminal {
+        workspace_key: WorkspaceKey,
+        history_id: u64,
+        source: String,
+        target: WorkspaceRunTarget,
+        terminal: WorkspaceHistoryTerminal,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -203,6 +316,7 @@ impl std::fmt::Debug for PendingWorkspaceHistory {
         formatter
             .debug_struct("PendingWorkspaceHistory")
             .field("workspace_key", &self.workspace_key)
+            .field("history_id", &self.history_id)
             .field("source", &"<redacted>")
             .field("target", &self.target)
             .field("started_at", &self.started_at)
@@ -481,6 +595,8 @@ pub struct DbotterApp {
     connection_filter: String,
     workspace_persistence: HashMap<WorkspaceKey, WorkspacePersistenceState>,
     pending_workspace_history: HashMap<OperationId, PendingWorkspaceHistory>,
+    retention_commit_barrier: RetentionCommitBarrier,
+    retention_reconcile_required: bool,
     workspace_history_search: HashMap<WorkspaceKey, String>,
     workspace_history_focus: Option<WorkspaceKey>,
     connection_filter_focus: bool,
@@ -530,6 +646,8 @@ impl DbotterApp {
             connection_filter: String::new(),
             workspace_persistence: HashMap::new(),
             pending_workspace_history: HashMap::new(),
+            retention_commit_barrier: RetentionCommitBarrier::default(),
+            retention_reconcile_required: true,
             workspace_history_search: HashMap::new(),
             workspace_history_focus: None,
             connection_filter_focus: false,
@@ -687,6 +805,556 @@ impl DbotterApp {
         bound
     }
 
+    fn prepare_workspace_history_reservation(
+        &mut self,
+        workspace_key: &WorkspaceKey,
+        seed: u64,
+        source: String,
+        target: WorkspaceRunTarget,
+    ) -> Result<Option<WorkspaceRetentionPlan>, RetentionPlanFailure> {
+        let persistence_enabled = self
+            .model
+            .workspace(workspace_key)
+            .and_then(ProfileWorkspace::persistence)
+            .is_some_and(ProfileWorkspacePersistence::persistence_enabled);
+        if !persistence_enabled {
+            return Ok(None);
+        }
+        if self.retention_commit_barrier.is_pending_or_failed() {
+            return Err(RetentionPlanFailure::BarrierActive);
+        }
+        let keys = self.ensure_current_workspace_persistence_bindings();
+        if !keys.iter().any(|key| key == workspace_key) {
+            return Err(RetentionPlanFailure::MissingWorkspace);
+        }
+        for key in &keys {
+            let Some(state) = self.workspace_persistence.get(key) else {
+                return Err(RetentionPlanFailure::MissingWorkspace);
+            };
+            if !matches!(state.load, WorkspaceLoadPhase::Ready) || state.mode.is_none() {
+                return Err(RetentionPlanFailure::RestoreUnresolved);
+            }
+            if state.clear.has_intent() || state.force_commit_until_success {
+                return Err(RetentionPlanFailure::PersistenceTransition);
+            }
+            if matches!(state.save, WorkspaceSavePhase::Saving { .. }) {
+                return Err(RetentionPlanFailure::SaveInFlight);
+            }
+        }
+        self.build_workspace_retention_plan(
+            &keys,
+            Some(RetentionHistoryChange::Reserve {
+                workspace_key: workspace_key.clone(),
+                seed,
+                source,
+                target,
+                started_at_unix_ms: current_unix_time_ms(),
+            }),
+        )
+        .map(Some)
+    }
+
+    fn build_workspace_retention_plan(
+        &self,
+        keys: &[WorkspaceKey],
+        change: Option<RetentionHistoryChange>,
+    ) -> Result<WorkspaceRetentionPlan, RetentionPlanFailure> {
+        let target_key = match change.as_ref() {
+            Some(RetentionHistoryChange::Reserve { workspace_key, .. })
+            | Some(RetentionHistoryChange::Terminal { workspace_key, .. }) => {
+                Some(workspace_key.clone())
+            }
+            None => None,
+        };
+        let mut clones = Vec::with_capacity(keys.len());
+        let mut input_snapshots = Vec::with_capacity(keys.len());
+        let mut instance_to_key = HashMap::with_capacity(keys.len());
+        let mut reserved_history_id = None;
+
+        for key in keys {
+            let Some(state) = self.workspace_persistence.get(key) else {
+                return Err(RetentionPlanFailure::MissingWorkspace);
+            };
+            let Some(mut workspace) = self.model.workspace(key).cloned() else {
+                return Err(RetentionPlanFailure::MissingWorkspace);
+            };
+            match change.as_ref() {
+                Some(RetentionHistoryChange::Reserve {
+                    workspace_key,
+                    seed,
+                    source,
+                    target,
+                    started_at_unix_ms,
+                }) if workspace_key == key => {
+                    let Some(persistence) = workspace.persistence() else {
+                        return Err(RetentionPlanFailure::MissingWorkspace);
+                    };
+                    let mut history = persistence.history().to_vec();
+                    let history_id = next_workspace_history_id(&history, *seed)
+                        .ok_or(RetentionPlanFailure::InvalidSnapshot)?;
+                    if history.len() >= MAX_HISTORY_ENTRIES_PER_PROFILE {
+                        let removable = history
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, entry)| {
+                                entry.status() != WorkspaceHistoryStatus::OutcomeUnknown
+                            })
+                            .min_by_key(|(_, entry)| (entry.completed_at_unix_ms(), entry.id()))
+                            .map(|(index, _)| index)
+                            .ok_or(RetentionPlanFailure::Retention(
+                                WorkspaceRetentionError::RetentionExhausted(
+                                    WorkspaceRetentionLimit::ProfileHistoryEntries,
+                                ),
+                            ))?;
+                        history.remove(removable);
+                    }
+                    let provisional = WorkspaceHistoryEntry::new(
+                        history_id,
+                        source,
+                        *target,
+                        *started_at_unix_ms,
+                        WorkspaceHistoryStatus::OutcomeUnknown,
+                        0,
+                        0,
+                        0,
+                        false,
+                    )
+                    .map_err(|_| RetentionPlanFailure::InvalidSnapshot)?;
+                    history.push(provisional);
+                    workspace
+                        .replace_persistence_history(history)
+                        .map_err(|_| RetentionPlanFailure::InvalidSnapshot)?;
+                    reserved_history_id = Some(history_id);
+                }
+                Some(RetentionHistoryChange::Terminal {
+                    workspace_key,
+                    history_id,
+                    source,
+                    target,
+                    terminal,
+                }) if workspace_key == key => {
+                    let Some(persistence) = workspace.persistence() else {
+                        return Err(RetentionPlanFailure::MissingWorkspace);
+                    };
+                    let mut history = persistence.history().to_vec();
+                    let Some(index) = history.iter().position(|entry| entry.id() == *history_id)
+                    else {
+                        return Err(RetentionPlanFailure::MissingWorkspace);
+                    };
+                    history[index] = WorkspaceHistoryEntry::new(
+                        *history_id,
+                        source,
+                        *target,
+                        terminal.completed_at_unix_ms,
+                        terminal.status,
+                        terminal.duration_ms,
+                        terminal.returned_rows,
+                        terminal.affected_rows,
+                        terminal.truncated,
+                    )
+                    .map_err(|_| RetentionPlanFailure::InvalidSnapshot)?;
+                    workspace
+                        .replace_persistence_history(history)
+                        .map_err(|_| RetentionPlanFailure::InvalidSnapshot)?;
+                }
+                _ => {}
+            }
+            let snapshot = workspace
+                .to_persistence_snapshot()
+                .map_err(|_| RetentionPlanFailure::InvalidSnapshot)?;
+            if instance_to_key
+                .insert(state.identity.instance_id(), key.clone())
+                .is_some()
+            {
+                return Err(RetentionPlanFailure::InvalidSnapshot);
+            }
+            input_snapshots.push(snapshot);
+            clones.push((key.clone(), workspace));
+        }
+
+        let planned = plan_workspace_snapshot_set(input_snapshots)
+            .map_err(RetentionPlanFailure::Retention)?;
+        let eviction_order = planned
+            .history_evictions()
+            .iter()
+            .filter_map(|identity| instance_to_key.get(&identity.instance_id()).cloned())
+            .collect::<Vec<_>>();
+        let mut normalized = planned
+            .into_profiles()
+            .into_iter()
+            .map(|snapshot| (snapshot.instance_id(), snapshot))
+            .collect::<HashMap<_, _>>();
+        let mut workspace_updates = Vec::new();
+        let mut commit_candidates = HashSet::new();
+        let mut request_parts = HashMap::new();
+        let mut local_only = false;
+
+        for (key, mut workspace) in clones {
+            let Some(state) = self.workspace_persistence.get(&key) else {
+                return Err(RetentionPlanFailure::MissingWorkspace);
+            };
+            let Some(planned_snapshot) = normalized.remove(&state.identity.instance_id()) else {
+                return Err(RetentionPlanFailure::InvalidSnapshot);
+            };
+            let live_revision = self
+                .model
+                .workspace(&key)
+                .map_or(u64::MAX, ProfileWorkspace::revision);
+            let live_history = self
+                .model
+                .workspace(&key)
+                .and_then(ProfileWorkspace::persistence)
+                .map(ProfileWorkspacePersistence::history)
+                .unwrap_or_default();
+            let history_changed = live_history != planned_snapshot.history();
+            if workspace
+                .persistence()
+                .is_some_and(ProfileWorkspacePersistence::persistence_enabled)
+                && workspace
+                    .persistence()
+                    .is_some_and(|persistence| persistence.history() != planned_snapshot.history())
+            {
+                workspace
+                    .replace_persistence_history(planned_snapshot.history().to_vec())
+                    .map_err(|_| RetentionPlanFailure::InvalidSnapshot)?;
+            }
+            let workspace_changed = history_changed || workspace.revision() != live_revision;
+            if workspace_changed {
+                workspace_updates.push((key.clone(), workspace.clone()));
+            }
+            let persistence_enabled = workspace
+                .persistence()
+                .is_some_and(ProfileWorkspacePersistence::persistence_enabled);
+            let live_dirty = self
+                .model
+                .workspace(&key)
+                .is_some_and(|workspace| !workspace.is_saved());
+            if persistence_enabled && (workspace_changed || live_dirty) {
+                commit_candidates.insert(key.clone());
+                if state.is_read_only() {
+                    local_only = true;
+                }
+            }
+            request_parts.insert(
+                key.clone(),
+                (
+                    state.identity.clone(),
+                    workspace.revision(),
+                    Box::new(planned_snapshot),
+                ),
+            );
+        }
+        if !normalized.is_empty() {
+            return Err(RetentionPlanFailure::InvalidSnapshot);
+        }
+
+        let mut commit_order = Vec::with_capacity(commit_candidates.len());
+        for key in eviction_order {
+            if target_key.as_ref() == Some(&key) {
+                continue;
+            }
+            if commit_candidates.remove(&key) {
+                commit_order.push(key);
+            }
+        }
+        let mut remaining = commit_candidates
+            .iter()
+            .filter(|key| target_key.as_ref() != Some(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        remaining.sort_unstable_by_key(|key| {
+            self.workspace_persistence
+                .get(key)
+                .map(|state| *state.identity.instance_id().as_bytes())
+                .unwrap_or([u8::MAX; 16])
+        });
+        commit_order.extend(remaining);
+        if let Some(target_key) = target_key
+            && commit_candidates.contains(&target_key)
+        {
+            commit_order.push(target_key);
+        }
+        let mut commit_requests = Vec::with_capacity(commit_order.len());
+        for key in commit_order {
+            let Some((identity, revision, snapshot)) = request_parts.remove(&key) else {
+                return Err(RetentionPlanFailure::InvalidSnapshot);
+            };
+            commit_requests.push(RetentionCommitRequest {
+                workspace_key: key,
+                identity,
+                revision,
+                snapshot,
+            });
+        }
+        if local_only {
+            commit_requests.clear();
+        }
+        Ok(WorkspaceRetentionPlan {
+            workspaces: workspace_updates,
+            commit_requests,
+            reserved_history_id,
+            local_only,
+        })
+    }
+
+    fn report_retention_plan_failure(&mut self, failure: RetentionPlanFailure) {
+        self.model.status = match failure {
+            RetentionPlanFailure::RestoreUnresolved => {
+                "Persistent execution is waiting for every private workspace restore to resolve."
+            }
+            RetentionPlanFailure::PersistenceTransition => {
+                "Persistent execution is waiting for Clear or Persistence Off to become durable."
+            }
+            RetentionPlanFailure::SaveInFlight | RetentionPlanFailure::BarrierActive => {
+                "Persistent execution is waiting for the global retention save barrier."
+            }
+            RetentionPlanFailure::Retention(WorkspaceRetentionError::RetentionExhausted(_)) => {
+                "Persistent execution is blocked because outcome-unknown history cannot be evicted; clear history or turn Persistence Off."
+            }
+            RetentionPlanFailure::MissingWorkspace
+            | RetentionPlanFailure::InvalidSnapshot
+            | RetentionPlanFailure::Retention(_) => {
+                "Private history retention planning failed; no database command was submitted."
+            }
+        }
+        .to_owned();
+    }
+
+    fn apply_workspace_retention_plan(&mut self, plan: WorkspaceRetentionPlan) -> Option<u64> {
+        let reserved_history_id = plan.reserved_history_id;
+        self.retention_reconcile_required = false;
+        for (key, workspace) in plan.workspaces {
+            self.model.workspaces.insert(key, workspace);
+        }
+        self.observe_workspace_revisions(Instant::now());
+        if plan.local_only {
+            self.model.status =
+                "Private history is bounded locally but remains Unsaved because the store is read-only."
+                    .to_owned();
+            return reserved_history_id;
+        }
+        if !plan.commit_requests.is_empty() {
+            self.merge_retention_commit_requests(plan.commit_requests);
+            self.drive_retention_commit_barrier(false);
+        }
+        reserved_history_id
+    }
+
+    fn merge_retention_commit_requests(&mut self, requests: Vec<RetentionCommitRequest>) {
+        let replacement_keys = requests
+            .iter()
+            .map(|request| request.workspace_key.clone())
+            .collect::<HashSet<_>>();
+        self.retention_commit_barrier
+            .queue
+            .retain(|request| !replacement_keys.contains(&request.workspace_key));
+        let requests = requests
+            .into_iter()
+            .filter(|request| {
+                !self
+                    .retention_commit_barrier
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| {
+                        active.workspace_key == request.workspace_key
+                            && active.revision == request.revision
+                    })
+            })
+            .collect::<Vec<_>>();
+        if self
+            .retention_commit_barrier
+            .queue
+            .len()
+            .saturating_add(requests.len())
+            > MAX_RETENTION_COMMIT_QUEUE
+        {
+            self.retention_commit_barrier.failure = Some(RetentionBarrierFailure::QueueLimit);
+            self.model.status =
+                "Private history retention queue reached its bound; Retry or discard local changes."
+                    .to_owned();
+            return;
+        }
+        self.retention_commit_barrier.queue.extend(requests);
+    }
+
+    fn drive_retention_commit_barrier(&mut self, retry_failed: bool) -> bool {
+        if self.retention_commit_barrier.active.is_some() {
+            self.model.status = "Saving the bounded private-history set…".to_owned();
+            return true;
+        }
+        if self.retention_commit_barrier.failure.is_some() {
+            if !retry_failed {
+                return false;
+            }
+            self.retention_commit_barrier.failure = None;
+        }
+        let Some(request) = self.retention_commit_barrier.queue.front() else {
+            return true;
+        };
+        let Some(state) = self.workspace_persistence.get(&request.workspace_key) else {
+            self.retention_commit_barrier.failure = Some(RetentionBarrierFailure::IdentityChanged);
+            self.model.status =
+                "Private history save identity changed; reload before retrying.".to_owned();
+            return false;
+        };
+        if state.identity != request.identity
+            || !matches!(state.load, WorkspaceLoadPhase::Ready)
+            || state.mode != Some(WorkspaceStoreMode::ReadWrite)
+            || state.clear.has_intent()
+            || state.force_commit_until_success
+            || matches!(state.save, WorkspaceSavePhase::Saving { .. })
+        {
+            self.retention_commit_barrier.failure = Some(RetentionBarrierFailure::IdentityChanged);
+            self.model.status =
+                "Private history save barrier needs workspace recovery before Retry.".to_owned();
+            return false;
+        }
+        let operation_id = self.model.next_operation();
+        let command = UiCommand::CommitWorkspace {
+            operation_id,
+            identity: request.identity.clone(),
+            revision: request.revision,
+            snapshot: request.snapshot.clone(),
+        };
+        match self.port.try_submit(command) {
+            Ok(()) => {
+                let Some(request) = self.retention_commit_barrier.queue.pop_front() else {
+                    self.retention_commit_barrier.failure = Some(RetentionBarrierFailure::Planning);
+                    self.model.status =
+                        "Private history save queue changed unexpectedly; Retry is required."
+                            .to_owned();
+                    return false;
+                };
+                if let Some(state) = self.workspace_persistence.get_mut(&request.workspace_key) {
+                    state.save = WorkspaceSavePhase::Saving {
+                        operation_id,
+                        revision: request.revision,
+                    };
+                    state.dirty_since = None;
+                    state.retry_not_before = None;
+                }
+                self.retention_commit_barrier.active = Some(ActiveRetentionCommit {
+                    workspace_key: request.workspace_key,
+                    operation_id,
+                    revision: request.revision,
+                });
+                self.model.status = "Saving the bounded private-history set…".to_owned();
+                true
+            }
+            Err(error) => {
+                self.retention_commit_barrier.failure =
+                    Some(RetentionBarrierFailure::Submit(error));
+                if let Some(state) = self.workspace_persistence.get_mut(&request.workspace_key) {
+                    let code = match error {
+                        SubmitError::Busy => WorkspaceFailureCode::Busy,
+                        SubmitError::Disconnected => WorkspaceFailureCode::Unavailable,
+                    };
+                    state.save = WorkspaceSavePhase::Failed {
+                        revision: request.revision,
+                        code,
+                    };
+                    state.dirty_since.get_or_insert(Instant::now());
+                    state.retry_not_before = Some(Instant::now() + WORKSPACE_SAVE_RETRY_DELAY);
+                }
+                self.model.status =
+                    "Private history save barrier is unavailable; Retry keeps every local change."
+                        .to_owned();
+                false
+            }
+        }
+    }
+
+    fn retry_retention_commit_barrier(&mut self) -> bool {
+        if self.retention_commit_barrier.active.is_some() {
+            return self.drive_retention_commit_barrier(false);
+        }
+        if matches!(
+            self.retention_commit_barrier.failure,
+            Some(
+                RetentionBarrierFailure::Operation(_)
+                    | RetentionBarrierFailure::IdentityChanged
+                    | RetentionBarrierFailure::QueueLimit
+                    | RetentionBarrierFailure::Planning
+            )
+        ) {
+            self.retention_commit_barrier.queue.clear();
+            self.retention_reconcile_required = true;
+        }
+        if self.retention_commit_barrier.queue.is_empty() {
+            self.retention_commit_barrier.failure = None;
+            self.retention_reconcile_required = true;
+            if !self.reconcile_workspace_retention(true) {
+                return false;
+            }
+        }
+        self.drive_retention_commit_barrier(true)
+    }
+
+    fn reconcile_workspace_retention(&mut self, force: bool) -> bool {
+        if !force && !self.retention_reconcile_required {
+            return true;
+        }
+        let keys = self.ensure_current_workspace_persistence_bindings();
+        if keys.is_empty() {
+            self.retention_reconcile_required = false;
+            return true;
+        }
+        if keys.iter().any(|key| {
+            self.workspace_persistence.get(key).is_none_or(|state| {
+                !matches!(state.load, WorkspaceLoadPhase::Ready)
+                    || state.mode.is_none()
+                    || state.clear.has_intent()
+                    || state.force_commit_until_success
+            })
+        }) {
+            return false;
+        }
+        let plan = match self.build_workspace_retention_plan(&keys, None) {
+            Ok(plan) => plan,
+            Err(failure) => {
+                self.retention_commit_barrier.failure = Some(RetentionBarrierFailure::Planning);
+                self.report_retention_plan_failure(failure);
+                return false;
+            }
+        };
+        self.retention_reconcile_required = false;
+        let local_only = plan.local_only;
+        let has_commits = !plan.commit_requests.is_empty();
+        let _ = self.apply_workspace_retention_plan(plan);
+        if !local_only && has_commits {
+            self.model.status = "Normalizing the bounded private-history set…".to_owned();
+        }
+        true
+    }
+
+    fn retention_barrier_references_current_identities(&self) -> bool {
+        let active_is_current =
+            self.retention_commit_barrier
+                .active
+                .as_ref()
+                .is_none_or(|active| {
+                    self.workspace_persistence
+                        .get(&active.workspace_key)
+                        .is_some_and(|state| {
+                            matches!(state.load, WorkspaceLoadPhase::Ready)
+                                && matches!(
+                                    state.save,
+                                    WorkspaceSavePhase::Saving {
+                                        operation_id,
+                                        revision,
+                                    } if operation_id == active.operation_id
+                                        && revision == active.revision
+                                )
+                        })
+                });
+        active_is_current
+            && self.retention_commit_barrier.queue.iter().all(|request| {
+                self.workspace_persistence
+                    .get(&request.workspace_key)
+                    .is_some_and(|state| state.identity == request.identity)
+            })
+    }
+
     fn request_workspace_load(&mut self, key: &WorkspaceKey) {
         let should_load = self.workspace_persistence.get(key).is_some_and(|state| {
             matches!(state.load, WorkspaceLoadPhase::Unloaded) && !state.clear.has_intent()
@@ -789,6 +1457,13 @@ impl DbotterApp {
         explicit: bool,
         force: bool,
     ) -> bool {
+        if self.retention_commit_barrier.is_pending_or_failed() {
+            return if explicit {
+                self.retry_retention_commit_barrier()
+            } else {
+                self.drive_retention_commit_barrier(false)
+            };
+        }
         let Some(state) = self.workspace_persistence.get(key) else {
             return false;
         };
@@ -948,6 +1623,10 @@ impl DbotterApp {
     fn flush_all_dirty_workspaces(&mut self) {
         let keys = self.ensure_current_workspace_persistence_bindings();
         self.observe_workspace_revisions(Instant::now());
+        if self.retention_commit_barrier.is_pending_or_failed() {
+            let _ = self.retry_retention_commit_barrier();
+            return;
+        }
         for key in keys {
             let dirty = self
                 .model
@@ -960,6 +1639,20 @@ impl DbotterApp {
     }
 
     fn autosave_workspaces(&mut self, now: Instant) {
+        if self.retention_commit_barrier.is_pending_or_failed() {
+            let retry_ready = self
+                .retention_commit_barrier
+                .queue
+                .front()
+                .and_then(|request| self.workspace_persistence.get(&request.workspace_key))
+                .is_some_and(|state| state.retry_not_before.is_none_or(|retry| now >= retry));
+            if self.retention_commit_barrier.failure.is_none() {
+                let _ = self.drive_retention_commit_barrier(false);
+            } else if retry_ready {
+                let _ = self.retry_retention_commit_barrier();
+            }
+            return;
+        }
         let keys = self
             .workspace_persistence
             .iter()
@@ -1199,6 +1892,15 @@ impl DbotterApp {
             } => {
                 let key =
                     WorkspaceKey::new(identity.profile_id().clone(), identity.profile_generation());
+                let barrier_matches =
+                    self.retention_commit_barrier
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| {
+                            active.workspace_key == key
+                                && active.operation_id == *operation_id
+                                && active.revision == *revision
+                        });
                 let matches_pending = self.workspace_persistence.get(&key).is_some_and(|state| {
                     state.identity == *identity
                         && matches!(
@@ -1247,6 +1949,20 @@ impl DbotterApp {
                 } else {
                     "A newer local revision remains Unsaved; another save is queued.".to_owned()
                 };
+                if barrier_matches {
+                    self.retention_commit_barrier.active = None;
+                    self.retention_commit_barrier.failure = None;
+                    if !saved {
+                        self.retention_reconcile_required = true;
+                    }
+                    if self.retention_commit_barrier.queue.is_empty()
+                        && self.retention_reconcile_required
+                    {
+                        let _ = self.reconcile_workspace_retention(true);
+                    } else {
+                        let _ = self.drive_retention_commit_barrier(false);
+                    }
+                }
             }
             UiEvent::WorkspaceCommitSuperseded {
                 operation_id,
@@ -1256,6 +1972,15 @@ impl DbotterApp {
             } => {
                 let key =
                     WorkspaceKey::new(identity.profile_id().clone(), identity.profile_generation());
+                let barrier_matches =
+                    self.retention_commit_barrier
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| {
+                            active.workspace_key == key
+                                && active.operation_id == *operation_id
+                                && active.revision == *revision
+                        });
                 let matches_pending = self.workspace_persistence.get(&key).is_some_and(|state| {
                     state.identity == *identity
                         && matches!(
@@ -1276,6 +2001,16 @@ impl DbotterApp {
                     state.resolve_conflict_on_commit = false;
                     self.model.status =
                         "A newer save superseded this revision; local work remains Unsaved."
+                            .to_owned();
+                }
+                if matches_pending && barrier_matches {
+                    self.retention_commit_barrier.active = None;
+                    self.retention_commit_barrier.failure = Some(
+                        RetentionBarrierFailure::Operation(WorkspaceFailureCode::Stale),
+                    );
+                    self.retention_reconcile_required = true;
+                    self.model.status =
+                        "Private history save was superseded; Retry preserves the bounded set."
                             .to_owned();
                 }
             }
@@ -1336,6 +2071,15 @@ impl DbotterApp {
             } => {
                 let key =
                     WorkspaceKey::new(identity.profile_id().clone(), identity.profile_generation());
+                let barrier_matches =
+                    self.retention_commit_barrier
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| {
+                            active.workspace_key == key
+                                && active.operation_id == *operation_id
+                                && active.revision == *revision
+                        });
                 let Some(state) = self.workspace_persistence.get_mut(&key) else {
                     return;
                 };
@@ -1405,6 +2149,15 @@ impl DbotterApp {
                         self.model.status =
                             "Private workspace Save failed; local changes remain Unsaved."
                                 .to_owned();
+                        if barrier_matches {
+                            self.retention_commit_barrier.active = None;
+                            self.retention_commit_barrier.failure =
+                                Some(RetentionBarrierFailure::Operation(*code));
+                            self.retention_reconcile_required = true;
+                            self.model.status =
+                                "Private history save failed; Retry keeps the bounded set Unsaved."
+                                    .to_owned();
+                        }
                     }
                     WorkspaceAction::Clear => {
                         if !matches!(
@@ -1433,48 +2186,56 @@ impl DbotterApp {
             }
             UiEvent::ConfigUncertain { .. } | UiEvent::RuntimeShutdown { .. } => {
                 self.pending_workspace_history.clear();
+                if self.retention_commit_barrier.is_active() {
+                    self.retention_commit_barrier.active = None;
+                    self.retention_commit_barrier.failure =
+                        Some(RetentionBarrierFailure::IdentityChanged);
+                    self.retention_reconcile_required = true;
+                }
             }
             _ => {}
         }
     }
 
     fn has_uncommitted_workspace(&self) -> bool {
-        self.workspace_persistence.iter().any(|(key, state)| {
-            let persistence_enabled = self
-                .model
-                .workspace(key)
-                .and_then(ProfileWorkspace::persistence)
-                .is_some_and(ProfileWorkspacePersistence::persistence_enabled);
-            let durable_dirty = persistence_enabled
-                && self
+        self.retention_commit_barrier.is_pending_or_failed()
+            || self.workspace_persistence.iter().any(|(key, state)| {
+                let persistence_enabled = self
                     .model
                     .workspace(key)
-                    .is_some_and(|workspace| !workspace.is_saved());
-            durable_dirty
-                || matches!(state.save, WorkspaceSavePhase::Saving { .. })
-                || matches!(state.save, WorkspaceSavePhase::Failed { .. })
-                || state.clear.has_intent()
-                || state.force_commit_until_success
-        })
+                    .and_then(ProfileWorkspace::persistence)
+                    .is_some_and(ProfileWorkspacePersistence::persistence_enabled);
+                let durable_dirty = persistence_enabled
+                    && self
+                        .model
+                        .workspace(key)
+                        .is_some_and(|workspace| !workspace.is_saved());
+                durable_dirty
+                    || matches!(state.save, WorkspaceSavePhase::Saving { .. })
+                    || matches!(state.save, WorkspaceSavePhase::Failed { .. })
+                    || state.clear.has_intent()
+                    || state.force_commit_until_success
+            })
     }
 
     fn has_workspace_save_failure(&self) -> bool {
-        self.workspace_persistence.iter().any(|(key, state)| {
-            let dirty = self
-                .model
-                .workspace(key)
-                .is_some_and(|workspace| !workspace.is_saved());
-            (dirty
-                && (state.is_read_only()
-                    || matches!(state.save, WorkspaceSavePhase::Failed { .. })
-                    || matches!(
-                        state.load,
-                        WorkspaceLoadPhase::Failed(_) | WorkspaceLoadPhase::Conflict
-                    )))
-                || (state.force_commit_until_success
-                    && matches!(state.save, WorkspaceSavePhase::Failed { .. }))
-                || matches!(state.clear, WorkspaceClearPhase::Failed { .. })
-        })
+        self.retention_commit_barrier.failure.is_some()
+            || self.workspace_persistence.iter().any(|(key, state)| {
+                let dirty = self
+                    .model
+                    .workspace(key)
+                    .is_some_and(|workspace| !workspace.is_saved());
+                (dirty
+                    && (state.is_read_only()
+                        || matches!(state.save, WorkspaceSavePhase::Failed { .. })
+                        || matches!(
+                            state.load,
+                            WorkspaceLoadPhase::Failed(_) | WorkspaceLoadPhase::Conflict
+                        )))
+                    || (state.force_commit_until_success
+                        && matches!(state.save, WorkspaceSavePhase::Failed { .. }))
+                    || matches!(state.clear, WorkspaceClearPhase::Failed { .. })
+            })
     }
 
     fn handle_workspace_close_request(&mut self, context: &egui::Context) {
@@ -1502,6 +2263,7 @@ impl DbotterApp {
         &mut self,
         operation_id: OperationId,
         workspace_key: WorkspaceKey,
+        history_id: u64,
         source: String,
         target: WorkspaceRunTarget,
     ) {
@@ -1509,6 +2271,7 @@ impl DbotterApp {
             operation_id,
             PendingWorkspaceHistory {
                 workspace_key,
+                history_id,
                 source,
                 target,
                 started_at: Instant::now(),
@@ -1628,66 +2391,70 @@ impl DbotterApp {
         if !identity_is_current {
             return None;
         }
-        let workspace = self.model.workspaces.get_mut(&pending.workspace_key)?;
-        let persistence = workspace.persistence()?;
-        if !persistence.persistence_enabled() {
+        let persistence_enabled = self
+            .model
+            .workspace(&pending.workspace_key)
+            .and_then(ProfileWorkspace::persistence)
+            .is_some_and(ProfileWorkspacePersistence::persistence_enabled);
+        if !persistence_enabled {
             return None;
         }
-        let mut history = persistence.history().to_vec();
-        let Some(history_id) = next_workspace_history_id(&history, operation_id.0) else {
-            let notice = "Execution history reached its bounded identity limit.".to_owned();
+        let keys = self.ensure_current_workspace_persistence_bindings();
+        let ready = keys.iter().all(|key| {
+            self.workspace_persistence.get(key).is_some_and(|state| {
+                matches!(state.load, WorkspaceLoadPhase::Ready)
+                    && state.mode.is_some()
+                    && !state.clear.has_intent()
+                    && !state.force_commit_until_success
+            })
+        });
+        if !ready {
+            let notice =
+                "Execution finished, but its protected history remains OutcomeUnknown until workspace recovery."
+                    .to_owned();
             self.model.status = notice.clone();
             return Some(notice);
-        };
-        let Ok(entry) = WorkspaceHistoryEntry::new(
-            history_id,
-            &pending.source,
-            pending.target,
-            terminal.completed_at_unix_ms,
-            terminal.status,
-            terminal.duration_ms,
-            terminal.returned_rows,
-            terminal.affected_rows,
-            terminal.truncated,
-        ) else {
-            let notice = "Execution history metadata was not retained.".to_owned();
-            self.model.status = notice.clone();
-            return Some(notice);
-        };
-        history.push(entry);
-        while history.len() > MAX_HISTORY_ENTRIES_PER_PROFILE {
-            let candidate = history
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.status() != WorkspaceHistoryStatus::OutcomeUnknown)
-                .min_by_key(|(_, entry)| (entry.completed_at_unix_ms(), entry.id()))
-                .map(|(index, entry)| (index, entry.id()));
-            let Some((index, removed_id)) = candidate else {
-                let _ = history.pop();
+        }
+        let plan = self.build_workspace_retention_plan(
+            &keys,
+            Some(RetentionHistoryChange::Terminal {
+                workspace_key: pending.workspace_key,
+                history_id: pending.history_id,
+                source: pending.source,
+                target: pending.target,
+                terminal,
+            }),
+        );
+        match plan {
+            Ok(plan) => {
+                let local_only = plan.local_only;
+                let _ = self.apply_workspace_retention_plan(plan);
+                if local_only {
+                    let notice =
+                        "Execution finished; bounded private history remains Unsaved because the store is read-only."
+                            .to_owned();
+                    self.model.status = notice.clone();
+                    Some(notice)
+                } else {
+                    None
+                }
+            }
+            Err(_) => {
                 let notice =
-                    "History is full of outcome-unknown entries; this terminal was not retained."
+                    "Execution finished, but its protected history remains OutcomeUnknown; Retry workspace save before continuing."
                         .to_owned();
                 self.model.status = notice.clone();
-                return Some(notice);
-            };
-            history.remove(index);
-            if removed_id == history_id {
-                let notice =
-                    "Outcome-unknown history was preserved; this terminal was not retained."
-                        .to_owned();
-                self.model.status = notice.clone();
-                return Some(notice);
+                Some(notice)
             }
         }
-        if let Err(error) = workspace.replace_persistence_history(history) {
-            let notice = error.to_string();
-            self.model.status = notice.clone();
-            return Some(notice);
-        }
-        None
     }
 
     fn set_workspace_persistence_enabled(&mut self, key: &WorkspaceKey, enabled: bool) {
+        if self.retention_commit_barrier.is_pending_or_failed() {
+            self.model.status =
+                "Persistence changes wait for the global private-history save barrier.".to_owned();
+            return;
+        }
         let Some(profile) = self
             .model
             .profiles
@@ -1742,6 +2509,11 @@ impl DbotterApp {
     }
 
     fn clear_workspace_history(&mut self, key: &WorkspaceKey) {
+        if self.retention_commit_barrier.is_pending_or_failed() {
+            self.model.status =
+                "History Clear waits for the global private-history save barrier.".to_owned();
+            return;
+        }
         let Some(profile) = self
             .model
             .profiles
@@ -1780,6 +2552,11 @@ impl DbotterApp {
     }
 
     fn submit_clear_workspace(&mut self, key: &WorkspaceKey) {
+        if self.retention_commit_barrier.is_pending_or_failed() {
+            self.model.status =
+                "Saved-data Clear waits for the global private-history save barrier.".to_owned();
+            return;
+        }
         let Some(state) = self.workspace_persistence.get(key) else {
             return;
         };
@@ -2475,10 +3252,23 @@ impl DbotterApp {
             self.apply_workspace_retages(workspace_retages);
             if profiles_loaded_accepted {
                 let keys = self.ensure_current_workspace_persistence_bindings();
+                if self.retention_commit_barrier.is_pending_or_failed()
+                    && !self.retention_barrier_references_current_identities()
+                {
+                    self.retention_commit_barrier.active = None;
+                    self.retention_commit_barrier.queue.clear();
+                    self.retention_commit_barrier.failure =
+                        Some(RetentionBarrierFailure::IdentityChanged);
+                    self.retention_reconcile_required = true;
+                    self.model.status =
+                        "Profile identities changed during private-history save; Retry after restore."
+                            .to_owned();
+                }
                 for key in keys {
                     self.request_workspace_load(&key);
                 }
             }
+            let _ = self.reconcile_workspace_retention(false);
             if let Some((profile_id, loaded, accepted)) = connect_follow_up {
                 self.pending_connect_after_refresh = None;
                 if loaded && accepted && self.model.active_generation(&profile_id).is_some() {
@@ -3355,15 +4145,33 @@ impl DbotterApp {
             let _ = self.ensure_workspace_persistence_binding(&workspace_key, &profile);
         }
         let operation_id = self.model.next_operation();
+        let retention_plan = match self.prepare_workspace_history_reservation(
+            &workspace_key,
+            operation_id.0,
+            history_source.clone(),
+            history_target,
+        ) {
+            Ok(plan) => plan,
+            Err(failure) => {
+                self.report_retention_plan_failure(failure);
+                return;
+            }
+        };
+        let retention_local_only = retention_plan.as_ref().is_some_and(|plan| plan.local_only);
         match self.port.try_submit(intent.into_ui_command(operation_id)) {
             Ok(()) => {
+                if let Some(plan) = retention_plan
+                    && let Some(history_id) = self.apply_workspace_retention_plan(plan)
+                {
+                    self.capture_pending_workspace_history(
+                        operation_id,
+                        WorkspaceKey::new(profile_id.clone(), profile_generation),
+                        history_id,
+                        history_source,
+                        history_target,
+                    );
+                }
                 self.model.workspace_mut(workspace_key).pending_execute = Some(operation_id);
-                self.capture_pending_workspace_history(
-                    operation_id,
-                    WorkspaceKey::new(profile_id.clone(), profile_generation),
-                    history_source,
-                    history_target,
-                );
                 self.active_operations.insert(
                     profile_id,
                     ActiveOperation {
@@ -3372,7 +4180,13 @@ impl DbotterApp {
                         kind: operation_kind,
                     },
                 );
-                self.model.status = format!("Run all: executing {target_count} targets…");
+                self.model.status = if retention_local_only {
+                    format!(
+                        "Run all: executing {target_count} targets; private history remains Unsaved (read-only)."
+                    )
+                } else {
+                    format!("Run all: executing {target_count} targets…")
+                };
             }
             Err(error) => self.report_submit_error(error),
         }
@@ -3411,17 +4225,35 @@ impl DbotterApp {
             let _ = self.ensure_workspace_persistence_binding(&workspace_key, &profile);
         }
         let operation_id = self.model.next_operation();
+        let retention_plan = match self.prepare_workspace_history_reservation(
+            &workspace_key,
+            operation_id.0,
+            history_source.clone(),
+            history_target,
+        ) {
+            Ok(plan) => plan,
+            Err(failure) => {
+                self.report_retention_plan_failure(failure);
+                return false;
+            }
+        };
+        let retention_local_only = retention_plan.as_ref().is_some_and(|plan| plan.local_only);
         match self.port.try_submit(intent.into_ui_command(operation_id)) {
             Ok(()) => {
+                if let Some(plan) = retention_plan
+                    && let Some(history_id) = self.apply_workspace_retention_plan(plan)
+                {
+                    self.capture_pending_workspace_history(
+                        operation_id,
+                        workspace_key.clone(),
+                        history_id,
+                        history_source,
+                        history_target,
+                    );
+                }
                 self.model
                     .workspace_mut(workspace_key.clone())
                     .pending_execute = Some(operation_id);
-                self.capture_pending_workspace_history(
-                    operation_id,
-                    workspace_key,
-                    history_source,
-                    history_target,
-                );
                 self.active_operations.insert(
                     profile_id,
                     ActiveOperation {
@@ -3430,7 +4262,11 @@ impl DbotterApp {
                         kind: operation_kind,
                     },
                 );
-                self.model.status = "Executing…".to_owned();
+                self.model.status = if retention_local_only {
+                    "Executing… private history remains Unsaved (read-only).".to_owned()
+                } else {
+                    "Executing…".to_owned()
+                };
                 true
             }
             Err(error) => {
@@ -4163,6 +4999,20 @@ impl DbotterApp {
         let Some(confirmation) = self.delete_confirmation.as_ref() else {
             return;
         };
+        if self.retention_commit_barrier.is_pending_or_failed() {
+            self.model.status =
+                "Profile delete waits for the global private-history save barrier.".to_owned();
+            return;
+        }
+        if self.pending_workspace_history.values().any(|pending| {
+            pending.workspace_key.profile_id == confirmation.profile_id
+                && pending.workspace_key.profile_generation == confirmation.profile_generation
+        }) {
+            self.model.status =
+                "Profile delete waits for active execution history to settle; cancel or wait."
+                    .to_owned();
+            return;
+        }
         if self.model.active_generation(&confirmation.profile_id)
             != Some(confirmation.profile_generation)
         {
@@ -6799,6 +7649,12 @@ fn current_unix_time_ms() -> i64 {
     i64::try_from(milliseconds).unwrap_or(i64::MAX)
 }
 
+fn plan_workspace_snapshot_set(
+    snapshots: Vec<ProfileWorkspaceSnapshot>,
+) -> Result<WorkspaceSnapshotSet, WorkspaceRetentionError> {
+    WorkspaceSnapshotSet::new_with_retention(snapshots)
+}
+
 fn history_failure_status(
     summary: PublicSummary,
     connection_outcome: ConnectionFailureOutcome,
@@ -7403,8 +8259,10 @@ mod tests {
     };
     use crate::ui::redis_explorer::RedisExplorerIntent;
     use crate::workspace::{
-        MAX_HISTORY_ENTRIES_PER_PROFILE, WorkspaceHistoryEntry, WorkspaceHistoryStatus,
-        WorkspaceRunTarget, WorkspaceStoreMode, WorkspaceStoreWarning,
+        MAX_HISTORY_ENTRIES_PER_PROFILE, MAX_HISTORY_SOURCE_BYTES, MAX_PROFILE_SHARD_BYTES,
+        MAX_WORKSPACE_STORE_BYTES, WorkspaceHistoryEntry, WorkspaceHistoryStatus,
+        WorkspaceRetentionError, WorkspaceRetentionLimit, WorkspaceRunTarget, WorkspaceStoreMode,
+        WorkspaceStoreWarning, conservative_encoded_profile_bytes_for_test,
     };
     use eframe::egui::{self, Context, Event, Key, Modifiers, RawInput, accesskit};
 
@@ -7594,6 +8452,60 @@ mod tests {
             .expect("J2 fixture snapshot")
     }
 
+    fn byte_boundary_snapshot(
+        instance_byte: u8,
+        tunable_ascii_bytes: usize,
+        status: WorkspaceHistoryStatus,
+    ) -> crate::workspace::ProfileWorkspaceSnapshot {
+        const FULL_ESCAPE_ENTRIES: usize = 85;
+        const TUNABLE_NUL_BYTES: usize = 16 * 1024;
+        assert!(tunable_ascii_bytes <= MAX_HISTORY_SOURCE_BYTES.saturating_sub(TUNABLE_NUL_BYTES));
+        let full_escape_source = "\0".repeat(MAX_HISTORY_SOURCE_BYTES);
+        let mut history = (0..FULL_ESCAPE_ENTRIES)
+            .map(|index| {
+                WorkspaceHistoryEntry::new(
+                    u64::try_from(index + 1).expect("byte-boundary id"),
+                    &full_escape_source,
+                    WorkspaceRunTarget::Current,
+                    i64::try_from(index + 100).expect("byte-boundary timestamp"),
+                    status,
+                    1,
+                    0,
+                    0,
+                    false,
+                )
+                .expect("byte-boundary history")
+            })
+            .collect::<Vec<_>>();
+        let mut tunable = "\0".repeat(TUNABLE_NUL_BYTES);
+        tunable.push_str(&"x".repeat(tunable_ascii_bytes));
+        history.push(
+            WorkspaceHistoryEntry::new(
+                u64::try_from(FULL_ESCAPE_ENTRIES + 1).expect("tunable history id"),
+                &tunable,
+                WorkspaceRunTarget::Current,
+                i64::try_from(FULL_ESCAPE_ENTRIES + 100).expect("tunable timestamp"),
+                status,
+                1,
+                0,
+                0,
+                false,
+            )
+            .expect("tunable byte-boundary history"),
+        );
+        crate::workspace::ProfileWorkspaceSnapshot::new(
+            ProfileInstanceId::from_bytes([instance_byte; 16]),
+            ProfileId(format!("byte-boundary-{instance_byte:02x}")),
+            true,
+            Vec::new(),
+            None,
+            crate::workspace::WorkspaceGeometrySnapshot::new(320.0, 0.65, true)
+                .expect("byte-boundary geometry"),
+            history,
+        )
+        .expect("byte-boundary snapshot")
+    }
+
     fn command_modifiers(shift: bool) -> Modifiers {
         #[cfg(target_os = "macos")]
         {
@@ -7674,6 +8586,11 @@ mod tests {
         assert!(service.try_next_command().is_some());
         let profile = j2_classified_environment_profile();
         let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
         let original_tab = app
             .model
             .workspace_mut(key.clone())
@@ -7690,6 +8607,16 @@ mod tests {
         )
         .expect("read execution intent");
         app.submit_editor_intent(EditorIntent::Execute(intent));
+        let (provisional_commit, workspace_identity, provisional_revision) =
+            match service.try_next_command() {
+                Some(UiCommand::CommitWorkspace {
+                    operation_id,
+                    identity,
+                    revision,
+                    ..
+                }) => (operation_id, identity, revision),
+                command => panic!("J2 fixture must reserve private history, got {command:?}"),
+            };
         let operation_id = match service.try_next_command() {
             Some(UiCommand::Execute {
                 operation_id,
@@ -7715,6 +8642,30 @@ mod tests {
                 operation_id,
                 ResultId(731),
             ),
+        }));
+        app.poll_events();
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: provisional_commit,
+            identity: workspace_identity.clone(),
+            revision: provisional_revision,
+            generation: 1,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        let (terminal_commit, terminal_revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                revision,
+                ..
+            }) => (operation_id, revision),
+            command => panic!("J2 terminal history must be saved, got {command:?}"),
+        };
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: terminal_commit,
+            identity: workspace_identity,
+            revision: terminal_revision,
+            generation: 2,
+            warnings: Vec::new(),
         }));
         app.poll_events();
         {
@@ -9705,7 +10656,8 @@ mod tests {
         app.poll_events();
         assert!(app.workspace_persistence.get(&key).is_some_and(|state| {
             matches!(state.load, WorkspaceLoadPhase::Ready)
-                && state.dirty_since.is_some()
+                && matches!(state.save, WorkspaceSavePhase::Saving { .. })
+                && state.dirty_since.is_none()
                 && state.restore_baseline_revision.is_none()
         }));
         app.autosave_workspaces(Instant::now() + Duration::from_secs(2));
@@ -9902,13 +10854,17 @@ mod tests {
     }
 
     #[test]
-    fn history_cap_preserves_outcome_unknown_and_collision_search_is_bounded() {
+    fn all_outcome_unknown_history_refuses_a_new_persistent_run_without_mutation_or_dispatch() {
         let (ui_port, mut service) = bounded_ports(4);
         let mut app = DbotterApp::new(ui_port);
         assert!(service.try_next_command().is_some());
         let profile = j2_classified_environment_profile();
         let key = install_j2_profile(&mut app, &profile);
         assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Protected", "SELECT protected_history")
+            .expect("protected-history editor");
         let history = (1..=MAX_HISTORY_ENTRIES_PER_PROFILE)
             .map(|id| {
                 WorkspaceHistoryEntry::new(
@@ -9929,37 +10885,42 @@ mod tests {
             .workspace_mut(key.clone())
             .replace_persistence_history(history)
             .expect("bounded history");
-        for operation_id in [OperationId(9_000), OperationId(9_001)] {
-            app.model.workspace_mut(key.clone()).pending_execute = Some(operation_id);
-            app.pending_workspace_history.insert(
-                operation_id,
-                super::PendingWorkspaceHistory {
-                    workspace_key: key.clone(),
-                    source: "SELECT terminal_not_retained".to_owned(),
-                    target: WorkspaceRunTarget::Current,
-                    started_at: Instant::now(),
-                },
-            );
-            assert!(service.try_emit(UiEvent::ExecuteUnavailable {
-                operation_id,
-                profile_id: profile.id.clone(),
-                profile_generation: profile.generation,
-                summary: PublicSummary::InvalidInput,
-            }));
-            app.poll_events();
-            assert!(
-                app.model
-                    .status
-                    .contains("Outcome-unknown history was preserved"),
-                "every identical terminal notice must survive the normal model fold"
-            );
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
         }
+        let revision_before = app
+            .model
+            .workspace(&key)
+            .map_or(u64::MAX, ProfileWorkspace::revision);
+        let histories_before = app
+            .model
+            .workspace(&key)
+            .and_then(ProfileWorkspace::persistence)
+            .expect("retained history")
+            .history()
+            .to_vec();
+        let intent = build_execute_intent(
+            &profile,
+            app.model.workspace(&key).expect("protected workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("bounded read intent");
+
+        assert!(!app.submit_editor_execute(intent));
+        assert!(service.try_next_command().is_none());
         let retained = app
             .model
             .workspace(&key)
             .and_then(ProfileWorkspace::persistence)
             .expect("retained history")
             .history();
+        assert_eq!(retained, histories_before);
+        assert_eq!(
+            app.model.workspace(&key).map(ProfileWorkspace::revision),
+            Some(revision_before)
+        );
+        assert!(app.model.status.contains("outcome-unknown"));
         assert_eq!(retained.len(), MAX_HISTORY_ENTRIES_PER_PROFILE);
         assert!(
             retained
@@ -9994,6 +10955,1692 @@ mod tests {
         ];
         assert_eq!(super::next_workspace_history_id(&collisions, 42), Some(2));
         assert_eq!(super::next_workspace_history_id(&collisions, 99), Some(99));
+    }
+
+    #[test]
+    fn global_retention_enqueues_oldest_shrink_before_target_growth() {
+        let (ui_port, mut service) = bounded_ports(16);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let base = j2_classified_environment_profile();
+        let profiles = (0_u8..6)
+            .map(|index| {
+                let mut profile = base.clone();
+                let id = format!("retention-{index}");
+                profile.id = ProfileId(id.clone());
+                profile.name = id.clone();
+                profile.persisted.id = id.clone();
+                profile.persisted.name = id;
+                profile.persisted.safety = ProfileSafetyPosture::classified(
+                    ProfileEnvironment::Development,
+                    ProfileAccess::ReadWrite,
+                    ProfileInstanceId::from_bytes([index.saturating_add(1); 16]),
+                );
+                profile
+            })
+            .collect::<Vec<_>>();
+        app.model.profiles.clone_from(&profiles);
+        app.model.selected_profile = Some(profiles[5].id.clone());
+        app.model.config = ConfigPresentation::for_source(
+            ConfigSourceVersion::V3,
+            &PathBuf::from("/private/tmp/dbotter-j2-global-retention.toml"),
+        );
+        for profile in &profiles {
+            app.model
+                .active_generations
+                .insert(profile.id.clone(), profile.generation);
+            let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+            assert!(app.ensure_workspace_persistence_binding(&key, profile));
+            if let Some(state) = app.workspace_persistence.get_mut(&key) {
+                state.load = WorkspaceLoadPhase::Ready;
+                state.mode = Some(WorkspaceStoreMode::ReadWrite);
+            }
+        }
+        for (profile_index, profile) in profiles.iter().take(5).enumerate() {
+            let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+            let history = (1..=MAX_HISTORY_ENTRIES_PER_PROFILE)
+                .map(|id| {
+                    let timestamp = i64::try_from(
+                        profile_index
+                            .saturating_mul(MAX_HISTORY_ENTRIES_PER_PROFILE)
+                            .saturating_add(id),
+                    )
+                    .expect("bounded global timestamp");
+                    WorkspaceHistoryEntry::new(
+                        u64::try_from(id).expect("bounded global id"),
+                        "SELECT retained",
+                        WorkspaceRunTarget::Current,
+                        timestamp,
+                        WorkspaceHistoryStatus::Succeeded,
+                        1,
+                        1,
+                        0,
+                        false,
+                    )
+                    .expect("valid global history")
+                })
+                .collect::<Vec<_>>();
+            app.model
+                .workspace_mut(key)
+                .replace_persistence_history(history)
+                .expect("global history fixture");
+        }
+        let target_key = WorkspaceKey::new(profiles[5].id.clone(), profiles[5].generation);
+        app.model
+            .workspace_mut(target_key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Target", "SELECT global_retention")
+            .expect("global target editor");
+        let intent = build_execute_intent(
+            &profiles[5],
+            app.model.workspace(&target_key).expect("global target"),
+            EditorCursor::caret(0),
+        )
+        .expect("global execute intent");
+
+        assert!(app.submit_editor_execute(intent));
+        let oldest_instance = profiles[0]
+            .persisted
+            .safety
+            .instance_id()
+            .expect("oldest instance");
+        let target_instance = profiles[5]
+            .persisted
+            .safety
+            .instance_id()
+            .expect("target instance");
+        let mut committed_instances = Vec::new();
+        while app.retention_commit_barrier.is_active() {
+            let (operation_id, identity, revision, history) = match service.try_next_command() {
+                Some(UiCommand::CommitWorkspace {
+                    operation_id,
+                    identity,
+                    revision,
+                    snapshot,
+                }) => (
+                    operation_id,
+                    identity,
+                    revision,
+                    snapshot.history().to_vec(),
+                ),
+                command => panic!("retention barrier must own the workspace lane, got {command:?}"),
+            };
+            if committed_instances.is_empty() {
+                assert_eq!(identity.instance_id(), oldest_instance);
+                assert_eq!(history.len(), MAX_HISTORY_ENTRIES_PER_PROFILE - 1);
+                assert!(history.iter().all(|entry| entry.id() != 1));
+            }
+            committed_instances.push(identity.instance_id());
+            assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+                operation_id,
+                identity,
+                revision,
+                generation: 1,
+                warnings: Vec::new(),
+            }));
+            app.poll_events();
+        }
+        assert_eq!(committed_instances.first(), Some(&oldest_instance));
+        assert_eq!(committed_instances.last(), Some(&target_instance));
+        // The test port observes the workspace lane before the work lane. This
+        // proves store-barrier ordering only; it is not a pre-execution commit
+        // protocol and does not claim the runtime waited for commit acks.
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::Execute { .. })
+        ));
+        assert!(service.try_next_command().is_none());
+        let target_history = app
+            .model
+            .workspace(&target_key)
+            .and_then(ProfileWorkspace::persistence)
+            .expect("target persistence")
+            .history();
+        assert_eq!(target_history.len(), 1);
+        assert_eq!(
+            target_history[0].status(),
+            WorkspaceHistoryStatus::OutcomeUnknown
+        );
+    }
+
+    #[test]
+    fn failed_execute_submit_keeps_live_history_revision_and_barrier_unchanged() {
+        let (ui_port, mut service) = bounded_ports(1);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Busy", "SELECT must_not_reserve")
+            .expect("busy editor");
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
+        app.port
+            .try_submit(UiCommand::Execute {
+                operation_id: OperationId(999_999),
+                profile_id: profile.id.clone(),
+                profile_generation: profile.generation,
+                editor_tab_id: None,
+                language: QueryLanguage::Sql,
+                text: "SELECT fills_work_lane".to_owned(),
+                row_limit: 1,
+                timeout_ms: 1,
+            })
+            .expect("fill work lane");
+        let revision_before = app
+            .model
+            .workspace(&key)
+            .map_or(u64::MAX, ProfileWorkspace::revision);
+        let history_before = app
+            .model
+            .workspace(&key)
+            .and_then(ProfileWorkspace::persistence)
+            .expect("busy persistence")
+            .history()
+            .to_vec();
+        let intent = build_execute_intent(
+            &profile,
+            app.model.workspace(&key).expect("busy workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("busy execute intent");
+
+        assert!(!app.submit_editor_execute(intent));
+        assert_eq!(
+            app.model.workspace(&key).map(ProfileWorkspace::revision),
+            Some(revision_before)
+        );
+        assert_eq!(
+            app.model
+                .workspace(&key)
+                .and_then(ProfileWorkspace::persistence)
+                .expect("unchanged busy persistence")
+                .history(),
+            history_before
+        );
+        assert!(!app.retention_commit_barrier.is_pending_or_failed());
+        assert!(app.pending_workspace_history.is_empty());
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::Execute {
+                operation_id: OperationId(999_999),
+                ..
+            })
+        ));
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn terminal_replaces_the_reserved_history_id_before_or_after_provisional_ack() {
+        for terminal_before_ack in [false, true] {
+            let (ui_port, mut service) = bounded_ports(8);
+            let mut app = DbotterApp::new(ui_port);
+            assert!(service.try_next_command().is_some());
+            let profile = j2_classified_environment_profile();
+            let key = install_j2_profile(&mut app, &profile);
+            assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+            let editor_tab_id = app
+                .model
+                .workspace_mut(key.clone())
+                .create_editor_tab(QueryLanguage::Sql, "Same ID", "SELECT same_history_id")
+                .expect("same-id editor");
+            if let Some(state) = app.workspace_persistence.get_mut(&key) {
+                state.load = WorkspaceLoadPhase::Ready;
+                state.mode = Some(WorkspaceStoreMode::ReadWrite);
+            }
+            let intent = build_execute_intent(
+                &profile,
+                app.model.workspace(&key).expect("same-id workspace"),
+                EditorCursor::caret(0),
+            )
+            .expect("same-id execute intent");
+            assert!(app.submit_editor_execute(intent));
+            let (provisional_commit, identity, provisional_revision) =
+                match service.try_next_command() {
+                    Some(UiCommand::CommitWorkspace {
+                        operation_id,
+                        identity,
+                        revision,
+                        snapshot,
+                    }) => {
+                        assert_eq!(snapshot.history().len(), 1);
+                        assert_eq!(
+                            snapshot.history()[0].status(),
+                            WorkspaceHistoryStatus::OutcomeUnknown
+                        );
+                        (operation_id, identity, revision)
+                    }
+                    command => panic!("expected provisional commit, got {command:?}"),
+                };
+            let operation_id = match service.try_next_command() {
+                Some(UiCommand::Execute { operation_id, .. }) => operation_id,
+                command => panic!("expected accepted execute, got {command:?}"),
+            };
+            let reserved_id = app
+                .model
+                .workspace(&key)
+                .and_then(ProfileWorkspace::persistence)
+                .expect("provisional history")
+                .history()[0]
+                .id();
+            assert_eq!(reserved_id, operation_id.0);
+            let terminal = UiEvent::QueryFinished {
+                operation_id,
+                profile_id: profile.id.clone(),
+                profile_generation: profile.generation,
+                editor_tab_id: Some(editor_tab_id),
+                session_generation: SessionGeneration(7),
+                result: result_snapshot_for_operation(
+                    &profile,
+                    "same-id-result",
+                    operation_id,
+                    ResultId(8_001 + u64::from(terminal_before_ack)),
+                ),
+            };
+
+            if terminal_before_ack {
+                assert!(service.try_emit(terminal.clone()));
+                app.poll_events();
+                let history = app
+                    .model
+                    .workspace(&key)
+                    .and_then(ProfileWorkspace::persistence)
+                    .expect("terminal-before history")
+                    .history();
+                assert_eq!(history.len(), 1);
+                assert_eq!(history[0].id(), reserved_id);
+                assert_eq!(history[0].status(), WorkspaceHistoryStatus::Succeeded);
+                assert!(service.try_next_command().is_none());
+            }
+            assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+                operation_id: provisional_commit,
+                identity: identity.clone(),
+                revision: provisional_revision,
+                generation: 1,
+                warnings: Vec::new(),
+            }));
+            app.poll_events();
+            if terminal_before_ack {
+                assert!(
+                    app.model
+                        .workspace(&key)
+                        .is_some_and(|workspace| !workspace.is_saved()),
+                    "an older provisional ack must never mark a newer terminal revision Saved"
+                );
+                assert!(app.workspace_persistence.get(&key).is_some_and(|state| {
+                    matches!(state.save, WorkspaceSavePhase::Saving { .. })
+                }));
+            }
+
+            if !terminal_before_ack {
+                let provisional = app
+                    .model
+                    .workspace(&key)
+                    .and_then(ProfileWorkspace::persistence)
+                    .expect("acked provisional history")
+                    .history();
+                assert_eq!(provisional.len(), 1);
+                assert_eq!(provisional[0].id(), reserved_id);
+                assert_eq!(
+                    provisional[0].status(),
+                    WorkspaceHistoryStatus::OutcomeUnknown
+                );
+                assert!(service.try_emit(terminal));
+                app.poll_events();
+            }
+            let (terminal_commit, terminal_revision) = match service.try_next_command() {
+                Some(UiCommand::CommitWorkspace {
+                    operation_id,
+                    revision,
+                    snapshot,
+                    ..
+                }) => {
+                    assert_eq!(snapshot.history().len(), 1);
+                    assert_eq!(snapshot.history()[0].id(), reserved_id);
+                    assert_eq!(
+                        snapshot.history()[0].status(),
+                        WorkspaceHistoryStatus::Succeeded
+                    );
+                    (operation_id, revision)
+                }
+                command => panic!("expected same-id terminal commit, got {command:?}"),
+            };
+            assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+                operation_id: terminal_commit,
+                identity,
+                revision: terminal_revision,
+                generation: 2,
+                warnings: Vec::new(),
+            }));
+            app.poll_events();
+            assert!(!app.retention_commit_barrier.is_pending_or_failed());
+            assert!(
+                app.model
+                    .workspace(&key)
+                    .is_some_and(ProfileWorkspace::is_saved)
+            );
+            let history = app
+                .model
+                .workspace(&key)
+                .and_then(ProfileWorkspace::persistence)
+                .expect("durable same-id history")
+                .history();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].id(), reserved_id);
+            assert_eq!(history[0].status(), WorkspaceHistoryStatus::Succeeded);
+            assert!(service.try_next_command().is_none());
+        }
+    }
+
+    #[test]
+    fn persistent_single_and_batch_keep_pending_cancel_and_terminal_correlation() {
+        {
+            let (ui_port, mut service) = bounded_ports(8);
+            let mut app = DbotterApp::new(ui_port);
+            assert!(service.try_next_command().is_some());
+            let profile = j2_classified_environment_profile();
+            let key = install_j2_profile(&mut app, &profile);
+            assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+            let editor_tab_id = app
+                .model
+                .workspace_mut(key.clone())
+                .create_editor_tab(QueryLanguage::Sql, "Pending", "SELECT pending_single")
+                .expect("persistent single editor");
+            if let Some(state) = app.workspace_persistence.get_mut(&key) {
+                state.load = WorkspaceLoadPhase::Ready;
+                state.mode = Some(WorkspaceStoreMode::ReadWrite);
+            }
+            let intent = build_execute_intent(
+                &profile,
+                app.model
+                    .workspace(&key)
+                    .expect("persistent single workspace"),
+                EditorCursor::caret(0),
+            )
+            .expect("persistent single intent");
+            assert!(app.submit_editor_execute(intent));
+            let pending = app
+                .model
+                .workspace(&key)
+                .and_then(|workspace| workspace.pending_execute)
+                .expect("persistent single pending");
+            assert!(matches!(
+                service.try_next_command(),
+                Some(UiCommand::CommitWorkspace { .. })
+            ));
+            assert!(matches!(
+                service.try_next_command(),
+                Some(UiCommand::Execute { operation_id, .. }) if operation_id == pending
+            ));
+            app.submit_editor_intent(EditorIntent::Cancel {
+                operation_id: pending,
+            });
+            assert!(matches!(
+                service.try_next_command(),
+                Some(UiCommand::CancelOperation { operation_id }) if operation_id == pending
+            ));
+            assert_eq!(
+                app.model
+                    .workspace(&key)
+                    .and_then(|workspace| workspace.pending_execute),
+                Some(pending)
+            );
+            assert!(service.try_emit(UiEvent::QueryFinished {
+                operation_id: pending,
+                profile_id: profile.id.clone(),
+                profile_generation: profile.generation,
+                editor_tab_id: Some(editor_tab_id),
+                session_generation: SessionGeneration(11),
+                result: result_snapshot_for_operation(
+                    &profile,
+                    "persistent-single-result",
+                    pending,
+                    ResultId(8_201),
+                ),
+            }));
+            app.poll_events();
+            let workspace = app
+                .model
+                .workspace(&key)
+                .expect("single terminal workspace");
+            assert!(workspace.pending_execute.is_none());
+            assert_eq!(
+                workspace
+                    .result_tabs()
+                    .last()
+                    .map(|tab| tab.snapshot().provenance.operation_id),
+                Some(pending)
+            );
+            let history = workspace
+                .persistence()
+                .expect("single terminal history")
+                .history();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].id(), pending.0);
+            assert_eq!(history[0].status(), WorkspaceHistoryStatus::Succeeded);
+        }
+
+        {
+            let (ui_port, mut service) = bounded_ports(8);
+            let mut app = DbotterApp::new(ui_port);
+            assert!(service.try_next_command().is_some());
+            let profile = j2_classified_environment_profile();
+            let key = install_j2_profile(&mut app, &profile);
+            assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+            let editor_tab_id = app
+                .model
+                .workspace_mut(key.clone())
+                .create_editor_tab(QueryLanguage::Sql, "Pending batch", "SELECT 1;\nSELECT 2;")
+                .expect("persistent batch editor");
+            if let Some(state) = app.workspace_persistence.get_mut(&key) {
+                state.load = WorkspaceLoadPhase::Ready;
+                state.mode = Some(WorkspaceStoreMode::ReadWrite);
+            }
+            let intent = build_execute_all_intent(
+                &profile,
+                app.model
+                    .workspace(&key)
+                    .expect("persistent batch workspace"),
+            )
+            .expect("persistent batch intent");
+            app.submit_editor_batch(intent);
+            let pending = app
+                .model
+                .workspace(&key)
+                .and_then(|workspace| workspace.pending_execute)
+                .expect("persistent batch pending");
+            assert!(matches!(
+                service.try_next_command(),
+                Some(UiCommand::CommitWorkspace { .. })
+            ));
+            assert!(matches!(
+                service.try_next_command(),
+                Some(UiCommand::ExecuteBatch { operation_id, .. }) if operation_id == pending
+            ));
+            app.submit_editor_intent(EditorIntent::Cancel {
+                operation_id: pending,
+            });
+            assert!(matches!(
+                service.try_next_command(),
+                Some(UiCommand::CancelOperation { operation_id }) if operation_id == pending
+            ));
+            assert_eq!(
+                app.model
+                    .workspace(&key)
+                    .and_then(|workspace| workspace.pending_execute),
+                Some(pending)
+            );
+            assert!(service.try_emit(UiEvent::QueryBatchFinished {
+                operation_id: pending,
+                profile_id: profile.id.clone(),
+                profile_generation: profile.generation,
+                editor_tab_id: Some(editor_tab_id),
+                session_generation: SessionGeneration(12),
+                target_count: 2,
+                completed_targets: 2,
+                discarded_results: 0,
+                results: vec![
+                    result_snapshot_for_operation(
+                        &profile,
+                        "persistent-batch-one",
+                        pending,
+                        ResultId(8_202),
+                    ),
+                    result_snapshot_for_operation(
+                        &profile,
+                        "persistent-batch-two",
+                        pending,
+                        ResultId(8_203),
+                    ),
+                ],
+                error: None,
+                session_disposition: SessionDisposition::Keep,
+            }));
+            app.poll_events();
+            let workspace = app.model.workspace(&key).expect("batch terminal workspace");
+            assert!(workspace.pending_execute.is_none());
+            assert_eq!(workspace.result_tabs().len(), 2);
+            assert!(workspace.result_tabs().iter().all(|tab| {
+                tab.snapshot().provenance.operation_id == pending
+                    && tab.origin_editor_tab_id() == Some(editor_tab_id)
+            }));
+            let history = workspace
+                .persistence()
+                .expect("batch terminal history")
+                .history();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].id(), pending.0);
+            assert_eq!(history[0].status(), WorkspaceHistoryStatus::Succeeded);
+        }
+    }
+
+    #[test]
+    fn superseded_retention_ack_never_marks_saved_and_close_retry_replans() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(
+                QueryLanguage::Sql,
+                "Superseded",
+                "SELECT superseded_history",
+            )
+            .expect("superseded editor");
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
+        let intent = build_execute_intent(
+            &profile,
+            app.model.workspace(&key).expect("superseded workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("superseded execute");
+        assert!(app.submit_editor_execute(intent));
+        let (old_operation, identity, old_revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                ..
+            }) => (operation_id, identity, revision),
+            command => panic!("expected provisional save, got {command:?}"),
+        };
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::Execute { .. })
+        ));
+        assert!(service.try_emit(UiEvent::WorkspaceCommitSuperseded {
+            operation_id: old_operation,
+            identity: identity.clone(),
+            revision: old_revision,
+            superseded_by: OperationId(99_001),
+            superseded_by_revision: old_revision.saturating_add(1),
+        }));
+        app.poll_events();
+        assert!(app.retention_commit_barrier.failure.is_some());
+        assert!(app.has_uncommitted_workspace());
+        assert!(app.has_workspace_save_failure());
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(|workspace| !workspace.is_saved())
+        );
+
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: old_operation,
+            identity: identity.clone(),
+            revision: old_revision,
+            generation: 1,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(app.retention_commit_barrier.failure.is_some());
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(|workspace| !workspace.is_saved()),
+            "a late superseded ack must not bypass the barrier"
+        );
+
+        app.flush_all_dirty_workspaces();
+        let (retry_operation, retry_revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                revision,
+                snapshot,
+                ..
+            }) => {
+                assert_eq!(snapshot.history().len(), 1);
+                assert_eq!(
+                    snapshot.history()[0].status(),
+                    WorkspaceHistoryStatus::OutcomeUnknown
+                );
+                (operation_id, revision)
+            }
+            command => panic!("close retry must replan the live bounded set, got {command:?}"),
+        };
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: retry_operation,
+            identity,
+            revision: retry_revision,
+            generation: 2,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(!app.retention_commit_barrier.is_pending_or_failed());
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(ProfileWorkspace::is_saved)
+        );
+    }
+
+    #[test]
+    fn busy_retention_lane_keeps_live_provisional_and_autosave_resumes() {
+        let (ui_port, mut service) = bounded_ports(1);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Busy store", "SELECT busy_store")
+            .expect("busy-store editor");
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
+        let (identity, revision) = app
+            .workspace_persistence
+            .get(&key)
+            .zip(app.model.workspace(&key))
+            .map(|(state, workspace)| (state.identity.clone(), workspace.revision()))
+            .expect("busy-store binding");
+        app.port
+            .try_submit(UiCommand::LoadWorkspace {
+                operation_id: OperationId(88_001),
+                identity,
+                base_revision: revision,
+            })
+            .expect("fill workspace lane");
+        let intent = build_execute_intent(
+            &profile,
+            app.model.workspace(&key).expect("busy-store workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("busy-store execute");
+
+        assert!(app.submit_editor_execute(intent));
+        assert!(matches!(
+            app.retention_commit_barrier.failure,
+            Some(super::RetentionBarrierFailure::Submit(
+                crate::ui::SubmitError::Busy
+            ))
+        ));
+        assert!(app.has_uncommitted_workspace());
+        assert!(app.has_workspace_save_failure());
+        let history = app
+            .model
+            .workspace(&key)
+            .and_then(ProfileWorkspace::persistence)
+            .expect("busy provisional")
+            .history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status(), WorkspaceHistoryStatus::OutcomeUnknown);
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::LoadWorkspace {
+                operation_id: OperationId(88_001),
+                ..
+            })
+        ));
+
+        app.autosave_workspaces(Instant::now() + Duration::from_secs(1));
+        let (commit_operation, identity, commit_revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                ..
+            }) => (operation_id, identity, revision),
+            command => panic!("autosave must resume the Busy barrier, got {command:?}"),
+        };
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::Execute { .. })
+        ));
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: commit_operation,
+            identity,
+            revision: commit_revision,
+            generation: 1,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(!app.retention_commit_barrier.is_pending_or_failed());
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(ProfileWorkspace::is_saved)
+        );
+    }
+
+    #[test]
+    fn read_only_history_stays_bounded_unsaved_and_does_not_block_later_queries() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        let editor_tab_id = app
+            .model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Read only", "SELECT read_only_history")
+            .expect("read-only editor");
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadOnly);
+        }
+        let first_intent = build_execute_intent(
+            &profile,
+            app.model.workspace(&key).expect("read-only workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("first read-only intent");
+        assert!(app.submit_editor_execute(first_intent));
+        assert!(app.model.status.contains("Unsaved"));
+        let first_operation = match service.try_next_command() {
+            Some(UiCommand::Execute { operation_id, .. }) => operation_id,
+            command => panic!("read-only execution must not enqueue a store write: {command:?}"),
+        };
+        assert!(service.try_next_command().is_none());
+        assert!(service.try_emit(UiEvent::QueryFinished {
+            operation_id: first_operation,
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            editor_tab_id: Some(editor_tab_id),
+            session_generation: SessionGeneration(9),
+            result: result_snapshot_for_operation(
+                &profile,
+                "read-only-result",
+                first_operation,
+                ResultId(8_101),
+            ),
+        }));
+        app.poll_events();
+        assert!(app.model.status.contains("Unsaved"));
+        assert!(!app.retention_commit_barrier.is_pending_or_failed());
+        let first_history_id = {
+            let history = app
+                .model
+                .workspace(&key)
+                .and_then(ProfileWorkspace::persistence)
+                .expect("read-only history")
+                .history();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].status(), WorkspaceHistoryStatus::Succeeded);
+            history[0].id()
+        };
+        assert!(app.has_uncommitted_workspace());
+        assert!(app.has_workspace_save_failure());
+
+        let second_intent = build_execute_intent(
+            &profile,
+            app.model
+                .workspace(&key)
+                .expect("later read-only workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("later read-only intent");
+        assert!(app.submit_editor_execute(second_intent));
+        let second_operation = match service.try_next_command() {
+            Some(UiCommand::Execute { operation_id, .. }) => operation_id,
+            command => panic!("later read-only execution must remain available: {command:?}"),
+        };
+        assert_ne!(second_operation.0, first_history_id);
+        let history = app
+            .model
+            .workspace(&key)
+            .and_then(ProfileWorkspace::persistence)
+            .expect("later read-only history")
+            .history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].id(), first_history_id);
+        assert_eq!(history[0].status(), WorkspaceHistoryStatus::Succeeded);
+        assert_eq!(history[1].id(), second_operation.0);
+        assert_eq!(history[1].status(), WorkspaceHistoryStatus::OutcomeUnknown);
+        assert!(app.model.status.contains("Unsaved"));
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn startup_restore_reconciles_global_retention_without_database_dispatch() {
+        let (ui_port, mut service) = bounded_ports(16);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let base = j2_classified_environment_profile();
+        let profiles = (0_u8..6)
+            .map(|index| {
+                let mut profile = base.clone();
+                let id = format!("startup-retention-{index}");
+                profile.id = ProfileId(id.clone());
+                profile.name = id.clone();
+                profile.persisted.id = id.clone();
+                profile.persisted.name = id;
+                profile.persisted.safety = ProfileSafetyPosture::classified(
+                    ProfileEnvironment::Development,
+                    ProfileAccess::ReadWrite,
+                    ProfileInstanceId::from_bytes([index.saturating_add(17); 16]),
+                );
+                profile
+            })
+            .collect::<Vec<_>>();
+        app.model.profiles.clone_from(&profiles);
+        app.model.selected_profile = Some(profiles[0].id.clone());
+        app.model.config = ConfigPresentation::for_source(
+            ConfigSourceVersion::V3,
+            &PathBuf::from("/private/tmp/dbotter-j2-startup-retention.toml"),
+        );
+        let mut snapshots = HashMap::new();
+        for (profile_index, profile) in profiles.iter().enumerate() {
+            app.model
+                .active_generations
+                .insert(profile.id.clone(), profile.generation);
+            let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+            assert!(app.ensure_workspace_persistence_binding(&key, profile));
+            let history_count = if profile_index < 5 {
+                MAX_HISTORY_ENTRIES_PER_PROFILE
+            } else {
+                1
+            };
+            let history = (1..=history_count)
+                .map(|id| {
+                    let timestamp = i64::try_from(
+                        profile_index
+                            .saturating_mul(MAX_HISTORY_ENTRIES_PER_PROFILE)
+                            .saturating_add(id),
+                    )
+                    .expect("startup timestamp");
+                    WorkspaceHistoryEntry::new(
+                        u64::try_from(id).expect("startup history id"),
+                        "SELECT startup_retained",
+                        WorkspaceRunTarget::Current,
+                        timestamp,
+                        WorkspaceHistoryStatus::Succeeded,
+                        1,
+                        1,
+                        0,
+                        false,
+                    )
+                    .expect("startup history")
+                })
+                .collect::<Vec<_>>();
+            let persistence = super::ProfileWorkspacePersistence::for_classified_profile(
+                &profile.persisted,
+                true,
+                crate::workspace::WorkspaceGeometrySnapshot::new(320.0, 0.65, true)
+                    .expect("startup geometry"),
+                history,
+            )
+            .expect("startup persistence");
+            let mut restored = ProfileWorkspace::default();
+            restored
+                .bind_persistence(persistence)
+                .expect("startup bind");
+            snapshots.insert(
+                profile
+                    .persisted
+                    .safety
+                    .instance_id()
+                    .expect("startup instance"),
+                Box::new(
+                    restored
+                        .to_persistence_snapshot()
+                        .expect("startup snapshot"),
+                ),
+            );
+            app.request_workspace_load(&key);
+        }
+        let mut loads = Vec::new();
+        for _ in &profiles {
+            match service.try_next_command() {
+                Some(UiCommand::LoadWorkspace {
+                    operation_id,
+                    identity,
+                    base_revision,
+                }) => loads.push((operation_id, identity, base_revision)),
+                command => panic!("startup must only request restores, got {command:?}"),
+            }
+        }
+        assert!(service.try_next_command().is_none());
+        for (operation_id, identity, base_revision) in loads {
+            let snapshot = snapshots
+                .remove(&identity.instance_id())
+                .expect("exact startup snapshot");
+            assert!(service.try_emit(UiEvent::WorkspaceLoaded {
+                operation_id,
+                identity,
+                base_revision,
+                mode: WorkspaceStoreMode::ReadWrite,
+                read_only_reason: None,
+                snapshot: Some(snapshot),
+            }));
+            app.poll_events();
+        }
+        let oldest_instance = profiles[0]
+            .persisted
+            .safety
+            .instance_id()
+            .expect("oldest startup instance");
+        let (commit_operation, identity, revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                snapshot,
+            }) => {
+                assert_eq!(identity.instance_id(), oldest_instance);
+                assert_eq!(
+                    snapshot.history().len(),
+                    MAX_HISTORY_ENTRIES_PER_PROFILE - 1
+                );
+                assert!(snapshot.history().iter().all(|entry| entry.id() != 1));
+                (operation_id, identity, revision)
+            }
+            command => panic!("startup reconciliation must submit one shrink, got {command:?}"),
+        };
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: commit_operation,
+            identity,
+            revision,
+            generation: 1,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(!app.retention_commit_barrier.is_pending_or_failed());
+        assert!(service.try_next_command().is_none());
+        assert!(app.active_operations.is_empty());
+        assert!(app.pending_workspace_history.is_empty());
+    }
+
+    #[test]
+    fn app_planner_uses_exact_production_shard_and_store_byte_boundaries() {
+        const TUNABLE_CAPACITY: usize = MAX_HISTORY_SOURCE_BYTES - 16 * 1024;
+
+        let find_shard_exact = |instance_byte, status| {
+            let size = |ascii_bytes| {
+                conservative_encoded_profile_bytes_for_test(&byte_boundary_snapshot(
+                    instance_byte,
+                    ascii_bytes,
+                    status,
+                ))
+                .expect("conservative shard bytes")
+                .0
+            };
+            let base = size(0);
+            let fits = usize::try_from(
+                (MAX_PROFILE_SHARD_BYTES as u64)
+                    .checked_sub(base)
+                    .expect("base fixture fits the shard limit"),
+            )
+            .expect("shard byte delta fits usize");
+            let over = fits.saturating_add(1);
+            assert!(over <= TUNABLE_CAPACITY);
+            assert_eq!(size(fits), MAX_PROFILE_SHARD_BYTES as u64);
+            assert_eq!(size(over), MAX_PROFILE_SHARD_BYTES as u64 + 1);
+            (fits, over)
+        };
+
+        let (terminal_exact_bytes, terminal_plus_one_bytes) =
+            find_shard_exact(0x70, WorkspaceHistoryStatus::Succeeded);
+        let terminal_exact = byte_boundary_snapshot(
+            0x70,
+            terminal_exact_bytes,
+            WorkspaceHistoryStatus::Succeeded,
+        );
+        let terminal_plus_one = byte_boundary_snapshot(
+            0x70,
+            terminal_plus_one_bytes,
+            WorkspaceHistoryStatus::Succeeded,
+        );
+        let exact_plan = super::plan_workspace_snapshot_set(vec![terminal_exact.clone()])
+            .expect("exact 32 MiB app planner input");
+        assert_eq!(exact_plan.history_evicted(), 0);
+        let plus_one_plan = super::plan_workspace_snapshot_set(vec![terminal_plus_one])
+            .expect("32 MiB plus-one terminal is normalized");
+        assert_eq!(plus_one_plan.history_evicted(), 1);
+        assert_eq!(plus_one_plan.history_evictions()[0].history_id(), 1);
+        assert_eq!(
+            plus_one_plan.history_evictions()[0].instance_id(),
+            terminal_exact.instance_id()
+        );
+
+        let (unknown_exact_bytes, unknown_plus_one_bytes) =
+            find_shard_exact(0x71, WorkspaceHistoryStatus::OutcomeUnknown);
+        let unknown_plus_one = byte_boundary_snapshot(
+            0x71,
+            unknown_plus_one_bytes,
+            WorkspaceHistoryStatus::OutcomeUnknown,
+        );
+        assert!(matches!(
+            super::plan_workspace_snapshot_set(vec![unknown_plus_one.clone()]),
+            Err(WorkspaceRetentionError::RetentionExhausted(
+                WorkspaceRetentionLimit::ProfileShardBytes
+            ))
+        ));
+
+        let shard_exact_profiles = (0x72_u8..=0x74)
+            .map(|instance_byte| {
+                byte_boundary_snapshot(
+                    instance_byte,
+                    terminal_exact_bytes,
+                    WorkspaceHistoryStatus::Succeeded,
+                )
+            })
+            .collect::<Vec<_>>();
+        let prefix_committed = shard_exact_profiles.iter().fold(0_u64, |total, snapshot| {
+            total.saturating_add(
+                conservative_encoded_profile_bytes_for_test(snapshot)
+                    .expect("terminal prefix bytes")
+                    .1,
+            )
+        });
+        let total_size = |ascii_bytes| {
+            prefix_committed.saturating_add(
+                conservative_encoded_profile_bytes_for_test(&byte_boundary_snapshot(
+                    0x75,
+                    ascii_bytes,
+                    WorkspaceHistoryStatus::Succeeded,
+                ))
+                .expect("terminal total bytes")
+                .1,
+            )
+        };
+        let total_base = total_size(0);
+        let total_fits = usize::try_from(
+            MAX_WORKSPACE_STORE_BYTES
+                .checked_sub(total_base)
+                .expect("base fixture fits the total-store limit"),
+        )
+        .expect("total-store byte delta fits usize");
+        let total_over = total_fits.saturating_add(1);
+        assert!(total_over <= TUNABLE_CAPACITY);
+        assert_eq!(total_size(total_fits), MAX_WORKSPACE_STORE_BYTES);
+        assert_eq!(total_size(total_over), MAX_WORKSPACE_STORE_BYTES + 1);
+        let mut total_exact = shard_exact_profiles.clone();
+        total_exact.push(byte_boundary_snapshot(
+            0x75,
+            total_fits,
+            WorkspaceHistoryStatus::Succeeded,
+        ));
+        assert_eq!(
+            super::plan_workspace_snapshot_set(total_exact)
+                .expect("exact 128 MiB app planner input")
+                .history_evicted(),
+            0
+        );
+        let mut total_plus_one = shard_exact_profiles;
+        total_plus_one.push(byte_boundary_snapshot(
+            0x75,
+            total_over,
+            WorkspaceHistoryStatus::Succeeded,
+        ));
+        let total_plan = super::plan_workspace_snapshot_set(total_plus_one)
+            .expect("128 MiB plus-one terminal is normalized");
+        assert_eq!(total_plan.history_evicted(), 1);
+        assert_eq!(
+            total_plan.history_evictions()[0].instance_id(),
+            ProfileInstanceId::from_bytes([0x72; 16])
+        );
+        assert_eq!(total_plan.history_evictions()[0].history_id(), 1);
+
+        let unknown_shard_exact_profiles = (0x76_u8..=0x78)
+            .map(|instance_byte| {
+                byte_boundary_snapshot(
+                    instance_byte,
+                    unknown_exact_bytes,
+                    WorkspaceHistoryStatus::OutcomeUnknown,
+                )
+            })
+            .collect::<Vec<_>>();
+        let unknown_prefix = unknown_shard_exact_profiles
+            .iter()
+            .fold(0_u64, |total, snapshot| {
+                total.saturating_add(
+                    conservative_encoded_profile_bytes_for_test(snapshot)
+                        .expect("unknown prefix bytes")
+                        .1,
+                )
+            });
+        let unknown_total_size = |ascii_bytes| {
+            unknown_prefix.saturating_add(
+                conservative_encoded_profile_bytes_for_test(&byte_boundary_snapshot(
+                    0x79,
+                    ascii_bytes,
+                    WorkspaceHistoryStatus::OutcomeUnknown,
+                ))
+                .expect("unknown total bytes")
+                .1,
+            )
+        };
+        let unknown_total_base = unknown_total_size(0);
+        let unknown_total_fits = usize::try_from(
+            MAX_WORKSPACE_STORE_BYTES
+                .checked_sub(unknown_total_base)
+                .expect("unknown base fixture fits the total-store limit"),
+        )
+        .expect("unknown total-store byte delta fits usize");
+        let unknown_total_over = unknown_total_fits.saturating_add(1);
+        assert!(unknown_total_over <= TUNABLE_CAPACITY);
+        assert_eq!(
+            unknown_total_size(unknown_total_fits),
+            MAX_WORKSPACE_STORE_BYTES
+        );
+        assert_eq!(
+            unknown_total_size(unknown_total_over),
+            MAX_WORKSPACE_STORE_BYTES + 1
+        );
+        let mut unknown_total_plus_one = unknown_shard_exact_profiles;
+        unknown_total_plus_one.push(byte_boundary_snapshot(
+            0x79,
+            unknown_total_over,
+            WorkspaceHistoryStatus::OutcomeUnknown,
+        ));
+        assert!(matches!(
+            super::plan_workspace_snapshot_set(unknown_total_plus_one),
+            Err(WorkspaceRetentionError::RetentionExhausted(
+                WorkspaceRetentionLimit::TotalStoreBytes
+            ))
+        ));
+
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let mut profile = j2_classified_environment_profile();
+        profile.id = unknown_plus_one.profile_id().clone();
+        profile.name = profile.id.0.clone();
+        profile.persisted.id = profile.id.0.clone();
+        profile.persisted.name = profile.name.clone();
+        profile.persisted.safety = ProfileSafetyPosture::classified(
+            ProfileEnvironment::Development,
+            ProfileAccess::ReadWrite,
+            unknown_plus_one.instance_id(),
+        );
+        let key = install_j2_profile(&mut app, &profile);
+        app.model.workspaces.insert(
+            key.clone(),
+            ProfileWorkspace::from_persistence_snapshot(unknown_plus_one)
+                .expect("unknown plus-one live workspace"),
+        );
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(
+                QueryLanguage::Sql,
+                "Protected bytes",
+                "SELECT protected_bytes",
+            )
+            .expect("protected-byte editor");
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
+        let revision_before = app
+            .model
+            .workspace(&key)
+            .map_or(u64::MAX, ProfileWorkspace::revision);
+        let history_before = app
+            .model
+            .workspace(&key)
+            .and_then(ProfileWorkspace::persistence)
+            .expect("protected-byte history")
+            .history()
+            .to_vec();
+        let intent = build_execute_intent(
+            &profile,
+            app.model.workspace(&key).expect("protected-byte workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("protected-byte execute intent");
+        assert!(!app.submit_editor_execute(intent));
+        assert!(service.try_next_command().is_none());
+        assert_eq!(
+            app.model.workspace(&key).map(ProfileWorkspace::revision),
+            Some(revision_before)
+        );
+        assert_eq!(
+            app.model
+                .workspace(&key)
+                .and_then(ProfileWorkspace::persistence)
+                .expect("unchanged protected-byte history")
+                .history(),
+            history_before
+        );
+        assert!(app.model.status.contains("outcome-unknown"));
+    }
+
+    #[test]
+    fn private_source_boundary_is_retained_then_omitted_and_debug_stays_redacted() {
+        for (case, source_bytes, source_omitted) in [
+            ("exact", MAX_HISTORY_SOURCE_BYTES, false),
+            ("plus-one", MAX_HISTORY_SOURCE_BYTES.saturating_add(1), true),
+        ] {
+            let (ui_port, mut service) = bounded_ports(8);
+            let mut app = DbotterApp::new(ui_port);
+            assert!(service.try_next_command().is_some());
+            let profile = j2_classified_environment_profile();
+            let key = install_j2_profile(&mut app, &profile);
+            assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+            let marker = format!("j2-private-{case}-marker");
+            let mut source = marker.clone();
+            source.push_str(&"x".repeat(source_bytes.saturating_sub(source.len())));
+            assert_eq!(source.len(), source_bytes);
+            app.model
+                .workspace_mut(key.clone())
+                .create_editor_tab(QueryLanguage::Sql, "Private boundary", source.clone())
+                .expect("private boundary editor");
+            if let Some(state) = app.workspace_persistence.get_mut(&key) {
+                state.load = WorkspaceLoadPhase::Ready;
+                state.mode = Some(WorkspaceStoreMode::ReadWrite);
+            }
+            let intent = build_execute_intent(
+                &profile,
+                app.model
+                    .workspace(&key)
+                    .expect("private boundary workspace"),
+                EditorCursor::caret(0),
+            )
+            .expect("private boundary execute intent");
+            assert!(app.submit_editor_execute(intent));
+            let commit = service
+                .try_next_command()
+                .expect("private boundary provisional commit");
+            let snapshot_debug = match &commit {
+                UiCommand::CommitWorkspace { snapshot, .. } => {
+                    assert_eq!(snapshot.history().len(), 1);
+                    assert_eq!(snapshot.history()[0].source_omitted(), source_omitted);
+                    if source_omitted {
+                        assert!(snapshot.history()[0].source().is_none());
+                    } else {
+                        assert_eq!(snapshot.history()[0].source(), Some(source.as_str()));
+                    }
+                    format!("{snapshot:?}")
+                }
+                command => panic!("expected private boundary commit, got {command:?}"),
+            };
+            assert!(!snapshot_debug.contains(&marker));
+            assert!(!format!("{:?}", app.pending_workspace_history).contains(&marker));
+            assert!(!format!("{:?}", app.retention_commit_barrier).contains(&marker));
+            assert!(!app.model.status.contains(&marker));
+            let execute = service
+                .try_next_command()
+                .expect("private boundary execute");
+            match &execute {
+                UiCommand::Execute { text, .. } => assert_eq!(text, &source),
+                command => panic!("expected private boundary execute, got {command:?}"),
+            }
+            assert!(!format!("{execute:?}").contains(&marker));
+            assert!(service.try_next_command().is_none());
+        }
+    }
+
+    #[test]
+    fn retag_invalidates_active_barrier_and_clear_cannot_bypass_recovery() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let old_key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&old_key, &profile));
+        app.model
+            .workspace_mut(old_key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Retag", "SELECT retag_barrier")
+            .expect("retag editor");
+        if let Some(state) = app.workspace_persistence.get_mut(&old_key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
+        let intent = build_execute_intent(
+            &profile,
+            app.model.workspace(&old_key).expect("retag workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("retag execute");
+        assert!(app.submit_editor_execute(intent));
+        let (old_commit, old_identity, old_revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                ..
+            }) => (operation_id, identity, revision),
+            command => panic!("expected old-key provisional commit, got {command:?}"),
+        };
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::Execute { .. })
+        ));
+        let history_before = app
+            .model
+            .workspace(&old_key)
+            .and_then(ProfileWorkspace::persistence)
+            .expect("old-key history")
+            .history()
+            .to_vec();
+        app.clear_workspace_history(&old_key);
+        app.set_workspace_persistence_enabled(&old_key, false);
+        assert_eq!(
+            app.model
+                .workspace(&old_key)
+                .and_then(ProfileWorkspace::persistence)
+                .expect("blocked old-key history")
+                .history(),
+            history_before
+        );
+        assert!(
+            app.model
+                .workspace(&old_key)
+                .and_then(ProfileWorkspace::persistence)
+                .is_some_and(|persistence| persistence.persistence_enabled())
+        );
+
+        let mut refreshed = profile.clone();
+        refreshed.generation = ProfileGeneration(profile.generation.0.saturating_add(1));
+        let new_key = WorkspaceKey::new(refreshed.id.clone(), refreshed.generation);
+        assert!(service.try_emit(UiEvent::ProfilesLoaded {
+            operation_id: OperationId(100),
+            profiles: vec![refreshed.clone()],
+            config: ConfigPresentation::for_source(
+                ConfigSourceVersion::V3,
+                &PathBuf::from("/private/tmp/dbotter-j2-retag-barrier.toml"),
+            ),
+        }));
+        app.poll_events();
+        assert!(!app.workspace_persistence.contains_key(&old_key));
+        assert!(app.workspace_persistence.contains_key(&new_key));
+        assert!(app.retention_commit_barrier.active.is_none());
+        assert!(matches!(
+            app.retention_commit_barrier.failure,
+            Some(super::RetentionBarrierFailure::IdentityChanged)
+        ));
+        assert!(app.retention_commit_barrier.queue.iter().all(|request| {
+            request.workspace_key == new_key
+                && request.identity.profile_generation() == refreshed.generation
+        }));
+        assert!(service.try_next_command().is_none());
+
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: old_commit,
+            identity: old_identity,
+            revision: old_revision,
+            generation: 1,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(matches!(
+            app.retention_commit_barrier.failure,
+            Some(super::RetentionBarrierFailure::IdentityChanged)
+        ));
+        let retagged_history = app
+            .model
+            .workspace(&new_key)
+            .and_then(ProfileWorkspace::persistence)
+            .expect("retagged history")
+            .history()
+            .to_vec();
+        app.clear_workspace_history(&new_key);
+        assert_eq!(
+            app.model
+                .workspace(&new_key)
+                .and_then(ProfileWorkspace::persistence)
+                .expect("blocked retagged history")
+                .history(),
+            retagged_history
+        );
+
+        assert!(app.retry_retention_commit_barrier());
+        let (retry_operation, retry_identity, retry_revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                ..
+            }) => (operation_id, identity, revision),
+            command => panic!("retag retry must use the new identity, got {command:?}"),
+        };
+        assert_eq!(retry_identity.profile_generation(), refreshed.generation);
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: retry_operation,
+            identity: retry_identity,
+            revision: retry_revision,
+            generation: 2,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(!app.retention_commit_barrier.is_pending_or_failed());
+    }
+
+    #[test]
+    fn identical_profile_refresh_preserves_the_exact_active_retention_barrier() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Refresh", "SELECT identical_refresh")
+            .expect("identical-refresh editor");
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
+        let intent = build_execute_intent(
+            &profile,
+            app.model
+                .workspace(&key)
+                .expect("identical-refresh workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("identical-refresh execute");
+        assert!(app.submit_editor_execute(intent));
+        let (commit_operation, identity, revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                ..
+            }) => (operation_id, identity, revision),
+            command => panic!("expected active retention commit, got {command:?}"),
+        };
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::Execute { .. })
+        ));
+        let active_before = app
+            .retention_commit_barrier
+            .active
+            .clone()
+            .expect("active barrier before refresh");
+
+        assert!(service.try_emit(UiEvent::ProfilesLoaded {
+            operation_id: OperationId(100),
+            profiles: vec![profile],
+            config: ConfigPresentation::for_source(
+                ConfigSourceVersion::V3,
+                &PathBuf::from("/private/tmp/dbotter-j2-identical-refresh.toml"),
+            ),
+        }));
+        app.poll_events();
+        assert_eq!(
+            app.retention_commit_barrier.active.as_ref(),
+            Some(&active_before)
+        );
+        assert!(app.retention_commit_barrier.failure.is_none());
+        assert!(app.retention_barrier_references_current_identities());
+        assert!(service.try_next_command().is_none());
+
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: commit_operation,
+            identity,
+            revision,
+            generation: 1,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(!app.retention_commit_barrier.is_pending_or_failed());
+    }
+
+    #[test]
+    fn deleted_profile_invalidates_the_active_retention_identity_and_stale_ack() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Delete", "SELECT deleted_barrier")
+            .expect("deleted-barrier editor");
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
+        let intent = build_execute_intent(
+            &profile,
+            app.model
+                .workspace(&key)
+                .expect("deleted-barrier workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("deleted-barrier execute");
+        assert!(app.submit_editor_execute(intent));
+        let (old_operation, old_identity, old_revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                ..
+            }) => (operation_id, identity, revision),
+            command => panic!("expected deleted-profile commit, got {command:?}"),
+        };
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::Execute { .. })
+        ));
+        assert!(service.try_emit(UiEvent::ProfilesLoaded {
+            operation_id: OperationId(100),
+            profiles: Vec::new(),
+            config: ConfigPresentation::for_source(
+                ConfigSourceVersion::V3,
+                &PathBuf::from("/private/tmp/dbotter-j2-delete-barrier.toml"),
+            ),
+        }));
+        app.poll_events();
+        assert!(app.workspace_persistence.is_empty());
+        assert!(app.retention_commit_barrier.active.is_none());
+        assert!(app.retention_commit_barrier.queue.is_empty());
+        assert!(matches!(
+            app.retention_commit_barrier.failure,
+            Some(super::RetentionBarrierFailure::IdentityChanged)
+        ));
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: old_operation,
+            identity: old_identity,
+            revision: old_revision,
+            generation: 1,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(matches!(
+            app.retention_commit_barrier.failure,
+            Some(super::RetentionBarrierFailure::IdentityChanged)
+        ));
+    }
+
+    #[test]
+    fn confirmed_delete_waits_for_retention_settle_and_keeps_confirmation() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Delete gate", "SELECT delete_gate")
+            .expect("delete-gate editor");
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
+        let intent = build_execute_intent(
+            &profile,
+            app.model.workspace(&key).expect("delete-gate workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("delete-gate execute");
+        assert!(app.submit_editor_execute(intent));
+        let (commit_operation, identity, revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                ..
+            }) => (operation_id, identity, revision),
+            command => panic!("expected delete-gate retention commit, got {command:?}"),
+        };
+        let execute_operation = match service.try_next_command() {
+            Some(UiCommand::Execute { operation_id, .. }) => operation_id,
+            command => panic!("expected delete-gate execute, got {command:?}"),
+        };
+
+        app.open_delete_confirmation(&profile);
+        app.confirm_delete_confirmation();
+        assert!(app.delete_confirmation.is_some());
+        assert!(app.model.status.contains("save barrier"));
+        assert!(service.try_next_command().is_none());
+
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: commit_operation,
+            identity,
+            revision,
+            generation: 1,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(!app.retention_commit_barrier.is_pending_or_failed());
+        app.confirm_delete_confirmation();
+        assert!(app.delete_confirmation.is_some());
+        assert!(app.model.status.contains("execution history"));
+        assert!(service.try_next_command().is_none());
+
+        assert!(service.try_emit(UiEvent::ExecuteUnavailable {
+            operation_id: execute_operation,
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            summary: PublicSummary::InvalidInput,
+        }));
+        app.poll_events();
+        let (terminal_operation, terminal_identity, terminal_revision) =
+            match service.try_next_command() {
+                Some(UiCommand::CommitWorkspace {
+                    operation_id,
+                    identity,
+                    revision,
+                    ..
+                }) => (operation_id, identity, revision),
+                command => panic!("expected delete-gate terminal commit, got {command:?}"),
+            };
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: terminal_operation,
+            identity: terminal_identity,
+            revision: terminal_revision,
+            generation: 2,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(!app.retention_commit_barrier.is_pending_or_failed());
+        assert!(app.pending_workspace_history.is_empty());
+        app.confirm_delete_confirmation();
+        assert!(app.delete_confirmation.is_none());
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::DeleteProfile(_))
+        ));
+        assert!(service.try_next_command().is_none());
     }
 
     #[test]
