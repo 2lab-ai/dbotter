@@ -16,7 +16,7 @@ mod theme;
 
 pub use adapter::{
     CONTROL_CAPACITY, DraftTestIntent, EVENT_CAPACITY, MUTATION_CAPACITY, ServicePort, SubmitError,
-    UiCommand, UiPort, WORK_CAPACITY, bounded_ports, controller_ports,
+    UiCommand, UiPort, WORK_CAPACITY, WORKSPACE_CAPACITY, bounded_ports, controller_ports,
 };
 pub use app::DEFAULT_EXECUTE_ROW_LIMIT;
 pub use editor::{
@@ -34,7 +34,8 @@ pub use model::{
     ConfigPresentation, ConnectionFailureOutcome, ConnectionState, EditorTab, EditorTabError,
     EditorTabId, MAX_EDITOR_TAB_TEXT_BYTES, PostCloseState, ProfileSnapshot, ProfileWorkspace,
     ProfileWorkspacePersistence, ResultAreaTab, ResultTab, ResultTabError, ResultTabId, UiEvent,
-    UiModel, WorkspaceKey, WorkspaceModelError,
+    UiModel, WorkspaceAction, WorkspaceFailureCode, WorkspaceIdentity, WorkspaceKey,
+    WorkspaceModelError,
 };
 pub use mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 pub use native_harness::NativeUiHarness;

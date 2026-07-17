@@ -1,7 +1,8 @@
 //! Bounded background controller for profile-scoped database operations.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -12,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use futures_util::FutureExt as _;
 
-use crate::config::CommitState;
+use crate::config::{CommitState, ConfigSourceVersion};
 use crate::export_file::{ConfirmedDestination, ExportFileError, export_result_to_file};
 use crate::model::{
     DraftId, ExportFormat, ExportResult, OperationId, OperationKind, OperationRecipeId,
@@ -25,16 +26,24 @@ use crate::service::{
     RuntimeMutationFailure, RuntimeReloadOutcome, RuntimeUpdateOutcome, ServiceError,
     SessionDisposition, TestDraftRequest,
 };
+use crate::workspace::{
+    ProfileWorkspaceSnapshot, WorkspaceReadOnlyReason, WorkspaceSnapshotError, WorkspaceStore,
+    WorkspaceStoreError, WorkspaceStoreMode, WorkspaceStoreWarning,
+};
 
 use super::adapter::{ControlKey, DraftTestIntent, ServicePort, UiCommand};
 use super::editor::{classify_execute_batch_operation, classify_execute_operation};
 use super::model::{
     ConfigPresentation, ConnectionFailureOutcome, PostCloseState, ProfileSnapshot, UiEvent,
+    WorkspaceAction, WorkspaceFailureCode, WorkspaceIdentity,
 };
 
 const GLOBAL_NETWORK_LIMIT: usize = 4;
 pub(super) const PROCESS_EXPORT_LIMIT: usize = 2;
 const SHUTDOWN_ASYNC_GRACE: Duration = Duration::from_secs(2);
+const WORKSPACE_PENDING_CAPACITY: usize = super::adapter::WORKSPACE_CAPACITY;
+const WORKSPACE_SHUTDOWN_PENDING_CAPACITY: usize =
+    WORKSPACE_PENDING_CAPACITY + super::adapter::WORKSPACE_CAPACITY;
 pub(super) static PROCESS_EXPORT_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(PROCESS_EXPORT_LIMIT)));
 
@@ -530,6 +539,684 @@ pub(super) async fn join_registered_for_shutdown_with_grace(
     report
 }
 
+#[derive(Clone)]
+enum WorkspaceBackend {
+    Ready(Arc<WorkspaceStore>),
+    Unavailable(WorkspaceFailureCode),
+}
+
+#[derive(Clone)]
+struct WorkspaceOperationMeta {
+    operation_id: OperationId,
+    identity: WorkspaceIdentity,
+    revision: u64,
+    action: WorkspaceAction,
+}
+
+enum WorkspaceRequest {
+    Load {
+        operation_id: OperationId,
+        identity: WorkspaceIdentity,
+        base_revision: u64,
+    },
+    Commit {
+        operation_id: OperationId,
+        identity: WorkspaceIdentity,
+        revision: u64,
+        snapshot: Box<ProfileWorkspaceSnapshot>,
+    },
+    Clear {
+        operation_id: OperationId,
+        identity: WorkspaceIdentity,
+        base_revision: u64,
+    },
+}
+
+impl WorkspaceRequest {
+    fn from_command(command: UiCommand) -> Option<Self> {
+        match command {
+            UiCommand::LoadWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            } => Some(Self::Load {
+                operation_id,
+                identity,
+                base_revision,
+            }),
+            UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                snapshot,
+            } => Some(Self::Commit {
+                operation_id,
+                identity,
+                revision,
+                snapshot,
+            }),
+            UiCommand::ClearWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            } => Some(Self::Clear {
+                operation_id,
+                identity,
+                base_revision,
+            }),
+            _ => None,
+        }
+    }
+
+    fn meta(&self) -> WorkspaceOperationMeta {
+        match self {
+            Self::Load {
+                operation_id,
+                identity,
+                base_revision,
+            } => WorkspaceOperationMeta {
+                operation_id: *operation_id,
+                identity: identity.clone(),
+                revision: *base_revision,
+                action: WorkspaceAction::Load,
+            },
+            Self::Commit {
+                operation_id,
+                identity,
+                revision,
+                ..
+            } => WorkspaceOperationMeta {
+                operation_id: *operation_id,
+                identity: identity.clone(),
+                revision: *revision,
+                action: WorkspaceAction::Commit,
+            },
+            Self::Clear {
+                operation_id,
+                identity,
+                base_revision,
+            } => WorkspaceOperationMeta {
+                operation_id: *operation_id,
+                identity: identity.clone(),
+                revision: *base_revision,
+                action: WorkspaceAction::Clear,
+            },
+        }
+    }
+
+    fn is_commit_for(&self, target: &WorkspaceIdentity) -> bool {
+        matches!(
+            self,
+            Self::Commit { identity, .. } if identity == target
+        )
+    }
+
+    fn is_barrier_for(&self, target: &WorkspaceIdentity) -> bool {
+        matches!(
+            self,
+            Self::Load { identity, .. } | Self::Clear { identity, .. }
+                if identity == target
+        )
+    }
+
+    fn snapshot_identity_is_valid(&self) -> bool {
+        match self {
+            Self::Commit {
+                identity, snapshot, ..
+            } => {
+                snapshot.instance_id() == identity.instance_id()
+                    && snapshot.profile_id() == identity.profile_id()
+            }
+            Self::Load { .. } | Self::Clear { .. } => true,
+        }
+    }
+}
+
+struct ReservedWorkspaceRequest {
+    reservation: TaskReservation,
+    request: WorkspaceRequest,
+}
+
+struct ActiveWorkspaceOperation {
+    reservation: TaskReservation,
+    meta: WorkspaceOperationMeta,
+    completion_sent: Arc<AtomicBool>,
+    join: JoinHandle<()>,
+}
+
+enum WorkspaceStoreOutput {
+    Loaded {
+        mode: WorkspaceStoreMode,
+        read_only_reason: Option<WorkspaceReadOnlyReason>,
+        snapshot: Option<Box<ProfileWorkspaceSnapshot>>,
+    },
+    Committed {
+        generation: u64,
+        warnings: Vec<WorkspaceStoreWarning>,
+    },
+    Cleared,
+}
+
+type WorkspaceExecutionResult = Result<WorkspaceStoreOutput, WorkspaceFailureCode>;
+
+struct WorkspaceCoordinator {
+    backend: WorkspaceBackend,
+    active: Option<ActiveWorkspaceOperation>,
+    pending: VecDeque<ReservedWorkspaceRequest>,
+}
+
+impl WorkspaceCoordinator {
+    fn new(backend: WorkspaceBackend) -> Self {
+        Self {
+            backend,
+            active: None,
+            pending: VecDeque::with_capacity(WORKSPACE_PENDING_CAPACITY),
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.active.is_none() && self.pending.is_empty()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn enqueue(
+        &mut self,
+        command: UiCommand,
+        pending_limit: usize,
+        port: &ServicePort,
+        application: &ApplicationService,
+        message_tx: &mpsc::UnboundedSender<ControllerMessage>,
+        registry: &mut TaskRegistry,
+    ) {
+        let command_operation_id = command.operation_id();
+        let request = match WorkspaceRequest::from_command(command) {
+            Some(request) => request,
+            None => {
+                let _ = port
+                    .emit(profiles_failed_event(
+                        command_operation_id,
+                        PublicSummary::InternalFailure,
+                        PublicCode::None,
+                    ))
+                    .await;
+                return;
+            }
+        };
+        let meta = request.meta();
+        let reservation = match registry.reserve(meta.operation_id) {
+            Ok(reservation) => reservation,
+            Err(()) => {
+                let _ = port
+                    .emit(workspace_failure_event(meta, WorkspaceFailureCode::Busy))
+                    .await;
+                return;
+            }
+        };
+        if !request.snapshot_identity_is_valid() {
+            registry.release_reservation(reservation);
+            let _ = port
+                .emit(workspace_failure_event(
+                    meta,
+                    WorkspaceFailureCode::InvalidIdentity,
+                ))
+                .await;
+            return;
+        }
+
+        let mut reserved = ReservedWorkspaceRequest {
+            reservation,
+            request,
+        };
+        match reserved.request.meta().action {
+            WorkspaceAction::Commit => {
+                match self.replace_pending_commit(reserved, port, registry).await {
+                    Ok(()) => return,
+                    Err(not_replaced) => {
+                        let replacement_meta = not_replaced.request.meta();
+                        if let Some(active_meta) = self.active_commit_superseding(&replacement_meta)
+                        {
+                            registry.release_reservation(not_replaced.reservation);
+                            let _ = port
+                                .emit(workspace_superseded_event(replacement_meta, &active_meta))
+                                .await;
+                            return;
+                        }
+                        reserved = not_replaced;
+                    }
+                }
+            }
+            WorkspaceAction::Clear => {
+                self.supersede_pending_commits_for_clear(&reserved.request.meta(), port, registry)
+                    .await;
+            }
+            WorkspaceAction::Load => {}
+        }
+        if self.pending.len() >= pending_limit {
+            let meta = reserved.request.meta();
+            registry.release_reservation(reserved.reservation);
+            let _ = port
+                .emit(workspace_failure_event(meta, WorkspaceFailureCode::Busy))
+                .await;
+            return;
+        }
+        self.pending.push_back(reserved);
+        self.start_next(application, message_tx);
+    }
+
+    async fn replace_pending_commit(
+        &mut self,
+        replacement: ReservedWorkspaceRequest,
+        port: &ServicePort,
+        registry: &mut TaskRegistry,
+    ) -> Result<(), ReservedWorkspaceRequest> {
+        let replacement_meta = replacement.request.meta();
+        let mut replace_index = None;
+        for index in (0..self.pending.len()).rev() {
+            let Some(candidate) = self.pending.get(index) else {
+                continue;
+            };
+            if candidate.request.is_barrier_for(&replacement_meta.identity) {
+                break;
+            }
+            if candidate.request.is_commit_for(&replacement_meta.identity) {
+                replace_index = Some(index);
+                break;
+            }
+        }
+        let Some(index) = replace_index else {
+            return Err(replacement);
+        };
+        let Some(slot) = self.pending.get_mut(index) else {
+            return Err(replacement);
+        };
+        let retained_meta = slot.request.meta();
+        if replacement_meta.revision <= retained_meta.revision {
+            registry.release_reservation(replacement.reservation);
+            let _ = port
+                .emit(workspace_superseded_event(replacement_meta, &retained_meta))
+                .await;
+            return Ok(());
+        }
+        let superseded = std::mem::replace(slot, replacement);
+        let superseded_meta = superseded.request.meta();
+        registry.release_reservation(superseded.reservation);
+        let _ = port
+            .emit(workspace_superseded_event(
+                superseded_meta,
+                &replacement_meta,
+            ))
+            .await;
+        Ok(())
+    }
+
+    fn active_commit_superseding(
+        &self,
+        replacement: &WorkspaceOperationMeta,
+    ) -> Option<WorkspaceOperationMeta> {
+        for pending in self.pending.iter().rev() {
+            if pending.request.is_barrier_for(&replacement.identity) {
+                return None;
+            }
+            if pending.request.is_commit_for(&replacement.identity) {
+                return None;
+            }
+        }
+        self.active
+            .as_ref()
+            .filter(|active| {
+                active.meta.action == WorkspaceAction::Commit
+                    && active.meta.identity == replacement.identity
+                    && active.meta.revision >= replacement.revision
+            })
+            .map(|active| active.meta.clone())
+    }
+
+    async fn supersede_pending_commits_for_clear(
+        &mut self,
+        clear: &WorkspaceOperationMeta,
+        port: &ServicePort,
+        registry: &mut TaskRegistry,
+    ) {
+        let mut index = self
+            .pending
+            .iter()
+            .rposition(|pending| pending.request.is_barrier_for(&clear.identity))
+            .map_or(0, |barrier| barrier.saturating_add(1));
+        while index < self.pending.len() {
+            let should_remove = self
+                .pending
+                .get(index)
+                .is_some_and(|pending| pending.request.is_commit_for(&clear.identity));
+            if !should_remove {
+                index += 1;
+                continue;
+            }
+            let Some(superseded) = self.pending.remove(index) else {
+                continue;
+            };
+            let superseded_meta = superseded.request.meta();
+            registry.release_reservation(superseded.reservation);
+            let _ = port
+                .emit(workspace_superseded_event(superseded_meta, clear))
+                .await;
+        }
+    }
+
+    fn start_next(
+        &mut self,
+        application: &ApplicationService,
+        message_tx: &mpsc::UnboundedSender<ControllerMessage>,
+    ) {
+        if self.active.is_some() {
+            return;
+        }
+        let Some(reserved) = self.pending.pop_front() else {
+            return;
+        };
+        let meta = reserved.request.meta();
+        let backend = self.backend.clone();
+        let service = application.clone();
+        let messages = message_tx.clone();
+        let completion_sent = Arc::new(AtomicBool::new(false));
+        let task_completion_sent = completion_sent.clone();
+        let operation_id = meta.operation_id;
+        let join = tokio::spawn(async move {
+            let result = execute_workspace_request(backend, service, reserved.request).await;
+            let sent = messages
+                .send(ControllerMessage::WorkspaceCompleted {
+                    operation_id,
+                    result,
+                })
+                .is_ok();
+            task_completion_sent.store(sent, Ordering::Release);
+        });
+        self.active = Some(ActiveWorkspaceOperation {
+            reservation: reserved.reservation,
+            meta,
+            completion_sent,
+            join,
+        });
+    }
+
+    async fn complete(
+        &mut self,
+        operation_id: OperationId,
+        result: WorkspaceExecutionResult,
+        port: &ServicePort,
+        application: &ApplicationService,
+        message_tx: &mpsc::UnboundedSender<ControllerMessage>,
+        registry: &mut TaskRegistry,
+    ) {
+        if self
+            .active
+            .as_ref()
+            .is_none_or(|active| active.meta.operation_id != operation_id)
+        {
+            return;
+        }
+        let Some(active) = self.active.take() else {
+            return;
+        };
+        let join_failed = active.join.await.is_err();
+        registry.release_reservation(active.reservation);
+        let event = if join_failed {
+            workspace_failure_event(active.meta, WorkspaceFailureCode::Internal)
+        } else {
+            workspace_terminal_event(active.meta, result)
+        };
+        let _ = port.emit(event).await;
+        self.start_next(application, message_tx);
+    }
+
+    async fn reap_panicked(
+        &mut self,
+        port: &ServicePort,
+        application: &ApplicationService,
+        message_tx: &mpsc::UnboundedSender<ControllerMessage>,
+        registry: &mut TaskRegistry,
+    ) {
+        let should_reap = self.active.as_ref().is_some_and(|active| {
+            active.join.is_finished() && !active.completion_sent.load(Ordering::Acquire)
+        });
+        if !should_reap {
+            return;
+        }
+        let Some(active) = self.active.take() else {
+            return;
+        };
+        let _ = active.join.await;
+        registry.release_reservation(active.reservation);
+        let _ = port
+            .emit(workspace_failure_event(
+                active.meta,
+                WorkspaceFailureCode::Internal,
+            ))
+            .await;
+        self.start_next(application, message_tx);
+    }
+}
+
+async fn open_workspace_backend(config_path: PathBuf) -> WorkspaceBackend {
+    match tokio::task::spawn_blocking(move || WorkspaceStore::open(&config_path)).await {
+        Ok(Ok(store)) => WorkspaceBackend::Ready(Arc::new(store)),
+        Ok(Err(error)) => WorkspaceBackend::Unavailable(workspace_store_failure(error, None)),
+        Err(_) => WorkspaceBackend::Unavailable(WorkspaceFailureCode::Internal),
+    }
+}
+
+async fn workspace_identity_is_current(
+    application: &ApplicationService,
+    identity: &WorkspaceIdentity,
+) -> bool {
+    if application.is_config_uncertain()
+        || application.source_version().await != ConfigSourceVersion::V3
+    {
+        return false;
+    }
+    application
+        .profiles_with_generations_snapshot()
+        .await
+        .into_iter()
+        .any(|(profile, generation)| {
+            profile.id == identity.profile_id().as_str()
+                && generation == identity.profile_generation()
+                && profile.safety.instance_id() == Some(identity.instance_id())
+        })
+}
+
+async fn execute_workspace_request(
+    backend: WorkspaceBackend,
+    application: ApplicationService,
+    request: WorkspaceRequest,
+) -> WorkspaceExecutionResult {
+    let identity = request.meta().identity;
+    if !workspace_identity_is_current(&application, &identity).await {
+        return Err(WorkspaceFailureCode::Stale);
+    }
+    let store = match backend {
+        WorkspaceBackend::Ready(store) => store,
+        WorkspaceBackend::Unavailable(code) => return Err(code),
+    };
+    let blocking_store = store.clone();
+    let result = match tokio::task::spawn_blocking(move || {
+        run_workspace_store_request(&blocking_store, request)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(WorkspaceFailureCode::Internal),
+    };
+    finalize_workspace_result(&application, &identity, result).await
+}
+
+async fn finalize_workspace_result(
+    application: &ApplicationService,
+    identity: &WorkspaceIdentity,
+    result: WorkspaceExecutionResult,
+) -> WorkspaceExecutionResult {
+    if result.is_ok() && !workspace_identity_is_current(application, identity).await {
+        return Err(WorkspaceFailureCode::Stale);
+    }
+    result
+}
+
+fn run_workspace_store_request(
+    store: &WorkspaceStore,
+    request: WorkspaceRequest,
+) -> WorkspaceExecutionResult {
+    match request {
+        WorkspaceRequest::Load { identity, .. } => {
+            let snapshot = store
+                .load(identity.instance_id())
+                .map_err(|error| workspace_store_failure(error, store.read_only_reason()))?;
+            if snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.instance_id() != identity.instance_id()
+                    || snapshot.profile_id() != identity.profile_id()
+            }) {
+                return Err(WorkspaceFailureCode::InvalidIdentity);
+            }
+            Ok(WorkspaceStoreOutput::Loaded {
+                mode: store.mode(),
+                read_only_reason: store.read_only_reason(),
+                snapshot: snapshot.map(Box::new),
+            })
+        }
+        WorkspaceRequest::Commit { snapshot, .. } => {
+            let commit = store
+                .commit(&snapshot)
+                .map_err(|error| workspace_store_failure(error, store.read_only_reason()))?;
+            Ok(WorkspaceStoreOutput::Committed {
+                generation: commit.generation(),
+                warnings: commit.warnings().to_vec(),
+            })
+        }
+        WorkspaceRequest::Clear { identity, .. } => {
+            store
+                .clear(identity.instance_id())
+                .map_err(|error| workspace_store_failure(error, store.read_only_reason()))?;
+            Ok(WorkspaceStoreOutput::Cleared)
+        }
+    }
+}
+
+fn workspace_store_failure(
+    error: WorkspaceStoreError,
+    read_only_reason: Option<WorkspaceReadOnlyReason>,
+) -> WorkspaceFailureCode {
+    match error {
+        WorkspaceStoreError::InvalidConfigPath | WorkspaceStoreError::WriterUnavailable => {
+            WorkspaceFailureCode::Unavailable
+        }
+        WorkspaceStoreError::ReadOnly => read_only_reason.map_or(
+            WorkspaceFailureCode::Unavailable,
+            WorkspaceFailureCode::ReadOnly,
+        ),
+        WorkspaceStoreError::UnsafePath => WorkspaceFailureCode::UnsafeStorage,
+        WorkspaceStoreError::CorruptManifest | WorkspaceStoreError::CorruptShard => {
+            WorkspaceFailureCode::Corrupt
+        }
+        WorkspaceStoreError::UnsupportedVersion => WorkspaceFailureCode::UnsupportedVersion,
+        WorkspaceStoreError::Snapshot(snapshot) => workspace_snapshot_failure(snapshot),
+        WorkspaceStoreError::ShardTooLarge | WorkspaceStoreError::StoreTooLarge => {
+            WorkspaceFailureCode::LimitExceeded
+        }
+        WorkspaceStoreError::ExternalChange => WorkspaceFailureCode::ExternalChange,
+        WorkspaceStoreError::DurabilityUnknown => WorkspaceFailureCode::DurabilityUnknown,
+        WorkspaceStoreError::RecoveryRequired => WorkspaceFailureCode::RecoveryRequired,
+        WorkspaceStoreError::Io(kind) => WorkspaceFailureCode::Io(kind),
+    }
+}
+
+fn workspace_snapshot_failure(error: WorkspaceSnapshotError) -> WorkspaceFailureCode {
+    match error {
+        WorkspaceSnapshotError::EditorSourceTooLarge
+        | WorkspaceSnapshotError::DatabaseBindingTooLarge
+        | WorkspaceSnapshotError::TooManyEditorTabs
+        | WorkspaceSnapshotError::TooManyEditorTabsTotal
+        | WorkspaceSnapshotError::TooManyHistoryEntries
+        | WorkspaceSnapshotError::TooManyHistoryEntriesTotal => WorkspaceFailureCode::LimitExceeded,
+        WorkspaceSnapshotError::InvalidEditorId
+        | WorkspaceSnapshotError::InvalidEditorTitle
+        | WorkspaceSnapshotError::InvalidEditorCursor
+        | WorkspaceSnapshotError::InvalidEditorSelection
+        | WorkspaceSnapshotError::InvalidHistoryId
+        | WorkspaceSnapshotError::InvalidHistorySource
+        | WorkspaceSnapshotError::InvalidGeometry
+        | WorkspaceSnapshotError::InvalidProfileId
+        | WorkspaceSnapshotError::DisabledPersistenceHasContent
+        | WorkspaceSnapshotError::DuplicateEditorId
+        | WorkspaceSnapshotError::UnknownSelectedEditor
+        | WorkspaceSnapshotError::DuplicateHistoryId
+        | WorkspaceSnapshotError::DuplicateProfileInstance => WorkspaceFailureCode::InvalidSnapshot,
+    }
+}
+
+fn workspace_terminal_event(
+    meta: WorkspaceOperationMeta,
+    result: WorkspaceExecutionResult,
+) -> UiEvent {
+    match (meta.action, result) {
+        (
+            WorkspaceAction::Load,
+            Ok(WorkspaceStoreOutput::Loaded {
+                mode,
+                read_only_reason,
+                snapshot,
+            }),
+        ) => UiEvent::WorkspaceLoaded {
+            operation_id: meta.operation_id,
+            identity: meta.identity,
+            base_revision: meta.revision,
+            mode,
+            read_only_reason,
+            snapshot,
+        },
+        (
+            WorkspaceAction::Commit,
+            Ok(WorkspaceStoreOutput::Committed {
+                generation,
+                warnings,
+            }),
+        ) => UiEvent::WorkspaceCommitted {
+            operation_id: meta.operation_id,
+            identity: meta.identity,
+            revision: meta.revision,
+            generation,
+            warnings,
+        },
+        (WorkspaceAction::Clear, Ok(WorkspaceStoreOutput::Cleared)) => UiEvent::WorkspaceCleared {
+            operation_id: meta.operation_id,
+            identity: meta.identity,
+            base_revision: meta.revision,
+        },
+        (_, Err(code)) => workspace_failure_event(meta, code),
+        _ => workspace_failure_event(meta, WorkspaceFailureCode::Internal),
+    }
+}
+
+fn workspace_failure_event(meta: WorkspaceOperationMeta, code: WorkspaceFailureCode) -> UiEvent {
+    UiEvent::WorkspaceOperationFailed {
+        operation_id: meta.operation_id,
+        identity: meta.identity,
+        revision: meta.revision,
+        action: meta.action,
+        code,
+    }
+}
+
+fn workspace_superseded_event(
+    superseded: WorkspaceOperationMeta,
+    replacement: &WorkspaceOperationMeta,
+) -> UiEvent {
+    UiEvent::WorkspaceCommitSuperseded {
+        operation_id: superseded.operation_id,
+        identity: superseded.identity,
+        revision: superseded.revision,
+        superseded_by: replacement.operation_id,
+        superseded_by_revision: replacement.revision,
+    }
+}
+
 pub struct RuntimeHandle {
     join: JoinHandle<()>,
 }
@@ -543,9 +1230,16 @@ impl RuntimeHandle {
 pub fn spawn(service_port: ServicePort, config_path: std::path::PathBuf) -> RuntimeHandle {
     RuntimeHandle {
         join: tokio::spawn(async move {
-            match ApplicationService::load_path(config_path) {
-                Ok(application) => run_controller(service_port, application).await,
-                Err(error) => run_unavailable(service_port, error.public_summary()).await,
+            let service_path = config_path.clone();
+            match tokio::task::spawn_blocking(move || ApplicationService::load_path(service_path))
+                .await
+            {
+                Ok(Ok(application)) => {
+                    let workspace = open_workspace_backend(config_path).await;
+                    run_controller(service_port, application, workspace).await;
+                }
+                Ok(Err(error)) => run_unavailable(service_port, error.public_summary()).await,
+                Err(_) => run_unavailable(service_port, PublicSummary::InternalFailure).await,
             }
         }),
     }
@@ -555,8 +1249,12 @@ pub fn spawn_with_service(
     service_port: ServicePort,
     application: ApplicationService,
 ) -> RuntimeHandle {
+    let config_path = application.config_path().to_owned();
     RuntimeHandle {
-        join: tokio::spawn(run_controller(service_port, application)),
+        join: tokio::spawn(async move {
+            let workspace = open_workspace_backend(config_path).await;
+            run_controller(service_port, application, workspace).await;
+        }),
     }
 }
 
@@ -568,6 +1266,10 @@ enum ControllerMessage {
     Completed {
         operation_id: OperationId,
         output: Box<TaskOutput>,
+    },
+    WorkspaceCompleted {
+        operation_id: OperationId,
+        result: WorkspaceExecutionResult,
     },
 }
 
@@ -763,12 +1465,17 @@ impl ProfileWork {
     }
 }
 
-async fn run_controller(mut port: ServicePort, application: ApplicationService) {
+async fn run_controller(
+    mut port: ServicePort,
+    application: ApplicationService,
+    workspace_backend: WorkspaceBackend,
+) {
     let (message_tx, mut message_rx) = mpsc::unbounded_channel();
     let global_permits = Arc::new(Semaphore::new(GLOBAL_NETWORK_LIMIT));
     let mut profile_permits = ProfilePermitRegistry::default();
     let mut draft_permits = DraftPermitRegistry::default();
     let mut registry = TaskRegistry::default();
+    let mut workspace = WorkspaceCoordinator::new(workspace_backend);
     let mut mutation_active = false;
     let mut reap_tick = tokio::time::interval(Duration::from_millis(5));
     let shutdown_operation = loop {
@@ -790,6 +1497,7 @@ async fn run_controller(mut port: ServicePort, application: ApplicationService) 
                     &message_tx,
                     &mut registry,
                     &mut mutation_active,
+                    &mut workspace,
                 ).await;
             }
             Some(command) = port.control_rx.recv() => {
@@ -812,6 +1520,16 @@ async fn run_controller(mut port: ServicePort, application: ApplicationService) 
                     &mut registry,
                 );
             }
+            Some(command) = port.workspace_rx.recv() => {
+                workspace.enqueue(
+                    command,
+                    WORKSPACE_PENDING_CAPACITY,
+                    &port,
+                    &application,
+                    &message_tx,
+                    &mut registry,
+                ).await;
+            }
             Some(command) = port.work_rx.recv() => {
                 handle_work(
                     command,
@@ -832,13 +1550,31 @@ async fn run_controller(mut port: ServicePort, application: ApplicationService) 
                     &mut registry,
                     &mut mutation_active,
                 ).await;
+                workspace.reap_panicked(
+                    &port,
+                    &application,
+                    &message_tx,
+                    &mut registry,
+                ).await;
                 profile_permits.prune_idle();
                 draft_permits.prune_idle();
             }
         }
     };
 
-    port.close_and_drain();
+    let queued_workspace = port.close_and_drain_for_shutdown();
+    for command in queued_workspace {
+        workspace
+            .enqueue(
+                command,
+                WORKSPACE_SHUTDOWN_PENDING_CAPACITY,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+    }
     finish_controller_shutdown(
         &port,
         &application,
@@ -846,12 +1582,16 @@ async fn run_controller(mut port: ServicePort, application: ApplicationService) 
         &mut message_rx,
         &mut registry,
         &mut mutation_active,
+        &mut workspace,
     )
     .await;
     application.shutdown_runtime().await;
-    let _ = port.try_emit(UiEvent::RuntimeShutdown {
-        operation_id: shutdown_operation,
-    });
+    drop(workspace);
+    let _ = port
+        .emit(UiEvent::RuntimeShutdown {
+            operation_id: shutdown_operation,
+        })
+        .await;
 }
 
 async fn finish_controller_shutdown(
@@ -861,11 +1601,15 @@ async fn finish_controller_shutdown(
     message_rx: &mut mpsc::UnboundedReceiver<ControllerMessage>,
     registry: &mut TaskRegistry,
     mutation_active: &mut bool,
+    workspace: &mut WorkspaceCoordinator,
 ) {
     registry.cancel_all();
     let deadline = tokio::time::Instant::now() + SHUTDOWN_ASYNC_GRACE;
     let mut reap_tick = tokio::time::interval(Duration::from_millis(5));
-    while !registry.is_empty_runtime() {
+    // Workspace commits and clears are durability barriers: once admitted they
+    // are joined without the network grace timeout so shutdown cannot report
+    // completion while an accepted save is still queued or writing.
+    while !registry.is_empty_runtime() || !workspace.is_idle() {
         if registry.has_bounded_shutdown_work() && tokio::time::Instant::now() >= deadline {
             let mut cleanup_ready = Vec::new();
             for entry in registry.take_all_bounded_shutdown_entries() {
@@ -922,6 +1666,7 @@ async fn finish_controller_shutdown(
                     message_tx,
                     registry,
                     mutation_active,
+                    workspace,
                 ).await;
             }
             _ = tokio::time::sleep_until(deadline), if registry.has_bounded_shutdown_work() => {}
@@ -932,6 +1677,12 @@ async fn finish_controller_shutdown(
                     message_tx,
                     registry,
                     mutation_active,
+                ).await;
+                workspace.reap_panicked(
+                    port,
+                    application,
+                    message_tx,
+                    registry,
                 ).await;
             }
         }
@@ -956,13 +1707,18 @@ async fn run_unavailable(mut port: ServicePort, summary: PublicSummary) {
             Some(command) = port.mutation_rx.recv() => {
                 let _ = port.try_emit(failure_for_unavailable(command, summary));
             }
+            Some(command) = port.workspace_rx.recv() => {
+                let _ = port.emit(failure_for_unavailable(command, summary)).await;
+            }
             Some(command) = port.work_rx.recv() => {
                 let _ = port.try_emit(failure_for_unavailable(command, summary));
             }
         }
     };
-    port.close_and_drain();
-    let _ = port.try_emit(UiEvent::RuntimeShutdown { operation_id });
+    for command in port.close_and_drain_for_shutdown() {
+        let _ = port.emit(failure_for_unavailable(command, summary)).await;
+    }
+    let _ = port.emit(UiEvent::RuntimeShutdown { operation_id }).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3379,6 +4135,7 @@ async fn handle_controller_message(
     message_tx: &mpsc::UnboundedSender<ControllerMessage>,
     registry: &mut TaskRegistry,
     mutation_active: &mut bool,
+    workspace: &mut WorkspaceCoordinator,
 ) {
     match message {
         ControllerMessage::SessionAcquired {
@@ -3446,6 +4203,21 @@ async fn handle_controller_message(
             let event = finish_task_output(*output, application, false).await;
             let _ = port.try_emit(event);
             terminal.cancel();
+        }
+        ControllerMessage::WorkspaceCompleted {
+            operation_id,
+            result,
+        } => {
+            workspace
+                .complete(
+                    operation_id,
+                    result,
+                    port,
+                    application,
+                    message_tx,
+                    registry,
+                )
+                .await;
         }
     }
 }
@@ -4457,6 +5229,46 @@ fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEven
             summary,
             PublicCode::None,
         ),
+        UiCommand::LoadWorkspace {
+            operation_id,
+            identity,
+            base_revision,
+        } => workspace_failure_event(
+            WorkspaceOperationMeta {
+                operation_id,
+                identity,
+                revision: base_revision,
+                action: WorkspaceAction::Load,
+            },
+            workspace_unavailable_code(summary),
+        ),
+        UiCommand::CommitWorkspace {
+            operation_id,
+            identity,
+            revision,
+            ..
+        } => workspace_failure_event(
+            WorkspaceOperationMeta {
+                operation_id,
+                identity,
+                revision,
+                action: WorkspaceAction::Commit,
+            },
+            workspace_unavailable_code(summary),
+        ),
+        UiCommand::ClearWorkspace {
+            operation_id,
+            identity,
+            base_revision,
+        } => workspace_failure_event(
+            WorkspaceOperationMeta {
+                operation_id,
+                identity,
+                revision: base_revision,
+                action: WorkspaceAction::Clear,
+            },
+            workspace_unavailable_code(summary),
+        ),
         UiCommand::TestConnection {
             operation_id,
             profile_id,
@@ -4547,6 +5359,14 @@ fn failure_for_unavailable(command: UiCommand, summary: PublicSummary) -> UiEven
     }
 }
 
+fn workspace_unavailable_code(summary: PublicSummary) -> WorkspaceFailureCode {
+    match summary {
+        PublicSummary::ResourceBusy => WorkspaceFailureCode::Busy,
+        PublicSummary::InternalFailure => WorkspaceFailureCode::Internal,
+        _ => WorkspaceFailureCode::Unavailable,
+    }
+}
+
 fn duration_from_millis(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms.max(1))
 }
@@ -4556,5 +5376,1068 @@ pub(super) fn commit_warning(state: CommitState) -> Option<PublicSummary> {
         CommitState::NotCommitted => Some(PublicSummary::ConfigWriteNotCommitted),
         CommitState::Committed => None,
         CommitState::CommittedDurabilityUnknown => Some(PublicSummary::CommittedDurabilityUnknown),
+    }
+}
+
+#[cfg(test)]
+mod workspace_runtime_tests {
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use crate::config::{CURRENT_CONFIG_VERSION, Config};
+    use crate::model::{
+        ConnectionProfile, CredentialMode, DriverKind, OperationId, ProfileAccess,
+        ProfileEnvironment, ProfileGeneration, ProfileId, ProfileInstanceId, ProfileSafetyPosture,
+        RedisTlsConfig, TlsMode,
+    };
+    use crate::service::ApplicationService;
+    use crate::ui::adapter::{
+        UiCommand, UiPort, bounded_ports, controller_ports, controller_ports_with_event_capacity,
+    };
+    use crate::ui::model::{UiEvent, WorkspaceAction, WorkspaceFailureCode, WorkspaceIdentity};
+    use crate::workspace::{
+        EditorTabSnapshot, ProfileWorkspaceSnapshot, WorkspaceGeometrySnapshot, WorkspaceLanguage,
+        WorkspaceReadOnlyReason, WorkspaceStore, WorkspaceStoreMode,
+    };
+
+    use super::{
+        ActiveWorkspaceOperation, ControllerMessage, RuntimeHandle, TaskRegistry, WorkspaceBackend,
+        WorkspaceCoordinator, WorkspaceOperationMeta, WorkspaceRequest, WorkspaceStoreOutput,
+        execute_workspace_request, finalize_workspace_result, run_workspace_store_request,
+        spawn_with_service,
+    };
+
+    fn classified_profile(id: &str, instance_id: ProfileInstanceId) -> ConnectionProfile {
+        ConnectionProfile {
+            id: id.to_owned(),
+            name: "Workspace fixture".to_owned(),
+            driver: DriverKind::MySql,
+            host: "127.0.0.1".to_owned(),
+            port: 3306,
+            database: None,
+            username: None,
+            safety: ProfileSafetyPosture::classified(
+                ProfileEnvironment::Development,
+                ProfileAccess::ReadWrite,
+                instance_id,
+            ),
+            tls: TlsMode::Disabled,
+            credential_mode: CredentialMode::None,
+            secret_env: None,
+            redis_tls: RedisTlsConfig::default(),
+        }
+    }
+
+    fn write_config(path: &std::path::Path, profiles: Vec<ConnectionProfile>) {
+        let config = Config {
+            version: CURRENT_CONFIG_VERSION,
+            profiles,
+        };
+        fs::write(
+            path,
+            toml::to_string(&config).expect("serialize test config"),
+        )
+        .expect("write test config");
+    }
+
+    fn service_fixture(
+        path: &std::path::Path,
+        profile_id: &str,
+        instance_id: ProfileInstanceId,
+    ) -> ApplicationService {
+        write_config(path, vec![classified_profile(profile_id, instance_id)]);
+        ApplicationService::load_path(path).expect("load test service")
+    }
+
+    fn identity(
+        profile_id: &str,
+        generation: u64,
+        instance_id: ProfileInstanceId,
+    ) -> WorkspaceIdentity {
+        WorkspaceIdentity::new(
+            ProfileId(profile_id.to_owned()),
+            ProfileGeneration(generation),
+            instance_id,
+        )
+    }
+
+    fn snapshot(
+        profile_id: &str,
+        instance_id: ProfileInstanceId,
+        source: &str,
+    ) -> Box<ProfileWorkspaceSnapshot> {
+        let editor = EditorTabSnapshot::new(
+            1,
+            "Workspace",
+            WorkspaceLanguage::Sql,
+            source,
+            None,
+            source.chars().count(),
+            None,
+        )
+        .expect("valid editor snapshot");
+        Box::new(
+            ProfileWorkspaceSnapshot::new(
+                instance_id,
+                ProfileId(profile_id.to_owned()),
+                true,
+                vec![editor],
+                Some(1),
+                WorkspaceGeometrySnapshot::new(240.0, 0.6, false)
+                    .expect("valid workspace geometry"),
+                Vec::new(),
+            )
+            .expect("valid workspace snapshot"),
+        )
+    }
+
+    fn commit_command(
+        operation_id: u64,
+        identity: WorkspaceIdentity,
+        revision: u64,
+        source: &str,
+    ) -> UiCommand {
+        UiCommand::CommitWorkspace {
+            operation_id: OperationId(operation_id),
+            snapshot: snapshot(
+                identity.profile_id().as_str(),
+                identity.instance_id(),
+                source,
+            ),
+            identity,
+            revision,
+        }
+    }
+
+    fn load_command(
+        operation_id: u64,
+        identity: WorkspaceIdentity,
+        base_revision: u64,
+    ) -> UiCommand {
+        UiCommand::LoadWorkspace {
+            operation_id: OperationId(operation_id),
+            identity,
+            base_revision,
+        }
+    }
+
+    fn clear_command(
+        operation_id: u64,
+        identity: WorkspaceIdentity,
+        base_revision: u64,
+    ) -> UiCommand {
+        UiCommand::ClearWorkspace {
+            operation_id: OperationId(operation_id),
+            identity,
+            base_revision,
+        }
+    }
+
+    fn block_coordinator(
+        coordinator: &mut WorkspaceCoordinator,
+        registry: &mut TaskRegistry,
+        operation_id: OperationId,
+        identity: WorkspaceIdentity,
+        revision: u64,
+    ) {
+        let reservation = registry
+            .reserve(operation_id)
+            .expect("reserve active workspace fixture");
+        coordinator.active = Some(ActiveWorkspaceOperation {
+            reservation,
+            meta: WorkspaceOperationMeta {
+                operation_id,
+                identity,
+                revision,
+                action: WorkspaceAction::Commit,
+            },
+            completion_sent: Arc::new(AtomicBool::new(false)),
+            join: tokio::spawn(std::future::pending()),
+        });
+    }
+
+    async fn release_blocked_coordinator(
+        coordinator: &mut WorkspaceCoordinator,
+        registry: &mut TaskRegistry,
+    ) {
+        if let Some(active) = coordinator.active.take() {
+            active.join.abort();
+            let _ = active.join.await;
+            registry.release_reservation(active.reservation);
+        }
+    }
+
+    async fn next_event(ui: &mut UiPort) -> UiEvent {
+        tokio::time::timeout(Duration::from_secs(3), ui.next_event())
+            .await
+            .expect("runtime event timeout")
+            .expect("runtime event channel open")
+    }
+
+    async fn wait_for_profiles(ui: &mut UiPort, operation_id: OperationId) {
+        loop {
+            if matches!(
+                next_event(ui).await,
+                UiEvent::ProfilesLoaded {
+                    operation_id: event_operation,
+                    ..
+                } if event_operation == operation_id
+            ) {
+                return;
+            }
+        }
+    }
+
+    async fn shutdown_runtime(ui: &mut UiPort, runtime: RuntimeHandle, operation_id: OperationId) {
+        ui.try_submit(UiCommand::ShutdownRuntime { operation_id })
+            .expect("submit runtime shutdown");
+        loop {
+            if matches!(
+                next_event(ui).await,
+                UiEvent::RuntimeShutdown {
+                    operation_id: event_operation,
+                } if event_operation == operation_id
+            ) {
+                break;
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(3), runtime.wait())
+            .await
+            .expect("runtime shutdown timeout")
+            .expect("runtime task join");
+    }
+
+    #[tokio::test]
+    async fn coordinator_keeps_active_and_only_latest_pending_commit_per_exact_identity() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let instance_id = ProfileInstanceId::from_bytes([1; 16]);
+        let application = service_fixture(&config_path, "coalesce", instance_id);
+        let (mut ui, port) = bounded_ports(16);
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = TaskRegistry::default();
+        let mut coordinator = WorkspaceCoordinator::new(WorkspaceBackend::Unavailable(
+            WorkspaceFailureCode::Unavailable,
+        ));
+        let identity = identity("coalesce", 1, instance_id);
+        block_coordinator(
+            &mut coordinator,
+            &mut registry,
+            OperationId(1),
+            identity.clone(),
+            1,
+        );
+
+        coordinator
+            .enqueue(
+                commit_command(6, identity.clone(), 1, "duplicate active revision"),
+                4,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+        for (operation_id, revision) in [(2, 2), (3, 3), (4, 4)] {
+            coordinator
+                .enqueue(
+                    commit_command(operation_id, identity.clone(), revision, "select 1"),
+                    4,
+                    &port,
+                    &application,
+                    &message_tx,
+                    &mut registry,
+                )
+                .await;
+        }
+        coordinator
+            .enqueue(
+                commit_command(5, identity.clone(), 3, "late stale revision"),
+                4,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+
+        assert_eq!(coordinator.pending.len(), 1);
+        assert_eq!(
+            coordinator
+                .pending
+                .front()
+                .map(|pending| pending.request.meta().operation_id),
+            Some(OperationId(4))
+        );
+        let events = ui.drain_events(8);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    UiEvent::WorkspaceCommitSuperseded {
+                        operation_id: OperationId(2 | 3 | 5 | 6),
+                        ..
+                    }
+                ))
+                .count(),
+            4
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UiEvent::WorkspaceCommitSuperseded {
+                operation_id: OperationId(6),
+                superseded_by: OperationId(1),
+                superseded_by_revision: 1,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UiEvent::WorkspaceCommitSuperseded {
+                operation_id: OperationId(5),
+                superseded_by: OperationId(4),
+                superseded_by_revision: 4,
+                ..
+            }
+        )));
+        for operation_id in [
+            OperationId(2),
+            OperationId(3),
+            OperationId(5),
+            OperationId(6),
+        ] {
+            let released = registry
+                .reserve(operation_id)
+                .expect("superseded reservation released exactly once");
+            registry.release_reservation(released);
+        }
+        assert!(registry.reserve(OperationId(1)).is_err());
+        assert!(registry.reserve(OperationId(4)).is_err());
+        release_blocked_coordinator(&mut coordinator, &mut registry).await;
+    }
+
+    #[tokio::test]
+    async fn clear_uses_exact_identity_and_does_not_cross_the_latest_load_barrier() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let instance_id = ProfileInstanceId::from_bytes([2; 16]);
+        let application = service_fixture(&config_path, "barrier", instance_id);
+        let (mut ui, port) = bounded_ports(16);
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = TaskRegistry::default();
+        let mut coordinator = WorkspaceCoordinator::new(WorkspaceBackend::Unavailable(
+            WorkspaceFailureCode::Unavailable,
+        ));
+        let current_identity = identity("barrier", 1, instance_id);
+        block_coordinator(
+            &mut coordinator,
+            &mut registry,
+            OperationId(10),
+            current_identity.clone(),
+            1,
+        );
+
+        coordinator
+            .enqueue(
+                commit_command(11, current_identity.clone(), 2, "before load"),
+                8,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+        coordinator
+            .enqueue(
+                load_command(12, current_identity.clone(), 2),
+                8,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+        let stale_generation = identity("barrier", 2, instance_id);
+        coordinator
+            .enqueue(
+                commit_command(17, stale_generation, 3, "stale generation"),
+                8,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+        coordinator
+            .enqueue(
+                commit_command(13, current_identity.clone(), 3, "after load"),
+                8,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+        coordinator
+            .enqueue(
+                clear_command(14, current_identity.clone(), 3),
+                8,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+        coordinator
+            .enqueue(
+                commit_command(15, current_identity.clone(), 4, "after clear"),
+                8,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+        coordinator
+            .enqueue(
+                commit_command(16, current_identity.clone(), 5, "latest after clear"),
+                8,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+
+        let pending = coordinator
+            .pending
+            .iter()
+            .map(|pending| pending.request.meta().operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending,
+            vec![
+                OperationId(11),
+                OperationId(12),
+                OperationId(17),
+                OperationId(14),
+                OperationId(16),
+            ]
+        );
+        let events = ui.drain_events(8);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UiEvent::WorkspaceCommitSuperseded {
+                operation_id: OperationId(13),
+                superseded_by: OperationId(14),
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UiEvent::WorkspaceCommitSuperseded {
+                operation_id: OperationId(15),
+                superseded_by: OperationId(16),
+                ..
+            }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            UiEvent::WorkspaceCommitSuperseded {
+                operation_id: OperationId(11 | 17),
+                ..
+            }
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, UiEvent::WorkspaceCommitSuperseded { .. }))
+                .count(),
+            2
+        );
+        release_blocked_coordinator(&mut coordinator, &mut registry).await;
+    }
+
+    #[tokio::test]
+    async fn load_barrier_prevents_cross_barrier_commit_coalescing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let instance_id = ProfileInstanceId::from_bytes([3; 16]);
+        let application = service_fixture(&config_path, "load-barrier", instance_id);
+        let (mut ui, port) = bounded_ports(16);
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = TaskRegistry::default();
+        let mut coordinator = WorkspaceCoordinator::new(WorkspaceBackend::Unavailable(
+            WorkspaceFailureCode::Unavailable,
+        ));
+        let identity = identity("load-barrier", 1, instance_id);
+        block_coordinator(
+            &mut coordinator,
+            &mut registry,
+            OperationId(20),
+            identity.clone(),
+            1,
+        );
+
+        for command in [
+            commit_command(21, identity.clone(), 2, "before load"),
+            load_command(22, identity.clone(), 2),
+            commit_command(23, identity.clone(), 3, "after load"),
+            commit_command(24, identity.clone(), 4, "latest after load"),
+        ] {
+            coordinator
+                .enqueue(command, 4, &port, &application, &message_tx, &mut registry)
+                .await;
+        }
+
+        let pending = coordinator
+            .pending
+            .iter()
+            .map(|pending| pending.request.meta().operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending,
+            vec![OperationId(21), OperationId(22), OperationId(24)]
+        );
+        let events = ui.drain_events(8);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events.first(),
+            Some(UiEvent::WorkspaceCommitSuperseded {
+                operation_id: OperationId(23),
+                superseded_by: OperationId(24),
+                ..
+            })
+        ));
+        release_blocked_coordinator(&mut coordinator, &mut registry).await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_capacity_collision_and_invalid_identity_release_reservations() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let instance_id = ProfileInstanceId::from_bytes([4; 16]);
+        let application = service_fixture(&config_path, "capacity", instance_id);
+        let (mut ui, port) = bounded_ports(16);
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = TaskRegistry::default();
+        let mut coordinator = WorkspaceCoordinator::new(WorkspaceBackend::Unavailable(
+            WorkspaceFailureCode::Unavailable,
+        ));
+        let identity = identity("capacity", 1, instance_id);
+        block_coordinator(
+            &mut coordinator,
+            &mut registry,
+            OperationId(30),
+            identity.clone(),
+            1,
+        );
+        for operation_id in [31, 32, 33] {
+            coordinator
+                .enqueue(
+                    load_command(operation_id, identity.clone(), 1),
+                    2,
+                    &port,
+                    &application,
+                    &message_tx,
+                    &mut registry,
+                )
+                .await;
+        }
+        assert_eq!(coordinator.pending.len(), 2);
+        assert!(ui.drain_events(4).iter().any(|event| matches!(
+            event,
+            UiEvent::WorkspaceOperationFailed {
+                operation_id: OperationId(33),
+                code: WorkspaceFailureCode::Busy,
+                ..
+            }
+        )));
+        let capacity_released = registry
+            .reserve(OperationId(33))
+            .expect("capacity rejection releases reservation");
+        registry.release_reservation(capacity_released);
+
+        let collision = registry
+            .reserve(OperationId(34))
+            .expect("simulate globally active non-workspace operation");
+        coordinator
+            .enqueue(
+                load_command(34, identity.clone(), 1),
+                2,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+        assert!(ui.drain_events(4).iter().any(|event| matches!(
+            event,
+            UiEvent::WorkspaceOperationFailed {
+                operation_id: OperationId(34),
+                code: WorkspaceFailureCode::Busy,
+                ..
+            }
+        )));
+        registry.release_reservation(collision);
+
+        let invalid_snapshot = UiCommand::CommitWorkspace {
+            operation_id: OperationId(35),
+            identity,
+            revision: 2,
+            snapshot: snapshot("different-profile", instance_id, "invalid identity"),
+        };
+        coordinator
+            .enqueue(
+                invalid_snapshot,
+                2,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+        assert!(ui.drain_events(4).iter().any(|event| matches!(
+            event,
+            UiEvent::WorkspaceOperationFailed {
+                operation_id: OperationId(35),
+                code: WorkspaceFailureCode::InvalidIdentity,
+                ..
+            }
+        )));
+        let invalid_released = registry
+            .reserve(OperationId(35))
+            .expect("invalid identity releases reservation");
+        registry.release_reservation(invalid_released);
+        release_blocked_coordinator(&mut coordinator, &mut registry).await;
+    }
+
+    #[tokio::test]
+    async fn closed_completion_channel_reaps_once_and_releases_reservation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let instance_id = ProfileInstanceId::from_bytes([5; 16]);
+        let application = service_fixture(&config_path, "closed", instance_id);
+        let (mut ui, port) = bounded_ports(16);
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel::<ControllerMessage>();
+        drop(message_rx);
+        let mut registry = TaskRegistry::default();
+        let mut coordinator = WorkspaceCoordinator::new(WorkspaceBackend::Unavailable(
+            WorkspaceFailureCode::Unavailable,
+        ));
+        coordinator
+            .enqueue(
+                load_command(40, identity("closed", 1, instance_id), 0),
+                4,
+                &port,
+                &application,
+                &message_tx,
+                &mut registry,
+            )
+            .await;
+        for _ in 0..100 {
+            if coordinator
+                .active
+                .as_ref()
+                .is_some_and(|active| active.join.is_finished())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        coordinator
+            .reap_panicked(&port, &application, &message_tx, &mut registry)
+            .await;
+        let events = ui.drain_events(4);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    UiEvent::WorkspaceOperationFailed {
+                        operation_id: OperationId(40),
+                        code: WorkspaceFailureCode::Internal,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        let released = registry
+            .reserve(OperationId(40))
+            .expect("closed completion releases reservation");
+        registry.release_reservation(released);
+    }
+
+    #[tokio::test]
+    async fn panicked_workspace_task_reaps_once_and_releases_reservation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let instance_id = ProfileInstanceId::from_bytes([6; 16]);
+        let application = service_fixture(&config_path, "panic", instance_id);
+        let (mut ui, port) = bounded_ports(16);
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = TaskRegistry::default();
+        let mut coordinator = WorkspaceCoordinator::new(WorkspaceBackend::Unavailable(
+            WorkspaceFailureCode::Unavailable,
+        ));
+        let reservation = registry
+            .reserve(OperationId(50))
+            .expect("reserve panic fixture");
+        coordinator.active = Some(ActiveWorkspaceOperation {
+            reservation,
+            meta: WorkspaceOperationMeta {
+                operation_id: OperationId(50),
+                identity: identity("panic", 1, instance_id),
+                revision: 1,
+                action: WorkspaceAction::Commit,
+            },
+            completion_sent: Arc::new(AtomicBool::new(false)),
+            join: tokio::spawn(async { panic!("test-only workspace worker panic") }),
+        });
+        while coordinator
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.join.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
+        coordinator
+            .reap_panicked(&port, &application, &message_tx, &mut registry)
+            .await;
+        assert_eq!(
+            ui.drain_events(4)
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    UiEvent::WorkspaceOperationFailed {
+                        operation_id: OperationId(50),
+                        code: WorkspaceFailureCode::Internal,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        let released = registry
+            .reserve(OperationId(50))
+            .expect("panic releases reservation");
+        registry.release_reservation(released);
+    }
+
+    #[tokio::test]
+    async fn stale_identity_is_rejected_before_io_and_cannot_commit() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let instance_id = ProfileInstanceId::from_bytes([7; 16]);
+        let application = service_fixture(&config_path, "pre-stale", instance_id);
+        let store = Arc::new(WorkspaceStore::open(&config_path).expect("open workspace store"));
+        let stale_identity = identity("pre-stale", 2, instance_id);
+        let result = execute_workspace_request(
+            WorkspaceBackend::Ready(store.clone()),
+            application,
+            WorkspaceRequest::Commit {
+                operation_id: OperationId(60),
+                identity: stale_identity,
+                revision: 1,
+                snapshot: snapshot("pre-stale", instance_id, "must not persist"),
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(WorkspaceFailureCode::Stale)));
+        assert!(
+            store
+                .load(instance_id)
+                .expect("load workspace after stale rejection")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_identity_after_io_masks_success_without_marking_current() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let instance_id = ProfileInstanceId::from_bytes([8; 16]);
+        let application = service_fixture(&config_path, "post-stale", instance_id);
+        let store = WorkspaceStore::open(&config_path).expect("open workspace store");
+        let current_identity = identity("post-stale", 1, instance_id);
+        let result = run_workspace_store_request(
+            &store,
+            WorkspaceRequest::Commit {
+                operation_id: OperationId(61),
+                identity: current_identity.clone(),
+                revision: 1,
+                snapshot: snapshot("post-stale", instance_id, "persisted before stale"),
+            },
+        );
+        assert!(matches!(result, Ok(WorkspaceStoreOutput::Committed { .. })));
+
+        write_config(&config_path, Vec::new());
+        application
+            .reload_configuration()
+            .await
+            .expect("reload removed profile");
+        assert!(!application.is_config_uncertain());
+        assert!(matches!(
+            finalize_workspace_result(&application, &current_identity, result).await,
+            Err(WorkspaceFailureCode::Stale)
+        ));
+        assert!(
+            store
+                .load(instance_id)
+                .expect("load post-I/O workspace")
+                .is_some(),
+            "the post-I/O validator must distinguish a completed write from a current UI save"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_lease_lives_until_shutdown_and_writer_busy_is_failure_isolated() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let instance_id = ProfileInstanceId::from_bytes([9; 16]);
+        let service_a = service_fixture(&config_path, "lease", instance_id);
+        let service_b = ApplicationService::load_path(&config_path).expect("second service");
+
+        let (mut ui_a, port_a) = controller_ports();
+        let runtime_a = spawn_with_service(port_a, service_a);
+        ui_a.try_submit(UiCommand::RefreshProfiles {
+            operation_id: OperationId(70),
+        })
+        .expect("refresh first runtime");
+        wait_for_profiles(&mut ui_a, OperationId(70)).await;
+
+        let observer = WorkspaceStore::open(&config_path).expect("open observer store");
+        assert_eq!(observer.mode(), WorkspaceStoreMode::ReadOnly);
+        assert_eq!(
+            observer.read_only_reason(),
+            Some(WorkspaceReadOnlyReason::WriterBusy)
+        );
+        drop(observer);
+
+        let (mut ui_b, port_b) = controller_ports();
+        let runtime_b = spawn_with_service(port_b, service_b.clone());
+        ui_b.try_submit(UiCommand::RefreshProfiles {
+            operation_id: OperationId(71),
+        })
+        .expect("refresh second runtime");
+        wait_for_profiles(&mut ui_b, OperationId(71)).await;
+
+        let current_identity = identity("lease", 1, instance_id);
+        ui_b.try_submit(load_command(72, current_identity.clone(), 0))
+            .expect("submit read-only load");
+        assert!(matches!(
+            next_event(&mut ui_b).await,
+            UiEvent::WorkspaceLoaded {
+                operation_id: OperationId(72),
+                mode: WorkspaceStoreMode::ReadOnly,
+                read_only_reason: Some(WorkspaceReadOnlyReason::WriterBusy),
+                ..
+            }
+        ));
+
+        ui_b.try_submit(commit_command(73, current_identity, 1, "read-only commit"))
+            .expect("submit read-only commit");
+        assert!(matches!(
+            next_event(&mut ui_b).await,
+            UiEvent::WorkspaceOperationFailed {
+                operation_id: OperationId(73),
+                action: WorkspaceAction::Commit,
+                code: WorkspaceFailureCode::ReadOnly(WorkspaceReadOnlyReason::WriterBusy),
+                ..
+            }
+        ));
+        assert!(!service_b.is_config_uncertain());
+        assert_eq!(service_b.cached_session_count().await, 0);
+
+        ui_b.try_submit(UiCommand::RefreshProfiles {
+            operation_id: OperationId(74),
+        })
+        .expect("refresh after workspace failure");
+        wait_for_profiles(&mut ui_b, OperationId(74)).await;
+
+        shutdown_runtime(&mut ui_b, runtime_b, OperationId(75)).await;
+        assert_eq!(
+            WorkspaceStore::open(&config_path)
+                .expect("first runtime still owns writer")
+                .mode(),
+            WorkspaceStoreMode::ReadOnly
+        );
+        shutdown_runtime(&mut ui_a, runtime_a, OperationId(76)).await;
+        assert_eq!(
+            WorkspaceStore::open(&config_path)
+                .expect("writer lease released after runtime shutdown")
+                .mode(),
+            WorkspaceStoreMode::ReadWrite
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_event_lane_backpressures_terminals_and_keeps_shutdown_last() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let instance_id = ProfileInstanceId::from_bytes([10; 16]);
+        let application = service_fixture(&config_path, "shutdown", instance_id);
+        let current_identity = identity("shutdown", 1, instance_id);
+        let (mut ui, port) = controller_ports_with_event_capacity(1);
+        assert!(port.try_emit(UiEvent::ConfigUncertain {
+            operation_id: OperationId(79),
+        }));
+        let critical_reserve = crate::ui::WORKSPACE_CAPACITY
+            .saturating_mul(2)
+            .saturating_add(2);
+        for offset in 0..critical_reserve {
+            assert!(
+                port.emit(UiEvent::ConfigUncertain {
+                    operation_id: OperationId(790 + offset as u64),
+                })
+                .await
+            );
+        }
+
+        for command in [
+            commit_command(80, current_identity.clone(), 1, "revision one"),
+            commit_command(81, current_identity.clone(), 2, "superseded"),
+            clear_command(82, current_identity.clone(), 2),
+            commit_command(83, current_identity, 3, "revision three"),
+        ] {
+            ui.try_submit(command).expect("queue workspace command");
+        }
+        ui.try_submit(UiCommand::ShutdownRuntime {
+            operation_id: OperationId(89),
+        })
+        .expect("queue shutdown");
+        let runtime = spawn_with_service(port, application);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !runtime.join.is_finished(),
+            "a full bounded event lane must backpressure terminal delivery"
+        );
+        assert!(matches!(
+            next_event(&mut ui).await,
+            UiEvent::ConfigUncertain {
+                operation_id: OperationId(79)
+            }
+        ));
+        for offset in 0..critical_reserve {
+            assert!(matches!(
+                next_event(&mut ui).await,
+                UiEvent::ConfigUncertain {
+                    operation_id,
+                } if operation_id == OperationId(790 + offset as u64)
+            ));
+        }
+
+        let mut events = Vec::new();
+        loop {
+            let event = next_event(&mut ui).await;
+            let is_shutdown = matches!(
+                event,
+                UiEvent::RuntimeShutdown {
+                    operation_id: OperationId(89)
+                }
+            );
+            events.push(event);
+            if is_shutdown {
+                break;
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(3), runtime.wait())
+            .await
+            .expect("queued shutdown timeout")
+            .expect("queued shutdown task");
+
+        for operation_id in [80, 81, 82, 83] {
+            let operation_id = OperationId(operation_id);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| match event {
+                        UiEvent::WorkspaceCommitted {
+                            operation_id: event_operation,
+                            ..
+                        }
+                        | UiEvent::WorkspaceCleared {
+                            operation_id: event_operation,
+                            ..
+                        }
+                        | UiEvent::WorkspaceCommitSuperseded {
+                            operation_id: event_operation,
+                            ..
+                        }
+                        | UiEvent::WorkspaceOperationFailed {
+                            operation_id: event_operation,
+                            ..
+                        } => *event_operation == operation_id,
+                        _ => false,
+                    })
+                    .count(),
+                1,
+                "each queued workspace command receives exactly one terminal"
+            );
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UiEvent::WorkspaceCommitSuperseded {
+                operation_id: OperationId(81),
+                superseded_by: OperationId(82),
+                ..
+            }
+        )));
+        let committed_one = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    UiEvent::WorkspaceCommitted {
+                        operation_id: OperationId(80),
+                        ..
+                    }
+                )
+            })
+            .expect("revision one committed");
+        let cleared = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    UiEvent::WorkspaceCleared {
+                        operation_id: OperationId(82),
+                        ..
+                    }
+                )
+            })
+            .expect("clear completed");
+        let committed_three = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    UiEvent::WorkspaceCommitted {
+                        operation_id: OperationId(83),
+                        ..
+                    }
+                )
+            })
+            .expect("revision three committed");
+        assert!(committed_one < cleared);
+        assert!(cleared < committed_three);
+        assert!(matches!(
+            events.last(),
+            Some(UiEvent::RuntimeShutdown {
+                operation_id: OperationId(89)
+            })
+        ));
+
+        let store = WorkspaceStore::open(&config_path).expect("reopen after runtime shutdown");
+        assert_eq!(store.mode(), WorkspaceStoreMode::ReadWrite);
+        let saved = store
+            .load(instance_id)
+            .expect("load final workspace")
+            .expect("final workspace persisted");
+        assert_eq!(saved.editor_tabs()[0].source(), "revision three");
     }
 }

@@ -21,7 +21,8 @@ use crate::secrets::EnvironmentAvailability;
 use crate::service::SessionDisposition;
 use crate::workspace::{
     EditorTabSnapshot, ProfileWorkspaceSnapshot, WorkspaceGeometrySnapshot, WorkspaceHistoryEntry,
-    WorkspaceLanguage, WorkspaceSnapshotError,
+    WorkspaceIoKind, WorkspaceLanguage, WorkspaceReadOnlyReason, WorkspaceSnapshotError,
+    WorkspaceStoreMode, WorkspaceStoreWarning,
 };
 
 use super::result_view::ResultViewState;
@@ -97,6 +98,76 @@ impl WorkspaceKey {
             profile_generation,
         }
     }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct WorkspaceIdentity {
+    profile_id: ProfileId,
+    profile_generation: ProfileGeneration,
+    instance_id: ProfileInstanceId,
+}
+
+impl WorkspaceIdentity {
+    pub fn new(
+        profile_id: ProfileId,
+        profile_generation: ProfileGeneration,
+        instance_id: ProfileInstanceId,
+    ) -> Self {
+        Self {
+            profile_id,
+            profile_generation,
+            instance_id,
+        }
+    }
+
+    pub fn profile_id(&self) -> &ProfileId {
+        &self.profile_id
+    }
+
+    pub const fn profile_generation(&self) -> ProfileGeneration {
+        self.profile_generation
+    }
+
+    pub const fn instance_id(&self) -> ProfileInstanceId {
+        self.instance_id
+    }
+}
+
+impl fmt::Debug for WorkspaceIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceIdentity")
+            .field("profile_id", &"<redacted>")
+            .field("profile_generation", &self.profile_generation)
+            .field("instance_id", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceAction {
+    Load,
+    Commit,
+    Clear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceFailureCode {
+    Unavailable,
+    Busy,
+    Stale,
+    InvalidIdentity,
+    ReadOnly(WorkspaceReadOnlyReason),
+    InvalidSnapshot,
+    LimitExceeded,
+    UnsafeStorage,
+    Corrupt,
+    UnsupportedVersion,
+    ExternalChange,
+    DurabilityUnknown,
+    RecoveryRequired,
+    Io(WorkspaceIoKind),
+    Internal,
 }
 
 pub const MAX_EDITOR_TABS: usize = 20;
@@ -1510,6 +1581,40 @@ pub enum UiEvent {
         profile_generation: ProfileGeneration,
         server_state_unknown: bool,
     },
+    WorkspaceLoaded {
+        operation_id: OperationId,
+        identity: WorkspaceIdentity,
+        base_revision: u64,
+        mode: WorkspaceStoreMode,
+        read_only_reason: Option<WorkspaceReadOnlyReason>,
+        snapshot: Option<Box<ProfileWorkspaceSnapshot>>,
+    },
+    WorkspaceCommitted {
+        operation_id: OperationId,
+        identity: WorkspaceIdentity,
+        revision: u64,
+        generation: u64,
+        warnings: Vec<WorkspaceStoreWarning>,
+    },
+    WorkspaceCleared {
+        operation_id: OperationId,
+        identity: WorkspaceIdentity,
+        base_revision: u64,
+    },
+    WorkspaceCommitSuperseded {
+        operation_id: OperationId,
+        identity: WorkspaceIdentity,
+        revision: u64,
+        superseded_by: OperationId,
+        superseded_by_revision: u64,
+    },
+    WorkspaceOperationFailed {
+        operation_id: OperationId,
+        identity: WorkspaceIdentity,
+        revision: u64,
+        action: WorkspaceAction,
+        code: WorkspaceFailureCode,
+    },
     ConfigUncertain {
         operation_id: OperationId,
     },
@@ -2156,6 +2261,11 @@ impl UiModel {
                 server_state_unknown,
                 ..
             } => self.fold_deleted(profile_id, profile_generation, server_state_unknown),
+            UiEvent::WorkspaceLoaded { .. }
+            | UiEvent::WorkspaceCommitted { .. }
+            | UiEvent::WorkspaceCleared { .. }
+            | UiEvent::WorkspaceCommitSuperseded { .. }
+            | UiEvent::WorkspaceOperationFailed { .. } => {}
             UiEvent::ConfigUncertain { operation_id } => {
                 if !self.accept_profiles_operation(operation_id) {
                     return;
