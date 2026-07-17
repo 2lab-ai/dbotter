@@ -122,16 +122,47 @@ fn result_area_exposes_distinct_results_and_history_tabs() {
 }
 
 #[test]
-fn session_only_workspace_retention_is_explicit_in_the_actual_renderer() {
+fn durable_workspace_controls_replace_session_only_retention_in_the_actual_renderer() {
+    let persistence = function_body(APP_RENDERER_SOURCE, "show_workspace_persistence_controls");
     assert!(
-        APP_RENDERER_SOURCE.contains("Session workspace")
-            && APP_RENDERER_SOURCE.contains("tabs and history clear on quit"),
-        "the Preview must disclose that query tabs and history are session-only"
+        !persistence.contains("workspace.session-retention")
+            && !persistence.contains("tabs and history clear on quit"),
+        "the durable workspace must not advertise session-only retention"
     );
     let tabs = function_body(APP_RENDERER_SOURCE, "show_editor_tab_strip");
     assert!(
         tabs.contains("is_dirty()") && tabs.contains("editor.tab.discard"),
         "dirty editor tabs need visible state and an explicit discard confirmation"
+    );
+    for author_id in [
+        "workspace.persistence.status",
+        "workspace.persistence.toggle",
+        "workspace.persistence.clear",
+        "editor.save",
+    ] {
+        assert!(
+            has_bound_author_id(persistence, author_id),
+            "durable workspace control needs stable author id `{author_id}`"
+        );
+    }
+    assert!(
+        persistence.contains("OpenAiTheme::MIN_CONTROL_HEIGHT"),
+        "all discrete persistence controls need the shared 44-point minimum"
+    );
+}
+
+#[test]
+fn editor_tab_strip_exposes_accessible_reorder_controls() {
+    let tabs = function_body(APP_RENDERER_SOURCE, "show_editor_tab_strip");
+    for author_id in ["editor.tab.move_left", "editor.tab.move_right"] {
+        assert!(
+            has_bound_author_id(tabs, author_id),
+            "editor reorder control needs stable author id `{author_id}`"
+        );
+    }
+    assert!(
+        tabs.contains("reorder_editor_tab") && tabs.contains("OpenAiTheme::MIN_CONTROL_HEIGHT"),
+        "editor reorder controls must invoke the model and retain 44-point targets"
     );
 }
 
@@ -182,6 +213,38 @@ fn actual_app_restores_and_saves_geometry_through_native_storage() {
         APP_RENDERER_SOURCE.contains("fn save(")
             && APP_RENDERER_SOURCE.contains("WORKSPACE_GEOMETRY_STORAGE_KEY"),
         "the native app must save geometry through eframe storage"
+    );
+    assert!(
+        APP_RENDERER_SOURCE.contains("fn persist_egui_memory(&self) -> bool")
+            && APP_RENDERER_SOURCE.contains("fn auto_save_interval(&self) -> Duration"),
+        "native persistence must disable generic egui memory and retain the two-second cadence"
+    );
+}
+
+#[test]
+fn private_history_renderer_searches_full_source_but_bounds_visible_rows() {
+    let history = function_body(APP_RENDERER_SOURCE, "show_result_surface");
+    for author_id in ["history.search", "history.clear"] {
+        assert!(
+            has_bound_author_id(history, author_id),
+            "private history control needs stable author id `{author_id}`"
+        );
+    }
+    for metric in [
+        "duration_ms()",
+        "returned_rows()",
+        "affected_rows()",
+        "truncated()",
+    ] {
+        assert!(
+            history.contains(metric),
+            "history rows must render typed metric `{metric}`"
+        );
+    }
+    assert!(
+        APP_RENDERER_SOURCE.contains("MAX_PREVIEW_CHARACTERS")
+            && history.contains("workspace_history_source_preview"),
+        "history must search retained source while rendering a bounded single-line preview"
     );
 }
 

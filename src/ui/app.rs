@@ -4,11 +4,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use eframe::egui;
 
-use crate::config::MigrationConsent;
+use crate::config::{ConfigSourceVersion, MigrationConsent};
 use crate::export_file::confirm_replace;
 use crate::model::{
     CatalogRequest, CredentialMode, DEFAULT_CATALOG_PAGE_SIZE, DEFAULT_CATALOG_TIMEOUT,
@@ -24,6 +25,11 @@ use crate::public_error::{
 };
 use crate::secrets::{EnvironmentAvailability, ReplacementSecretBuffer};
 use crate::service::DeleteProfileRequest;
+use crate::workspace::{
+    MAX_HISTORY_ENTRIES_PER_PROFILE, WorkspaceGeometrySnapshot, WorkspaceHistoryCode,
+    WorkspaceHistoryEntry, WorkspaceHistoryStatus, WorkspaceReadOnlyReason, WorkspaceRunTarget,
+    WorkspaceStoreMode,
+};
 
 use super::accessibility::{
     named_author_id, named_author_id_with_label, named_dynamic_author_id,
@@ -40,8 +46,9 @@ use super::layout::{
     WorkspaceGeometry,
 };
 use super::model::{
-    ConnectionState, EditorTabError, EditorTabId, ProfileSnapshot, ProfileWorkspace, ResultAreaTab,
-    UiEvent, UiModel, WorkspaceKey,
+    ConnectionFailureOutcome, ConnectionState, EditorTabError, EditorTabId, ProfileSnapshot,
+    ProfileWorkspace, ProfileWorkspacePersistence, ResultAreaTab, UiEvent, UiModel,
+    WorkspaceAction, WorkspaceFailureCode, WorkspaceIdentity, WorkspaceKey,
 };
 use super::mysql_explorer::{MySqlExplorerIntent, MySqlExplorerState};
 use super::profile_form::{
@@ -58,6 +65,10 @@ const MAX_RETAINED_WORKSPACE_GEOMETRIES: usize = 128;
 const MAX_WORKSPACE_GEOMETRY_STORAGE_BYTES: usize = 64 * 1024;
 pub const DEFAULT_EXECUTE_ROW_LIMIT: u32 = 500;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const WORKSPACE_AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(750);
+const WORKSPACE_SAVE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const WORKSPACE_EDITOR_COLLAPSED_SHARE: f32 = 0.1;
+const WORKSPACE_RESULTS_COLLAPSED_SHARE: f32 = 0.9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveOperation {
@@ -71,6 +82,150 @@ enum EditorTabAction {
     Rename(EditorTabId),
     New,
     Duplicate(EditorTabId),
+    MoveLeft(EditorTabId),
+    MoveRight(EditorTabId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorkspaceLoadPhase {
+    Unloaded,
+    Loading {
+        operation_id: OperationId,
+        base_revision: u64,
+        restore_allowed: bool,
+    },
+    Ready,
+    Failed(WorkspaceFailureCode),
+    Conflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorkspaceSavePhase {
+    Idle,
+    Saving {
+        operation_id: OperationId,
+        revision: u64,
+    },
+    Failed {
+        revision: u64,
+        code: WorkspaceFailureCode,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorkspaceClearPhase {
+    Idle,
+    Pending {
+        operation_id: OperationId,
+        revision: u64,
+    },
+    Failed {
+        revision: u64,
+        code: WorkspaceFailureCode,
+    },
+}
+
+impl WorkspaceClearPhase {
+    fn has_intent(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WorkspacePersistenceState {
+    identity: WorkspaceIdentity,
+    load: WorkspaceLoadPhase,
+    mode: Option<WorkspaceStoreMode>,
+    read_only_reason: Option<WorkspaceReadOnlyReason>,
+    save: WorkspaceSavePhase,
+    clear: WorkspaceClearPhase,
+    observed_revision: u64,
+    dirty_since: Option<Instant>,
+    retry_not_before: Option<Instant>,
+    force_commit_until_success: bool,
+    resolve_conflict_on_commit: bool,
+    clean_empty_baseline_pending: Option<u64>,
+    restore_baseline_revision: Option<u64>,
+}
+
+impl WorkspacePersistenceState {
+    fn new(
+        identity: WorkspaceIdentity,
+        revision: u64,
+        restore_baseline_revision: Option<u64>,
+    ) -> Self {
+        Self {
+            identity,
+            load: WorkspaceLoadPhase::Unloaded,
+            mode: None,
+            read_only_reason: None,
+            save: WorkspaceSavePhase::Idle,
+            clear: WorkspaceClearPhase::Idle,
+            observed_revision: revision,
+            dirty_since: None,
+            retry_not_before: None,
+            force_commit_until_success: false,
+            resolve_conflict_on_commit: false,
+            clean_empty_baseline_pending: None,
+            restore_baseline_revision,
+        }
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.mode == Some(WorkspaceStoreMode::ReadOnly)
+    }
+
+    fn load_can_restore(&self) -> bool {
+        !matches!(self.load, WorkspaceLoadPhase::Ready)
+    }
+}
+
+#[derive(Clone)]
+struct PendingWorkspaceHistory {
+    workspace_key: WorkspaceKey,
+    source: String,
+    target: WorkspaceRunTarget,
+    started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkspaceHistoryTerminal {
+    status: WorkspaceHistoryStatus,
+    completed_at_unix_ms: i64,
+    duration_ms: u64,
+    returned_rows: u64,
+    affected_rows: u64,
+    truncated: bool,
+}
+
+impl std::fmt::Debug for PendingWorkspaceHistory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingWorkspaceHistory")
+            .field("workspace_key", &self.workspace_key)
+            .field("source", &"<redacted>")
+            .field("target", &self.target)
+            .field("started_at", &self.started_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WorkspaceCloseGuard {
+    #[default]
+    Closed,
+    AwaitingSave,
+    SaveFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModalKind {
+    Delete,
+    EditorDiscard,
+    Credential,
+    WorkspaceClear,
+    WorkspaceConflict,
+    WorkspaceClose,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,6 +384,19 @@ const fn delete_failure_is_known_non_committed(summary: PublicSummary) -> bool {
     )
 }
 
+const fn workspace_failure_is_transient(code: WorkspaceFailureCode) -> bool {
+    matches!(
+        code,
+        WorkspaceFailureCode::Busy
+            | WorkspaceFailureCode::Stale
+            | WorkspaceFailureCode::Unavailable
+    )
+}
+
+fn operation_status_claims_workspace_saved(status: &str) -> bool {
+    status.starts_with("Private workspace Saved") || status == "Private workspace is Saved."
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct DeleteConfirmation {
     profile_id: ProfileId,
@@ -311,11 +479,23 @@ pub struct DbotterApp {
     committed_export_destinations: HashMap<ResultId, PathBuf>,
     result_export_formats: HashMap<ResultId, ExportFormat>,
     connection_filter: String,
+    workspace_persistence: HashMap<WorkspaceKey, WorkspacePersistenceState>,
+    pending_workspace_history: HashMap<OperationId, PendingWorkspaceHistory>,
+    workspace_history_search: HashMap<WorkspaceKey, String>,
+    workspace_history_focus: Option<WorkspaceKey>,
+    connection_filter_focus: bool,
+    workspace_close_guard: WorkspaceCloseGuard,
+    discard_local_changes_on_close: bool,
+    workspace_clear_confirmation: Option<WorkspaceKey>,
+    workspace_restore_conflict_confirmation: Option<WorkspaceKey>,
+    close_after_restore_conflict_confirmation: bool,
     workspace_geometries: HashMap<WorkspaceKey, WorkspaceGeometry>,
     collapsed_workspace_panes: HashMap<WorkspaceKey, Pane>,
     compact_fallback: CompactFallback,
     compact_restore_focus: Option<egui::Id>,
     compact_workspace: Option<WorkspaceKey>,
+    focused_modal: Option<ModalKind>,
+    frame_workspace_dirty_hint: bool,
 }
 
 impl DbotterApp {
@@ -348,11 +528,23 @@ impl DbotterApp {
             committed_export_destinations: HashMap::new(),
             result_export_formats: HashMap::new(),
             connection_filter: String::new(),
+            workspace_persistence: HashMap::new(),
+            pending_workspace_history: HashMap::new(),
+            workspace_history_search: HashMap::new(),
+            workspace_history_focus: None,
+            connection_filter_focus: false,
+            workspace_close_guard: WorkspaceCloseGuard::Closed,
+            discard_local_changes_on_close: false,
+            workspace_clear_confirmation: None,
+            workspace_restore_conflict_confirmation: None,
+            close_after_restore_conflict_confirmation: false,
             workspace_geometries,
             collapsed_workspace_panes: HashMap::new(),
             compact_fallback: CompactFallback::default(),
             compact_restore_focus: None,
             compact_workspace: None,
+            focused_modal: None,
+            frame_workspace_dirty_hint: false,
         };
         let operation_id = app.model.next_operation();
         let _ = app
@@ -373,6 +565,1266 @@ impl DbotterApp {
             self.model.config.migration_backup(),
         );
         editor
+    }
+
+    fn workspace_identity_for(&self, profile: &ProfileSnapshot) -> Option<WorkspaceIdentity> {
+        if self.model.config.source_version() != ConfigSourceVersion::V3 {
+            return None;
+        }
+        Some(WorkspaceIdentity::new(
+            profile.id.clone(),
+            profile.generation,
+            profile.persisted.safety.instance_id()?,
+        ))
+    }
+
+    fn workspace_geometry_snapshot(&self, key: &WorkspaceKey) -> Option<WorkspaceGeometrySnapshot> {
+        let geometry = self
+            .workspace_geometries
+            .get(key)
+            .copied()
+            .unwrap_or_else(WorkspaceGeometry::default);
+        WorkspaceGeometrySnapshot::new(
+            geometry.navigator_width(),
+            geometry.editor_share().clamp(
+                WORKSPACE_EDITOR_COLLAPSED_SHARE,
+                WORKSPACE_RESULTS_COLLAPSED_SHARE,
+            ),
+            geometry.inspector_visible(),
+        )
+        .ok()
+    }
+
+    /// Installs only the in-memory persistence identity. It is intentionally
+    /// idempotent and never submits work, so save/logic/execute paths may call
+    /// it while the renderer remains side-effect free.
+    fn ensure_workspace_persistence_binding(
+        &mut self,
+        key: &WorkspaceKey,
+        profile: &ProfileSnapshot,
+    ) -> bool {
+        let Some(identity) = self.workspace_identity_for(profile) else {
+            return false;
+        };
+        if identity.profile_id() != &key.profile_id
+            || identity.profile_generation() != key.profile_generation
+        {
+            return false;
+        }
+        let Some(geometry) = self.workspace_geometry_snapshot(key) else {
+            self.model.status = "Workspace geometry is outside the durable bounds.".to_owned();
+            return false;
+        };
+        let workspace = self.model.workspace_mut(key.clone());
+        let pristine_before_binding =
+            workspace.editor_tabs().is_empty() && workspace.editor_text.is_empty();
+        if let Some(persistence) = workspace.persistence() {
+            if persistence.profile_id() != identity.profile_id()
+                || persistence.instance_id() != identity.instance_id()
+            {
+                self.model.status =
+                    "Workspace persistence identity does not match this profile.".to_owned();
+                return false;
+            }
+        } else {
+            let Ok(persistence) = ProfileWorkspacePersistence::for_classified_profile(
+                &profile.persisted,
+                true,
+                geometry,
+                Vec::new(),
+            ) else {
+                self.model.status =
+                    "Workspace persistence requires a classified v3 profile.".to_owned();
+                return false;
+            };
+            if let Err(error) = workspace.bind_persistence(persistence) {
+                self.model.status = error.to_string();
+                return false;
+            }
+        }
+        let revision = workspace.revision();
+        let restore_baseline_revision = pristine_before_binding.then_some(revision);
+        match self.workspace_persistence.get(key) {
+            Some(state) if state.identity == identity => {}
+            _ => {
+                self.workspace_persistence.insert(
+                    key.clone(),
+                    WorkspacePersistenceState::new(identity, revision, restore_baseline_revision),
+                );
+            }
+        }
+        true
+    }
+
+    fn ensure_selected_workspace_persistence_binding(&mut self) -> Option<WorkspaceKey> {
+        let profile = self.model.selected_profile_snapshot()?.clone();
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        self.ensure_workspace_persistence_binding(&key, &profile)
+            .then_some(key)
+    }
+
+    fn ensure_current_workspace_persistence_bindings(&mut self) -> Vec<WorkspaceKey> {
+        let profiles = self.model.profiles.clone();
+        let mut bound = Vec::new();
+        for profile in profiles {
+            let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+            if self.ensure_workspace_persistence_binding(&key, &profile) {
+                bound.push(key);
+            }
+        }
+        self.workspace_persistence.retain(|key, state| {
+            self.model.active_generation(&key.profile_id) == Some(key.profile_generation)
+                && self.model.profiles.iter().any(|profile| {
+                    profile.id == key.profile_id
+                        && profile.generation == key.profile_generation
+                        && profile.persisted.safety.instance_id()
+                            == Some(state.identity.instance_id())
+                })
+        });
+        self.workspace_history_search.retain(|key, _| {
+            self.model.active_generation(&key.profile_id) == Some(key.profile_generation)
+        });
+        bound
+    }
+
+    fn request_workspace_load(&mut self, key: &WorkspaceKey) {
+        let should_load = self.workspace_persistence.get(key).is_some_and(|state| {
+            matches!(state.load, WorkspaceLoadPhase::Unloaded) && !state.clear.has_intent()
+        });
+        if !should_load {
+            return;
+        }
+        let Some((identity, restore_baseline_revision)) = self
+            .workspace_persistence
+            .get(key)
+            .map(|state| (state.identity.clone(), state.restore_baseline_revision))
+        else {
+            return;
+        };
+        let Some(base_revision) = self.model.workspace(key).map(ProfileWorkspace::revision) else {
+            return;
+        };
+        let restore_allowed = restore_baseline_revision == Some(base_revision);
+        let operation_id = self.model.next_operation();
+        match self.port.try_submit(UiCommand::LoadWorkspace {
+            operation_id,
+            identity,
+            base_revision,
+        }) {
+            Ok(()) => {
+                if let Some(state) = self.workspace_persistence.get_mut(key) {
+                    state.load = WorkspaceLoadPhase::Loading {
+                        operation_id,
+                        base_revision,
+                        restore_allowed,
+                    };
+                    state.clean_empty_baseline_pending = None;
+                }
+                self.model.status = "Loading private workspace…".to_owned();
+            }
+            Err(error) => {
+                if let Some(state) = self.workspace_persistence.get_mut(key) {
+                    let code = match error {
+                        SubmitError::Busy => WorkspaceFailureCode::Busy,
+                        SubmitError::Disconnected => WorkspaceFailureCode::Unavailable,
+                    };
+                    state.load = WorkspaceLoadPhase::Failed(code);
+                    state.retry_not_before = Some(Instant::now() + WORKSPACE_SAVE_RETRY_DELAY);
+                }
+                self.report_submit_error(error);
+            }
+        }
+    }
+
+    fn observe_workspace_revisions(&mut self, now: Instant) {
+        let mut became_dirty = false;
+        let keys = self
+            .workspace_persistence
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            let Some((revision, saved)) = self
+                .model
+                .workspace(&key)
+                .map(|workspace| (workspace.revision(), workspace.is_saved()))
+            else {
+                continue;
+            };
+            let Some(state) = self.workspace_persistence.get_mut(&key) else {
+                continue;
+            };
+            if revision != state.observed_revision {
+                state.observed_revision = revision;
+                state.clean_empty_baseline_pending = None;
+                if !saved {
+                    state.dirty_since = Some(now);
+                    became_dirty = true;
+                }
+            }
+            if saved {
+                state.dirty_since = None;
+                state.retry_not_before = None;
+                if !matches!(state.save, WorkspaceSavePhase::Saving { .. }) {
+                    state.save = WorkspaceSavePhase::Idle;
+                }
+            }
+        }
+        if became_dirty && operation_status_claims_workspace_saved(&self.model.status) {
+            self.model.status = "Local workspace changes are Unsaved.".to_owned();
+        }
+    }
+
+    fn submit_workspace_commit(&mut self, key: &WorkspaceKey, explicit: bool) -> bool {
+        let force = self
+            .workspace_persistence
+            .get(key)
+            .is_some_and(|state| state.force_commit_until_success);
+        self.submit_workspace_commit_inner(key, explicit, force)
+    }
+
+    fn submit_workspace_commit_inner(
+        &mut self,
+        key: &WorkspaceKey,
+        explicit: bool,
+        force: bool,
+    ) -> bool {
+        let Some(state) = self.workspace_persistence.get(key) else {
+            return false;
+        };
+        if state.is_read_only() || state.clear.has_intent() {
+            self.model.status = if state.is_read_only() {
+                "Workspace persistence is read-only; changes remain local.".to_owned()
+            } else {
+                "Clearing private workspace data…".to_owned()
+            };
+            return false;
+        }
+        if matches!(state.save, WorkspaceSavePhase::Saving { .. }) {
+            self.model.status = "Saving private workspace…".to_owned();
+            return false;
+        }
+        if matches!(state.load, WorkspaceLoadPhase::Loading { .. }) {
+            self.model.status =
+                "Workspace restore is still loading; save remains pending.".to_owned();
+            return false;
+        }
+        if !force && !matches!(state.load, WorkspaceLoadPhase::Ready) {
+            self.model.status =
+                "Workspace restore is unresolved; Retry restore before saving.".to_owned();
+            return false;
+        }
+        if !explicit && state.mode != Some(WorkspaceStoreMode::ReadWrite) {
+            return false;
+        }
+        let persistence_enabled = self
+            .model
+            .workspace(key)
+            .and_then(ProfileWorkspace::persistence)
+            .is_some_and(ProfileWorkspacePersistence::persistence_enabled);
+        if !persistence_enabled && !force {
+            self.model.status =
+                "Persistence Off — editor changes are local only until quit.".to_owned();
+            return false;
+        }
+        let identity = state.identity.clone();
+        let snapshot = {
+            let Some(workspace) = self.model.workspaces.get_mut(key) else {
+                return false;
+            };
+            match workspace.to_persistence_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.model.status = error.to_string();
+                    return false;
+                }
+            }
+        };
+        let Some(revision) = self.model.workspace(key).map(ProfileWorkspace::revision) else {
+            return false;
+        };
+        if !force
+            && self
+                .model
+                .workspace(key)
+                .is_some_and(ProfileWorkspace::is_saved)
+        {
+            self.model.status = "Private workspace is Saved.".to_owned();
+            return true;
+        }
+        let operation_id = self.model.next_operation();
+        match self.port.try_submit(UiCommand::CommitWorkspace {
+            operation_id,
+            identity,
+            revision,
+            snapshot: Box::new(snapshot),
+        }) {
+            Ok(()) => {
+                if let Some(state) = self.workspace_persistence.get_mut(key) {
+                    state.save = WorkspaceSavePhase::Saving {
+                        operation_id,
+                        revision,
+                    };
+                    state.dirty_since = None;
+                    state.retry_not_before = None;
+                }
+                self.model.status = "Saving private workspace…".to_owned();
+                true
+            }
+            Err(error) => {
+                if let Some(state) = self.workspace_persistence.get_mut(key) {
+                    let code = match error {
+                        SubmitError::Busy => WorkspaceFailureCode::Busy,
+                        SubmitError::Disconnected => WorkspaceFailureCode::Unavailable,
+                    };
+                    state.save = WorkspaceSavePhase::Failed { revision, code };
+                    state.dirty_since.get_or_insert(Instant::now());
+                    state.retry_not_before = Some(Instant::now() + WORKSPACE_SAVE_RETRY_DELAY);
+                }
+                self.report_submit_error(error);
+                false
+            }
+        }
+    }
+
+    fn submit_conflict_resolution_commit(&mut self, key: &WorkspaceKey) -> bool {
+        let is_conflict = self
+            .workspace_persistence
+            .get(key)
+            .is_some_and(|state| matches!(state.load, WorkspaceLoadPhase::Conflict));
+        if !is_conflict {
+            return false;
+        }
+        if let Some(state) = self.workspace_persistence.get_mut(key) {
+            state.load = WorkspaceLoadPhase::Ready;
+        }
+        let submitted = self.submit_workspace_commit_inner(key, true, false);
+        let armed = self
+            .workspace_persistence
+            .get(key)
+            .is_some_and(|state| matches!(state.save, WorkspaceSavePhase::Saving { .. }));
+        if let Some(state) = self.workspace_persistence.get_mut(key) {
+            state.load = WorkspaceLoadPhase::Conflict;
+            state.resolve_conflict_on_commit = submitted && armed;
+        }
+        if submitted && armed {
+            self.model.status =
+                "Replacing the prior saved workspace with the confirmed local workspace…"
+                    .to_owned();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn request_selected_workspace_save(&mut self) -> bool {
+        let Some(key) = self.ensure_selected_workspace_persistence_binding() else {
+            self.model.status =
+                "Workspace persistence requires a classified version 3 profile.".to_owned();
+            return false;
+        };
+        if self
+            .workspace_persistence
+            .get(&key)
+            .is_some_and(|state| matches!(state.load, WorkspaceLoadPhase::Conflict))
+        {
+            self.workspace_restore_conflict_confirmation = Some(key);
+            return false;
+        }
+        self.observe_workspace_revisions(Instant::now());
+        self.submit_workspace_commit(&key, true)
+    }
+
+    fn flush_selected_workspace(&mut self) -> bool {
+        let Some(key) = self.ensure_selected_workspace_persistence_binding() else {
+            self.model.status =
+                "Workspace persistence requires a classified version 3 profile.".to_owned();
+            return false;
+        };
+        self.observe_workspace_revisions(Instant::now());
+        self.submit_workspace_commit(&key, true)
+    }
+
+    fn flush_all_dirty_workspaces(&mut self) {
+        let keys = self.ensure_current_workspace_persistence_bindings();
+        self.observe_workspace_revisions(Instant::now());
+        for key in keys {
+            let dirty = self
+                .model
+                .workspace(&key)
+                .is_some_and(|workspace| !workspace.is_saved());
+            if dirty {
+                let _ = self.submit_workspace_commit(&key, true);
+            }
+        }
+    }
+
+    fn autosave_workspaces(&mut self, now: Instant) {
+        let keys = self
+            .workspace_persistence
+            .iter()
+            .filter_map(|(key, state)| {
+                let current_revision = self.model.workspace(key).map(ProfileWorkspace::revision);
+                let persistence_enabled = self
+                    .model
+                    .workspace(key)
+                    .and_then(ProfileWorkspace::persistence)
+                    .is_some_and(ProfileWorkspacePersistence::persistence_enabled);
+                let debounce_elapsed = state.dirty_since.is_some_and(|changed| {
+                    now.duration_since(changed) >= WORKSPACE_AUTOSAVE_DEBOUNCE
+                });
+                let retry_ready = state.retry_not_before.is_none_or(|retry| now >= retry);
+                let ready = matches!(state.load, WorkspaceLoadPhase::Ready)
+                    || state.force_commit_until_success;
+                let permanent_failure_for_current_revision = matches!(
+                    state.save,
+                    WorkspaceSavePhase::Failed { revision, code }
+                        if Some(revision) == current_revision
+                            && !workspace_failure_is_transient(code)
+                );
+                (debounce_elapsed
+                    && retry_ready
+                    && ready
+                    && state.mode == Some(WorkspaceStoreMode::ReadWrite)
+                    && (persistence_enabled || state.force_commit_until_success)
+                    && !matches!(state.save, WorkspaceSavePhase::Saving { .. })
+                    && !permanent_failure_for_current_revision
+                    && !state.clear.has_intent())
+                .then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in keys {
+            let _ = self.submit_workspace_commit(&key, false);
+        }
+    }
+
+    fn retry_workspace_loads(&mut self, now: Instant) {
+        let retry_keys = self
+            .workspace_persistence
+            .iter()
+            .filter_map(|(key, state)| {
+                let transient = matches!(
+                    state.load,
+                    WorkspaceLoadPhase::Failed(
+                        WorkspaceFailureCode::Busy
+                            | WorkspaceFailureCode::Stale
+                            | WorkspaceFailureCode::Unavailable
+                    )
+                );
+                (transient
+                    && !state.clear.has_intent()
+                    && state.retry_not_before.is_none_or(|retry| now >= retry))
+                .then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in retry_keys {
+            if let Some(state) = self.workspace_persistence.get_mut(&key) {
+                state.load = WorkspaceLoadPhase::Unloaded;
+                state.retry_not_before = None;
+            }
+            self.request_workspace_load(&key);
+        }
+    }
+
+    fn handle_workspace_event(&mut self, event: &UiEvent) {
+        match event {
+            UiEvent::WorkspaceLoaded {
+                operation_id,
+                identity,
+                base_revision,
+                mode,
+                read_only_reason,
+                snapshot,
+            } => {
+                let key =
+                    WorkspaceKey::new(identity.profile_id().clone(), identity.profile_generation());
+                let restore_allowed = self.workspace_persistence.get(&key).and_then(|state| {
+                    if state.identity != *identity {
+                        return None;
+                    }
+                    match state.load {
+                        WorkspaceLoadPhase::Loading {
+                            operation_id: pending,
+                            base_revision: pending_revision,
+                            restore_allowed,
+                        } if pending == *operation_id && pending_revision == *base_revision => {
+                            Some(restore_allowed)
+                        }
+                        _ => None,
+                    }
+                });
+                let Some(restore_allowed) = restore_allowed else {
+                    return;
+                };
+                let current_revision = self
+                    .model
+                    .workspace(&key)
+                    .map_or(u64::MAX, ProfileWorkspace::revision);
+                if let Some(state) = self.workspace_persistence.get_mut(&key) {
+                    state.mode = Some(*mode);
+                    state.read_only_reason = *read_only_reason;
+                    state.load = WorkspaceLoadPhase::Ready;
+                    state.retry_not_before = None;
+                    state.clean_empty_baseline_pending = None;
+                }
+                if let Some(snapshot) = snapshot.as_deref()
+                    && (snapshot.profile_id() != identity.profile_id()
+                        || snapshot.instance_id() != identity.instance_id())
+                {
+                    if let Some(state) = self.workspace_persistence.get_mut(&key) {
+                        state.load =
+                            WorkspaceLoadPhase::Failed(WorkspaceFailureCode::InvalidIdentity);
+                    }
+                    self.model.status =
+                        "The restored workspace identity did not match this profile.".to_owned();
+                    return;
+                }
+                let restored_opt_out = snapshot
+                    .as_deref()
+                    .is_some_and(|snapshot| !snapshot.persistence_enabled());
+                if restored_opt_out && (current_revision != *base_revision || !restore_allowed) {
+                    let resolved_revision =
+                        if let Some(workspace) = self.model.workspaces.get_mut(&key) {
+                            if let Err(error) = workspace.set_persistence_enabled(false) {
+                                self.model.status = error.to_string();
+                                return;
+                            }
+                            let revision = workspace.revision();
+                            let _ = workspace.mark_saved_if_revision(revision);
+                            revision
+                        } else {
+                            current_revision
+                        };
+                    if let Some(state) = self.workspace_persistence.get_mut(&key) {
+                        state.load = WorkspaceLoadPhase::Ready;
+                        state.observed_revision = resolved_revision;
+                        state.dirty_since = None;
+                        state.retry_not_before = None;
+                        state.restore_baseline_revision = Some(resolved_revision);
+                    }
+                    self.model.status =
+                        "Persistence Off restored; the local draft remains local-only.".to_owned();
+                    return;
+                }
+                if snapshot.is_some() && (current_revision != *base_revision || !restore_allowed) {
+                    if let Some(state) = self.workspace_persistence.get_mut(&key) {
+                        state.load = WorkspaceLoadPhase::Conflict;
+                        state.dirty_since.get_or_insert(Instant::now());
+                        state.retry_not_before = None;
+                    }
+                    self.model.status =
+                        "Restore conflict: choose Keep local, Persistence Off, or Clear saved data."
+                            .to_owned();
+                    return;
+                }
+                if let Some(snapshot) = snapshot.as_deref() {
+                    let geometry = snapshot.geometry();
+                    match ProfileWorkspace::from_persistence_snapshot(snapshot.clone()) {
+                        Ok(restored) => {
+                            let restored_revision = restored.revision();
+                            let restored_empty = restored.editor_tabs().is_empty();
+                            self.model.workspaces.insert(key.clone(), restored);
+                            let restored_geometry = WorkspaceGeometry::restore(
+                                geometry.navigator_width(),
+                                geometry.editor_share(),
+                                geometry.inspector_visible(),
+                            );
+                            self.workspace_geometries
+                                .insert(key.clone(), restored_geometry);
+                            self.sync_collapsed_workspace_pane(&key, restored_geometry);
+                            if let Some(state) = self.workspace_persistence.get_mut(&key) {
+                                state.observed_revision = restored_revision;
+                                state.dirty_since = None;
+                                state.save = WorkspaceSavePhase::Idle;
+                                state.clean_empty_baseline_pending =
+                                    restored_empty.then_some(restored_revision);
+                                state.restore_baseline_revision = Some(restored_revision);
+                            }
+                            if self.model.selected_workspace_key().as_ref() == Some(&key) {
+                                self.compact_workspace = None;
+                            }
+                            self.editor_surface = EditorSurface::default();
+                            self.model.status = if *mode == WorkspaceStoreMode::ReadOnly {
+                                "Private workspace restored read-only; another app owns the writer."
+                                    .to_owned()
+                            } else {
+                                "Private workspace restored.".to_owned()
+                            };
+                        }
+                        Err(error) => {
+                            if let Some(state) = self.workspace_persistence.get_mut(&key) {
+                                state.load = WorkspaceLoadPhase::Failed(
+                                    WorkspaceFailureCode::InvalidSnapshot,
+                                );
+                            }
+                            self.model.status = error.to_string();
+                        }
+                    }
+                } else {
+                    let clean_empty_baseline =
+                        self.model
+                            .workspaces
+                            .get_mut(&key)
+                            .is_some_and(|workspace| {
+                                workspace.editor_tabs().is_empty()
+                                    && workspace.mark_saved_if_revision(*base_revision)
+                            });
+                    let current_revision = self
+                        .model
+                        .workspace(&key)
+                        .map_or(*base_revision, ProfileWorkspace::revision);
+                    if let Some(state) = self.workspace_persistence.get_mut(&key) {
+                        state.observed_revision = current_revision;
+                        state.dirty_since = (!clean_empty_baseline).then_some(Instant::now());
+                        state.save = WorkspaceSavePhase::Idle;
+                        state.clean_empty_baseline_pending =
+                            clean_empty_baseline.then_some(*base_revision);
+                        state.restore_baseline_revision =
+                            clean_empty_baseline.then_some(*base_revision);
+                    }
+                    self.model.status = if *mode == WorkspaceStoreMode::ReadOnly {
+                        "Workspace persistence is read-only; another app owns the writer."
+                            .to_owned()
+                    } else {
+                        "Private workspace is ready.".to_owned()
+                    };
+                }
+            }
+            UiEvent::WorkspaceCommitted {
+                operation_id,
+                identity,
+                revision,
+                warnings,
+                ..
+            } => {
+                let key =
+                    WorkspaceKey::new(identity.profile_id().clone(), identity.profile_generation());
+                let matches_pending = self.workspace_persistence.get(&key).is_some_and(|state| {
+                    state.identity == *identity
+                        && matches!(
+                            state.save,
+                            WorkspaceSavePhase::Saving {
+                                operation_id: pending,
+                                revision: pending_revision,
+                            } if pending == *operation_id && pending_revision == *revision
+                        )
+                });
+                if !matches_pending {
+                    return;
+                }
+                let saved = self
+                    .model
+                    .workspaces
+                    .get_mut(&key)
+                    .is_some_and(|workspace| workspace.mark_saved_if_revision(*revision));
+                let current_revision = self
+                    .model
+                    .workspace(&key)
+                    .map_or(*revision, ProfileWorkspace::revision);
+                if let Some(state) = self.workspace_persistence.get_mut(&key) {
+                    if state.resolve_conflict_on_commit {
+                        state.load = WorkspaceLoadPhase::Ready;
+                    }
+                    state.mode = Some(WorkspaceStoreMode::ReadWrite);
+                    state.save = WorkspaceSavePhase::Idle;
+                    state.observed_revision = current_revision;
+                    state.retry_not_before = None;
+                    state.force_commit_until_success = false;
+                    state.resolve_conflict_on_commit = false;
+                    state.restore_baseline_revision = Some(*revision);
+                    if saved {
+                        state.dirty_since = None;
+                    } else {
+                        state.dirty_since.get_or_insert(Instant::now());
+                    }
+                }
+                self.model.status = if saved {
+                    if warnings.is_empty() {
+                        "Private workspace Saved.".to_owned()
+                    } else {
+                        "Private workspace Saved with a bounded recovery warning.".to_owned()
+                    }
+                } else {
+                    "A newer local revision remains Unsaved; another save is queued.".to_owned()
+                };
+            }
+            UiEvent::WorkspaceCommitSuperseded {
+                operation_id,
+                identity,
+                revision,
+                ..
+            } => {
+                let key =
+                    WorkspaceKey::new(identity.profile_id().clone(), identity.profile_generation());
+                let matches_pending = self.workspace_persistence.get(&key).is_some_and(|state| {
+                    state.identity == *identity
+                        && matches!(
+                            state.save,
+                            WorkspaceSavePhase::Saving {
+                                operation_id: pending,
+                                revision: pending_revision,
+                            } if pending == *operation_id && pending_revision == *revision
+                        )
+                });
+                if matches_pending && let Some(state) = self.workspace_persistence.get_mut(&key) {
+                    state.save = WorkspaceSavePhase::Failed {
+                        revision: *revision,
+                        code: WorkspaceFailureCode::Stale,
+                    };
+                    state.dirty_since.get_or_insert(Instant::now());
+                    state.retry_not_before = Some(Instant::now() + WORKSPACE_SAVE_RETRY_DELAY);
+                    state.resolve_conflict_on_commit = false;
+                    self.model.status =
+                        "A newer save superseded this revision; local work remains Unsaved."
+                            .to_owned();
+                }
+            }
+            UiEvent::WorkspaceCleared {
+                operation_id,
+                identity,
+                base_revision,
+            } => {
+                let key =
+                    WorkspaceKey::new(identity.profile_id().clone(), identity.profile_generation());
+                let matches_pending = self.workspace_persistence.get(&key).is_some_and(|state| {
+                    state.identity == *identity
+                        && matches!(
+                            state.clear,
+                            WorkspaceClearPhase::Pending {
+                                operation_id: pending,
+                                revision,
+                            } if pending == *operation_id && revision == *base_revision
+                        )
+                });
+                if !matches_pending {
+                    return;
+                }
+                let current_revision = if let Some(workspace) = self.model.workspaces.get_mut(&key)
+                {
+                    if workspace.set_persistence_enabled(false).is_err() {
+                        self.model.status =
+                            "Saved data was cleared, but local persistence state needs attention."
+                                .to_owned();
+                        return;
+                    }
+                    workspace.revision()
+                } else {
+                    *base_revision
+                };
+                if let Some(state) = self.workspace_persistence.get_mut(&key) {
+                    state.clear = WorkspaceClearPhase::Idle;
+                    state.load = WorkspaceLoadPhase::Ready;
+                    state.save = WorkspaceSavePhase::Idle;
+                    state.dirty_since = Some(Instant::now());
+                    state.retry_not_before = None;
+                    state.observed_revision = current_revision;
+                    state.force_commit_until_success = true;
+                    state.resolve_conflict_on_commit = false;
+                    state.clean_empty_baseline_pending = None;
+                    state.restore_baseline_revision = Some(current_revision);
+                }
+                self.model.status =
+                    "Saved data cleared; recording durable Persistence Off…".to_owned();
+                let _ = self.submit_workspace_commit_inner(&key, true, true);
+            }
+            UiEvent::WorkspaceOperationFailed {
+                operation_id,
+                identity,
+                revision,
+                action,
+                code,
+            } => {
+                let key =
+                    WorkspaceKey::new(identity.profile_id().clone(), identity.profile_generation());
+                let Some(state) = self.workspace_persistence.get_mut(&key) else {
+                    return;
+                };
+                if state.identity != *identity {
+                    return;
+                }
+                match action {
+                    WorkspaceAction::Load => {
+                        let matches = matches!(
+                            state.load,
+                            WorkspaceLoadPhase::Loading {
+                                operation_id: pending,
+                                base_revision,
+                                ..
+                            } if pending == *operation_id && base_revision == *revision
+                        );
+                        if !matches {
+                            return;
+                        }
+                        if let WorkspaceFailureCode::ReadOnly(reason) = code {
+                            state.mode = Some(WorkspaceStoreMode::ReadOnly);
+                            state.read_only_reason = Some(*reason);
+                        }
+                        state.load = WorkspaceLoadPhase::Failed(*code);
+                        state.clean_empty_baseline_pending = None;
+                        if matches!(
+                            code,
+                            WorkspaceFailureCode::Busy
+                                | WorkspaceFailureCode::Stale
+                                | WorkspaceFailureCode::Unavailable
+                        ) {
+                            state.retry_not_before =
+                                Some(Instant::now() + WORKSPACE_SAVE_RETRY_DELAY);
+                        }
+                        self.model.status = "Private workspace restore failed.".to_owned();
+                    }
+                    WorkspaceAction::Commit => {
+                        let matches = matches!(
+                            state.save,
+                            WorkspaceSavePhase::Saving {
+                                operation_id: pending,
+                                revision: pending_revision,
+                            } if pending == *operation_id && pending_revision == *revision
+                        );
+                        if !matches {
+                            return;
+                        }
+                        if let WorkspaceFailureCode::ReadOnly(reason) = code {
+                            state.mode = Some(WorkspaceStoreMode::ReadOnly);
+                            state.read_only_reason = Some(*reason);
+                        }
+                        state.save = WorkspaceSavePhase::Failed {
+                            revision: *revision,
+                            code: *code,
+                        };
+                        state.resolve_conflict_on_commit = false;
+                        state.dirty_since.get_or_insert(Instant::now());
+                        if matches!(
+                            code,
+                            WorkspaceFailureCode::Busy
+                                | WorkspaceFailureCode::Stale
+                                | WorkspaceFailureCode::Unavailable
+                        ) {
+                            state.retry_not_before =
+                                Some(Instant::now() + WORKSPACE_SAVE_RETRY_DELAY);
+                        }
+                        self.model.status =
+                            "Private workspace Save failed; local changes remain Unsaved."
+                                .to_owned();
+                    }
+                    WorkspaceAction::Clear => {
+                        if !matches!(
+                            state.clear,
+                            WorkspaceClearPhase::Pending {
+                                operation_id: pending,
+                                revision: pending_revision,
+                            } if pending == *operation_id && pending_revision == *revision
+                        ) {
+                            return;
+                        }
+                        if let WorkspaceFailureCode::ReadOnly(reason) = code {
+                            state.mode = Some(WorkspaceStoreMode::ReadOnly);
+                            state.read_only_reason = Some(*reason);
+                        }
+                        state.clear = WorkspaceClearPhase::Failed {
+                            revision: *revision,
+                            code: *code,
+                        };
+                        state.save = WorkspaceSavePhase::Idle;
+                        self.model.status =
+                            "Clearing private workspace failed; Retry keeps the clear intent."
+                                .to_owned();
+                    }
+                }
+            }
+            UiEvent::ConfigUncertain { .. } | UiEvent::RuntimeShutdown { .. } => {
+                self.pending_workspace_history.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn has_uncommitted_workspace(&self) -> bool {
+        self.workspace_persistence.iter().any(|(key, state)| {
+            let persistence_enabled = self
+                .model
+                .workspace(key)
+                .and_then(ProfileWorkspace::persistence)
+                .is_some_and(ProfileWorkspacePersistence::persistence_enabled);
+            let durable_dirty = persistence_enabled
+                && self
+                    .model
+                    .workspace(key)
+                    .is_some_and(|workspace| !workspace.is_saved());
+            durable_dirty
+                || matches!(state.save, WorkspaceSavePhase::Saving { .. })
+                || matches!(state.save, WorkspaceSavePhase::Failed { .. })
+                || state.clear.has_intent()
+                || state.force_commit_until_success
+        })
+    }
+
+    fn has_workspace_save_failure(&self) -> bool {
+        self.workspace_persistence.iter().any(|(key, state)| {
+            let dirty = self
+                .model
+                .workspace(key)
+                .is_some_and(|workspace| !workspace.is_saved());
+            (dirty
+                && (state.is_read_only()
+                    || matches!(state.save, WorkspaceSavePhase::Failed { .. })
+                    || matches!(
+                        state.load,
+                        WorkspaceLoadPhase::Failed(_) | WorkspaceLoadPhase::Conflict
+                    )))
+                || (state.force_commit_until_success
+                    && matches!(state.save, WorkspaceSavePhase::Failed { .. }))
+                || matches!(state.clear, WorkspaceClearPhase::Failed { .. })
+        })
+    }
+
+    fn handle_workspace_close_request(&mut self, context: &egui::Context) {
+        if self.discard_local_changes_on_close {
+            self.workspace_close_guard = WorkspaceCloseGuard::Closed;
+            return;
+        }
+        let close_requested = context.input(|input| input.viewport().close_requested());
+        if close_requested && self.has_uncommitted_workspace() {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.workspace_close_guard = WorkspaceCloseGuard::AwaitingSave;
+            self.flush_all_dirty_workspaces();
+        }
+        if self.workspace_close_guard == WorkspaceCloseGuard::AwaitingSave {
+            if self.has_workspace_save_failure() {
+                self.workspace_close_guard = WorkspaceCloseGuard::SaveFailed;
+            } else if !self.has_uncommitted_workspace() {
+                self.workspace_close_guard = WorkspaceCloseGuard::Closed;
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn capture_pending_workspace_history(
+        &mut self,
+        operation_id: OperationId,
+        workspace_key: WorkspaceKey,
+        source: String,
+        target: WorkspaceRunTarget,
+    ) {
+        self.pending_workspace_history.insert(
+            operation_id,
+            PendingWorkspaceHistory {
+                workspace_key,
+                source,
+                target,
+                started_at: Instant::now(),
+            },
+        );
+    }
+
+    fn capture_workspace_history_terminal(&mut self, event: &UiEvent) -> Option<String> {
+        let (operation_id, terminal) = match event {
+            UiEvent::QueryFinished {
+                operation_id,
+                result,
+                ..
+            } => (
+                *operation_id,
+                WorkspaceHistoryTerminal {
+                    status: WorkspaceHistoryStatus::Succeeded,
+                    completed_at_unix_ms: result.provenance.completed_at_unix_ms,
+                    duration_ms: saturating_u128_to_u64(result.provenance.duration_ms),
+                    returned_rows: saturating_usize_to_u64(result.rows.len()),
+                    affected_rows: result.affected_rows,
+                    truncated: result.truncated,
+                },
+            ),
+            UiEvent::QueryBatchFinished {
+                operation_id,
+                discarded_results,
+                results,
+                error,
+                ..
+            } => {
+                let completed_at_unix_ms =
+                    results.last().map_or_else(current_unix_time_ms, |result| {
+                        result.provenance.completed_at_unix_ms
+                    });
+                let duration_ms = results.iter().fold(0_u64, |total, result| {
+                    total.saturating_add(saturating_u128_to_u64(result.provenance.duration_ms))
+                });
+                let returned_rows = results.iter().fold(0_u64, |total, result| {
+                    total.saturating_add(saturating_usize_to_u64(result.rows.len()))
+                });
+                let affected_rows = results.iter().fold(0_u64, |total, result| {
+                    total.saturating_add(result.affected_rows)
+                });
+                (
+                    *operation_id,
+                    WorkspaceHistoryTerminal {
+                        status: error
+                            .as_ref()
+                            .map_or(WorkspaceHistoryStatus::Succeeded, |error| {
+                                history_failure_status(
+                                    error.summary,
+                                    ConnectionFailureOutcome::Preserve,
+                                )
+                            }),
+                        completed_at_unix_ms,
+                        duration_ms,
+                        returned_rows,
+                        affected_rows,
+                        truncated: *discarded_results > 0
+                            || results.iter().any(|result| result.truncated),
+                    },
+                )
+            }
+            UiEvent::OperationFailed {
+                operation_id,
+                kind: OperationKind::ExecuteRead | OperationKind::ExecuteMutation,
+                error,
+                connection_outcome,
+                ..
+            } => {
+                let pending = self.pending_workspace_history.get(operation_id)?;
+                (
+                    *operation_id,
+                    WorkspaceHistoryTerminal {
+                        status: history_failure_status(error.summary, *connection_outcome),
+                        completed_at_unix_ms: current_unix_time_ms(),
+                        duration_ms: saturating_u128_to_u64(
+                            pending.started_at.elapsed().as_millis(),
+                        ),
+                        returned_rows: 0,
+                        affected_rows: 0,
+                        truncated: false,
+                    },
+                )
+            }
+            UiEvent::ExecuteUnavailable {
+                operation_id,
+                summary,
+                ..
+            } => {
+                let pending = self.pending_workspace_history.get(operation_id)?;
+                (
+                    *operation_id,
+                    WorkspaceHistoryTerminal {
+                        status: history_failure_status(
+                            *summary,
+                            ConnectionFailureOutcome::Preserve,
+                        ),
+                        completed_at_unix_ms: current_unix_time_ms(),
+                        duration_ms: saturating_u128_to_u64(
+                            pending.started_at.elapsed().as_millis(),
+                        ),
+                        returned_rows: 0,
+                        affected_rows: 0,
+                        truncated: false,
+                    },
+                )
+            }
+            _ => return None,
+        };
+        let pending = self.pending_workspace_history.remove(&operation_id)?;
+        let identity_is_current = self
+            .model
+            .active_generation(&pending.workspace_key.profile_id)
+            == Some(pending.workspace_key.profile_generation);
+        if !identity_is_current {
+            return None;
+        }
+        let workspace = self.model.workspaces.get_mut(&pending.workspace_key)?;
+        let persistence = workspace.persistence()?;
+        if !persistence.persistence_enabled() {
+            return None;
+        }
+        let mut history = persistence.history().to_vec();
+        let Some(history_id) = next_workspace_history_id(&history, operation_id.0) else {
+            let notice = "Execution history reached its bounded identity limit.".to_owned();
+            self.model.status = notice.clone();
+            return Some(notice);
+        };
+        let Ok(entry) = WorkspaceHistoryEntry::new(
+            history_id,
+            &pending.source,
+            pending.target,
+            terminal.completed_at_unix_ms,
+            terminal.status,
+            terminal.duration_ms,
+            terminal.returned_rows,
+            terminal.affected_rows,
+            terminal.truncated,
+        ) else {
+            let notice = "Execution history metadata was not retained.".to_owned();
+            self.model.status = notice.clone();
+            return Some(notice);
+        };
+        history.push(entry);
+        while history.len() > MAX_HISTORY_ENTRIES_PER_PROFILE {
+            let candidate = history
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.status() != WorkspaceHistoryStatus::OutcomeUnknown)
+                .min_by_key(|(_, entry)| (entry.completed_at_unix_ms(), entry.id()))
+                .map(|(index, entry)| (index, entry.id()));
+            let Some((index, removed_id)) = candidate else {
+                let _ = history.pop();
+                let notice =
+                    "History is full of outcome-unknown entries; this terminal was not retained."
+                        .to_owned();
+                self.model.status = notice.clone();
+                return Some(notice);
+            };
+            history.remove(index);
+            if removed_id == history_id {
+                let notice =
+                    "Outcome-unknown history was preserved; this terminal was not retained."
+                        .to_owned();
+                self.model.status = notice.clone();
+                return Some(notice);
+            }
+        }
+        if let Err(error) = workspace.replace_persistence_history(history) {
+            let notice = error.to_string();
+            self.model.status = notice.clone();
+            return Some(notice);
+        }
+        None
+    }
+
+    fn set_workspace_persistence_enabled(&mut self, key: &WorkspaceKey, enabled: bool) {
+        let Some(profile) = self
+            .model
+            .profiles
+            .iter()
+            .find(|profile| {
+                profile.id == key.profile_id && profile.generation == key.profile_generation
+            })
+            .cloned()
+        else {
+            self.model.status = "The selected workspace is stale.".to_owned();
+            return;
+        };
+        if !self.ensure_workspace_persistence_binding(key, &profile) {
+            return;
+        }
+        let blocked = self.workspace_persistence.get(key).is_some_and(|state| {
+            state.is_read_only()
+                || matches!(state.load, WorkspaceLoadPhase::Loading { .. })
+                || matches!(state.save, WorkspaceSavePhase::Saving { .. })
+                || state.clear.has_intent()
+        });
+        if blocked {
+            self.model.status =
+                "Workspace persistence cannot change while restore/save is unavailable.".to_owned();
+            return;
+        }
+        let outcome = self
+            .model
+            .workspaces
+            .get_mut(key)
+            .map(|workspace| workspace.set_persistence_enabled(enabled));
+        match outcome {
+            Some(Ok(())) => {
+                if !enabled {
+                    let revision = self
+                        .model
+                        .workspace(key)
+                        .map_or(0, ProfileWorkspace::revision);
+                    if let Some(state) = self.workspace_persistence.get_mut(key) {
+                        state.force_commit_until_success = true;
+                        state.load = WorkspaceLoadPhase::Ready;
+                        state.restore_baseline_revision = Some(revision);
+                    }
+                }
+                self.observe_workspace_revisions(Instant::now());
+                let force = !enabled;
+                let _ = self.submit_workspace_commit_inner(key, true, force);
+            }
+            Some(Err(error)) => self.model.status = error.to_string(),
+            None => self.model.status = "The selected workspace is unavailable.".to_owned(),
+        }
+    }
+
+    fn clear_workspace_history(&mut self, key: &WorkspaceKey) {
+        let Some(profile) = self
+            .model
+            .profiles
+            .iter()
+            .find(|profile| {
+                profile.id == key.profile_id && profile.generation == key.profile_generation
+            })
+            .cloned()
+        else {
+            return;
+        };
+        if !self.ensure_workspace_persistence_binding(key, &profile) {
+            return;
+        }
+        let read_only = self
+            .workspace_persistence
+            .get(key)
+            .is_some_and(WorkspacePersistenceState::is_read_only);
+        if read_only {
+            self.model.status = "Read-only workspace history cannot be cleared.".to_owned();
+            return;
+        }
+        let outcome = self
+            .model
+            .workspaces
+            .get_mut(key)
+            .map(|workspace| workspace.replace_persistence_history(Vec::new()));
+        match outcome {
+            Some(Ok(())) => {
+                self.observe_workspace_revisions(Instant::now());
+                let _ = self.submit_workspace_commit(key, true);
+            }
+            Some(Err(error)) => self.model.status = error.to_string(),
+            None => {}
+        }
+    }
+
+    fn submit_clear_workspace(&mut self, key: &WorkspaceKey) {
+        let Some(state) = self.workspace_persistence.get(key) else {
+            return;
+        };
+        if state.is_read_only()
+            || matches!(state.clear, WorkspaceClearPhase::Pending { .. })
+            || matches!(state.load, WorkspaceLoadPhase::Loading { .. })
+            || matches!(state.save, WorkspaceSavePhase::Saving { .. })
+        {
+            self.model.status =
+                "Private workspace data cannot be cleared while persistence is busy.".to_owned();
+            return;
+        }
+        let identity = state.identity.clone();
+        let Some(base_revision) = self.model.workspace(key).map(ProfileWorkspace::revision) else {
+            return;
+        };
+        let operation_id = self.model.next_operation();
+        match self.port.try_submit(UiCommand::ClearWorkspace {
+            operation_id,
+            identity,
+            base_revision,
+        }) {
+            Ok(()) => {
+                if let Some(state) = self.workspace_persistence.get_mut(key) {
+                    state.clear = WorkspaceClearPhase::Pending {
+                        operation_id,
+                        revision: base_revision,
+                    };
+                }
+                self.model.status = "Clearing saved private drafts and history…".to_owned();
+            }
+            Err(error) => {
+                let code = match error {
+                    SubmitError::Busy => WorkspaceFailureCode::Busy,
+                    SubmitError::Disconnected => WorkspaceFailureCode::Unavailable,
+                };
+                if let Some(state) = self.workspace_persistence.get_mut(key) {
+                    state.clear = WorkspaceClearPhase::Failed {
+                        revision: base_revision,
+                        code,
+                    };
+                }
+                self.report_submit_error(error);
+            }
+        }
     }
 
     fn result_snapshot(&self, result_id: ResultId) -> Option<Arc<ResultSnapshot>> {
@@ -839,21 +2291,85 @@ impl DbotterApp {
             if self.compact_workspace.as_ref() == Some(&previous) {
                 self.compact_workspace = Some(refreshed.clone());
             }
+            let mut reissue_clear = false;
+            if let Some(mut state) = self.workspace_persistence.remove(&previous)
+                && let Some(profile) = self.model.profiles.iter().find(|profile| {
+                    profile.id == refreshed.profile_id
+                        && profile.generation == refreshed.profile_generation
+                })
+                && let Some(instance_id) = profile.persisted.safety.instance_id()
+            {
+                state.identity = WorkspaceIdentity::new(
+                    refreshed.profile_id.clone(),
+                    refreshed.profile_generation,
+                    instance_id,
+                );
+                let restore_still_required = !matches!(state.load, WorkspaceLoadPhase::Ready);
+                state.load = if restore_still_required {
+                    state.mode = None;
+                    state.read_only_reason = None;
+                    WorkspaceLoadPhase::Unloaded
+                } else {
+                    WorkspaceLoadPhase::Ready
+                };
+                state.save = WorkspaceSavePhase::Idle;
+                state.resolve_conflict_on_commit = false;
+                reissue_clear = state.clear.has_intent();
+                state.clean_empty_baseline_pending = None;
+                state.observed_revision = self
+                    .model
+                    .workspace(&refreshed)
+                    .map_or(state.observed_revision, ProfileWorkspace::revision);
+                state.clear = if reissue_clear {
+                    WorkspaceClearPhase::Failed {
+                        revision: state.observed_revision,
+                        code: WorkspaceFailureCode::Stale,
+                    }
+                } else {
+                    WorkspaceClearPhase::Idle
+                };
+                state.dirty_since.get_or_insert(Instant::now());
+                self.workspace_persistence.insert(refreshed.clone(), state);
+            }
+            if reissue_clear {
+                self.submit_clear_workspace(&refreshed);
+            }
+            if let Some(search) = self.workspace_history_search.remove(&previous) {
+                self.workspace_history_search
+                    .insert(refreshed.clone(), search);
+            }
             if let Some(confirmation) = self.editor_discard_confirmation.as_mut()
                 && confirmation.workspace_key == previous
             {
-                confirmation.workspace_key = refreshed;
+                confirmation.workspace_key = refreshed.clone();
+            }
+            if self.workspace_clear_confirmation.as_ref() == Some(&previous) {
+                self.workspace_clear_confirmation = Some(refreshed.clone());
+            }
+            if self.workspace_restore_conflict_confirmation.as_ref() == Some(&previous) {
+                self.workspace_restore_conflict_confirmation = Some(refreshed.clone());
+            }
+            if self.workspace_history_focus.as_ref() == Some(&previous) {
+                self.workspace_history_focus = Some(refreshed);
             }
         }
     }
 
     fn poll_events(&mut self) {
         for mut event in self.port.drain_events(EVENT_DRAIN_LIMIT) {
-            if let UiEvent::ConfigUncertain { operation_id } = &event
-                && !self.model.profiles_operation_is_newer(*operation_id)
-            {
+            let profiles_refresh_accepted = match &event {
+                UiEvent::ProfilesLoaded { operation_id, .. }
+                | UiEvent::ProfilesFailed { operation_id, .. }
+                | UiEvent::ConfigUncertain { operation_id } => {
+                    self.model.profiles_operation_is_newer(*operation_id)
+                }
+                _ => true,
+            };
+            if !profiles_refresh_accepted {
                 continue;
             }
+            let profiles_loaded_accepted =
+                profiles_refresh_accepted && matches!(&event, UiEvent::ProfilesLoaded { .. });
             match self.redis_resource_event_disposition(&event) {
                 RedisResourceEventDisposition::Ignore => continue,
                 RedisResourceEventDisposition::StaleTerminal(operation_id) => {
@@ -863,6 +2379,8 @@ impl DbotterApp {
                 }
                 RedisResourceEventDisposition::NotRedis | RedisResourceEventDisposition::Apply => {}
             }
+            self.handle_workspace_event(&event);
+            let history_terminal_notice = self.capture_workspace_history_terminal(&event);
             self.handle_export_terminal(&event);
             self.attach_retry_recipe(&mut event);
             self.capture_common_error(&event);
@@ -951,7 +2469,16 @@ impl DbotterApp {
                 _ => Vec::new(),
             };
             self.model.fold(event);
+            if let Some(notice) = history_terminal_notice {
+                self.model.status = notice;
+            }
             self.apply_workspace_retages(workspace_retages);
+            if profiles_loaded_accepted {
+                let keys = self.ensure_current_workspace_persistence_bindings();
+                for key in keys {
+                    self.request_workspace_load(&key);
+                }
+            }
             if let Some((profile_id, loaded, accepted)) = connect_follow_up {
                 self.pending_connect_after_refresh = None;
                 if loaded && accepted && self.model.active_generation(&profile_id).is_some() {
@@ -1795,6 +3322,8 @@ impl DbotterApp {
         let profile_generation = intent.profile_generation();
         let operation_kind = intent.operation_kind();
         let target_count = intent.target_count();
+        let history_source = intent.text().to_owned();
+        let history_target = intent.run_target();
         let workspace_key = WorkspaceKey::new(profile_id.clone(), profile_generation);
         if target_count == 0 || operation_kind != OperationKind::ExecuteRead {
             self.model.status = "Run all accepts a non-empty read-only batch.".to_owned();
@@ -1816,10 +3345,25 @@ impl DbotterApp {
             self.model.status = "Another operation is active for this connection".to_owned();
             return;
         }
+        if let Some(profile) = self
+            .model
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id && profile.generation == profile_generation)
+            .cloned()
+        {
+            let _ = self.ensure_workspace_persistence_binding(&workspace_key, &profile);
+        }
         let operation_id = self.model.next_operation();
         match self.port.try_submit(intent.into_ui_command(operation_id)) {
             Ok(()) => {
                 self.model.workspace_mut(workspace_key).pending_execute = Some(operation_id);
+                self.capture_pending_workspace_history(
+                    operation_id,
+                    WorkspaceKey::new(profile_id.clone(), profile_generation),
+                    history_source,
+                    history_target,
+                );
                 self.active_operations.insert(
                     profile_id,
                     ActiveOperation {
@@ -1838,6 +3382,8 @@ impl DbotterApp {
         let profile_id = intent.profile_id().clone();
         let profile_generation = intent.profile_generation();
         let operation_kind = intent.operation_kind();
+        let history_source = intent.text().to_owned();
+        let history_target = intent.run_target();
         let workspace_key = WorkspaceKey::new(profile_id.clone(), profile_generation);
         if self.model.active_generation(intent.profile_id()) != Some(profile_generation) {
             self.model.status = "The selected profile generation is stale.".to_owned();
@@ -1855,12 +3401,27 @@ impl DbotterApp {
             self.model.status = "Another operation is active for this connection".to_owned();
             return false;
         }
+        if let Some(profile) = self
+            .model
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id && profile.generation == profile_generation)
+            .cloned()
+        {
+            let _ = self.ensure_workspace_persistence_binding(&workspace_key, &profile);
+        }
         let operation_id = self.model.next_operation();
         match self.port.try_submit(intent.into_ui_command(operation_id)) {
             Ok(()) => {
                 self.model
                     .workspace_mut(workspace_key.clone())
                     .pending_execute = Some(operation_id);
+                self.capture_pending_workspace_history(
+                    operation_id,
+                    workspace_key,
+                    history_source,
+                    history_target,
+                );
                 self.active_operations.insert(
                     profile_id,
                     ActiveOperation {
@@ -2650,7 +4211,7 @@ impl DbotterApp {
         }
     }
 
-    fn show_delete_confirmation(&mut self, root_ui: &mut egui::Ui) {
+    fn show_delete_confirmation(&mut self, root_ui: &mut egui::Ui, request_focus: bool) {
         let Some(confirmation) = self.delete_confirmation.as_mut() else {
             return;
         };
@@ -2696,13 +4257,15 @@ impl DbotterApp {
                         [104.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
                         egui::Button::new("Cancel"),
                     );
-                    if named_author_id(
+                    let cancel = named_author_id(
                         cancel,
                         "profile.delete.cancel",
                         "Cancel profile deletion",
-                    )
-                    .clicked()
-                    {
+                    );
+                    if request_focus {
+                        cancel.request_focus();
+                    }
+                    if cancel.clicked() {
                         action = Some(DeleteDialogAction::Cancel);
                     }
                     let confirm = ui.add(
@@ -2763,7 +4326,7 @@ impl DbotterApp {
         }
     }
 
-    fn show_editor_discard_confirmation(&mut self, root_ui: &mut egui::Ui) {
+    fn show_editor_discard_confirmation(&mut self, root_ui: &mut egui::Ui, request_focus: bool) {
         let Some(confirmation) = self.editor_discard_confirmation.as_ref() else {
             return;
         };
@@ -2786,9 +4349,15 @@ impl DbotterApp {
                         [104.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
                         egui::Button::new("Keep tab"),
                     );
-                    if named_author_id(keep, "editor.tab.discard.cancel", "Keep unsaved query tab")
-                        .clicked()
-                    {
+                    let keep = named_author_id(
+                        keep,
+                        "editor.tab.discard.cancel",
+                        "Keep unsaved query tab",
+                    );
+                    if request_focus {
+                        keep.request_focus();
+                    }
+                    if keep.clicked() {
                         cancel = true;
                     }
                     let confirm = ui.add(
@@ -2826,7 +4395,7 @@ impl DbotterApp {
         }
     }
 
-    fn show_credential_prompt(&mut self, root_ui: &mut egui::Ui) {
+    fn show_credential_prompt(&mut self, root_ui: &mut egui::Ui, request_focus: bool) {
         let Some(prompt) = self.credential_prompt.as_mut() else {
             return;
         };
@@ -2849,11 +4418,14 @@ impl DbotterApp {
                         .password(true)
                         .desired_width(f32::INFINITY),
                 );
-                named_author_id(
+                let credential = named_author_id(
                     credential,
                     "connection.credential.value",
                     "Protected session credential",
                 );
+                if request_focus {
+                    credential.request_focus();
+                }
                 ui.small(&prompt.status);
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
@@ -2890,8 +4462,487 @@ impl DbotterApp {
         }
     }
 
+    fn show_workspace_clear_confirmation(&mut self, root_ui: &mut egui::Ui, request_focus: bool) {
+        let Some(key) = self.workspace_clear_confirmation.clone() else {
+            return;
+        };
+        let mut cancel =
+            root_ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let mut confirm = false;
+        egui::Window::new("Clear saved workspace data?")
+            .collapsible(false)
+            .resizable(false)
+            .show(root_ui.ctx(), |ui| {
+                ui.heading("Clear this profile's saved drafts and history?");
+                ui.label(
+                    "The profile and credentials are not deleted. Open editors remain visible in this session.",
+                );
+                ui.label(
+                    "After the durable clear completes, persistence switches Off so autosave cannot recreate the data.",
+                );
+                ui.horizontal(|ui| {
+                    let keep = ui.add_sized(
+                        [104.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                        egui::Button::new("Cancel"),
+                    );
+                    let keep = named_author_id(
+                        keep,
+                        "workspace.persistence.clear.cancel",
+                        "Cancel clearing saved workspace data",
+                    );
+                    if request_focus {
+                        keep.request_focus();
+                    }
+                    if keep.clicked() {
+                        cancel = true;
+                    }
+                    let clear = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("Clear saved data")
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::BLACK)
+                        .min_size(egui::vec2(152.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                    );
+                    confirm = named_author_id(
+                        clear,
+                        "workspace.persistence.clear.confirm",
+                        "Confirm clearing saved drafts and history",
+                    )
+                    .clicked();
+                });
+            });
+        if cancel {
+            self.workspace_clear_confirmation = None;
+            self.model.status = "Saved workspace data was kept.".to_owned();
+        } else if confirm {
+            self.workspace_clear_confirmation = None;
+            self.submit_clear_workspace(&key);
+        }
+    }
+
+    fn show_workspace_restore_conflict_confirmation(
+        &mut self,
+        root_ui: &mut egui::Ui,
+        request_focus: bool,
+    ) {
+        let Some(key) = self.workspace_restore_conflict_confirmation.clone() else {
+            return;
+        };
+        let still_conflicted = self
+            .workspace_persistence
+            .get(&key)
+            .is_some_and(|state| matches!(state.load, WorkspaceLoadPhase::Conflict));
+        if !still_conflicted {
+            self.workspace_restore_conflict_confirmation = None;
+            self.close_after_restore_conflict_confirmation = false;
+            return;
+        }
+        let mut cancel =
+            root_ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let mut confirm = false;
+        egui::Window::new("Replace prior saved workspace?")
+            .collapsible(false)
+            .resizable(false)
+            .show(root_ui.ctx(), |ui| {
+                ui.heading("Keep this local workspace instead?");
+                ui.label(
+                    "This replaces the prior durable tabs and private history that could not be restored.",
+                );
+                ui.label("Cancel keeps both the local draft in memory and prior saved data unchanged.");
+                ui.horizontal(|ui| {
+                    let cancel_button = ui.add_sized(
+                        [112.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                        egui::Button::new("Cancel"),
+                    );
+                    let cancel_response = named_author_id(
+                        cancel_button,
+                        "workspace.conflict.cancel",
+                        "Cancel replacing the prior saved workspace",
+                    );
+                    if request_focus {
+                        cancel_response.request_focus();
+                    }
+                    cancel = cancel_response.clicked();
+                    let confirm_button = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("Replace saved with local")
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::BLACK)
+                        .min_size(egui::vec2(208.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                    );
+                    confirm = named_author_id(
+                        confirm_button,
+                        "workspace.conflict.confirm",
+                        "Replace prior saved tabs and history with the local workspace",
+                    )
+                    .clicked();
+                });
+            });
+        if cancel {
+            self.workspace_restore_conflict_confirmation = None;
+            self.close_after_restore_conflict_confirmation = false;
+            self.workspace_close_guard = WorkspaceCloseGuard::Closed;
+            self.model.status =
+                "Restore conflict kept unresolved; no saved data changed.".to_owned();
+        } else if confirm {
+            self.workspace_restore_conflict_confirmation = None;
+            let close_after = std::mem::take(&mut self.close_after_restore_conflict_confirmation);
+            if self.submit_conflict_resolution_commit(&key) && close_after {
+                self.workspace_close_guard = WorkspaceCloseGuard::AwaitingSave;
+            }
+        }
+    }
+
+    fn show_workspace_close_guard(&mut self, root_ui: &mut egui::Ui, request_focus: bool) {
+        if self.workspace_close_guard == WorkspaceCloseGuard::Closed {
+            return;
+        }
+        let failed = self.workspace_close_guard == WorkspaceCloseGuard::SaveFailed;
+        let clear_failed = self
+            .workspace_persistence
+            .values()
+            .any(|state| matches!(state.clear, WorkspaceClearPhase::Failed { .. }));
+        let restore_conflict = self
+            .workspace_persistence
+            .values()
+            .any(|state| matches!(state.load, WorkspaceLoadPhase::Conflict));
+        let local_dirty = self.workspace_persistence.keys().any(|key| {
+            self.model
+                .workspace(key)
+                .is_some_and(|workspace| !workspace.is_saved())
+        });
+        let mut retry = false;
+        let mut discard = false;
+        let mut cancel =
+            root_ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        egui::Window::new(if failed {
+            "Private workspace save failed"
+        } else {
+            "Saving before close"
+        })
+        .collapsible(false)
+        .resizable(false)
+        .show(root_ui.ctx(), |ui| {
+            if failed {
+                if restore_conflict {
+                    ui.heading("Restored data conflicts with local changes.");
+                    ui.label(
+                        "Review Keep local, use Persistence Off or Clear saved data, or explicitly discard local changes and close.",
+                    );
+                } else if clear_failed && local_dirty {
+                    ui.heading("Saved data was not cleared and local changes are unsaved.");
+                    ui.label(
+                        "Closing now keeps the durable data, abandons the clear request, and discards local changes.",
+                    );
+                } else if clear_failed {
+                    ui.heading("Saved private data was not cleared.");
+                    ui.label(
+                        "Retry clearing, or keep the durable data and close. Closing now abandons the clear request.",
+                    );
+                } else {
+                    ui.heading("Local workspace changes are not durably saved.");
+                    ui.label(
+                        "Retry saving, explicitly discard local changes and close, or cancel closing.",
+                    );
+                }
+            } else {
+                ui.heading("Saving private workspace before close…");
+                ui.label("The window will close only after the exact revision is durable.");
+                ui.add(egui::Spinner::new());
+            }
+            ui.horizontal_wrapped(|ui| {
+                if failed {
+                    let retry_button = ui.add_sized(
+                        [104.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                        egui::Button::new(if restore_conflict {
+                            "Keep local…"
+                        } else {
+                            "Retry"
+                        }),
+                    );
+                    retry = named_author_id(
+                        retry_button,
+                        "workspace.close.retry",
+                        if restore_conflict {
+                            "Review replacing prior saved data with the local workspace"
+                        } else {
+                            "Retry saving before close"
+                        },
+                    )
+                    .clicked();
+                    let discard_button = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new(if restore_conflict {
+                                "Discard local & close"
+                            } else if clear_failed && local_dirty {
+                                "Keep saved data, discard local & close"
+                            } else if clear_failed {
+                                "Keep saved data & close"
+                            } else {
+                                "Discard local changes"
+                            })
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::BLACK)
+                        .min_size(egui::vec2(176.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                    );
+                    discard = named_author_id(
+                        discard_button,
+                        "workspace.close.discard",
+                        if restore_conflict {
+                            "Discard local changes, preserve the prior durable workspace, and close"
+                        } else if clear_failed && local_dirty {
+                            "Keep durable saved data, abandon clearing, discard local changes, and close"
+                        } else if clear_failed {
+                            "Keep durable saved data, abandon clearing, and close"
+                        } else {
+                            "Discard local changes and close"
+                        },
+                    )
+                    .clicked();
+                }
+                let cancel_button = ui.add_sized(
+                    [112.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                    egui::Button::new("Cancel close"),
+                );
+                let cancel_button = named_author_id(
+                    cancel_button,
+                    "workspace.close.cancel",
+                    "Cancel closing the application",
+                );
+                if request_focus {
+                    cancel_button.request_focus();
+                }
+                if cancel_button.clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if retry && restore_conflict {
+            self.workspace_close_guard = WorkspaceCloseGuard::Closed;
+            self.workspace_restore_conflict_confirmation =
+                self.workspace_persistence.iter().find_map(|(key, state)| {
+                    matches!(state.load, WorkspaceLoadPhase::Conflict).then(|| key.clone())
+                });
+            self.close_after_restore_conflict_confirmation =
+                self.workspace_restore_conflict_confirmation.is_some();
+            self.model.status =
+                "Confirm whether the local workspace may replace prior saved data.".to_owned();
+        } else if retry {
+            self.discard_local_changes_on_close = false;
+            let clear_keys = self
+                .workspace_persistence
+                .iter()
+                .filter(|(_, state)| matches!(state.clear, WorkspaceClearPhase::Failed { .. }))
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for key in clear_keys {
+                self.submit_clear_workspace(&key);
+            }
+            let load_keys = self
+                .workspace_persistence
+                .iter()
+                .filter(|(_, state)| {
+                    matches!(state.load, WorkspaceLoadPhase::Failed(_)) && !state.clear.has_intent()
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for key in load_keys {
+                if let Some(state) = self.workspace_persistence.get_mut(&key) {
+                    state.load = WorkspaceLoadPhase::Unloaded;
+                }
+                self.request_workspace_load(&key);
+            }
+            self.flush_all_dirty_workspaces();
+            self.workspace_close_guard = WorkspaceCloseGuard::AwaitingSave;
+        } else if discard {
+            self.workspace_close_guard = WorkspaceCloseGuard::Closed;
+            self.discard_local_changes_on_close = true;
+            root_ui
+                .ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if cancel {
+            self.workspace_close_guard = WorkspaceCloseGuard::Closed;
+            self.discard_local_changes_on_close = false;
+            self.model.status = "Close cancelled; local changes were kept.".to_owned();
+        }
+    }
+
+    fn handle_workspace_shortcuts(&mut self, ui: &mut egui::Ui) {
+        let modal_open = self.active_modal_kind().is_some();
+        if modal_open {
+            ui.input_mut(|input| {
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Enter,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.command && !modifiers.alt
+                    )
+                });
+            });
+        }
+        let shortcut_context = !modal_open && self.profile_editor.is_none();
+        let history_find = shortcut_context && consume_command_key(ui, egui::Key::F, true);
+        let save = shortcut_context && consume_command_key(ui, egui::Key::S, false);
+        let new_editor = shortcut_context && consume_command_key(ui, egui::Key::T, false);
+        let close_editor = shortcut_context && consume_command_key(ui, egui::Key::W, false);
+        let context_find =
+            shortcut_context && !history_find && consume_command_key(ui, egui::Key::F, false);
+        let escape_actionable = modal_open
+            || self.profile_editor.is_some()
+            || self
+                .model
+                .selected_workspace()
+                .is_some_and(|workspace| workspace.pending_execute.is_some());
+        let escape = escape_actionable
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+
+        if save {
+            let _ = self.request_selected_workspace_save();
+        }
+        if history_find && let Some(key) = self.model.selected_workspace_key() {
+            self.model
+                .workspace_mut(key.clone())
+                .select_result_area_tab(ResultAreaTab::History);
+            self.workspace_history_focus = Some(key);
+        } else if context_find {
+            let history_key = self.model.selected_workspace_key().filter(|key| {
+                self.model
+                    .workspace(key)
+                    .is_some_and(|workspace| workspace.result_area_tab() == ResultAreaTab::History)
+            });
+            if let Some(key) = history_key {
+                self.workspace_history_focus = Some(key);
+            } else {
+                self.connection_filter_focus = true;
+            }
+        }
+        if new_editor && let Some(profile) = self.model.selected_profile_snapshot().cloned() {
+            let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+            let loading = self
+                .workspace_persistence
+                .get(&key)
+                .is_some_and(WorkspacePersistenceState::load_can_restore);
+            if loading {
+                self.model.status =
+                    "Wait for private workspace restore before creating a tab.".to_owned();
+            } else {
+                let workspace = self.model.workspace_mut(key);
+                let title = format!("Query {}", workspace.editor_tabs().len().saturating_add(1));
+                match workspace.create_editor_tab(profile.driver.language(), title, String::new()) {
+                    Ok(_) => self.editor_surface = EditorSurface::default(),
+                    Err(error) => self.model.status = error.to_string(),
+                }
+            }
+        }
+        if close_editor
+            && let Some(key) = self.model.selected_workspace_key()
+            && let Some(tab_id) = self
+                .model
+                .workspace(&key)
+                .and_then(ProfileWorkspace::selected_editor_tab_id)
+        {
+            self.request_editor_tab_close(key, tab_id, "editor.tab.discard");
+        }
+        if escape {
+            if self.workspace_close_guard != WorkspaceCloseGuard::Closed {
+                self.workspace_close_guard = WorkspaceCloseGuard::Closed;
+                self.discard_local_changes_on_close = false;
+                self.model.status = "Close cancelled; local changes were kept.".to_owned();
+            } else if self.workspace_restore_conflict_confirmation.is_some() {
+                self.workspace_restore_conflict_confirmation = None;
+                self.close_after_restore_conflict_confirmation = false;
+            } else if self.workspace_clear_confirmation.is_some() {
+                self.workspace_clear_confirmation = None;
+            } else if self.editor_discard_confirmation.is_some() {
+                self.editor_discard_confirmation = None;
+            } else if self.delete_confirmation.is_some() {
+                self.cancel_delete_confirmation();
+            } else if self.credential_prompt.is_some() {
+                self.cancel_credential_prompt();
+            } else if self.profile_editor.is_some() {
+                self.profile_editor = None;
+            } else if let Some(operation_id) = self
+                .model
+                .selected_workspace()
+                .and_then(|workspace| workspace.pending_execute)
+            {
+                self.submit_editor_intent(EditorIntent::Cancel { operation_id });
+            }
+        }
+    }
+
+    fn active_modal_kind(&self) -> Option<ModalKind> {
+        if self.workspace_close_guard != WorkspaceCloseGuard::Closed {
+            Some(ModalKind::WorkspaceClose)
+        } else if self.workspace_restore_conflict_confirmation.is_some() {
+            Some(ModalKind::WorkspaceConflict)
+        } else if self.workspace_clear_confirmation.is_some() {
+            Some(ModalKind::WorkspaceClear)
+        } else if self.editor_discard_confirmation.is_some() {
+            Some(ModalKind::EditorDiscard)
+        } else if self.credential_prompt.is_some() {
+            Some(ModalKind::Credential)
+        } else if self.delete_confirmation.is_some() {
+            Some(ModalKind::Delete)
+        } else {
+            None
+        }
+    }
+
+    fn workspace_mutation_input_pending(ui: &egui::Ui) -> bool {
+        ui.input(|input| {
+            let pointer_dragging = input.pointer.any_down();
+            input.events.iter().any(|event| match event {
+                egui::Event::Cut
+                | egui::Event::Paste(_)
+                | egui::Event::Text(_)
+                | egui::Event::Ime(_)
+                | egui::Event::PointerButton { .. }
+                | egui::Event::Touch { .. }
+                | egui::Event::AccessKitActionRequest(_) => true,
+                egui::Event::Key { pressed, .. } => *pressed,
+                egui::Event::PointerMoved(_) => pointer_dragging,
+                _ => false,
+            })
+        })
+    }
+
+    fn show_modal_surfaces(&mut self, ui: &mut egui::Ui) {
+        let active = self.active_modal_kind();
+        let request_focus = active.is_some() && self.focused_modal != active;
+        self.focused_modal = active;
+        match active {
+            Some(ModalKind::Delete) => self.show_delete_confirmation(ui, request_focus),
+            Some(ModalKind::EditorDiscard) => {
+                self.show_editor_discard_confirmation(ui, request_focus);
+            }
+            Some(ModalKind::Credential) => self.show_credential_prompt(ui, request_focus),
+            Some(ModalKind::WorkspaceClear) => {
+                self.show_workspace_clear_confirmation(ui, request_focus);
+            }
+            Some(ModalKind::WorkspaceConflict) => {
+                self.show_workspace_restore_conflict_confirmation(ui, request_focus);
+            }
+            Some(ModalKind::WorkspaceClose) => {
+                self.show_workspace_close_guard(ui, request_focus);
+            }
+            None => {}
+        }
+    }
+
     fn show_native(&mut self, ui: &mut egui::Ui) {
         OpenAiTheme::apply(ui.ctx());
+        self.handle_workspace_shortcuts(ui);
+        let modal_open = self.active_modal_kind().is_some();
+        let workspace_dirty_hint = !modal_open && Self::workspace_mutation_input_pending(ui);
+        self.frame_workspace_dirty_hint = workspace_dirty_hint;
         let selected_workspace = self.model.selected_workspace_key();
         if self.compact_workspace != selected_workspace {
             ui.ctx().data_mut(|data| {
@@ -2910,28 +4961,28 @@ impl DbotterApp {
         let layout = NativeLayout::resolve(ui.available_width(), ui.available_height(), geometry);
         let compact_fallback: CompactFallback = self.compact_fallback.clone();
 
-        self.show_status_strip(ui);
         if self.model.profile_load_succeeded()
             && self.model.profiles.is_empty()
             && self.profile_editor.is_none()
         {
-            egui::CentralPanel::default().show(ui, |ui| self.show_first_run(ui));
-            self.show_delete_confirmation(ui);
-            self.show_editor_discard_confirmation(ui);
-            self.show_credential_prompt(ui);
+            self.show_status_strip(ui, workspace_dirty_hint);
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.add_enabled_ui(!modal_open, |ui| self.show_first_run(ui));
+            });
+            self.show_modal_surfaces(ui);
             return;
         }
 
+        self.show_status_strip(ui, workspace_dirty_hint);
         match layout.mode() {
             LayoutMode::Wide => self.show_wide_workspace(ui, geometry),
             LayoutMode::Compact => self.show_compact_workspace(ui, compact_fallback),
         }
-        self.show_delete_confirmation(ui);
-        self.show_editor_discard_confirmation(ui);
-        self.show_credential_prompt(ui);
+        self.show_modal_surfaces(ui);
     }
 
     fn show_wide_workspace(&mut self, root_ui: &mut egui::Ui, geometry: WorkspaceGeometry) {
+        let modal_open = self.active_modal_kind().is_some();
         let navigator = egui::Panel::left("navigator")
             .resizable(true)
             .default_size(if geometry.navigator_width().is_finite() {
@@ -2940,8 +4991,10 @@ impl DbotterApp {
                 NativeLayout::NAVIGATOR_DEFAULT_WIDTH
             })
             .size_range(NativeLayout::NAVIGATOR_WIDTH_RANGE.clone())
-            .show(root_ui, |ui| self.show_workspace_navigator(ui));
-        self.remember_workspace_geometry(Some(navigator.response.rect.width()), None);
+            .show(root_ui, |ui| {
+                ui.add_enabled_ui(!modal_open, |ui| self.show_workspace_navigator(ui));
+            });
+        self.remember_workspace_geometry(Some(navigator.response.rect.width()), None, None);
         self.show_editor_result_shell(root_ui, geometry);
     }
 
@@ -2950,6 +5003,7 @@ impl DbotterApp {
         root_ui: &mut egui::Ui,
         compact_fallback: CompactFallback,
     ) {
+        let modal_open = self.active_modal_kind().is_some();
         let prior_focus = root_ui.ctx().memory(|memory| memory.focused());
         let mut open_surface = None;
         let mut navigator_open_id = None;
@@ -2957,25 +5011,28 @@ impl DbotterApp {
         egui::Panel::top("compact-workspace-actions")
             .resizable(false)
             .show(root_ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let navigator = ui.add_sized(
-                        NativeLayout::ACTION_MIN_SIZE,
-                        egui::Button::new("Navigator"),
-                    );
-                    let navigator = named_author_id(navigator, "navigator.open", "Open navigator");
-                    navigator_open_id = Some(navigator.id);
-                    if navigator.clicked() {
-                        open_surface = Some(FallbackSurface::Navigator);
-                    }
+                ui.add_enabled_ui(!modal_open, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let navigator = ui.add_sized(
+                            NativeLayout::ACTION_MIN_SIZE,
+                            egui::Button::new("Navigator"),
+                        );
+                        let navigator =
+                            named_author_id(navigator, "navigator.open", "Open navigator");
+                        navigator_open_id = Some(navigator.id);
+                        if navigator.clicked() {
+                            open_surface = Some(FallbackSurface::Navigator);
+                        }
 
-                    let inspector =
-                        ui.add_sized(NativeLayout::ACTION_MIN_SIZE, egui::Button::new("Results"));
-                    let inspector =
-                        named_author_id(inspector, "inspector.open", "Open result inspector");
-                    inspector_open_id = Some(inspector.id);
-                    if inspector.clicked() {
-                        open_surface = Some(FallbackSurface::Inspector);
-                    }
+                        let inspector = ui
+                            .add_sized(NativeLayout::ACTION_MIN_SIZE, egui::Button::new("Results"));
+                        let inspector =
+                            named_author_id(inspector, "inspector.open", "Open result inspector");
+                        inspector_open_id = Some(inspector.id);
+                        if inspector.clicked() {
+                            open_surface = Some(FallbackSurface::Inspector);
+                        }
+                    });
                 });
             });
 
@@ -2993,18 +5050,20 @@ impl DbotterApp {
             .visible_surface()
             .or(compact_fallback.visible_surface());
         let mut close_fallback = false;
-        egui::CentralPanel::default().show(root_ui, |ui| match visible_surface {
-            Some(FallbackSurface::Navigator) => {
-                close_fallback = self.show_fallback_close(ui, "Close navigator");
-                ui.separator();
-                self.show_workspace_navigator(ui);
-            }
-            Some(FallbackSurface::Inspector) => {
-                close_fallback = self.show_fallback_close(ui, "Close result inspector");
-                ui.separator();
-                self.show_result_surface(ui);
-            }
-            None => self.show_editor_surface(ui),
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            ui.add_enabled_ui(!modal_open, |ui| match visible_surface {
+                Some(FallbackSurface::Navigator) => {
+                    close_fallback = self.show_fallback_close(ui, "Close navigator");
+                    ui.separator();
+                    self.show_workspace_navigator(ui);
+                }
+                Some(FallbackSurface::Inspector) => {
+                    close_fallback = self.show_fallback_close(ui, "Close result inspector");
+                    ui.separator();
+                    self.show_result_surface(ui);
+                }
+                None => self.show_editor_surface(ui),
+            });
         });
 
         if close_fallback {
@@ -3029,6 +5088,7 @@ impl DbotterApp {
         &mut self,
         navigator_width: Option<f32>,
         editor_share: Option<f32>,
+        inspector_visible: Option<bool>,
     ) {
         let Some(key) = self.model.selected_workspace_key() else {
             return;
@@ -3044,13 +5104,63 @@ impl DbotterApp {
                 *NativeLayout::NAVIGATOR_WIDTH_RANGE.start(),
                 *NativeLayout::NAVIGATOR_WIDTH_RANGE.end(),
             );
-        let editor_share = editor_share.unwrap_or_else(|| previous.editor_share());
-        let geometry =
-            WorkspaceGeometry::restore(navigator_width, editor_share, previous.inspector_visible());
-        self.workspace_geometries.insert(key, geometry);
+        let editor_share = editor_share
+            .unwrap_or_else(|| previous.editor_share())
+            .clamp(
+                WORKSPACE_EDITOR_COLLAPSED_SHARE,
+                WORKSPACE_RESULTS_COLLAPSED_SHARE,
+            );
+        let inspector_visible = inspector_visible.unwrap_or_else(|| previous.inspector_visible());
+        let geometry = WorkspaceGeometry::restore(navigator_width, editor_share, inspector_visible);
+        self.workspace_geometries.insert(key.clone(), geometry);
+        self.sync_collapsed_workspace_pane(&key, geometry);
+        if self
+            .workspace_persistence
+            .get(&key)
+            .is_some_and(|state| !matches!(state.load, WorkspaceLoadPhase::Ready))
+        {
+            return;
+        }
+        if let Ok(snapshot) = WorkspaceGeometrySnapshot::new(
+            geometry.navigator_width(),
+            geometry.editor_share(),
+            geometry.inspector_visible(),
+        ) && self
+            .model
+            .workspace(&key)
+            .and_then(ProfileWorkspace::persistence)
+            .is_some()
+            && let Err(error) = self
+                .model
+                .workspace_mut(key)
+                .set_persistence_geometry(snapshot)
+        {
+            self.model.status = error.to_string();
+        }
     }
 
-    fn show_status_strip(&mut self, root_ui: &mut egui::Ui) {
+    fn collapsed_pane_for_geometry(geometry: WorkspaceGeometry) -> Option<Pane> {
+        if !geometry.inspector_visible()
+            || geometry.editor_share() >= WORKSPACE_RESULTS_COLLAPSED_SHARE
+        {
+            Some(Pane::Subordinate)
+        } else if geometry.editor_share() <= WORKSPACE_EDITOR_COLLAPSED_SHARE {
+            Some(Pane::Editor)
+        } else {
+            None
+        }
+    }
+
+    fn sync_collapsed_workspace_pane(&mut self, key: &WorkspaceKey, geometry: WorkspaceGeometry) {
+        if let Some(pane) = Self::collapsed_pane_for_geometry(geometry) {
+            self.collapsed_workspace_panes.insert(key.clone(), pane);
+        } else {
+            self.collapsed_workspace_panes.remove(key);
+        }
+    }
+
+    fn show_status_strip(&mut self, root_ui: &mut egui::Ui, workspace_dirty_hint: bool) {
+        let modal_open = self.active_modal_kind().is_some();
         let selected = self.model.selected_profile_snapshot().cloned();
         let connection = selected
             .as_ref()
@@ -3085,83 +5195,99 @@ impl DbotterApp {
                     )
                 },
             );
-        let operation_status = self.model.status.clone();
+        let selected_workspace_is_dirty = self
+            .model
+            .selected_workspace()
+            .is_some_and(|workspace| !workspace.is_saved());
+        let operation_status = if (workspace_dirty_hint || selected_workspace_is_dirty)
+            && operation_status_claims_workspace_saved(&self.model.status)
+        {
+            "Local workspace changes are Unsaved.".to_owned()
+        } else {
+            self.model.status.clone()
+        };
         let mut cancel = None;
 
         egui::Panel::bottom("status-action-context")
             .resizable(false)
             .show(root_ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let status = ui.strong("Status");
-                    named_author_id(status, "status-action-context", "Status and action context");
-                    if let Some(profile) = selected.as_ref() {
-                        let profile_name = profile.name.clone();
-                        let profile_status = ui.small(format!("Profile: {profile_name}"));
-                        named_dynamic_value_author_id(
-                            profile_status,
-                            "status.profile".to_owned(),
-                            "Selected profile".to_owned(),
-                            profile_name,
+                ui.add_enabled_ui(!modal_open, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let status = ui.strong("Status");
+                        named_author_id(
+                            status,
+                            "status-action-context",
+                            "Status and action context",
                         );
+                        if let Some(profile) = selected.as_ref() {
+                            let profile_name = profile.name.clone();
+                            let profile_status = ui.small(format!("Profile: {profile_name}"));
+                            named_dynamic_value_author_id(
+                                profile_status,
+                                "status.profile".to_owned(),
+                                "Selected profile".to_owned(),
+                                profile_name,
+                            );
 
-                        let target = match profile.database.as_deref() {
-                            Some(database) => format!("{} / {database}", profile.endpoint),
-                            None => profile.endpoint.clone(),
-                        };
-                        let target_status = ui.small(format!("Target: {target}"));
-                        named_dynamic_value_author_id(
-                            target_status,
-                            "status.target".to_owned(),
-                            "Selected target".to_owned(),
-                            target,
-                        );
+                            let target = match profile.database.as_deref() {
+                                Some(database) => format!("{} / {database}", profile.endpoint),
+                                None => profile.endpoint.clone(),
+                            };
+                            let target_status = ui.small(format!("Target: {target}"));
+                            named_dynamic_value_author_id(
+                                target_status,
+                                "status.target".to_owned(),
+                                "Selected target".to_owned(),
+                                target,
+                            );
 
-                        ui.small(format!(
-                            "Environment: {}",
-                            profile_environment_label(profile.persisted.safety.environment())
-                        ));
-                        ui.small(format!(
-                            "Access: {}",
-                            profile_access_label(profile.persisted.safety.effective_access())
-                        ));
-                    } else {
-                        ui.small("Profile: None");
-                        ui.small("Environment: Unclassified");
-                        ui.small("Access: Read-only");
-                    }
-                    ui.small(format!("Connection: {connection}"));
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let status = ui.small(format!("Operation: {operation_status}"));
-                    named_dynamic_value_author_id(
-                        status,
-                        "status.operation".to_owned(),
-                        "Current operation status".to_owned(),
-                        operation_status,
-                    );
-                    let result = ui.small(format!("Latest result: {result_summary}"));
-                    named_dynamic_value_author_id(
-                        result,
-                        "status.result".to_owned(),
-                        "Selected result summary".to_owned(),
-                        result_summary.clone(),
-                    );
-                    if let Some(operation) = active {
-                        ui.small(format!("Active: {}", operation_kind_label(operation.kind)));
-                        let button = ui.add_sized(
-                            [112.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
-                            egui::Button::new("Cancel"),
-                        );
-                        if named_author_id(
-                            button,
-                            "status.cancel",
-                            "Cancel current selected operation",
-                        )
-                        .clicked()
-                        {
-                            cancel = Some(operation);
+                            ui.small(format!(
+                                "Environment: {}",
+                                profile_environment_label(profile.persisted.safety.environment())
+                            ));
+                            ui.small(format!(
+                                "Access: {}",
+                                profile_access_label(profile.persisted.safety.effective_access())
+                            ));
+                        } else {
+                            ui.small("Profile: None");
+                            ui.small("Environment: Unclassified");
+                            ui.small("Access: Read-only");
                         }
-                    }
+                        ui.small(format!("Connection: {connection}"));
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        let status = ui.small(format!("Operation: {operation_status}"));
+                        named_dynamic_value_author_id(
+                            status,
+                            "status.operation".to_owned(),
+                            "Current operation status".to_owned(),
+                            operation_status,
+                        );
+                        let result = ui.small(format!("Latest result: {result_summary}"));
+                        named_dynamic_value_author_id(
+                            result,
+                            "status.result".to_owned(),
+                            "Selected result summary".to_owned(),
+                            result_summary.clone(),
+                        );
+                        if let Some(operation) = active {
+                            ui.small(format!("Active: {}", operation_kind_label(operation.kind)));
+                            let button = ui.add_sized(
+                                [112.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                                egui::Button::new("Cancel"),
+                            );
+                            if named_author_id(
+                                button,
+                                "status.cancel",
+                                "Cancel current selected operation",
+                            )
+                            .clicked()
+                            {
+                                cancel = Some(operation);
+                            }
+                        }
+                    });
                 });
             });
 
@@ -3274,7 +5400,11 @@ impl DbotterApp {
                 .hint_text("Filter connections")
                 .desired_width(f32::INFINITY),
         );
-        named_author_id(filter, "navigator.connection-filter", "Filter connections");
+        let filter = named_author_id(filter, "navigator.connection-filter", "Filter connections");
+        if self.connection_filter_focus {
+            filter.request_focus();
+            self.connection_filter_focus = false;
+        }
         ui.add_space(8.0);
         let actions_enabled = !self.model.is_config_uncertain();
         let mut new_driver = None;
@@ -3594,7 +5724,11 @@ impl DbotterApp {
     }
 
     fn show_editor_result_shell(&mut self, root_ui: &mut egui::Ui, geometry: WorkspaceGeometry) {
+        let modal_open = self.active_modal_kind().is_some();
         let workspace_key = self.model.selected_workspace_key();
+        if let Some(key) = workspace_key.as_ref() {
+            self.sync_collapsed_workspace_pane(key, geometry);
+        }
         let collapsed = workspace_key
             .as_ref()
             .and_then(|key| self.collapsed_workspace_panes.get(key))
@@ -3602,26 +5736,34 @@ impl DbotterApp {
         if let Some(pane) = collapsed {
             let mut restore = false;
             egui::CentralPanel::default().show(root_ui, |ui| {
-                let (label, author_id) = match pane {
-                    Pane::Editor => ("Restore editor", "workspace.editor.restore"),
-                    Pane::Subordinate => ("Restore results/history", "workspace.results.restore"),
-                };
-                let button = ui.add_sized(
-                    [184.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
-                    egui::Button::new(label),
-                );
-                restore = named_author_id(button, author_id, label).clicked();
-                ui.separator();
-                match pane {
-                    Pane::Editor => self.show_result_surface(ui),
-                    Pane::Subordinate => self.show_editor_surface(ui),
-                }
+                ui.add_enabled_ui(!modal_open, |ui| {
+                    let (label, author_id) = match pane {
+                        Pane::Editor => ("Restore editor", "workspace.editor.restore"),
+                        Pane::Subordinate => {
+                            ("Restore results/history", "workspace.results.restore")
+                        }
+                    };
+                    let button = ui.add_sized(
+                        [184.0, OpenAiTheme::MIN_CONTROL_HEIGHT],
+                        egui::Button::new(label),
+                    );
+                    restore = named_author_id(button, author_id, label).clicked();
+                    ui.separator();
+                    match pane {
+                        Pane::Editor => self.show_result_surface(ui),
+                        Pane::Subordinate => self.show_editor_surface(ui),
+                    }
+                });
             });
             if restore {
                 if let Some(key) = workspace_key {
                     self.collapsed_workspace_panes.remove(&key);
                 }
-                self.remember_workspace_geometry(None, Some(NativeLayout::DEFAULT_EDITOR_SHARE));
+                self.remember_workspace_geometry(
+                    None,
+                    Some(NativeLayout::DEFAULT_EDITOR_SHARE),
+                    Some(true),
+                );
             }
             return;
         }
@@ -3640,29 +5782,38 @@ impl DbotterApp {
             .show_separator_line(false)
             .exact_size(subordinate_extent)
             .show(root_ui, |ui| {
-                let next_layout = show_workspace_splitter(ui, total_extent, editor_extent);
-                self.show_result_surface(ui);
-                next_layout
+                ui.add_enabled_ui(!modal_open, |ui| {
+                    let next_layout = show_workspace_splitter(ui, total_extent, editor_extent);
+                    self.show_result_surface(ui);
+                    next_layout
+                })
+                .inner
             });
         if let Some(next_layout) = result_panel.inner {
             if next_layout.editor_restore_label().is_some() {
-                if let Some(key) = workspace_key {
-                    self.collapsed_workspace_panes.insert(key, Pane::Editor);
-                }
+                self.remember_workspace_geometry(
+                    None,
+                    Some(WORKSPACE_EDITOR_COLLAPSED_SHARE),
+                    Some(true),
+                );
             } else if next_layout.subordinate_restore_label().is_some() {
-                if let Some(key) = workspace_key {
-                    self.collapsed_workspace_panes
-                        .insert(key, Pane::Subordinate);
-                }
+                self.remember_workspace_geometry(
+                    None,
+                    Some(WORKSPACE_RESULTS_COLLAPSED_SHARE),
+                    Some(false),
+                );
             } else if let Some(next_editor_extent) = next_layout.editor_extent() {
                 self.remember_workspace_geometry(
                     None,
-                    Some((next_editor_extent / total_extent).clamp(0.01, 0.99)),
+                    Some(next_editor_extent / total_extent),
+                    Some(true),
                 );
             }
         }
 
-        egui::CentralPanel::default().show(root_ui, |ui| self.show_editor_surface(ui));
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            ui.add_enabled_ui(!modal_open, |ui| self.show_editor_surface(ui));
+        });
     }
 
     #[cfg(test)]
@@ -3692,8 +5843,14 @@ impl DbotterApp {
         let mut editor_intent = None;
         let mut recovery = None;
         if let Some(profile) = self.model.selected_profile_snapshot().cloned() {
-            let editor_enabled = !self.model.is_config_uncertain();
             let key = super::model::WorkspaceKey::new(profile.id.clone(), profile.generation);
+            let restore_resolved = self
+                .workspace_persistence
+                .get(&key)
+                .is_none_or(|state| !state.load_can_restore());
+            let editor_enabled = !self.model.is_config_uncertain()
+                && restore_resolved
+                && self.active_modal_kind().is_none();
             let context_value = self.workspace_context_value(&profile);
             let context = ui.add(
                 egui::Label::new(
@@ -3713,7 +5870,7 @@ impl DbotterApp {
             self.show_editor_tab_strip(ui, &profile, &key, editor_enabled);
             ui.separator();
             let sync_error = {
-                let workspace = self.model.workspace_mut(key);
+                let workspace = self.model.workspace_mut(key.clone());
                 editor_intent = self.editor_surface.show(
                     ui,
                     &profile,
@@ -3725,6 +5882,8 @@ impl DbotterApp {
             if let Some(error) = sync_error {
                 self.model.status = error.to_string();
             }
+            self.observe_workspace_revisions(Instant::now());
+            self.show_workspace_persistence_controls(ui, &profile, &key);
         } else {
             ui.weak("Select a connection to edit a statement or command.");
         }
@@ -3789,35 +5948,163 @@ impl DbotterApp {
         }
         let selected_area = next_area.unwrap_or(selected_area);
         if selected_area == ResultAreaTab::History {
-            if let Some(workspace) = selected_workspace_key
-                .as_ref()
-                .and_then(|key| self.model.workspace(key))
-                && workspace
-                    .result_tabs_for_editor(selected_editor_tab_id)
-                    .next()
-                    .is_some()
-            {
-                ui.heading("Execution history");
+            let Some(key) = selected_workspace_key else {
+                ui.weak("Select a profile to inspect private history.");
+                return;
+            };
+            let history = self
+                .model
+                .workspace(&key)
+                .and_then(ProfileWorkspace::persistence)
+                .map_or_else(Vec::new, |persistence| persistence.history().to_vec());
+            let persistence_enabled = self
+                .model
+                .workspace(&key)
+                .and_then(ProfileWorkspace::persistence)
+                .is_some_and(ProfileWorkspacePersistence::persistence_enabled);
+            let history_writable = persistence_enabled
+                && self.workspace_persistence.get(&key).is_none_or(|state| {
+                    !state.is_read_only()
+                        && !matches!(state.load, WorkspaceLoadPhase::Loading { .. })
+                        && !matches!(state.save, WorkspaceSavePhase::Saving { .. })
+                        && !state.clear.has_intent()
+                });
+            let search = self
+                .workspace_history_search
+                .entry(key.clone())
+                .or_default();
+            ui.heading("Execution history");
+            let search_response = ui.add_sized(
+                [
+                    ui.available_width().max(120.0),
+                    OpenAiTheme::MIN_CONTROL_HEIGHT,
+                ],
+                egui::TextEdit::singleline(search)
+                    .id_salt("history.search")
+                    .hint_text("Search source, status, or Unix date")
+                    .desired_width(f32::INFINITY),
+            );
+            let search_response =
+                named_author_id(search_response, "history.search", "Search private history");
+            if self.workspace_history_focus.as_ref() == Some(&key) {
+                search_response.request_focus();
+                self.workspace_history_focus = None;
+            }
+            let normalized = search.trim().to_ascii_lowercase();
+            let clear_button = ui
+                .add_enabled(
+                    !history.is_empty() && history_writable,
+                    egui::Button::new("Clear history")
+                        .min_size(egui::vec2(128.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                )
+                .on_disabled_hover_text(
+                    "History can be cleared only while private persistence is On and writable.",
+                );
+            let clear = named_author_id(
+                clear_button,
+                "history.clear",
+                "Clear persisted history for this profile",
+            )
+            .clicked();
+            ui.separator();
+            let mut reopen = None;
+            let matching = history
+                .iter()
+                .rev()
+                .filter(|entry| {
+                    if normalized.is_empty() {
+                        return true;
+                    }
+                    let source = entry.source().unwrap_or("");
+                    let searchable = format!(
+                        "{} {} {}",
+                        source,
+                        workspace_history_status_label(entry.status()),
+                        workspace_history_date_label(entry.completed_at_unix_ms())
+                    )
+                    .to_ascii_lowercase();
+                    searchable.contains(&normalized)
+                })
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                ui.weak(if history.is_empty() {
+                    "No execution history yet"
+                } else {
+                    "No history matches this search"
+                });
+            } else {
                 egui::ScrollArea::vertical()
                     .id_salt("result.history.list")
                     .show(ui, |ui| {
-                        for tab in workspace
-                            .result_tabs_for_editor(selected_editor_tab_id)
-                            .rev()
-                        {
-                            let result = tab.snapshot();
-                            ui.label(format!(
-                                "Operation {} · {} ms · {} returned rows · {} affected rows",
-                                result.provenance.operation_id.0,
-                                result.provenance.duration_ms,
-                                result.rows.len(),
-                                result.affected_rows
-                            ));
+                        for entry in matching {
+                            let source_label = entry.source().map_or_else(
+                                || "Source omitted (over 64 KiB)".to_owned(),
+                                workspace_history_source_preview,
+                            );
+                            let label = format!(
+                                "{} · {} · {} · {} · {} ms · {} returned · {} affected · {}",
+                                source_label,
+                                workspace_history_status_label(entry.status()),
+                                workspace_history_date_label(entry.completed_at_unix_ms()),
+                                workspace_run_target_label(entry.target()),
+                                entry.duration_ms(),
+                                entry.returned_rows(),
+                                entry.affected_rows(),
+                                if entry.truncated() {
+                                    "Truncated"
+                                } else {
+                                    "Complete"
+                                }
+                            );
+                            let button = ui.add_enabled(
+                                entry.is_reopenable(),
+                                egui::Button::new(&label)
+                                    .min_size(egui::vec2(
+                                        ui.available_width(),
+                                        OpenAiTheme::MIN_CONTROL_HEIGHT,
+                                    )),
+                            );
+                            let button = named_dynamic_value_author_id(
+                                button,
+                                format!("history.entry.{}", entry.id()),
+                                if entry.source_omitted() {
+                                    "History source omitted because it exceeded 64 KiB; this entry cannot be reopened"
+                                        .to_owned()
+                                } else {
+                                    "Open history source in a new editor".to_owned()
+                                },
+                                label,
+                            );
+                            if button.clicked()
+                                && let Some(source) = entry.source()
+                            {
+                                reopen = Some((entry.id(), source.to_owned()));
+                            }
                         }
                     });
-                ui.small("History metadata is retained in this running workspace.");
-            } else {
-                ui.weak("No execution history yet");
+            }
+            if clear {
+                self.clear_workspace_history(&key);
+            } else if let Some((history_id, source)) = reopen {
+                let language = self
+                    .model
+                    .selected_profile_snapshot()
+                    .map(|profile| profile.driver.language());
+                if let Some(language) = language {
+                    let title = format!("History {history_id}");
+                    match self
+                        .model
+                        .workspace_mut(key)
+                        .create_editor_tab(language, title, source)
+                    {
+                        Ok(_) => {
+                            self.editor_surface = EditorSurface::default();
+                            self.model.status =
+                                "History opened as a new draft; Run remains explicit.".to_owned();
+                        }
+                        Err(error) => self.model.status = error.to_string(),
+                    }
+                }
             }
             return;
         }
@@ -3923,13 +6210,48 @@ impl DbotterApp {
             .model
             .workspace(key)
             .is_none_or(|workspace| workspace.editor_tabs().is_empty());
-        if needs_initial_tab {
+        let restore_pending = self
+            .workspace_persistence
+            .get(key)
+            .is_some_and(WorkspacePersistenceState::load_can_restore);
+        if !needs_initial_tab && let Some(state) = self.workspace_persistence.get_mut(key) {
+            state.clean_empty_baseline_pending = None;
+        }
+        if needs_initial_tab && !restore_pending {
+            let clean_empty_baseline_revision = self
+                .workspace_persistence
+                .get(key)
+                .and_then(|state| state.clean_empty_baseline_pending);
             let initial_text = self
                 .model
                 .workspace(key)
                 .map_or_else(String::new, |workspace| workspace.editor_text.clone());
-            let workspace = self.model.workspace_mut(key.clone());
-            let _ = workspace.create_editor_tab(profile.driver.language(), "Query 1", initial_text);
+            let initial_text_is_empty = initial_text.is_empty();
+            let created = {
+                let workspace = self.model.workspace_mut(key.clone());
+                let revision_before_create = workspace.revision();
+                workspace
+                    .create_editor_tab(profile.driver.language(), "Query 1", initial_text)
+                    .map(|_| {
+                        (
+                            clean_empty_baseline_revision == Some(revision_before_create)
+                                && initial_text_is_empty,
+                            workspace.revision(),
+                        )
+                    })
+                    .ok()
+            };
+            if let Some((mark_clean, created_revision)) = created {
+                if let Some(state) = self.workspace_persistence.get_mut(key) {
+                    state.clean_empty_baseline_pending = None;
+                }
+                if mark_clean {
+                    let _ = self
+                        .model
+                        .workspace_mut(key.clone())
+                        .mark_saved_if_revision(created_revision);
+                }
+            }
         }
 
         let (tabs, selected) = self.model.workspace(key).map_or_else(
@@ -3995,13 +6317,6 @@ impl DbotterApp {
                     }
                 });
             });
-        let retention = ui.weak("Session workspace • tabs and history clear on quit");
-        named_author_id(
-            retention,
-            "workspace.session-retention",
-            "Session-only query tabs and history",
-        );
-
         if let Some(tab_id) = close_tab {
             self.request_editor_tab_close(key.clone(), tab_id, "editor.tab.discard");
             return;
@@ -4029,6 +6344,8 @@ impl DbotterApp {
                     .map(|tab| tab.title().to_owned())
             })
             .unwrap_or_default();
+        let selected_index = selected
+            .and_then(|selected| tabs.iter().position(|(tab_id, _, _)| *tab_id == selected));
         let mut action = None;
         ui.horizontal_wrapped(|ui| {
             let rename = ui.add_enabled(
@@ -4059,6 +6376,29 @@ impl DbotterApp {
             {
                 action = selected.map(EditorTabAction::Duplicate);
             }
+            let move_left = ui.add_enabled(
+                enabled && selected_index.is_some_and(|index| index > 0),
+                egui::Button::new("←").min_size(egui::vec2(
+                    OpenAiTheme::MIN_CONTROL_HEIGHT,
+                    OpenAiTheme::MIN_CONTROL_HEIGHT,
+                )),
+            );
+            if named_author_id(move_left, "editor.tab.move_left", "Move editor tab left").clicked()
+            {
+                action = selected.map(EditorTabAction::MoveLeft);
+            }
+            let move_right = ui.add_enabled(
+                enabled && selected_index.is_some_and(|index| index.saturating_add(1) < tabs.len()),
+                egui::Button::new("→").min_size(egui::vec2(
+                    OpenAiTheme::MIN_CONTROL_HEIGHT,
+                    OpenAiTheme::MIN_CONTROL_HEIGHT,
+                )),
+            );
+            if named_author_id(move_right, "editor.tab.move_right", "Move editor tab right")
+                .clicked()
+            {
+                action = selected.map(EditorTabAction::MoveRight);
+            }
         });
         let workspace = self.model.workspace_mut(key.clone());
         let outcome = match action {
@@ -4072,6 +6412,23 @@ impl DbotterApp {
             Some(EditorTabAction::Duplicate(tab_id)) => {
                 workspace.duplicate_editor_tab(tab_id).map(|_| ())
             }
+            Some(EditorTabAction::MoveLeft(tab_id)) => workspace
+                .editor_tabs()
+                .iter()
+                .position(|tab| tab.id() == tab_id)
+                .and_then(|index| index.checked_sub(1))
+                .map_or(Ok(()), |target| {
+                    workspace.reorder_editor_tab(tab_id, target)
+                }),
+            Some(EditorTabAction::MoveRight(tab_id)) => workspace
+                .editor_tabs()
+                .iter()
+                .position(|tab| tab.id() == tab_id)
+                .and_then(|index| index.checked_add(1))
+                .filter(|target| *target < workspace.editor_tabs().len())
+                .map_or(Ok(()), |target| {
+                    workspace.reorder_editor_tab(tab_id, target)
+                }),
             None => Ok(()),
         };
         if let Err(error) = outcome {
@@ -4079,6 +6436,182 @@ impl DbotterApp {
         }
         if action.is_some() {
             self.editor_surface = EditorSurface::default();
+        }
+    }
+
+    fn show_workspace_persistence_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        profile: &ProfileSnapshot,
+        key: &WorkspaceKey,
+    ) {
+        let available = self.model.config.source_version() == ConfigSourceVersion::V3
+            && profile.persisted.safety.instance_id().is_some();
+        let persistence_enabled = self
+            .model
+            .workspace(key)
+            .and_then(ProfileWorkspace::persistence)
+            .is_none_or(ProfileWorkspacePersistence::persistence_enabled);
+        let state = self.workspace_persistence.get(key);
+        let read_only = state.is_some_and(WorkspacePersistenceState::is_read_only);
+        let clear_failed =
+            state.is_some_and(|state| matches!(state.clear, WorkspaceClearPhase::Failed { .. }));
+        let restore_conflict =
+            state.is_some_and(|state| matches!(state.load, WorkspaceLoadPhase::Conflict));
+        let busy = state.is_some_and(|state| {
+            matches!(state.load, WorkspaceLoadPhase::Loading { .. })
+                || matches!(state.save, WorkspaceSavePhase::Saving { .. })
+                || matches!(state.clear, WorkspaceClearPhase::Pending { .. })
+        });
+        let writes_blocked = busy || clear_failed;
+        let save_failed = state.is_some_and(|state| {
+            matches!(
+                state.load,
+                WorkspaceLoadPhase::Failed(_) | WorkspaceLoadPhase::Conflict
+            ) || matches!(state.save, WorkspaceSavePhase::Failed { .. })
+                || clear_failed
+        });
+        let retryable_failure = state.is_some_and(|state| {
+            matches!(state.load, WorkspaceLoadPhase::Failed(_))
+                || matches!(state.save, WorkspaceSavePhase::Failed { .. })
+                || clear_failed
+        });
+        let saved = !self.frame_workspace_dirty_hint
+            && self
+                .model
+                .workspace(key)
+                .is_some_and(ProfileWorkspace::is_saved);
+        let status = if !available {
+            "Unavailable — migrate this profile to classified v3"
+        } else if read_only {
+            "Read-only — another app instance owns workspace persistence"
+        } else if state
+            .is_some_and(|state| matches!(state.load, WorkspaceLoadPhase::Loading { .. }))
+        {
+            "Loading"
+        } else if state.is_some_and(|state| matches!(state.save, WorkspaceSavePhase::Saving { .. }))
+        {
+            "Saving"
+        } else if clear_failed {
+            "Clear failed"
+        } else if restore_conflict {
+            "Restore conflict — choose Keep local, Off, or Clear"
+        } else if save_failed {
+            "Save failed"
+        } else if !persistence_enabled {
+            "Off — local-only until quit"
+        } else if saved {
+            "Saved"
+        } else {
+            "Unsaved"
+        };
+        ui.add_space(4.0);
+        let mut toggle = false;
+        let mut save = false;
+        let mut clear = false;
+        let mut retry = false;
+        ui.horizontal_wrapped(|ui| {
+            let status_response = ui.small(format!("Private workspace · {status}"));
+            named_dynamic_value_author_id(
+                status_response,
+                "workspace.persistence.status".to_owned(),
+                "Private workspace persistence status".to_owned(),
+                status.to_owned(),
+            );
+            let toggle_button = ui.add_enabled(
+                available && !read_only && !writes_blocked,
+                egui::Button::new(if persistence_enabled {
+                    "Persistence On"
+                } else {
+                    "Persistence Off"
+                })
+                .selected(persistence_enabled)
+                .min_size(egui::vec2(144.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            toggle = named_author_id(
+                toggle_button,
+                "workspace.persistence.toggle",
+                "Toggle private draft and history persistence",
+            )
+            .clicked();
+            let save_button = ui.add_enabled(
+                available && persistence_enabled && !read_only && !writes_blocked,
+                egui::Button::new(if restore_conflict {
+                    "Keep local…"
+                } else {
+                    "Save"
+                })
+                .min_size(egui::vec2(88.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            save = named_author_id(
+                save_button,
+                "editor.save",
+                if restore_conflict {
+                    "Keep local workspace after restore conflict"
+                } else {
+                    "Save private workspace"
+                },
+            )
+            .clicked();
+            let clear_button = ui.add_enabled(
+                available && !read_only && !writes_blocked,
+                egui::Button::new("Clear saved data")
+                    .min_size(egui::vec2(144.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+            );
+            clear = named_author_id(
+                clear_button,
+                "workspace.persistence.clear",
+                "Clear all saved drafts and history for this profile",
+            )
+            .clicked();
+            if retryable_failure {
+                let retry_button = ui.add_enabled(
+                    available && !read_only && !busy,
+                    egui::Button::new("Retry")
+                        .min_size(egui::vec2(88.0, OpenAiTheme::MIN_CONTROL_HEIGHT)),
+                );
+                retry = named_author_id(
+                    retry_button,
+                    "workspace.persistence.retry",
+                    "Retry private workspace persistence",
+                )
+                .clicked();
+            }
+        });
+        if toggle {
+            self.set_workspace_persistence_enabled(key, !persistence_enabled);
+        } else if save {
+            if restore_conflict {
+                self.workspace_restore_conflict_confirmation = Some(key.clone());
+            } else {
+                let _ = self.request_selected_workspace_save();
+            }
+        } else if clear {
+            self.workspace_clear_confirmation = Some(key.clone());
+        } else if retry {
+            if restore_conflict {
+                self.workspace_restore_conflict_confirmation = Some(key.clone());
+                return;
+            }
+            let retry_clear = self
+                .workspace_persistence
+                .get(key)
+                .is_some_and(|state| matches!(state.clear, WorkspaceClearPhase::Failed { .. }));
+            let retry_load = self
+                .workspace_persistence
+                .get(key)
+                .is_some_and(|state| matches!(state.load, WorkspaceLoadPhase::Failed(_)));
+            if retry_clear {
+                self.submit_clear_workspace(key);
+            } else if retry_load {
+                if let Some(state) = self.workspace_persistence.get_mut(key) {
+                    state.load = WorkspaceLoadPhase::Unloaded;
+                    state.retry_not_before = None;
+                }
+                self.request_workspace_load(key);
+            } else {
+                let _ = self.submit_workspace_commit(key, true);
+            }
         }
     }
 
@@ -4166,6 +6699,16 @@ impl RecoveryCommandDispatcher for DbotterApp {
 impl eframe::App for DbotterApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
+        let _ = self.ensure_current_workspace_persistence_bindings();
+        let now = Instant::now();
+        self.observe_workspace_revisions(now);
+        if !self.discard_local_changes_on_close
+            && self.workspace_close_guard != WorkspaceCloseGuard::SaveFailed
+        {
+            self.retry_workspace_loads(now);
+            self.autosave_workspaces(now);
+        }
+        self.handle_workspace_close_request(context);
         context.request_repaint_after(Duration::from_millis(50));
     }
 
@@ -4174,6 +6717,9 @@ impl eframe::App for DbotterApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if !self.discard_local_changes_on_close {
+            let _ = self.flush_selected_workspace();
+        }
         let mut retained = self
             .workspace_geometries
             .iter()
@@ -4198,6 +6744,161 @@ impl eframe::App for DbotterApp {
             storage.set_string(WORKSPACE_GEOMETRY_STORAGE_KEY, encoded);
         }
     }
+
+    fn auto_save_interval(&self) -> Duration {
+        Duration::from_secs(2)
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+}
+
+fn consume_command_key(ui: &egui::Ui, key: egui::Key, shift: bool) -> bool {
+    ui.input_mut(|input| {
+        let mut pressed = false;
+        input.events.retain(|event| {
+            let egui::Event::Key {
+                key: event_key,
+                pressed: key_pressed,
+                repeat,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            let matches = *event_key == key
+                && *key_pressed
+                && !*repeat
+                && modifiers.command
+                && modifiers.shift == shift
+                && !modifiers.alt;
+            if matches {
+                pressed = true;
+            }
+            !matches
+        });
+        pressed
+    })
+}
+
+fn saturating_u128_to_u64(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn saturating_usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn current_unix_time_ms() -> i64 {
+    let milliseconds = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis(),
+        Err(_) => return 0,
+    };
+    i64::try_from(milliseconds).unwrap_or(i64::MAX)
+}
+
+fn history_failure_status(
+    summary: PublicSummary,
+    connection_outcome: ConnectionFailureOutcome,
+) -> WorkspaceHistoryStatus {
+    if connection_outcome == ConnectionFailureOutcome::Unknown
+        || summary == PublicSummary::CommittedDurabilityUnknown
+    {
+        return WorkspaceHistoryStatus::OutcomeUnknown;
+    }
+    if summary == PublicSummary::OperationCancelled {
+        return WorkspaceHistoryStatus::Cancelled;
+    }
+    let code = match summary {
+        PublicSummary::CredentialRequired | PublicSummary::AuthenticationFailed => {
+            WorkspaceHistoryCode::Authentication
+        }
+        PublicSummary::PermissionDenied => WorkspaceHistoryCode::Permission,
+        PublicSummary::NetworkUnavailable | PublicSummary::TlsVerificationFailed => {
+            WorkspaceHistoryCode::Network
+        }
+        PublicSummary::OperationTimedOut => WorkspaceHistoryCode::Timeout,
+        PublicSummary::InvalidInput
+        | PublicSummary::SyntaxRejected
+        | PublicSummary::ConstraintRejected
+        | PublicSummary::UnsupportedFeature
+        | PublicSummary::ResourceBusy
+        | PublicSummary::ResourceStale => WorkspaceHistoryCode::Admission,
+        PublicSummary::ConfigWriteNotCommitted | PublicSummary::ExportFailed => {
+            WorkspaceHistoryCode::Backend
+        }
+        PublicSummary::InternalFailure | PublicSummary::CommittedDurabilityUnknown => {
+            WorkspaceHistoryCode::Internal
+        }
+        PublicSummary::OperationCancelled => WorkspaceHistoryCode::None,
+    };
+    WorkspaceHistoryStatus::Failed(code)
+}
+
+fn next_workspace_history_id(history: &[WorkspaceHistoryEntry], preferred: u64) -> Option<u64> {
+    if preferred != 0 && history.iter().all(|entry| entry.id() != preferred) {
+        return Some(preferred);
+    }
+    let search_bound = u64::try_from(MAX_HISTORY_ENTRIES_PER_PROFILE)
+        .ok()?
+        .saturating_add(1);
+    (1..=search_bound).find(|candidate| history.iter().all(|entry| entry.id() != *candidate))
+}
+
+const fn workspace_history_status_label(status: WorkspaceHistoryStatus) -> &'static str {
+    match status {
+        WorkspaceHistoryStatus::Succeeded => "Succeeded",
+        WorkspaceHistoryStatus::Failed(WorkspaceHistoryCode::None) => "Failed",
+        WorkspaceHistoryStatus::Failed(WorkspaceHistoryCode::Admission) => "Failed · admission",
+        WorkspaceHistoryStatus::Failed(WorkspaceHistoryCode::Authentication) => {
+            "Failed · authentication"
+        }
+        WorkspaceHistoryStatus::Failed(WorkspaceHistoryCode::Permission) => "Failed · permission",
+        WorkspaceHistoryStatus::Failed(WorkspaceHistoryCode::Network) => "Failed · network",
+        WorkspaceHistoryStatus::Failed(WorkspaceHistoryCode::Timeout) => "Failed · timeout",
+        WorkspaceHistoryStatus::Failed(WorkspaceHistoryCode::Backend) => "Failed · backend",
+        WorkspaceHistoryStatus::Failed(WorkspaceHistoryCode::Internal) => "Failed · internal",
+        WorkspaceHistoryStatus::Cancelled => "Cancelled",
+        WorkspaceHistoryStatus::OutcomeUnknown => "Outcome unknown",
+    }
+}
+
+const fn workspace_run_target_label(target: WorkspaceRunTarget) -> &'static str {
+    match target {
+        WorkspaceRunTarget::Current => "Current",
+        WorkspaceRunTarget::Selection => "Selection",
+        WorkspaceRunTarget::All => "All",
+    }
+}
+
+fn workspace_history_date_label(completed_at_unix_ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(completed_at_unix_ms).map_or_else(
+        || format!("UTC timestamp {completed_at_unix_ms}"),
+        |completed| completed.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+    )
+}
+
+fn workspace_history_source_preview(source: &str) -> String {
+    const MAX_PREVIEW_CHARACTERS: usize = 160;
+    let mut preview = String::with_capacity(MAX_PREVIEW_CHARACTERS.saturating_add(1));
+    let mut truncated = false;
+    for (index, character) in source.chars().enumerate() {
+        if index >= MAX_PREVIEW_CHARACTERS {
+            truncated = true;
+            break;
+        }
+        if character == '\n' || character == '\r' {
+            preview.push(' ');
+        } else {
+            preview.push(character);
+        }
+    }
+    if truncated {
+        preview.push('…');
+    }
+    preview
 }
 
 fn show_workspace_splitter(
@@ -4336,7 +7037,10 @@ fn restore_workspace_geometries(
         .map(|(key, geometry)| {
             let geometry = WorkspaceGeometry::restore(
                 geometry.navigator_width(),
-                geometry.editor_share(),
+                geometry.editor_share().clamp(
+                    WORKSPACE_EDITOR_COLLAPSED_SHARE,
+                    WORKSPACE_RESULTS_COLLAPSED_SHARE,
+                ),
                 geometry.inspector_visible(),
             );
             (key, geometry)
@@ -4666,11 +7370,12 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         ActiveOperation, ConnectionState, DbotterApp, MySqlExplorerIntent, PendingDelete,
-        ProfileEditor,
+        ProfileEditor, ProfileWorkspace, WorkspaceClearPhase, WorkspaceCloseGuard,
+        WorkspaceLoadPhase, WorkspaceSavePhase,
     };
     use crate::config::ConfigSourceVersion;
     use crate::model::{
@@ -4692,11 +7397,15 @@ mod tests {
     use crate::ui::editor::{
         EditorCursor, EditorIntent, build_execute_all_intent, build_execute_intent,
     };
-    use crate::ui::layout::{NativeLayout, WorkspaceGeometry};
+    use crate::ui::layout::{NativeLayout, Pane, WorkspaceGeometry};
     use crate::ui::model::{
         ConfigPresentation, ProfileSnapshot, ResultAreaTab, UiEvent, WorkspaceKey,
     };
     use crate::ui::redis_explorer::RedisExplorerIntent;
+    use crate::workspace::{
+        MAX_HISTORY_ENTRIES_PER_PROFILE, WorkspaceHistoryEntry, WorkspaceHistoryStatus,
+        WorkspaceRunTarget, WorkspaceStoreMode, WorkspaceStoreWarning,
+    };
     use eframe::egui::{self, Context, Event, Key, Modifiers, RawInput, accesskit};
 
     #[derive(Default)]
@@ -4857,6 +7566,65 @@ mod tests {
         key
     }
 
+    fn j2_workspace_snapshot(
+        profile: &ProfileSnapshot,
+        persistence_enabled: bool,
+        source: Option<&str>,
+    ) -> crate::workspace::ProfileWorkspaceSnapshot {
+        let geometry = crate::workspace::WorkspaceGeometrySnapshot::new(320.0, 0.65, true)
+            .expect("valid J2 fixture geometry");
+        let persistence = super::ProfileWorkspacePersistence::for_classified_profile(
+            &profile.persisted,
+            persistence_enabled,
+            geometry,
+            Vec::new(),
+        )
+        .expect("classified J2 fixture persistence");
+        let mut workspace = ProfileWorkspace::default();
+        workspace
+            .bind_persistence(persistence)
+            .expect("bind J2 fixture persistence");
+        if let Some(source) = source {
+            workspace
+                .create_editor_tab(QueryLanguage::Sql, "Durable", source)
+                .expect("J2 fixture tab");
+        }
+        workspace
+            .to_persistence_snapshot()
+            .expect("J2 fixture snapshot")
+    }
+
+    fn command_modifiers(shift: bool) -> Modifiers {
+        #[cfg(target_os = "macos")]
+        {
+            Modifiers {
+                shift,
+                mac_cmd: true,
+                command: true,
+                ..Modifiers::default()
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Modifiers {
+                ctrl: true,
+                shift,
+                command: true,
+                ..Modifiers::default()
+            }
+        }
+    }
+
+    fn command_key_event(key: Key, shift: bool) -> Event {
+        Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: command_modifiers(shift),
+        }
+    }
+
     #[test]
     fn j2_red_actual_frame_exposes_durable_workspace_and_searchable_history_controls() {
         let (ui_port, mut service) = bounded_ports(4);
@@ -4949,6 +7717,28 @@ mod tests {
             ),
         }));
         app.poll_events();
+        {
+            let workspace = app.model.workspace_mut(key.clone());
+            let history = workspace
+                .persistence()
+                .expect("bound private persistence")
+                .history();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].id(), operation_id.0);
+            assert_eq!(
+                history[0].target(),
+                crate::workspace::WorkspaceRunTarget::Current
+            );
+            let snapshot = workspace
+                .to_persistence_snapshot()
+                .expect("bounded private snapshot");
+            let encoded = serde_json::to_string(&snapshot).expect("snapshot JSON");
+            assert!(encoded.contains("j2_history_private_source"));
+            assert!(
+                !encoded.contains("ephemeral-result-must-not-persist"),
+                "result payload must never enter durable history"
+            );
+        }
         app.model
             .workspace_mut(key.clone())
             .select_result_area_tab(ResultAreaTab::History);
@@ -5037,6 +7827,13 @@ mod tests {
         assert!(service.try_next_command().is_some());
         let profile = j2_classified_environment_profile();
         let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        let persistence = app
+            .workspace_persistence
+            .get_mut(&key)
+            .expect("J2 workspace persistence");
+        persistence.load = WorkspaceLoadPhase::Ready;
+        persistence.mode = Some(WorkspaceStoreMode::ReadWrite);
         app.model
             .workspace_mut(key)
             .create_editor_tab(
@@ -5060,9 +7857,2143 @@ mod tests {
             "query source must never be serialized into eframe native storage"
         );
         assert!(
-            service.try_next_command().is_some(),
-            "native Save must enqueue a bounded private-workspace flush before reporting Saved"
+            !eframe::App::persist_egui_memory(&app),
+            "generic egui memory may retain private TextEdit contents and must stay disabled"
         );
+        match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace { snapshot, .. }) => {
+                assert!(snapshot.persistence_enabled());
+                assert_eq!(snapshot.editor_tabs().len(), 1);
+                assert_eq!(
+                    snapshot.editor_tabs()[0].source(),
+                    "SELECT j2_private_source"
+                );
+            }
+            command => panic!(
+                "native Save must enqueue only a bounded private-workspace commit, got {command:?}"
+            ),
+        }
+        assert!(
+            service.try_next_command().is_none(),
+            "native Save must never route through a database command"
+        );
+    }
+
+    #[test]
+    fn persistence_off_commits_only_disabled_empty_state_then_keeps_later_edits_local() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Private", "SELECT off_fixture")
+            .expect("private tab");
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+
+        app.set_workspace_persistence_enabled(&key, false);
+        let (operation_id, identity, revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                snapshot,
+            }) => {
+                assert!(!snapshot.persistence_enabled());
+                assert!(snapshot.editor_tabs().is_empty());
+                assert!(snapshot.history().is_empty());
+                (operation_id, identity, revision)
+            }
+            command => panic!("toggle Off must submit disabled-empty commit, got {command:?}"),
+        };
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id,
+            identity,
+            revision,
+            generation: 1,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(
+            app.model
+                .workspace(&key)
+                .and_then(|workspace| workspace.persistence())
+                .is_some_and(|persistence| !persistence.persistence_enabled())
+        );
+        assert!(
+            !app.workspace_persistence
+                .get(&key)
+                .is_some_and(|state| state.force_commit_until_success)
+        );
+
+        {
+            let workspace = app.model.workspace_mut(key.clone());
+            workspace.editor_text.push_str(" -- remains local");
+            workspace
+                .sync_selected_editor_tab_from_surface()
+                .expect("bounded local edit");
+        }
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert!(
+            service.try_next_command().is_none(),
+            "Persistence Off must never autosave or native-save local SQL"
+        );
+
+        assert!(
+            service.try_emit(UiEvent::WorkspaceCommitted {
+                operation_id,
+                identity: app
+                    .workspace_persistence
+                    .get(&key)
+                    .expect("bound state")
+                    .identity
+                    .clone(),
+                revision,
+                generation: 1,
+                warnings: Vec::new(),
+            })
+        );
+        app.poll_events();
+        assert!(
+            service.try_next_command().is_none(),
+            "an older duplicate commit terminal must not resurrect saving"
+        );
+    }
+
+    #[test]
+    fn clear_success_forces_a_durable_disabled_empty_commit_before_completion() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Private", "SELECT clear_fixture")
+            .expect("private tab");
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
+
+        app.submit_clear_workspace(&key);
+        let (clear_operation, identity, base_revision) = match service.try_next_command() {
+            Some(UiCommand::ClearWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            }) => (operation_id, identity, base_revision),
+            command => {
+                panic!("clear confirmation must submit exact ClearWorkspace, got {command:?}")
+            }
+        };
+        assert!(service.try_emit(UiEvent::WorkspaceCleared {
+            operation_id: clear_operation,
+            identity: identity.clone(),
+            base_revision,
+        }));
+        app.poll_events();
+
+        let (commit_operation, commit_revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity: committed_identity,
+                revision,
+                snapshot,
+            }) => {
+                assert_eq!(committed_identity, identity);
+                assert!(!snapshot.persistence_enabled());
+                assert!(snapshot.editor_tabs().is_empty());
+                assert!(snapshot.history().is_empty());
+                (operation_id, revision)
+            }
+            command => panic!(
+                "successful clear must force a durable disabled-empty commit, got {command:?}"
+            ),
+        };
+        assert!(app.workspace_persistence.get(&key).is_some_and(|state| {
+            state.force_commit_until_success
+                && matches!(
+                    state.save,
+                    WorkspaceSavePhase::Saving {
+                        operation_id,
+                        revision,
+                    } if operation_id == commit_operation && revision == commit_revision
+                )
+        }));
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: commit_operation,
+            identity,
+            revision: commit_revision,
+            generation: 2,
+            warnings: vec![WorkspaceStoreWarning::CorruptProfileQuarantined],
+        }));
+        app.poll_events();
+        assert!(app.workspace_persistence.get(&key).is_some_and(|state| {
+            !state.force_commit_until_success && matches!(state.save, WorkspaceSavePhase::Idle)
+        }));
+    }
+
+    #[test]
+    fn discard_local_changes_close_never_reflushes_private_sql_through_native_save() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(
+                QueryLanguage::Sql,
+                "Discarded",
+                "SELECT discard_close_fixture",
+            )
+            .expect("discard fixture");
+        let revision = app
+            .model
+            .workspace(&key)
+            .map_or(0, ProfileWorkspace::revision);
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+            state.save = WorkspaceSavePhase::Failed {
+                revision,
+                code: super::WorkspaceFailureCode::Unavailable,
+            };
+            state.dirty_since = Some(Instant::now() - Duration::from_secs(2));
+            state.retry_not_before = None;
+        }
+        app.workspace_close_guard = WorkspaceCloseGuard::SaveFailed;
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let first = context.run_ui(RawInput::default(), |ui| app.show_native(ui));
+        let first = first
+            .platform_output
+            .accesskit_update
+            .expect("close recovery frame");
+        let (discard_id, _) = accesskit_author_node(&first, "workspace.close.discard");
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: discard_id,
+                    data: None,
+                })],
+                ..RawInput::default()
+            },
+            |ui| app.show_native(ui),
+        );
+        assert!(app.discard_local_changes_on_close);
+        assert!(service.try_next_command().is_none());
+
+        let mut close_input = RawInput::default();
+        close_input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut frame = eframe::Frame::_new_kittest();
+        let close_output = context.run_ui(close_input, |ui| {
+            eframe::App::logic(&mut app, ui.ctx(), &mut frame);
+        });
+        let close_commands = &close_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .commands;
+        assert!(
+            !close_commands.contains(&egui::ViewportCommand::CancelClose),
+            "the frame after explicit Discard must never cancel closing"
+        );
+        assert!(
+            service.try_next_command().is_none(),
+            "the frame after explicit Discard must not autosave or flush"
+        );
+
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert!(service.try_next_command().is_none());
+        assert!(
+            storage
+                .values
+                .values()
+                .all(|value| !value.contains("discard_close_fixture"))
+        );
+
+        app.workspace_close_guard = WorkspaceCloseGuard::SaveFailed;
+        let ids = shell_author_ids(&mut app, 1440.0, 900.0);
+        for id in [
+            "workspace.close.retry",
+            "workspace.close.discard",
+            "workspace.close.cancel",
+        ] {
+            assert!(ids.contains(id), "close recovery is missing {id}");
+        }
+    }
+
+    #[test]
+    fn stale_profiles_loaded_cannot_retag_or_reload_workspace_persistence() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let config = ConfigPresentation::for_source(
+            ConfigSourceVersion::V3,
+            &PathBuf::from("/private/tmp/dbotter-j2-config.toml"),
+        );
+        assert!(service.try_emit(UiEvent::ProfilesLoaded {
+            operation_id: OperationId(100),
+            profiles: vec![profile.clone()],
+            config: config.clone(),
+        }));
+        app.poll_events();
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::LoadWorkspace { .. })
+        ));
+        app.workspace_persistence
+            .get_mut(&key)
+            .expect("accepted profile load bound persistence")
+            .load = WorkspaceLoadPhase::Unloaded;
+        app.workspace_geometries
+            .insert(key.clone(), WorkspaceGeometry::restore(333.0, 0.61, true));
+        app.workspace_history_search
+            .insert(key.clone(), "stable-search".to_owned());
+
+        let mut stale = profile.clone();
+        stale.generation = ProfileGeneration(profile.generation.0.saturating_add(1));
+        assert!(service.try_emit(UiEvent::ProfilesLoaded {
+            operation_id: OperationId(99),
+            profiles: vec![stale.clone()],
+            config,
+        }));
+        app.poll_events();
+
+        assert_eq!(
+            app.model.active_generation(&profile.id),
+            Some(profile.generation)
+        );
+        assert!(app.workspace_persistence.contains_key(&key));
+        assert!(app.workspace_geometries.contains_key(&key));
+        assert_eq!(
+            app.workspace_history_search.get(&key).map(String::as_str),
+            Some("stable-search")
+        );
+        assert!(
+            !app.workspace_persistence
+                .contains_key(&WorkspaceKey::new(stale.id, stale.generation))
+        );
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn same_instance_retag_reissues_pending_load_with_the_original_restore_fence() {
+        let (ui_port, mut service) = bounded_ports(12);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let old_key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&old_key, &profile));
+        app.request_workspace_load(&old_key);
+        let (old_operation, old_identity, old_base_revision) = match service.try_next_command() {
+            Some(UiCommand::LoadWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            }) => (operation_id, identity, base_revision),
+            command => panic!("expected initial exact load, got {command:?}"),
+        };
+        app.workspace_clear_confirmation = Some(old_key.clone());
+        app.workspace_history_focus = Some(old_key.clone());
+
+        let mut refreshed = profile.clone();
+        refreshed.generation = ProfileGeneration(profile.generation.0.saturating_add(1));
+        let new_key = WorkspaceKey::new(refreshed.id.clone(), refreshed.generation);
+        assert!(service.try_emit(UiEvent::ProfilesLoaded {
+            operation_id: OperationId(100),
+            profiles: vec![refreshed.clone()],
+            config: ConfigPresentation::for_source(
+                ConfigSourceVersion::V3,
+                &PathBuf::from("/private/tmp/dbotter-j2-config.toml"),
+            ),
+        }));
+        app.poll_events();
+        let (new_operation, new_identity, new_base_revision) = match service.try_next_command() {
+            Some(UiCommand::LoadWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            }) => (operation_id, identity, base_revision),
+            command => panic!("retag must reissue exact LoadWorkspace, got {command:?}"),
+        };
+        assert_eq!(new_identity.profile_generation(), refreshed.generation);
+        assert_eq!(new_identity.instance_id(), old_identity.instance_id());
+        assert_eq!(new_base_revision, old_base_revision);
+        assert!(!app.workspace_persistence.contains_key(&old_key));
+        assert!(matches!(
+            app.workspace_persistence
+                .get(&new_key)
+                .map(|state| &state.load),
+            Some(WorkspaceLoadPhase::Loading { .. })
+        ));
+        assert_eq!(app.workspace_clear_confirmation.as_ref(), Some(&new_key));
+        assert_eq!(app.workspace_history_focus.as_ref(), Some(&new_key));
+
+        let durable = j2_workspace_snapshot(&refreshed, true, Some("SELECT durable_after_retag"));
+        assert!(service.try_emit(UiEvent::WorkspaceLoaded {
+            operation_id: old_operation,
+            identity: old_identity,
+            base_revision: old_base_revision,
+            mode: WorkspaceStoreMode::ReadWrite,
+            read_only_reason: None,
+            snapshot: Some(Box::new(durable.clone())),
+        }));
+        app.poll_events();
+        assert!(
+            app.model
+                .workspace(&new_key)
+                .is_some_and(|workspace| workspace.editor_tabs().is_empty()),
+            "old-generation load completion must be ignored"
+        );
+
+        assert!(service.try_emit(UiEvent::WorkspaceLoaded {
+            operation_id: new_operation,
+            identity: new_identity,
+            base_revision: new_base_revision,
+            mode: WorkspaceStoreMode::ReadWrite,
+            read_only_reason: None,
+            snapshot: Some(Box::new(durable)),
+        }));
+        app.poll_events();
+        assert!(app.model.workspace(&new_key).is_some_and(|workspace| {
+            workspace
+                .editor_tabs()
+                .iter()
+                .any(|tab| tab.text() == "SELECT durable_after_retag")
+                && workspace.is_saved()
+        }));
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn same_instance_retag_reissues_pending_clear_and_blocks_every_commit_until_off_is_durable() {
+        let (ui_port, mut service) = bounded_ports(16);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let old_key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&old_key, &profile));
+        app.model
+            .workspace_mut(old_key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Private", "SELECT clear_retag_fixture")
+            .expect("clear retag fixture");
+        if let Some(state) = app.workspace_persistence.get_mut(&old_key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
+        app.submit_clear_workspace(&old_key);
+        let (old_clear_operation, old_identity, old_revision) = match service.try_next_command() {
+            Some(UiCommand::ClearWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            }) => (operation_id, identity, base_revision),
+            command => panic!("expected initial exact clear, got {command:?}"),
+        };
+
+        let mut refreshed = profile.clone();
+        refreshed.generation = ProfileGeneration(profile.generation.0.saturating_add(1));
+        let new_key = WorkspaceKey::new(refreshed.id.clone(), refreshed.generation);
+        assert!(service.try_emit(UiEvent::ProfilesLoaded {
+            operation_id: OperationId(200),
+            profiles: vec![refreshed.clone()],
+            config: ConfigPresentation::for_source(
+                ConfigSourceVersion::V3,
+                &PathBuf::from("/private/tmp/dbotter-j2-config.toml"),
+            ),
+        }));
+        app.poll_events();
+        let (new_clear_operation, new_identity, new_revision) = match service.try_next_command() {
+            Some(UiCommand::ClearWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            }) => (operation_id, identity, base_revision),
+            command => panic!("retag must reissue exact ClearWorkspace, got {command:?}"),
+        };
+        assert_eq!(new_identity.profile_generation(), refreshed.generation);
+        assert_eq!(new_identity.instance_id(), old_identity.instance_id());
+        assert!(matches!(
+            app.workspace_persistence
+                .get(&new_key)
+                .map(|state| &state.clear),
+            Some(WorkspaceClearPhase::Pending { .. })
+        ));
+
+        assert!(service.try_emit(UiEvent::WorkspaceCleared {
+            operation_id: old_clear_operation,
+            identity: old_identity,
+            base_revision: old_revision,
+        }));
+        app.poll_events();
+        assert!(!app.flush_selected_workspace());
+        assert!(
+            service.try_next_command().is_none(),
+            "old clear terminal and every save path must stay blocked"
+        );
+
+        assert!(service.try_emit(UiEvent::WorkspaceCleared {
+            operation_id: new_clear_operation,
+            identity: new_identity.clone(),
+            base_revision: new_revision,
+        }));
+        app.poll_events();
+        let (commit_operation, commit_revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                snapshot,
+            }) => {
+                assert_eq!(identity, new_identity);
+                assert!(!snapshot.persistence_enabled());
+                assert!(snapshot.editor_tabs().is_empty());
+                assert!(snapshot.history().is_empty());
+                (operation_id, revision)
+            }
+            command => panic!("clear success must force durable Off, got {command:?}"),
+        };
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: commit_operation,
+            identity: new_identity,
+            revision: commit_revision,
+            generation: 2,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(
+            app.workspace_persistence
+                .get(&new_key)
+                .is_some_and(|state| {
+                    matches!(state.clear, WorkspaceClearPhase::Idle)
+                        && matches!(state.load, WorkspaceLoadPhase::Ready)
+                        && !state.force_commit_until_success
+                        && state.restore_baseline_revision == Some(commit_revision)
+                })
+        );
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn command_save_is_workspace_only_and_is_gated_while_a_modal_is_open() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        let persistence = app
+            .workspace_persistence
+            .get_mut(&key)
+            .expect("J2 workspace persistence");
+        persistence.load = WorkspaceLoadPhase::Ready;
+        persistence.mode = Some(WorkspaceStoreMode::ReadWrite);
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(
+                QueryLanguage::Sql,
+                "Shortcut",
+                "SELECT command_save_fixture",
+            )
+            .expect("shortcut tab");
+        let context = Context::default();
+        context.enable_accesskit();
+
+        app.workspace_clear_confirmation = Some(key);
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![command_key_event(Key::S, false)],
+                ..RawInput::default()
+            },
+            |ui| app.show_native(ui),
+        );
+        assert!(
+            service.try_next_command().is_none(),
+            "modal context must not consume Cmd-S into any persistence or database action"
+        );
+
+        app.workspace_clear_confirmation = None;
+        let save_context = Context::default();
+        save_context.enable_accesskit();
+        let _ = save_context.run_ui(
+            RawInput {
+                events: vec![command_key_event(Key::S, false)],
+                ..RawInput::default()
+            },
+            |ui| app.show_native(ui),
+        );
+        match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace { snapshot, .. }) => {
+                assert_eq!(
+                    snapshot.editor_tabs()[0].source(),
+                    "SELECT command_save_fixture"
+                );
+            }
+            command => panic!("Cmd-S must dispatch only CommitWorkspace, got {command:?}"),
+        }
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn editor_and_title_mutations_replace_both_saved_labels_in_the_same_actual_frame() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Saved draft", "SELECT 1")
+            .expect("saved editor fixture");
+        let mark_saved = |app: &mut DbotterApp| {
+            let revision = app
+                .model
+                .workspace(&key)
+                .map_or(0, ProfileWorkspace::revision);
+            assert!(
+                app.model
+                    .workspace_mut(key.clone())
+                    .mark_saved_if_revision(revision)
+            );
+            let state = app
+                .workspace_persistence
+                .get_mut(&key)
+                .expect("workspace persistence state");
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+            state.save = WorkspaceSavePhase::Idle;
+            state.observed_revision = revision;
+            state.dirty_since = None;
+            app.model.status = "Private workspace Saved.".to_owned();
+        };
+        mark_saved(&mut app);
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let render = |app: &mut DbotterApp, events: Vec<Event>| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 900.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| app.show_native(ui),
+            )
+        };
+        let assert_unsaved_labels = |update: &egui::accesskit::TreeUpdate| {
+            let (_, persistence) = accesskit_author_node(update, "workspace.persistence.status");
+            assert_eq!(
+                persistence.value(),
+                Some("Unsaved"),
+                "the private-workspace label must change in the mutation frame"
+            );
+            let (_, operation) = accesskit_author_node(update, "status.operation");
+            assert_eq!(
+                operation.value(),
+                Some("Local workspace changes are Unsaved."),
+                "the operation strip must not retain a stale Saved claim"
+            );
+        };
+
+        let initial = render(&mut app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("initial saved frame");
+        let (editor_id, _) = accesskit_author_node(&initial, "editor.input");
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: editor_id,
+                data: None,
+            })],
+        );
+        app.model.status = "Private workspace Saved.".to_owned();
+        let text_frame = render(&mut app, vec![Event::Text(" /* same-frame */".to_owned())])
+            .platform_output
+            .accesskit_update
+            .expect("editor mutation frame");
+        assert_unsaved_labels(&text_frame);
+        assert!(
+            app.model
+                .workspace(&key)
+                .and_then(ProfileWorkspace::selected_editor_tab_id)
+                .and_then(|tab_id| {
+                    app.model
+                        .workspace(&key)
+                        .and_then(|workspace| workspace.editor_tab(tab_id))
+                })
+                .is_some_and(|tab| tab.text().contains("same-frame")),
+            "the SQL mutation must be visible in the same frame under test"
+        );
+        assert_eq!(
+            app.model.status, "Local workspace changes are Unsaved.",
+            "the next frame must inherit truthful operation state"
+        );
+        let mut forced_close_storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut forced_close_storage);
+        match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace { snapshot, .. }) => assert!(
+                snapshot.editor_tabs()[0].source().contains("same-frame"),
+                "a force-close flush must carry the exact SQL that was visibly marked Unsaved"
+            ),
+            command => panic!("force-close flush must save the visible revision, got {command:?}"),
+        }
+
+        mark_saved(&mut app);
+        let title_frame = render(&mut app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("title baseline frame");
+        let (title_id, _) = accesskit_author_node(&title_frame, "editor.tab.title");
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: title_id,
+                data: None,
+            })],
+        );
+        app.model.status = "Private workspace Saved.".to_owned();
+        let title_mutation = render(&mut app, vec![Event::Text(" renamed".to_owned())])
+            .platform_output
+            .accesskit_update
+            .expect("title mutation frame");
+        assert_unsaved_labels(&title_mutation);
+        assert!(
+            app.model
+                .workspace(&key)
+                .and_then(ProfileWorkspace::selected_editor_tab_id)
+                .and_then(|tab_id| {
+                    app.model
+                        .workspace(&key)
+                        .and_then(|workspace| workspace.editor_tab(tab_id))
+                })
+                .is_some_and(|tab| tab.title().contains("renamed")),
+            "the title mutation must be visible in the same frame under test"
+        );
+
+        mark_saved(&mut app);
+        let selection_baseline = render(&mut app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("selection baseline frame");
+        let (editor_id, _) = accesskit_author_node(&selection_baseline, "editor.input");
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: editor_id,
+                data: None,
+            })],
+        );
+        app.model.status = "Private workspace Saved.".to_owned();
+        let selection_mutation = render(&mut app, vec![command_key_event(Key::A, false)])
+            .platform_output
+            .accesskit_update
+            .expect("selection mutation frame");
+        assert_unsaved_labels(&selection_mutation);
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(|workspace| workspace.selection_character_range.is_some()),
+            "the keyboard selection must be visible in the same frame under test"
+        );
+
+        mark_saved(&mut app);
+        let geometry_baseline = render(&mut app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("geometry baseline frame");
+        let (splitter_id, _) = accesskit_author_node(&geometry_baseline, "workspace.splitter");
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: splitter_id,
+                data: None,
+            })],
+        );
+        app.model.status = "Private workspace Saved.".to_owned();
+        let geometry_mutation = render(
+            &mut app,
+            vec![Event::Key {
+                key: Key::ArrowDown,
+                physical_key: Some(Key::ArrowDown),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        )
+        .platform_output
+        .accesskit_update
+        .expect("geometry mutation frame");
+        assert_unsaved_labels(&geometry_mutation);
+        assert_ne!(
+            app.workspace_geometries
+                .get(&key)
+                .map(|geometry| geometry.editor_share()),
+            Some(NativeLayout::DEFAULT_EDITOR_SHARE),
+            "the keyboard geometry mutation must be visible in the tested frame"
+        );
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn every_workspace_modal_contains_focus_and_blocks_background_editor_input_and_execution() {
+        let (ui_port, mut service) = bounded_ports(16);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        let tab_id = app
+            .model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Modal guard", "SELECT modal_guard")
+            .expect("modal editor fixture");
+        let revision = app
+            .model
+            .workspace(&key)
+            .map_or(0, ProfileWorkspace::revision);
+        {
+            let state = app
+                .workspace_persistence
+                .get_mut(&key)
+                .expect("workspace persistence state");
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+            state.observed_revision = revision;
+        }
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let render = |app: &mut DbotterApp, events: Vec<Event>| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 900.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| app.show_native(ui),
+            )
+        };
+        let initial = render(&mut app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("initial editor frame");
+        let (editor_id, _) = accesskit_author_node(&initial, "editor.input");
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: editor_id,
+                data: None,
+            })],
+        );
+
+        let source_before = app
+            .model
+            .workspace(&key)
+            .and_then(|workspace| workspace.editor_tab(tab_id))
+            .map(|tab| tab.text().to_owned())
+            .expect("editor source");
+        let caret_before = app
+            .model
+            .workspace(&key)
+            .map(|workspace| {
+                (
+                    workspace.caret_character_index,
+                    workspace.selection_character_range.clone(),
+                )
+            })
+            .expect("editor cursor");
+        let mut assert_blocked = |app: &mut DbotterApp, expected_focus: &str| {
+            let output = render(
+                app,
+                vec![
+                    Event::Text(" SHOULD_NOT_APPEAR".to_owned()),
+                    command_key_event(Key::Enter, false),
+                    command_key_event(Key::Enter, true),
+                ],
+            );
+            let update = output
+                .platform_output
+                .accesskit_update
+                .expect("modal frame must emit AccessKit");
+            let focused_author = update.nodes.iter().find_map(|(node_id, node)| {
+                (*node_id == update.focus)
+                    .then(|| node.author_id())
+                    .flatten()
+            });
+            assert_eq!(
+                focused_author,
+                Some(expected_focus),
+                "keyboard focus must move into the active dialog"
+            );
+            let (connect_id, connect_node) = accesskit_author_node(&update, "connection.connect");
+            assert!(
+                connect_node.is_disabled(),
+                "the navigator Connect action must be inert behind every modal"
+            );
+            let workspace = app.model.workspace(&key).expect("workspace retained");
+            assert_eq!(
+                workspace.editor_tab(tab_id).map(|tab| tab.text()),
+                Some(source_before.as_str())
+            );
+            assert_eq!(
+                (
+                    workspace.caret_character_index,
+                    workspace.selection_character_range.clone(),
+                ),
+                caret_before
+            );
+            assert_eq!(workspace.revision(), revision);
+            assert!(
+                app.active_modal_kind().is_some(),
+                "{expected_focus} modal must remain active after blocked editor shortcuts"
+            );
+            assert!(
+                service.try_next_command().is_none(),
+                "modal input must dispatch neither current nor Run all"
+            );
+            let _ = render(
+                app,
+                vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: connect_id,
+                    data: None,
+                })],
+            );
+            let background_command = service.try_next_command();
+            assert!(
+                background_command.is_none(),
+                "an AccessKit click on a navigator action behind {expected_focus} must dispatch nothing, got {background_command:?}"
+            );
+        };
+
+        app.workspace_clear_confirmation = Some(key.clone());
+        app.workspace_close_guard = WorkspaceCloseGuard::SaveFailed;
+        let _ = render(&mut app, Vec::new());
+        let stacked = render(&mut app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("the highest-priority modal must emit AccessKit");
+        let stacked_ids = stacked
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.author_id())
+            .collect::<BTreeSet<_>>();
+        assert!(stacked_ids.contains("workspace.close.cancel"));
+        assert!(
+            !stacked_ids.contains("workspace.persistence.clear.cancel")
+                && !stacked_ids.contains("workspace.persistence.clear.confirm"),
+            "only the highest-priority modal may be rendered"
+        );
+        app.workspace_close_guard = WorkspaceCloseGuard::Closed;
+        let _ = render(&mut app, Vec::new());
+        let revealed = render(&mut app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("the queued modal must become active after the priority modal closes");
+        let revealed_ids = revealed
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.author_id())
+            .collect::<BTreeSet<_>>();
+        assert!(revealed_ids.contains("workspace.persistence.clear.cancel"));
+        assert!(
+            !revealed_ids.contains("workspace.close.cancel"),
+            "the closed priority modal must leave the accessibility tree"
+        );
+        app.workspace_clear_confirmation = None;
+
+        app.workspace_clear_confirmation = Some(key.clone());
+        assert_blocked(&mut app, "workspace.persistence.clear.cancel");
+        let tabbed = render(
+            &mut app,
+            vec![Event::Key {
+                key: Key::Tab,
+                physical_key: Some(Key::Tab),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        )
+        .platform_output
+        .accesskit_update
+        .expect("Tab navigation must keep emitting the active modal");
+        let tabbed_focus = tabbed.nodes.iter().find_map(|(node_id, node)| {
+            (*node_id == tabbed.focus)
+                .then(|| node.author_id())
+                .flatten()
+        });
+        assert_eq!(
+            tabbed_focus,
+            Some("workspace.persistence.clear.confirm"),
+            "Tab must advance within the modal instead of resetting to its default action"
+        );
+        app.workspace_clear_confirmation = None;
+
+        app.workspace_persistence
+            .get_mut(&key)
+            .expect("workspace persistence state")
+            .load = WorkspaceLoadPhase::Conflict;
+        app.workspace_restore_conflict_confirmation = Some(key.clone());
+        assert_blocked(&mut app, "workspace.conflict.cancel");
+        app.workspace_restore_conflict_confirmation = None;
+        app.workspace_persistence
+            .get_mut(&key)
+            .expect("workspace persistence state")
+            .load = WorkspaceLoadPhase::Ready;
+
+        app.workspace_close_guard = WorkspaceCloseGuard::SaveFailed;
+        assert_blocked(&mut app, "workspace.close.cancel");
+        app.workspace_close_guard = WorkspaceCloseGuard::Closed;
+
+        app.open_delete_confirmation(&profile);
+        assert_blocked(&mut app, "profile.delete.cancel");
+        app.delete_confirmation = None;
+
+        app.editor_discard_confirmation = Some(super::EditorDiscardConfirmation {
+            workspace_key: key.clone(),
+            tab_id,
+            title: "Modal guard".to_owned(),
+            discard_author_id: "editor.tab.discard",
+        });
+        assert_blocked(&mut app, "editor.tab.discard.cancel");
+    }
+
+    #[test]
+    fn editor_focus_keeps_new_close_find_and_escape_shortcuts_operable() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "One", String::new())
+            .expect("first empty tab");
+        let context = Context::default();
+        context.enable_accesskit();
+        let render = |app: &mut DbotterApp, events: Vec<Event>| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 900.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| app.show_native(ui),
+            )
+        };
+        let initial = render(&mut app, Vec::new());
+        let initial = initial
+            .platform_output
+            .accesskit_update
+            .expect("editor frame");
+        let (editor_id, _) = accesskit_author_node(&initial, "editor.input");
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: editor_id,
+                data: None,
+            })],
+        );
+        let _ = render(&mut app, vec![command_key_event(Key::T, false)]);
+        assert_eq!(
+            app.model
+                .workspace(&key)
+                .map(|workspace| workspace.editor_tabs().len()),
+            Some(2),
+            "Cmd-T must create a tab even while the actual editor has focus"
+        );
+        let _ = render(&mut app, vec![command_key_event(Key::W, false)]);
+        assert_eq!(
+            app.model
+                .workspace(&key)
+                .map(|workspace| workspace.editor_tabs().len()),
+            Some(1),
+            "Cmd-W must close the selected clean editor"
+        );
+
+        let _ = render(&mut app, vec![command_key_event(Key::F, true)]);
+        assert_eq!(
+            app.model
+                .workspace(&key)
+                .map(ProfileWorkspace::result_area_tab),
+            Some(ResultAreaTab::History)
+        );
+        let found = render(&mut app, vec![command_key_event(Key::F, false)]);
+        let found = found
+            .platform_output
+            .accesskit_update
+            .expect("history find frame");
+        let (history_search_id, _) = accesskit_author_node(&found, "history.search");
+        assert_eq!(
+            found.focus, history_search_id,
+            "Cmd-F in History must focus the actual search field"
+        );
+
+        app.model.workspace_mut(key).pending_execute = Some(OperationId(707));
+        let _ = render(
+            &mut app,
+            vec![Event::Key {
+                key: Key::Escape,
+                physical_key: Some(Key::Escape),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::CancelOperation {
+                operation_id: OperationId(707)
+            })
+        ));
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn read_only_empty_baseline_is_clean_but_user_input_requires_close_recovery() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        let empty_load_revision = {
+            let workspace = app.model.workspace_mut(key.clone());
+            let revision = workspace.revision();
+            assert!(workspace.mark_saved_if_revision(revision));
+            revision
+        };
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadOnly);
+            state.clean_empty_baseline_pending = Some(empty_load_revision);
+        }
+        app.model
+            .workspace_mut(key.clone())
+            .select_result_area_tab(ResultAreaTab::History);
+        let context = Context::default();
+        context.enable_accesskit();
+        let output = context.run_ui(RawInput::default(), |ui| app.show_native(ui));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("read-only frame");
+        let read_only_controls = [
+            "workspace.persistence.toggle",
+            "editor.save",
+            "workspace.persistence.clear",
+            "history.clear",
+        ];
+        let mut read_only_nodes = Vec::new();
+        for author_id in read_only_controls {
+            let (node_id, node) = accesskit_author_node(&update, author_id);
+            assert!(
+                node.is_disabled(),
+                "{author_id} must be disabled in a read-only second instance"
+            );
+            read_only_nodes.push(node_id);
+        }
+        for node_id in read_only_nodes {
+            let _ = context.run_ui(
+                RawInput {
+                    events: vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                        action: accesskit::Action::Click,
+                        target_tree: accesskit::TreeId::ROOT,
+                        target_node: node_id,
+                        data: None,
+                    })],
+                    ..RawInput::default()
+                },
+                |ui| app.show_native(ui),
+            );
+        }
+        assert!(
+            service.try_next_command().is_none(),
+            "rendering/clicking no read-only write control may dispatch"
+        );
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(ProfileWorkspace::is_saved),
+            "automatic empty Query 1 is only a clean read-only baseline"
+        );
+        assert!(!app.has_uncommitted_workspace());
+
+        {
+            let workspace = app.model.workspace_mut(key.clone());
+            workspace.editor_text = "SELECT read_only_local_edit".to_owned();
+            workspace
+                .sync_selected_editor_tab_from_surface()
+                .expect("bounded local edit");
+        }
+        app.observe_workspace_revisions(Instant::now());
+        assert!(app.has_uncommitted_workspace());
+        assert!(app.has_workspace_save_failure());
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.save = WorkspaceSavePhase::Failed {
+                revision: app
+                    .model
+                    .workspace(&key)
+                    .map_or(0, ProfileWorkspace::revision),
+                code: super::WorkspaceFailureCode::ReadOnly(
+                    crate::workspace::WorkspaceReadOnlyReason::WriterBusy,
+                ),
+            };
+        }
+        app.workspace_close_guard = WorkspaceCloseGuard::SaveFailed;
+        let ids = shell_author_ids(&mut app, 1440.0, 900.0);
+        assert!(ids.contains("workspace.close.retry"));
+        assert!(ids.contains("workspace.close.discard"));
+    }
+
+    #[test]
+    fn unavailable_commit_backs_off_and_clear_failure_requires_exact_retry_or_explicit_close() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Clean", String::new())
+            .expect("clean tab fixture");
+        let identity = app
+            .workspace_persistence
+            .get(&key)
+            .expect("persistence state")
+            .identity
+            .clone();
+        let revision = app
+            .model
+            .workspace(&key)
+            .map_or(0, ProfileWorkspace::revision);
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+            state.save = WorkspaceSavePhase::Saving {
+                operation_id: OperationId(801),
+                revision,
+            };
+        }
+        app.handle_workspace_event(&UiEvent::WorkspaceOperationFailed {
+            operation_id: OperationId(801),
+            identity: identity.clone(),
+            revision,
+            action: super::WorkspaceAction::Commit,
+            code: super::WorkspaceFailureCode::Unavailable,
+        });
+        assert!(
+            app.workspace_persistence
+                .get(&key)
+                .is_some_and(|state| state.retry_not_before.is_some())
+        );
+
+        {
+            let workspace = app.model.workspace_mut(key.clone());
+            let current = workspace.revision();
+            assert!(workspace.mark_saved_if_revision(current));
+        }
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.save = WorkspaceSavePhase::Idle;
+            state.clear = WorkspaceClearPhase::Pending {
+                operation_id: OperationId(802),
+                revision,
+            };
+            state.dirty_since = None;
+            state.retry_not_before = None;
+        }
+        app.handle_workspace_event(&UiEvent::WorkspaceOperationFailed {
+            operation_id: OperationId(802),
+            identity: identity.clone(),
+            revision,
+            action: super::WorkspaceAction::Clear,
+            code: super::WorkspaceFailureCode::Unavailable,
+        });
+        assert!(app.workspace_persistence.get(&key).is_some_and(|state| {
+            matches!(
+                state.clear,
+                WorkspaceClearPhase::Failed {
+                    revision: failed_revision,
+                    code: super::WorkspaceFailureCode::Unavailable,
+                } if failed_revision == revision
+            ) && matches!(state.save, WorkspaceSavePhase::Idle)
+        }));
+        assert!(app.has_uncommitted_workspace());
+        assert!(app.has_workspace_save_failure());
+
+        app.model
+            .workspace_mut(key.clone())
+            .select_result_area_tab(ResultAreaTab::History);
+        app.workspace_close_guard = WorkspaceCloseGuard::SaveFailed;
+        let context = Context::default();
+        context.enable_accesskit();
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 900.0),
+                )),
+                ..RawInput::default()
+            },
+            |ui| app.show_native(ui),
+        );
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 900.0),
+                )),
+                ..RawInput::default()
+            },
+            |ui| app.show_native(ui),
+        );
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("clear failure frame");
+        for author_id in [
+            "workspace.persistence.toggle",
+            "editor.save",
+            "workspace.persistence.clear",
+            "history.clear",
+        ] {
+            let (_, node) = accesskit_author_node(&update, author_id);
+            assert!(node.is_disabled(), "{author_id} must stay disabled");
+        }
+        let (_, retry) = accesskit_author_node(&update, "workspace.persistence.retry");
+        assert!(
+            retry.is_disabled(),
+            "the background Retry must be inert while close recovery owns focus"
+        );
+        let (_, close_retry) = accesskit_author_node(&update, "workspace.close.retry");
+        assert!(
+            !close_retry.is_disabled(),
+            "the close dialog must retain the exact clear Retry path: {close_retry:?}"
+        );
+        let (_, discard_close) = accesskit_author_node(&update, "workspace.close.discard");
+        assert_eq!(
+            discard_close.label(),
+            Some("Keep durable saved data, abandon clearing, and close")
+        );
+
+        app.submit_clear_workspace(&key);
+        assert!(matches!(
+            service.try_next_command(),
+            Some(UiCommand::ClearWorkspace {
+                identity: retry_identity,
+                base_revision: retry_revision,
+                ..
+            }) if retry_identity == identity && retry_revision == revision
+        ));
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn permanent_commit_failure_blocks_autosave_until_a_new_revision_exists() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(
+                QueryLanguage::Sql,
+                "Permanent failure",
+                "SELECT first_revision",
+            )
+            .expect("permanent failure fixture");
+        {
+            let state = app
+                .workspace_persistence
+                .get_mut(&key)
+                .expect("workspace persistence state");
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
+        app.observe_workspace_revisions(Instant::now());
+        assert!(app.submit_workspace_commit(&key, true));
+        let (operation_id, identity, failed_revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                ..
+            }) => (operation_id, identity, revision),
+            command => panic!("expected the initial workspace commit, got {command:?}"),
+        };
+        app.handle_workspace_event(&UiEvent::WorkspaceOperationFailed {
+            operation_id,
+            identity,
+            revision: failed_revision,
+            action: super::WorkspaceAction::Commit,
+            code: super::WorkspaceFailureCode::LimitExceeded,
+        });
+        assert!(app.workspace_persistence.get(&key).is_some_and(|state| {
+            matches!(
+                state.save,
+                WorkspaceSavePhase::Failed {
+                    revision,
+                    code: super::WorkspaceFailureCode::LimitExceeded,
+                } if revision == failed_revision
+            ) && state.retry_not_before.is_none()
+        }));
+
+        for seconds in [2, 10, 60] {
+            app.autosave_workspaces(Instant::now() + Duration::from_secs(seconds));
+            assert!(
+                service.try_next_command().is_none(),
+                "a permanent failure for the same revision must not create an autosave loop"
+            );
+        }
+
+        {
+            let workspace = app.model.workspace_mut(key.clone());
+            workspace.editor_text = "SELECT second_revision".to_owned();
+            workspace
+                .sync_selected_editor_tab_from_surface()
+                .expect("bounded second revision");
+        }
+        let changed_at = Instant::now();
+        app.observe_workspace_revisions(changed_at);
+        app.autosave_workspaces(changed_at + Duration::from_secs(2));
+        match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                revision, snapshot, ..
+            }) => {
+                assert!(revision > failed_revision);
+                assert_eq!(snapshot.editor_tabs()[0].source(), "SELECT second_revision");
+            }
+            command => panic!("a new revision must resume autosave once, got {command:?}"),
+        }
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn workspace_load_is_exactly_fenced_and_renderer_never_wins_with_query_one() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.request_workspace_load(&key);
+        let (operation_id, identity, base_revision) = match service.try_next_command() {
+            Some(UiCommand::LoadWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            }) => (operation_id, identity, base_revision),
+            command => panic!("expected exact workspace load, got {command:?}"),
+        };
+
+        let _ = shell_author_ids(&mut app, 1440.0, 900.0);
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(|workspace| workspace.editor_tabs().is_empty()),
+            "renderer must not create Query 1 while an exact restore can still arrive"
+        );
+        assert!(service.try_next_command().is_none());
+
+        let geometry = crate::workspace::WorkspaceGeometrySnapshot::new(320.0, 0.65, true)
+            .expect("valid restored geometry");
+        let persistence = super::ProfileWorkspacePersistence::for_classified_profile(
+            &profile.persisted,
+            true,
+            geometry,
+            Vec::new(),
+        )
+        .expect("classified fixture persistence");
+        let mut restored = ProfileWorkspace::default();
+        restored
+            .bind_persistence(persistence)
+            .expect("bind restored fixture");
+        restored
+            .create_editor_tab(QueryLanguage::Sql, "Restored", "SELECT restored_source")
+            .expect("restored tab");
+        let snapshot = restored
+            .to_persistence_snapshot()
+            .expect("restored snapshot");
+
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Local", "SELECT local_wins")
+            .expect("local edit during load");
+        assert!(service.try_emit(UiEvent::WorkspaceLoaded {
+            operation_id,
+            identity,
+            base_revision,
+            mode: WorkspaceStoreMode::ReadWrite,
+            read_only_reason: None,
+            snapshot: Some(Box::new(snapshot)),
+        }));
+        app.poll_events();
+        let workspace = app.model.workspace(&key).expect("local workspace");
+        assert!(
+            workspace
+                .editor_tabs()
+                .iter()
+                .any(|tab| tab.text() == "SELECT local_wins")
+        );
+        assert!(
+            workspace
+                .editor_tabs()
+                .iter()
+                .all(|tab| tab.text() != "SELECT restored_source")
+        );
+    }
+
+    #[test]
+    fn failed_load_retry_never_overwrites_local_sql_or_commits_before_resolution() {
+        let (ui_port, mut service) = bounded_ports(12);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.request_workspace_load(&key);
+        let (failed_operation, identity, failed_revision) = match service.try_next_command() {
+            Some(UiCommand::LoadWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            }) => (operation_id, identity, base_revision),
+            command => panic!("expected initial exact load, got {command:?}"),
+        };
+        assert!(service.try_emit(UiEvent::WorkspaceOperationFailed {
+            operation_id: failed_operation,
+            identity: identity.clone(),
+            revision: failed_revision,
+            action: super::WorkspaceAction::Load,
+            code: super::WorkspaceFailureCode::Unavailable,
+        }));
+        app.poll_events();
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 900.0),
+                )),
+                ..RawInput::default()
+            },
+            |ui| app.show_native(ui),
+        );
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("failed restore frame");
+        let (_, input) = accesskit_author_node(&update, "editor.input");
+        assert!(
+            !input.supports_action(accesskit::Action::ReplaceSelectedText)
+                && !input.supports_action(accesskit::Action::SetValue),
+            "the actual editor must remain disabled while a restore can still arrive"
+        );
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(|workspace| workspace.editor_tabs().is_empty()),
+            "transient load failure must not manufacture Query 1"
+        );
+
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(QueryLanguage::Sql, "Local", "SELECT local_after_failure")
+            .expect("local race fixture");
+        if let Some(state) = app.workspace_persistence.get_mut(&key) {
+            state.load = WorkspaceLoadPhase::Unloaded;
+            state.retry_not_before = None;
+        }
+        app.request_workspace_load(&key);
+        let (retry_operation, retry_revision) = match service.try_next_command() {
+            Some(UiCommand::LoadWorkspace {
+                operation_id,
+                identity: retry_identity,
+                base_revision,
+            }) => {
+                assert_eq!(retry_identity, identity);
+                (operation_id, base_revision)
+            }
+            command => panic!("expected exact retry load, got {command:?}"),
+        };
+        assert!(retry_revision > failed_revision);
+        let durable = j2_workspace_snapshot(&profile, true, Some("SELECT durable_before_failure"));
+        assert!(service.try_emit(UiEvent::WorkspaceLoaded {
+            operation_id: retry_operation,
+            identity,
+            base_revision: retry_revision,
+            mode: WorkspaceStoreMode::ReadWrite,
+            read_only_reason: None,
+            snapshot: Some(Box::new(durable)),
+        }));
+        app.poll_events();
+        assert!(matches!(
+            app.workspace_persistence.get(&key).map(|state| &state.load),
+            Some(WorkspaceLoadPhase::Conflict)
+        ));
+        assert!(app.model.workspace(&key).is_some_and(|workspace| {
+            workspace
+                .editor_tabs()
+                .iter()
+                .any(|tab| tab.text() == "SELECT local_after_failure")
+                && workspace
+                    .editor_tabs()
+                    .iter()
+                    .all(|tab| tab.text() != "SELECT durable_before_failure")
+        }));
+
+        let revision_before_geometry = app
+            .model
+            .workspace(&key)
+            .map_or(u64::MAX, ProfileWorkspace::revision);
+        app.remember_workspace_geometry(Some(375.0), Some(0.71), Some(true));
+        assert_eq!(
+            app.model.workspace(&key).map(ProfileWorkspace::revision),
+            Some(revision_before_geometry),
+            "unresolved restore must gate persistence geometry mutation"
+        );
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert!(!app.flush_selected_workspace());
+        app.autosave_workspaces(Instant::now() + Duration::from_secs(2));
+        assert!(
+            service.try_next_command().is_none(),
+            "native save, explicit save before confirmation, and autosave must all stay blocked"
+        );
+
+        let conflict_context = Context::default();
+        conflict_context.enable_accesskit();
+        let render = |app: &mut DbotterApp, events: Vec<Event>| {
+            conflict_context.run_ui(
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 900.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| app.show_native(ui),
+            )
+        };
+        let conflict = render(&mut app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("restore conflict frame");
+        let (keep_local_id, keep_local) = accesskit_author_node(&conflict, "editor.save");
+        assert_eq!(
+            keep_local.label(),
+            Some("Keep local workspace after restore conflict")
+        );
+        assert!(!keep_local.is_disabled());
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: keep_local_id,
+                data: None,
+            })],
+        );
+        assert!(service.try_next_command().is_none());
+        let confirmation = render(&mut app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("conflict confirmation frame");
+        let (confirm_id, confirm_node) =
+            accesskit_author_node(&confirmation, "workspace.conflict.confirm");
+        assert_eq!(
+            confirm_node.label(),
+            Some("Replace prior saved tabs and history with the local workspace")
+        );
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: confirm_id,
+                data: None,
+            })],
+        );
+        let (first_commit, first_commit_revision, first_commit_identity) =
+            match service.try_next_command() {
+                Some(UiCommand::CommitWorkspace {
+                    operation_id,
+                    identity,
+                    revision,
+                    snapshot,
+                }) => {
+                    assert!(
+                        snapshot
+                            .editor_tabs()
+                            .iter()
+                            .any(|tab| { tab.source() == "SELECT local_after_failure" })
+                    );
+                    assert!(
+                        snapshot
+                            .editor_tabs()
+                            .iter()
+                            .all(|tab| { tab.source() != "SELECT durable_before_failure" })
+                    );
+                    (operation_id, revision, identity)
+                }
+                command => panic!("confirmed Keep local must commit once, got {command:?}"),
+            };
+        assert!(service.try_emit(UiEvent::WorkspaceOperationFailed {
+            operation_id: first_commit,
+            identity: first_commit_identity.clone(),
+            revision: first_commit_revision,
+            action: super::WorkspaceAction::Commit,
+            code: super::WorkspaceFailureCode::Unavailable,
+        }));
+        app.poll_events();
+        assert!(app.workspace_persistence.get(&key).is_some_and(|state| {
+            matches!(state.load, WorkspaceLoadPhase::Conflict)
+                && matches!(state.save, WorkspaceSavePhase::Failed { .. })
+                && !state.resolve_conflict_on_commit
+        }));
+
+        let failed = render(&mut app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("failed Keep local frame");
+        let (retry_id, retry) = accesskit_author_node(&failed, "workspace.persistence.retry");
+        assert!(!retry.is_disabled());
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: retry_id,
+                data: None,
+            })],
+        );
+        assert!(service.try_next_command().is_none());
+        let reconfirm = render(&mut app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("reconfirm Keep local frame");
+        let (reconfirm_id, _) = accesskit_author_node(&reconfirm, "workspace.conflict.confirm");
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: reconfirm_id,
+                data: None,
+            })],
+        );
+        let (successful_commit, successful_revision) = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace {
+                operation_id,
+                identity,
+                revision,
+                ..
+            }) => {
+                assert_eq!(identity, first_commit_identity);
+                (operation_id, revision)
+            }
+            command => panic!("reconfirmed Keep local must retry exact commit, got {command:?}"),
+        };
+        assert!(service.try_emit(UiEvent::WorkspaceCommitted {
+            operation_id: successful_commit,
+            identity: first_commit_identity,
+            revision: successful_revision,
+            generation: 3,
+            warnings: Vec::new(),
+        }));
+        app.poll_events();
+        assert!(app.workspace_persistence.get(&key).is_some_and(|state| {
+            matches!(state.load, WorkspaceLoadPhase::Ready)
+                && matches!(state.save, WorkspaceSavePhase::Idle)
+                && !state.resolve_conflict_on_commit
+                && state.restore_baseline_revision == Some(successful_revision)
+        }));
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(ProfileWorkspace::is_saved)
+        );
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn preexisting_local_draft_is_never_pristine_and_empty_store_response_autosaves_it() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        app.model
+            .workspace_mut(key.clone())
+            .create_editor_tab(
+                QueryLanguage::Sql,
+                "Migrated local",
+                "SELECT local_before_v3_binding",
+            )
+            .expect("preexisting local draft");
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        assert!(
+            app.workspace_persistence
+                .get(&key)
+                .is_some_and(|state| { state.restore_baseline_revision.is_none() })
+        );
+        app.request_workspace_load(&key);
+        let (operation_id, identity, base_revision) = match service.try_next_command() {
+            Some(UiCommand::LoadWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            }) => (operation_id, identity, base_revision),
+            command => panic!("expected exact load, got {command:?}"),
+        };
+        assert!(service.try_emit(UiEvent::WorkspaceLoaded {
+            operation_id,
+            identity,
+            base_revision,
+            mode: WorkspaceStoreMode::ReadWrite,
+            read_only_reason: None,
+            snapshot: None,
+        }));
+        app.poll_events();
+        assert!(app.workspace_persistence.get(&key).is_some_and(|state| {
+            matches!(state.load, WorkspaceLoadPhase::Ready)
+                && state.dirty_since.is_some()
+                && state.restore_baseline_revision.is_none()
+        }));
+        app.autosave_workspaces(Instant::now() + Duration::from_secs(2));
+        match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace { snapshot, .. }) => {
+                assert!(
+                    snapshot
+                        .editor_tabs()
+                        .iter()
+                        .any(|tab| { tab.source() == "SELECT local_before_v3_binding" })
+                );
+            }
+            command => {
+                panic!("empty durable response must autosave the local draft, got {command:?}")
+            }
+        }
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn exact_empty_load_marks_only_the_first_automatic_blank_baseline_clean() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.request_workspace_load(&key);
+        let (operation_id, identity, base_revision) = match service.try_next_command() {
+            Some(UiCommand::LoadWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            }) => (operation_id, identity, base_revision),
+            command => panic!("expected exact workspace load, got {command:?}"),
+        };
+        assert!(service.try_emit(UiEvent::WorkspaceLoaded {
+            operation_id,
+            identity,
+            base_revision,
+            mode: WorkspaceStoreMode::ReadWrite,
+            read_only_reason: None,
+            snapshot: None,
+        }));
+        app.poll_events();
+
+        let _ = shell_author_ids(&mut app, 1440.0, 900.0);
+        let first_blank = app
+            .model
+            .workspace(&key)
+            .and_then(ProfileWorkspace::selected_editor_tab_id)
+            .expect("exact empty load creates one automatic baseline");
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(ProfileWorkspace::is_saved),
+            "the exact empty load may mark its one automatic blank baseline clean"
+        );
+        assert!(
+            app.workspace_persistence
+                .get(&key)
+                .is_some_and(|state| { state.clean_empty_baseline_pending.is_none() })
+        );
+
+        app.request_editor_tab_close(key.clone(), first_blank, "editor.tab.discard");
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(|workspace| workspace.editor_tabs().is_empty())
+        );
+        let _ = shell_author_ids(&mut app, 1440.0, 900.0);
+        assert!(
+            app.model
+                .workspace(&key)
+                .is_some_and(|workspace| !workspace.is_saved()),
+            "a later last-tab close must leave its replacement blank tab Unsaved"
+        );
+
+        assert!(app.flush_selected_workspace());
+        match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace { snapshot, .. }) => {
+                assert_eq!(snapshot.editor_tabs().len(), 1);
+                assert!(snapshot.editor_tabs()[0].source().is_empty());
+            }
+            command => {
+                panic!("last-tab deletion must commit its blank replacement, got {command:?}")
+            }
+        }
+        assert!(service.try_next_command().is_none());
+    }
+
+    #[test]
+    fn exact_restored_geometry_resets_existing_panel_state_before_next_frame() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        app.request_workspace_load(&key);
+        let (operation_id, identity, base_revision) = match service.try_next_command() {
+            Some(UiCommand::LoadWorkspace {
+                operation_id,
+                identity,
+                base_revision,
+            }) => (operation_id, identity, base_revision),
+            command => panic!("expected exact workspace load, got {command:?}"),
+        };
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let render = |app: &mut DbotterApp| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 900.0),
+                    )),
+                    ..RawInput::default()
+                },
+                |ui| app.show_native(ui),
+            )
+        };
+        let _ = render(&mut app);
+        assert_eq!(
+            app.workspace_geometries
+                .get(&key)
+                .map(|geometry| geometry.navigator_width()),
+            Some(NativeLayout::NAVIGATOR_DEFAULT_WIDTH)
+        );
+        assert_eq!(app.compact_workspace.as_ref(), Some(&key));
+
+        let restored_geometry = crate::workspace::WorkspaceGeometrySnapshot::new(360.0, 0.67, true)
+            .expect("valid private geometry");
+        let persistence = super::ProfileWorkspacePersistence::for_classified_profile(
+            &profile.persisted,
+            true,
+            restored_geometry,
+            Vec::new(),
+        )
+        .expect("classified persistence");
+        let mut restored = ProfileWorkspace::default();
+        restored
+            .bind_persistence(persistence)
+            .expect("bind restored persistence");
+        restored
+            .create_editor_tab(QueryLanguage::Sql, "Restored", "SELECT geometry_fixture")
+            .expect("restored tab");
+        let snapshot = restored
+            .to_persistence_snapshot()
+            .expect("restored snapshot");
+        assert!(service.try_emit(UiEvent::WorkspaceLoaded {
+            operation_id,
+            identity,
+            base_revision,
+            mode: WorkspaceStoreMode::ReadWrite,
+            read_only_reason: None,
+            snapshot: Some(Box::new(snapshot)),
+        }));
+        app.poll_events();
+        assert!(
+            app.compact_workspace.is_none(),
+            "selected exact restore must force stale egui PanelState eviction"
+        );
+        let restored_revision = app
+            .model
+            .workspace(&key)
+            .map_or(u64::MAX, ProfileWorkspace::revision);
+
+        let _ = render(&mut app);
+        let applied = app
+            .workspace_geometries
+            .get(&key)
+            .copied()
+            .expect("applied geometry");
+        assert_eq!(applied.navigator_width(), 360.0);
+        assert_eq!(applied.editor_share(), 0.67);
+        let workspace = app.model.workspace(&key).expect("restored workspace");
+        let durable_geometry = workspace
+            .persistence()
+            .expect("restored persistence")
+            .geometry();
+        assert_eq!(durable_geometry.navigator_width(), 360.0);
+        assert_eq!(durable_geometry.editor_share(), 0.67);
+        assert_eq!(workspace.revision(), restored_revision);
+        assert!(workspace.is_saved());
+
+        app.observe_workspace_revisions(Instant::now());
+        app.autosave_workspaces(Instant::now() + Duration::from_secs(2));
+        assert!(
+            service.try_next_command().is_none(),
+            "applying exact private geometry must not create an autosave revision"
+        );
+    }
+
+    #[test]
+    fn history_cap_preserves_outcome_unknown_and_collision_search_is_bounded() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        let history = (1..=MAX_HISTORY_ENTRIES_PER_PROFILE)
+            .map(|id| {
+                WorkspaceHistoryEntry::new(
+                    u64::try_from(id).expect("bounded fixture id"),
+                    "SELECT outcome_unknown",
+                    WorkspaceRunTarget::Current,
+                    i64::try_from(id).expect("bounded fixture timestamp"),
+                    WorkspaceHistoryStatus::OutcomeUnknown,
+                    1,
+                    0,
+                    0,
+                    false,
+                )
+                .expect("bounded outcome-unknown entry")
+            })
+            .collect::<Vec<_>>();
+        app.model
+            .workspace_mut(key.clone())
+            .replace_persistence_history(history)
+            .expect("bounded history");
+        for operation_id in [OperationId(9_000), OperationId(9_001)] {
+            app.model.workspace_mut(key.clone()).pending_execute = Some(operation_id);
+            app.pending_workspace_history.insert(
+                operation_id,
+                super::PendingWorkspaceHistory {
+                    workspace_key: key.clone(),
+                    source: "SELECT terminal_not_retained".to_owned(),
+                    target: WorkspaceRunTarget::Current,
+                    started_at: Instant::now(),
+                },
+            );
+            assert!(service.try_emit(UiEvent::ExecuteUnavailable {
+                operation_id,
+                profile_id: profile.id.clone(),
+                profile_generation: profile.generation,
+                summary: PublicSummary::InvalidInput,
+            }));
+            app.poll_events();
+            assert!(
+                app.model
+                    .status
+                    .contains("Outcome-unknown history was preserved"),
+                "every identical terminal notice must survive the normal model fold"
+            );
+        }
+        let retained = app
+            .model
+            .workspace(&key)
+            .and_then(ProfileWorkspace::persistence)
+            .expect("retained history")
+            .history();
+        assert_eq!(retained.len(), MAX_HISTORY_ENTRIES_PER_PROFILE);
+        assert!(
+            retained
+                .iter()
+                .all(|entry| entry.status() == WorkspaceHistoryStatus::OutcomeUnknown)
+        );
+        let collisions = vec![
+            WorkspaceHistoryEntry::new(
+                1,
+                "SELECT 1",
+                WorkspaceRunTarget::Current,
+                1,
+                WorkspaceHistoryStatus::Succeeded,
+                1,
+                1,
+                0,
+                false,
+            )
+            .expect("collision one"),
+            WorkspaceHistoryEntry::new(
+                42,
+                "SELECT 42",
+                WorkspaceRunTarget::Current,
+                2,
+                WorkspaceHistoryStatus::Succeeded,
+                1,
+                1,
+                0,
+                false,
+            )
+            .expect("collision forty-two"),
+        ];
+        assert_eq!(super::next_workspace_history_id(&collisions, 42), Some(2));
+        assert_eq!(super::next_workspace_history_id(&collisions, 99), Some(99));
     }
 
     #[test]
@@ -5681,14 +10612,17 @@ mod tests {
         let (ui_port, mut service) = bounded_ports(4);
         let mut app = DbotterApp::new(ui_port);
         assert!(service.try_next_command().is_some());
-        let profile = profile(DriverKind::MySql, DriverAvailability::Ready);
-        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
-        app.model.profiles = vec![profile.clone()];
-        app.model.selected_profile = Some(profile.id.clone());
-        app.model
-            .active_generations
-            .insert(profile.id.clone(), profile.generation);
-        app.model.workspace_mut(key.clone());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        assert!(app.ensure_workspace_persistence_binding(&key, &profile));
+        {
+            let state = app
+                .workspace_persistence
+                .get_mut(&key)
+                .expect("workspace persistence state");
+            state.load = WorkspaceLoadPhase::Ready;
+            state.mode = Some(WorkspaceStoreMode::ReadWrite);
+        }
         app.workspace_geometries
             .insert(key.clone(), WorkspaceGeometry::restore(280.0, 0.30, true));
 
@@ -5776,6 +10710,15 @@ mod tests {
                     app.collapsed_workspace_panes.get(&key)
                 )
             });
+        assert_eq!(
+            app.workspace_geometries.get(&key).copied(),
+            Some(WorkspaceGeometry::restore(
+                280.0,
+                super::WORKSPACE_EDITOR_COLLAPSED_SHARE,
+                true,
+            )),
+            "editor collapse must use the exact durable lower-bound sentinel"
+        );
         let (restore_editor_id, restore_editor) =
             accesskit_author_node(&editor_collapsed, "workspace.editor.restore");
         assert_eq!(restore_editor.role(), accesskit::Role::Button);
@@ -5823,6 +10766,73 @@ mod tests {
         );
         let results_collapsed = collapse(&mut app, Key::ArrowDown, "workspace.results.restore")
             .expect("crossing 160 points must expose Restore results/history");
+        assert_eq!(
+            app.workspace_geometries.get(&key).copied(),
+            Some(WorkspaceGeometry::restore(
+                280.0,
+                super::WORKSPACE_RESULTS_COLLAPSED_SHARE,
+                false,
+            )),
+            "results collapse must durably hide the inspector at the upper-bound sentinel"
+        );
+        assert!(app.flush_selected_workspace());
+        let collapsed_snapshot = match service.try_next_command() {
+            Some(UiCommand::CommitWorkspace { snapshot, .. }) => {
+                assert_eq!(
+                    snapshot.geometry().editor_share(),
+                    super::WORKSPACE_RESULTS_COLLAPSED_SHARE
+                );
+                assert!(!snapshot.geometry().inspector_visible());
+                snapshot
+            }
+            command => panic!("keyboard collapse must commit its exact geometry, got {command:?}"),
+        };
+
+        let (restored_port, mut restored_service) = bounded_ports(4);
+        let mut restored_app = DbotterApp::new(restored_port);
+        assert!(restored_service.try_next_command().is_some());
+        let restored_key = install_j2_profile(&mut restored_app, &profile);
+        assert_eq!(restored_key, key);
+        assert!(restored_app.ensure_workspace_persistence_binding(&restored_key, &profile));
+        restored_app.request_workspace_load(&restored_key);
+        let (load_operation, load_identity, base_revision) =
+            match restored_service.try_next_command() {
+                Some(UiCommand::LoadWorkspace {
+                    operation_id,
+                    identity,
+                    base_revision,
+                }) => (operation_id, identity, base_revision),
+                command => panic!("exact restore must begin with LoadWorkspace, got {command:?}"),
+            };
+        assert!(restored_service.try_emit(UiEvent::WorkspaceLoaded {
+            operation_id: load_operation,
+            identity: load_identity,
+            base_revision,
+            mode: WorkspaceStoreMode::ReadWrite,
+            read_only_reason: None,
+            snapshot: Some(collapsed_snapshot),
+        }));
+        restored_app.poll_events();
+        assert_eq!(
+            restored_app
+                .workspace_geometries
+                .get(&restored_key)
+                .copied(),
+            Some(WorkspaceGeometry::restore(
+                280.0,
+                super::WORKSPACE_RESULTS_COLLAPSED_SHARE,
+                false,
+            ))
+        );
+        assert_eq!(
+            restored_app.collapsed_workspace_panes.get(&restored_key),
+            Some(&Pane::Subordinate)
+        );
+        let restored_ids = shell_author_ids(&mut restored_app, 1440.0, 900.0);
+        assert!(
+            restored_ids.contains("workspace.results.restore"),
+            "exact restored inspector=false geometry must expose its named restore action"
+        );
         let (restore_results_id, restore_results) =
             accesskit_author_node(&results_collapsed, "workspace.results.restore");
         assert_eq!(restore_results.role(), accesskit::Role::Button);
@@ -7044,7 +12054,9 @@ mod tests {
         app.open_delete_confirmation(&profile);
         let context = Context::default();
         context.enable_accesskit();
-        let output = context.run_ui(RawInput::default(), |ui| app.show_delete_confirmation(ui));
+        let output = context.run_ui(RawInput::default(), |ui| {
+            app.show_delete_confirmation(ui, false)
+        });
         let warning = output
             .platform_output
             .accesskit_update
@@ -7597,7 +12609,8 @@ mod tests {
 
         let context = Context::default();
         context.enable_accesskit();
-        let with_result = context.run_ui(RawInput::default(), |ui| app.show_status_strip(ui));
+        let with_result =
+            context.run_ui(RawInput::default(), |ui| app.show_status_strip(ui, false));
         let with_result = with_result
             .platform_output
             .accesskit_update
@@ -7613,7 +12626,8 @@ mod tests {
             .workspace_mut(key)
             .close_result_tab(result_tab)
             .expect("last result closes");
-        let without_result = context.run_ui(RawInput::default(), |ui| app.show_status_strip(ui));
+        let without_result =
+            context.run_ui(RawInput::default(), |ui| app.show_status_strip(ui, false));
         let without_result = without_result
             .platform_output
             .accesskit_update
@@ -8193,7 +13207,7 @@ mod tests {
         let frame = context
             .run_ui(RawInput::default(), |ui| {
                 app.show_result_surface(ui);
-                app.show_status_strip(ui);
+                app.show_status_strip(ui, false);
             })
             .platform_output
             .accesskit_update
@@ -8942,9 +13956,12 @@ mod tests {
         app.open_delete_confirmation(&profile);
         let delete_context = Context::default();
         delete_context.enable_accesskit();
-        let _ = delete_context.run_ui(RawInput::default(), |ui| app.show_delete_confirmation(ui));
-        let delete_output =
-            delete_context.run_ui(RawInput::default(), |ui| app.show_delete_confirmation(ui));
+        let _ = delete_context.run_ui(RawInput::default(), |ui| {
+            app.show_delete_confirmation(ui, false)
+        });
+        let delete_output = delete_context.run_ui(RawInput::default(), |ui| {
+            app.show_delete_confirmation(ui, false)
+        });
         let delete_update = delete_output
             .platform_output
             .accesskit_update
@@ -9019,9 +14036,12 @@ mod tests {
         );
         let delete_context = Context::default();
         delete_context.enable_accesskit();
-        let _ = delete_context.run_ui(RawInput::default(), |ui| app.show_delete_confirmation(ui));
-        let delete_output =
-            delete_context.run_ui(RawInput::default(), |ui| app.show_delete_confirmation(ui));
+        let _ = delete_context.run_ui(RawInput::default(), |ui| {
+            app.show_delete_confirmation(ui, false)
+        });
+        let delete_output = delete_context.run_ui(RawInput::default(), |ui| {
+            app.show_delete_confirmation(ui, false)
+        });
         let delete_update = delete_output
             .platform_output
             .accesskit_update
