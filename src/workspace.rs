@@ -1671,7 +1671,7 @@ impl WorkspaceStore {
             self.recover_root_profile_corruption(snapshot.instance_id(), marker)?;
             return Err(marker.state().error());
         }
-        let (other_editor_tabs, other_history_entries, warnings) =
+        let (other_editor_tabs, other_history_entries, other_committed_bytes, warnings) =
             self.committed_usage_except(snapshot.instance_id())?;
         if other_editor_tabs
             .checked_add(snapshot.editor_tabs.len())
@@ -1770,8 +1770,7 @@ impl WorkspaceStore {
         if manifest_bytes.len() > MAX_MANIFEST_BYTES {
             return Err(WorkspaceStoreError::CorruptManifest);
         }
-        let retained = retained_store_bytes(&self.root_directory)?;
-        let prospective = retained
+        let prospective = other_committed_bytes
             .checked_add(shard_bytes.len() as u64)
             .and_then(|value| value.checked_add(manifest_bytes.len() as u64))
             .ok_or(WorkspaceStoreError::StoreTooLarge)?;
@@ -2450,9 +2449,10 @@ impl WorkspaceStore {
     fn committed_usage_except(
         &self,
         excluded: ProfileInstanceId,
-    ) -> Result<(usize, usize, Vec<WorkspaceStoreWarning>), WorkspaceStoreError> {
+    ) -> Result<(usize, usize, u64, Vec<WorkspaceStoreWarning>), WorkspaceStoreError> {
         let mut editor_tabs = 0_usize;
         let mut history_entries = 0_usize;
+        let mut committed_bytes = 0_u64;
         let mut warnings = Vec::new();
         let markers = self.root_profile_corrupt_markers()?;
         for (instance_id, marker) in &markers {
@@ -2493,8 +2493,8 @@ impl WorkspaceStore {
                 }
                 return Err(error);
             };
-            let snapshot = match read_committed_snapshot(&directory, instance_id) {
-                Ok(Some(snapshot)) => snapshot,
+            let committed = match read_committed_snapshot(&directory, instance_id) {
+                Ok(Some(committed)) => committed,
                 Ok(None) => continue,
                 Err(error) => {
                     let Some(state) = known_profile_corruption(&error) else {
@@ -2507,13 +2507,17 @@ impl WorkspaceStore {
                 }
             };
             editor_tabs = editor_tabs
-                .checked_add(snapshot.editor_tabs.len())
+                .checked_add(committed.snapshot.editor_tabs.len())
                 .ok_or(WorkspaceStoreError::StoreTooLarge)?;
             history_entries = history_entries
-                .checked_add(snapshot.history.len())
+                .checked_add(committed.snapshot.history.len())
+                .ok_or(WorkspaceStoreError::StoreTooLarge)?;
+            committed_bytes = committed_bytes
+                .checked_add(committed.committed_bytes)
                 .ok_or(WorkspaceStoreError::StoreTooLarge)?;
         }
-        Ok((editor_tabs, history_entries, warnings))
+        validate_retained_store_entries(&self.root_directory)?;
+        Ok((editor_tabs, history_entries, committed_bytes, warnings))
     }
 
     fn profile_corruption_error(
@@ -3055,40 +3059,53 @@ fn validate_manifest_reference(
     Ok(())
 }
 
+struct CommittedWorkspaceSnapshot {
+    snapshot: ProfileWorkspaceSnapshot,
+    committed_bytes: u64,
+}
+
 fn read_committed_snapshot(
     directory: &fs::File,
     instance_id: ProfileInstanceId,
-) -> Result<Option<ProfileWorkspaceSnapshot>, WorkspaceStoreError> {
+) -> Result<Option<CommittedWorkspaceSnapshot>, WorkspaceStoreError> {
     if let Some(state) = read_profile_corrupt_state(directory)? {
         return Err(state.error());
     }
-    let manifest_bytes =
-        match read_optional_private_file_at(directory, "manifest.json", MAX_MANIFEST_BYTES) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(None),
-            Err(WorkspaceStoreError::ShardTooLarge) => {
-                return Err(WorkspaceStoreError::CorruptManifest);
-            }
-            Err(error) => return Err(error),
-        };
-    let manifest = parse_manifest(&manifest_bytes)?;
+    let manifest_snapshot = match read_optional_private_file_snapshot_at(
+        directory,
+        "manifest.json",
+        MAX_MANIFEST_BYTES,
+    ) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return Ok(None),
+        Err(WorkspaceStoreError::ShardTooLarge) => {
+            return Err(WorkspaceStoreError::CorruptManifest);
+        }
+        Err(error) => return Err(error),
+    };
+    let manifest = parse_manifest(&manifest_snapshot.bytes)?;
     validate_manifest_reference(&manifest, instance_id)?;
-    let shard_bytes =
-        match read_private_file_at(directory, &manifest.shard, MAX_PROFILE_SHARD_BYTES) {
-            Ok(bytes) => bytes,
-            Err(
-                WorkspaceStoreError::ShardTooLarge
-                | WorkspaceStoreError::UnsafePath
-                | WorkspaceStoreError::Io(WorkspaceIoKind::NotFound),
-            ) => return Err(WorkspaceStoreError::CorruptShard),
-            Err(error) => return Err(error),
-        };
+    let shard_snapshot = match read_optional_private_file_snapshot_at(
+        directory,
+        &manifest.shard,
+        MAX_PROFILE_SHARD_BYTES,
+    ) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return Err(WorkspaceStoreError::CorruptShard),
+        Err(
+            WorkspaceStoreError::ShardTooLarge
+            | WorkspaceStoreError::UnsafePath
+            | WorkspaceStoreError::Io(WorkspaceIoKind::NotFound),
+        ) => return Err(WorkspaceStoreError::CorruptShard),
+        Err(error) => return Err(error),
+    };
+    let shard_bytes = &shard_snapshot.bytes;
     if shard_bytes.len() as u64 != manifest.shard_length
-        || checksum(&shard_bytes) != manifest.checksum
+        || checksum(shard_bytes) != manifest.checksum
     {
         return Err(WorkspaceStoreError::CorruptShard);
     }
-    let shard = serde_json::from_slice::<WorkspaceShard>(&shard_bytes)
+    let shard = serde_json::from_slice::<WorkspaceShard>(shard_bytes)
         .map_err(|_| WorkspaceStoreError::CorruptShard)?;
     if shard.schema != SHARD_SCHEMA {
         return Err(WorkspaceStoreError::UnsupportedVersion);
@@ -3104,7 +3121,13 @@ fn read_committed_snapshot(
     {
         return Err(WorkspaceStoreError::CorruptShard);
     }
-    Ok(Some(shard.payload))
+    let committed_bytes = (manifest_snapshot.bytes.len() as u64)
+        .checked_add(shard_snapshot.bytes.len() as u64)
+        .ok_or(WorkspaceStoreError::StoreTooLarge)?;
+    Ok(Some(CommittedWorkspaceSnapshot {
+        snapshot: shard.payload,
+        committed_bytes,
+    }))
 }
 
 fn shard_name(generation: u64) -> String {
@@ -3626,38 +3649,33 @@ fn directory_entry_names(directory: &fs::File) -> Result<Vec<String>, WorkspaceS
     Ok(names)
 }
 
-fn retained_store_bytes(root: &fs::File) -> Result<u64, WorkspaceStoreError> {
+fn validate_retained_store_entries(root: &fs::File) -> Result<(), WorkspaceStoreError> {
     fn walk(
         directory: &fs::File,
         depth: usize,
         entries: &mut usize,
-    ) -> Result<u64, WorkspaceStoreError> {
-        if depth > 4 || *entries > 10_000 {
+    ) -> Result<(), WorkspaceStoreError> {
+        if depth > 4 {
             return Err(WorkspaceStoreError::StoreTooLarge);
         }
-        let mut total = 0_u64;
         for name in directory_entry_names(directory)? {
-            *entries = entries.saturating_add(1);
+            *entries = entries
+                .checked_add(1)
+                .ok_or(WorkspaceStoreError::StoreTooLarge)?;
+            if *entries > 10_000 {
+                return Err(WorkspaceStoreError::StoreTooLarge);
+            }
             let stat = rustix::fs::statat(directory, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(workspace_error_from_errno)?;
             let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
             if file_type.is_dir() {
                 let child = open_private_directory_entry(directory, &name)?;
-                total = total
-                    .checked_add(walk(&child, depth + 1, entries)?)
-                    .ok_or(WorkspaceStoreError::StoreTooLarge)?;
-            } else if stat_is_private_regular(&stat) {
-                total = total
-                    .checked_add(
-                        u64::try_from(stat.st_size)
-                            .map_err(|_| WorkspaceStoreError::StoreTooLarge)?,
-                    )
-                    .ok_or(WorkspaceStoreError::StoreTooLarge)?;
-            } else {
+                walk(&child, depth + 1, entries)?;
+            } else if !stat_is_private_regular(&stat) {
                 return Err(WorkspaceStoreError::UnsafePath);
             }
         }
-        Ok(total)
+        Ok(())
     }
     walk(root, 0, &mut 0)
 }

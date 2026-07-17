@@ -11,12 +11,12 @@ use dbotter::model::{ProfileId, ProfileInstanceId};
 use dbotter::workspace::{
     EditorTabSnapshot, MAX_EDITOR_SOURCE_BYTES, MAX_EDITOR_TABS_PER_PROFILE, MAX_EDITOR_TABS_TOTAL,
     MAX_HISTORY_ENTRIES_PER_PROFILE, MAX_HISTORY_ENTRIES_TOTAL, MAX_HISTORY_SOURCE_BYTES,
-    MAX_PROFILE_SHARD_BYTES, MAX_QUARANTINE_BYTES, MAX_QUARANTINE_FILES, ProfileWorkspaceSnapshot,
-    WorkspaceCommit, WorkspaceGeometrySnapshot, WorkspaceHistoryCode, WorkspaceHistoryEntry,
-    WorkspaceHistoryStatus, WorkspaceLanguage, WorkspaceReadOnlyReason, WorkspaceRetentionError,
-    WorkspaceRetentionLimit, WorkspaceRunTarget, WorkspaceSnapshotError, WorkspaceSnapshotSet,
-    WorkspaceStore, WorkspaceStoreError, WorkspaceStoreMode, WorkspaceStoreWarning,
-    workspace_root_for_config,
+    MAX_PROFILE_SHARD_BYTES, MAX_QUARANTINE_BYTES, MAX_QUARANTINE_FILES, MAX_WORKSPACE_STORE_BYTES,
+    ProfileWorkspaceSnapshot, WorkspaceCommit, WorkspaceGeometrySnapshot, WorkspaceHistoryCode,
+    WorkspaceHistoryEntry, WorkspaceHistoryStatus, WorkspaceLanguage, WorkspaceReadOnlyReason,
+    WorkspaceRetentionError, WorkspaceRetentionLimit, WorkspaceRunTarget, WorkspaceSnapshotError,
+    WorkspaceSnapshotSet, WorkspaceStore, WorkspaceStoreError, WorkspaceStoreMode,
+    WorkspaceStoreWarning, workspace_root_for_config,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -172,6 +172,112 @@ fn quarantine_entry_name(instance_id: ProfileInstanceId, nonce_byte: u8) -> Stri
     format!("q-{scope}-{nonce}.bin")
 }
 
+fn quota_snapshot(instance_byte: u8, source: &str) -> ProfileWorkspaceSnapshot {
+    ProfileWorkspaceSnapshot::new(
+        ProfileInstanceId::from_bytes([instance_byte; 16]),
+        ProfileId(format!("quota-{instance_byte:02x}")),
+        true,
+        vec![editor(1, "Quota", source)],
+        Some(1),
+        WorkspaceGeometrySnapshot::new(300.0, 0.6, true).expect("quota geometry"),
+        Vec::new(),
+    )
+    .expect("quota workspace")
+}
+
+fn referenced_committed_bytes(root: &Path, instance_id: ProfileInstanceId) -> u64 {
+    let (_, manifest_path, shard_path, _) = current_generation_paths(root, instance_id);
+    fs::metadata(manifest_path)
+        .expect("committed manifest metadata")
+        .len()
+        + fs::metadata(shard_path)
+            .expect("manifest-referenced shard metadata")
+            .len()
+}
+
+fn total_referenced_committed_bytes(root: &Path, instance_ids: &[ProfileInstanceId]) -> u64 {
+    instance_ids
+        .iter()
+        .map(|instance_id| referenced_committed_bytes(root, *instance_id))
+        .sum()
+}
+
+fn manifest_bytes_with_shard_metadata(
+    manifest: &serde_json::Value,
+    shard_length: u64,
+    checksum: &str,
+) -> Vec<u8> {
+    let mut manifest = manifest.clone();
+    manifest["shard_length"] = serde_json::Value::from(shard_length);
+    manifest["checksum"] = serde_json::Value::String(checksum.to_owned());
+    serde_json::to_vec(&manifest).expect("encode adjusted manifest")
+}
+
+fn pad_manifest_referenced_shard_to(
+    root: &Path,
+    instance_id: ProfileInstanceId,
+    target_shard_bytes: u64,
+) -> u64 {
+    let (_, manifest_path, shard_path, manifest) = current_generation_paths(root, instance_id);
+    let mut shard = fs::read(&shard_path).expect("read shard before bounded padding");
+    shard.resize(
+        usize::try_from(target_shard_bytes).expect("bounded target shard length"),
+        b' ',
+    );
+    let checksum = lower_hex(&Sha256::digest(&shard));
+    fs::write(&shard_path, &shard).expect("write padded shard");
+    let manifest_bytes =
+        manifest_bytes_with_shard_metadata(&manifest, target_shard_bytes, &checksum);
+    fs::write(&manifest_path, &manifest_bytes).expect("write adjusted manifest");
+    assert_eq!(
+        fs::metadata(&shard_path)
+            .expect("padded shard metadata")
+            .len(),
+        target_shard_bytes
+    );
+    target_shard_bytes + manifest_bytes.len() as u64
+}
+
+fn pad_committed_profile_to(
+    root: &Path,
+    instance_id: ProfileInstanceId,
+    target_committed_bytes: u64,
+) {
+    let (_, manifest_path, shard_path, manifest) = current_generation_paths(root, instance_id);
+    let mut target_shard = target_committed_bytes
+        .checked_sub(
+            fs::metadata(&manifest_path)
+                .expect("original manifest metadata")
+                .len(),
+        )
+        .expect("target committed bytes exceed manifest");
+    loop {
+        let probe = manifest_bytes_with_shard_metadata(
+            &manifest,
+            target_shard,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let adjusted = target_committed_bytes
+            .checked_sub(u64::try_from(probe.len()).expect("probe manifest length"))
+            .expect("target committed bytes exceed adjusted manifest");
+        if adjusted == target_shard {
+            break;
+        }
+        target_shard = adjusted;
+    }
+    assert!(
+        target_shard
+            >= fs::metadata(&shard_path)
+                .expect("minimum shard metadata")
+                .len()
+    );
+    assert!(target_shard <= MAX_PROFILE_SHARD_BYTES as u64);
+    assert_eq!(
+        pad_manifest_referenced_shard_to(root, instance_id, target_shard),
+        target_committed_bytes
+    );
+}
+
 fn assert_commit(commit: &WorkspaceCommit, generation: u64) {
     assert_eq!(commit.generation(), generation);
     assert_eq!(commit.checksum().len(), 64);
@@ -274,6 +380,168 @@ fn bounds_fail_before_commit_and_history_plus_one_is_metadata_only() {
         ),
         Err(WorkspaceSnapshotError::TooManyEditorTabs)
     ));
+}
+
+#[test]
+fn manifest_referenced_shard_accepts_exact_limit_and_rejects_limit_plus_one() {
+    let temp = tempfile::tempdir().expect("shard boundary workspace parent");
+    let config = temp.path().join("dbotter.toml");
+    let root = workspace_root_for_config(&config).expect("shard boundary workspace root");
+    let expected = quota_snapshot(0xe8, "SELECT shard_boundary");
+    let store = WorkspaceStore::open(&config).expect("shard boundary store");
+    store
+        .commit(&expected)
+        .expect("commit shard boundary fixture");
+
+    assert_eq!(
+        pad_manifest_referenced_shard_to(
+            &root,
+            expected.instance_id(),
+            MAX_PROFILE_SHARD_BYTES as u64,
+        ),
+        referenced_committed_bytes(&root, expected.instance_id())
+    );
+    assert_eq!(
+        store
+            .load(expected.instance_id())
+            .expect("exact shard bound remains loadable"),
+        Some(expected.clone())
+    );
+
+    pad_manifest_referenced_shard_to(
+        &root,
+        expected.instance_id(),
+        MAX_PROFILE_SHARD_BYTES as u64 + 1,
+    );
+    assert!(matches!(
+        store.load(expected.instance_id()),
+        Err(WorkspaceStoreError::CorruptManifest)
+    ));
+}
+
+#[test]
+fn committed_store_quota_is_exact_excludes_replacement_and_ignores_non_committed_bytes() {
+    let incoming = quota_snapshot(0xed, "SELECT quota_boundary");
+    let incoming_plus_one = quota_snapshot(0xed, "SELECT quota_boundaryx");
+    let temp = tempfile::tempdir().expect("exact store quota parent");
+    let config = temp.path().join("dbotter.toml");
+    let root = workspace_root_for_config(&config).expect("exact store quota root");
+    let store = WorkspaceStore::open(&config).expect("exact store quota");
+    store
+        .commit(&incoming)
+        .expect("commit incoming quota probe");
+    let incoming_bytes = referenced_committed_bytes(&root, incoming.instance_id());
+    store
+        .commit(&incoming_plus_one)
+        .expect("commit plus-one quota probe");
+    assert_eq!(
+        referenced_committed_bytes(&root, incoming.instance_id()),
+        incoming_bytes + 1
+    );
+    store
+        .clear(incoming.instance_id())
+        .expect("clear incoming quota probe");
+
+    let seeds = [
+        quota_snapshot(0xe9, "SELECT quota_seed_1"),
+        quota_snapshot(0xea, "SELECT quota_seed_2"),
+        quota_snapshot(0xeb, "SELECT quota_seed_3"),
+        quota_snapshot(0xec, "SELECT quota_seed_4"),
+    ];
+    for seed in &seeds {
+        store.commit(seed).expect("commit quota seed");
+    }
+    let seed_ids = seeds
+        .iter()
+        .map(ProfileWorkspaceSnapshot::instance_id)
+        .collect::<Vec<_>>();
+    let target_seed_bytes = MAX_WORKSPACE_STORE_BYTES
+        .checked_sub(incoming_bytes)
+        .expect("incoming fits store quota");
+    let base = target_seed_bytes / seed_ids.len() as u64;
+    let remainder = target_seed_bytes % seed_ids.len() as u64;
+    for (index, instance_id) in seed_ids.iter().enumerate() {
+        pad_committed_profile_to(
+            &root,
+            *instance_id,
+            base + u64::from(index == 0) * remainder,
+        );
+    }
+    assert_eq!(
+        total_referenced_committed_bytes(&root, &seed_ids),
+        target_seed_bytes
+    );
+
+    fs::write(root.join("writer.lock"), vec![b'l'; 1024 * 1024])
+        .expect("write non-committed lock payload");
+    fs::set_permissions(root.join("writer.lock"), fs::Permissions::from_mode(0o600))
+        .expect("private writer lock");
+    let quarantine_noise = root
+        .join("quarantine")
+        .join(quarantine_entry_name(seed_ids[0], 0xee));
+    fs::write(&quarantine_noise, vec![b'q'; 1024 * 1024])
+        .expect("write non-committed quarantine payload");
+    fs::set_permissions(&quarantine_noise, fs::Permissions::from_mode(0o600))
+        .expect("private quarantine payload");
+    let profile_noise = root
+        .join("profiles")
+        .join(seed_ids[0].to_string())
+        .join(".dbotter-workspace.unreferenced.tmp.fixture");
+    fs::write(&profile_noise, vec![b't'; 1024 * 1024]).expect("write unreferenced private temp");
+    fs::set_permissions(&profile_noise, fs::Permissions::from_mode(0o600))
+        .expect("private unreferenced temp");
+
+    assert_commit(
+        &store
+            .commit(&incoming)
+            .expect("exact committed quota ignores non-committed bytes"),
+        1,
+    );
+    let all_ids = seed_ids
+        .iter()
+        .copied()
+        .chain(std::iter::once(incoming.instance_id()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        total_referenced_committed_bytes(&root, &all_ids),
+        MAX_WORKSPACE_STORE_BYTES
+    );
+
+    assert_commit(
+        &store
+            .commit(&incoming)
+            .expect("replacement excludes its previous committed generation"),
+        2,
+    );
+    assert_eq!(
+        total_referenced_committed_bytes(&root, &all_ids),
+        MAX_WORKSPACE_STORE_BYTES
+    );
+    assert!(matches!(
+        store.commit(&incoming_plus_one),
+        Err(WorkspaceStoreError::StoreTooLarge)
+    ));
+    assert_eq!(
+        store
+            .load(incoming.instance_id())
+            .expect("failed plus-one retains prior exact commit"),
+        Some(incoming)
+    );
+
+    let outside = temp.path().join("outside-unreferenced-temp");
+    fs::write(&outside, CREDENTIAL_SENTINEL).expect("write unsafe outside target");
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600))
+        .expect("private unsafe outside target");
+    fs::remove_file(&profile_noise).expect("remove safe unreferenced temp");
+    symlink(&outside, &profile_noise).expect("replace unreferenced temp with unsafe symlink");
+    assert!(matches!(
+        store.commit(&quota_snapshot(0xf1, "SELECT blocked_by_unsafe_entry")),
+        Err(WorkspaceStoreError::UnsafePath)
+    ));
+    assert_eq!(
+        fs::read_to_string(&outside).expect("unsafe outside target survives"),
+        CREDENTIAL_SENTINEL
+    );
 }
 
 #[test]
