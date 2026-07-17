@@ -12,7 +12,7 @@ without credentials, query values, keys, cell values or imported/exported data.
 
 | Journey | RED commit | GREEN commit(s) | Local/live/native evidence | Preview/xbrew/installed evidence | Status |
 |---|---|---|---|---|---|
-| J2 durable SQL workspace/history | — | — | — | — | not started |
+| J2 durable SQL workspace/history | this commit — `test(j2): freeze durable workspace boundary` | — | RED actual-frame/native-save contract: `cargo test --all-features j2_red -- --nocapture` fails 3/3 until durable status/save/history controls replace the session-only label, an actual searched history entry reopens as a new draft with zero dispatch, and native Save submits a private workspace flush without placing SQL source in eframe storage | — | RED |
 | J1 secure MySQL connection/Data | — | — | — | — | not started |
 | J3 safe typed MySQL row edit | — | — | — | — | not started |
 | J4 bounded export/CSV import | — | — | — | — | not started |

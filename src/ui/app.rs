@@ -4677,11 +4677,12 @@ mod tests {
         CatalogLevel, CatalogNode, CatalogNodeIdentity, CatalogNodeKind, CatalogPage,
         CatalogRetainedCounts, Cell, Column, ConnectionProfile, CredentialMode, DraftId,
         DriverAvailability, DriverKind, ExportFormat, OperationId, OperationKind,
-        OperationRecipeId, OverwritePolicy, ProfileFieldId, ProfileGeneration, ProfileId,
-        PublicCode, PublicSummary, QueryLanguage, QueryResult, RedisKeyEntry, RedisKeyFilter,
-        RedisKeyId, RedisKeyPage, RedisScanConsistency, RedisScanRequest, RedisTlsConfig,
-        RequestIdentity, ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot,
-        SessionGeneration, TlsMode,
+        OperationRecipeId, OverwritePolicy, ProfileAccess, ProfileEnvironment, ProfileFieldId,
+        ProfileGeneration, ProfileId, ProfileInstanceId, ProfileSafetyPosture, PublicCode,
+        PublicSummary, QueryLanguage, QueryResult, RedisKeyEntry, RedisKeyFilter, RedisKeyId,
+        RedisKeyPage, RedisScanConsistency, RedisScanRequest, RedisTlsConfig, RequestIdentity,
+        ResultId, ResultProvenance, ResultRetentionPolicy, ResultSnapshot, SessionGeneration,
+        TlsMode,
     };
     use crate::public_error::{PublicOperationError, RecoveryAction, SafeContext};
     use crate::secrets::EnvironmentAvailability;
@@ -4692,7 +4693,9 @@ mod tests {
         EditorCursor, EditorIntent, build_execute_all_intent, build_execute_intent,
     };
     use crate::ui::layout::{NativeLayout, WorkspaceGeometry};
-    use crate::ui::model::{ConfigPresentation, ProfileSnapshot, UiEvent, WorkspaceKey};
+    use crate::ui::model::{
+        ConfigPresentation, ProfileSnapshot, ResultAreaTab, UiEvent, WorkspaceKey,
+    };
     use crate::ui::redis_explorer::RedisExplorerIntent;
     use eframe::egui::{self, Context, Event, Key, Modifiers, RawInput, accesskit};
 
@@ -4825,6 +4828,241 @@ mod tests {
             .into_iter()
             .filter_map(|(_, node)| node.author_id().map(str::to_owned))
             .collect()
+    }
+
+    fn j2_classified_environment_profile() -> ProfileSnapshot {
+        let mut profile = profile(DriverKind::MySql, DriverAvailability::Ready);
+        profile.persisted.safety = ProfileSafetyPosture::classified(
+            ProfileEnvironment::Development,
+            ProfileAccess::ReadWrite,
+            ProfileInstanceId::from_bytes([0x2a; 16]),
+        );
+        profile.persisted.credential_mode = CredentialMode::Environment;
+        profile.persisted.secret_env = Some("DBOTTER_J2_PASSWORD".to_owned());
+        profile.environment_availability = Some(EnvironmentAvailability::Available);
+        profile
+    }
+
+    fn install_j2_profile(app: &mut DbotterApp, profile: &ProfileSnapshot) -> WorkspaceKey {
+        let key = WorkspaceKey::new(profile.id.clone(), profile.generation);
+        app.model.profiles = vec![profile.clone()];
+        app.model.selected_profile = Some(profile.id.clone());
+        app.model
+            .active_generations
+            .insert(profile.id.clone(), profile.generation);
+        app.model.config = ConfigPresentation::for_source(
+            ConfigSourceVersion::V3,
+            &PathBuf::from("/private/tmp/dbotter-j2-config.toml"),
+        );
+        key
+    }
+
+    #[test]
+    fn j2_red_actual_frame_exposes_durable_workspace_and_searchable_history_controls() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        let workspace = app.model.workspace_mut(key);
+        workspace
+            .create_editor_tab(QueryLanguage::Sql, "Orders", "SELECT 1")
+            .expect("first J2 draft");
+        workspace
+            .create_editor_tab(QueryLanguage::Sql, "Customers", "SELECT 2")
+            .expect("second J2 draft");
+        workspace.select_result_area_tab(ResultAreaTab::History);
+
+        let ids = shell_author_ids(&mut app, 1440.0, 900.0);
+        let missing = [
+            "workspace.persistence.status",
+            "workspace.persistence.toggle",
+            "editor.save",
+            "history.search",
+            "history.clear",
+        ]
+        .into_iter()
+        .filter(|id| !ids.contains(*id))
+        .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "J2 durable-work controls are absent from the actual frame: {missing:?}"
+        );
+        assert!(
+            !ids.contains("workspace.session-retention"),
+            "the actual frame still advertises session-only loss on quit"
+        );
+        assert!(
+            service.try_next_command().is_none(),
+            "rendering persistence controls must not dispatch work"
+        );
+    }
+
+    #[test]
+    fn j2_red_actual_history_reopens_as_new_editor_without_dispatch() {
+        let (ui_port, mut service) = bounded_ports(8);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        let original_tab = app
+            .model
+            .workspace_mut(key.clone())
+            .create_editor_tab(
+                QueryLanguage::Sql,
+                "Original",
+                "SELECT j2_history_private_source",
+            )
+            .expect("original history source");
+        let intent = build_execute_intent(
+            &profile,
+            app.model.workspace(&key).expect("J2 workspace"),
+            EditorCursor::caret(0),
+        )
+        .expect("read execution intent");
+        app.submit_editor_intent(EditorIntent::Execute(intent));
+        let operation_id = match service.try_next_command() {
+            Some(UiCommand::Execute {
+                operation_id,
+                editor_tab_id: Some(editor_tab_id),
+                text,
+                ..
+            }) => {
+                assert_eq!(editor_tab_id, original_tab);
+                assert_eq!(text, "SELECT j2_history_private_source");
+                operation_id
+            }
+            _ => panic!("J2 fixture must dispatch one read"),
+        };
+        assert!(service.try_emit(UiEvent::QueryFinished {
+            operation_id,
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            editor_tab_id: Some(original_tab),
+            session_generation: SessionGeneration(7),
+            result: result_snapshot_for_operation(
+                &profile,
+                "ephemeral-result-must-not-persist",
+                operation_id,
+                ResultId(731),
+            ),
+        }));
+        app.poll_events();
+        app.model
+            .workspace_mut(key.clone())
+            .select_result_area_tab(ResultAreaTab::History);
+        assert!(service.try_next_command().is_none());
+
+        let context = Context::default();
+        context.enable_accesskit();
+        let render = |app: &mut DbotterApp, events: Vec<Event>| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 900.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| app.show_native(ui),
+            )
+        };
+
+        let initial = render(&mut app, Vec::new());
+        let initial = initial
+            .platform_output
+            .accesskit_update
+            .expect("history frame must emit AccessKit");
+        let (search_id, _) = accesskit_author_node(&initial, "history.search");
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: search_id,
+                data: None,
+            })],
+        );
+        let filtered = render(
+            &mut app,
+            vec![Event::Text("j2_history_private_source".to_owned())],
+        );
+        let filtered = filtered
+            .platform_output
+            .accesskit_update
+            .expect("filtered history frame must emit AccessKit");
+        let entry_author_id = format!("history.entry.{}", operation_id.0);
+        let (entry_id, _) = accesskit_author_node(&filtered, &entry_author_id);
+        let _ = render(
+            &mut app,
+            vec![Event::AccessKitActionRequest(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: entry_id,
+                data: None,
+            })],
+        );
+        let _ = render(
+            &mut app,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+
+        let workspace = app.model.workspace(&key).expect("J2 workspace retained");
+        assert_eq!(workspace.editor_tabs().len(), 2);
+        assert_eq!(
+            workspace
+                .selected_editor_tab_id()
+                .and_then(|tab_id| workspace.editor_tab(tab_id))
+                .map(|tab| tab.text()),
+            Some("SELECT j2_history_private_source")
+        );
+        assert!(
+            service.try_next_command().is_none(),
+            "opening history must create a draft with zero automatic network dispatch"
+        );
+    }
+
+    #[test]
+    fn j2_red_native_save_flushes_private_workspace_without_leaking_source_to_eframe_storage() {
+        let (ui_port, mut service) = bounded_ports(4);
+        let mut app = DbotterApp::new(ui_port);
+        assert!(service.try_next_command().is_some());
+        let profile = j2_classified_environment_profile();
+        let key = install_j2_profile(&mut app, &profile);
+        app.model
+            .workspace_mut(key)
+            .create_editor_tab(
+                QueryLanguage::Sql,
+                "Private draft",
+                "SELECT j2_private_source",
+            )
+            .expect("J2 draft");
+
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        let native_storage = storage
+            .values
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !native_storage.contains("j2_private_source"),
+            "query source must never be serialized into eframe native storage"
+        );
+        assert!(
+            service.try_next_command().is_some(),
+            "native Save must enqueue a bounded private-workspace flush before reporting Saved"
+        );
     }
 
     #[test]
