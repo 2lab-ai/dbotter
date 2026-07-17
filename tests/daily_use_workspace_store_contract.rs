@@ -11,11 +11,12 @@ use dbotter::model::{ProfileId, ProfileInstanceId};
 use dbotter::workspace::{
     EditorTabSnapshot, MAX_EDITOR_SOURCE_BYTES, MAX_EDITOR_TABS_PER_PROFILE, MAX_EDITOR_TABS_TOTAL,
     MAX_HISTORY_ENTRIES_PER_PROFILE, MAX_HISTORY_ENTRIES_TOTAL, MAX_HISTORY_SOURCE_BYTES,
-    MAX_QUARANTINE_BYTES, MAX_QUARANTINE_FILES, ProfileWorkspaceSnapshot, WorkspaceCommit,
-    WorkspaceGeometrySnapshot, WorkspaceHistoryCode, WorkspaceHistoryEntry, WorkspaceHistoryStatus,
-    WorkspaceLanguage, WorkspaceReadOnlyReason, WorkspaceRunTarget, WorkspaceSnapshotError,
-    WorkspaceSnapshotSet, WorkspaceStore, WorkspaceStoreError, WorkspaceStoreMode,
-    WorkspaceStoreWarning, workspace_root_for_config,
+    MAX_PROFILE_SHARD_BYTES, MAX_QUARANTINE_BYTES, MAX_QUARANTINE_FILES, ProfileWorkspaceSnapshot,
+    WorkspaceCommit, WorkspaceGeometrySnapshot, WorkspaceHistoryCode, WorkspaceHistoryEntry,
+    WorkspaceHistoryStatus, WorkspaceLanguage, WorkspaceReadOnlyReason, WorkspaceRetentionError,
+    WorkspaceRetentionLimit, WorkspaceRunTarget, WorkspaceSnapshotError, WorkspaceSnapshotSet,
+    WorkspaceStore, WorkspaceStoreError, WorkspaceStoreMode, WorkspaceStoreWarning,
+    workspace_root_for_config,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -324,6 +325,12 @@ fn total_tab_and_history_bounds_are_exact_and_oldest_terminal_history_is_evicted
     let bounded_history =
         WorkspaceSnapshotSet::new(history_plus_one).expect("history plus one is evicted");
     assert_eq!(bounded_history.history_evicted(), 1);
+    assert_eq!(bounded_history.history_evictions().len(), 1);
+    assert_eq!(
+        bounded_history.history_evictions()[0].instance_id(),
+        ProfileInstanceId::from_bytes([0xa5; 16])
+    );
+    assert_eq!(bounded_history.history_evictions()[0].history_id(), 1);
     assert_eq!(
         bounded_history
             .profiles()
@@ -425,6 +432,11 @@ fn outcome_unknown_history_is_never_evicted_and_unsatisfied_overflow_is_rejected
 
     let bounded = WorkspaceSnapshotSet::new(mixed_profiles).expect("evict terminal overflow");
     assert_eq!(bounded.history_evicted(), 1);
+    assert_eq!(
+        bounded.history_evictions()[0].instance_id(),
+        protected_instance
+    );
+    assert_eq!(bounded.history_evictions()[0].history_id(), 2);
     let retained = bounded
         .profiles()
         .iter()
@@ -453,9 +465,94 @@ fn outcome_unknown_history_is_never_evicted_and_unsatisfied_overflow_is_rejected
         WorkspaceHistoryStatus::OutcomeUnknown,
     ));
     assert!(matches!(
+        WorkspaceSnapshotSet::new_with_retention(all_unknown.clone()),
+        Err(WorkspaceRetentionError::RetentionExhausted(
+            WorkspaceRetentionLimit::TotalHistoryEntries
+        ))
+    ));
+    assert!(matches!(
         WorkspaceSnapshotSet::new(all_unknown),
         Err(WorkspaceSnapshotError::TooManyHistoryEntriesTotal)
     ));
+}
+
+#[test]
+fn production_shard_bound_evicts_escape_heavy_history_without_exposing_source_in_results() {
+    const ENTRY_COUNT: usize = 256;
+    const PRIVATE_SENTINEL: &str = "j2_escape_heavy_private_source";
+
+    let fixture_started = Instant::now();
+    let mut source = PRIVATE_SENTINEL.to_owned();
+    source.push_str(&"\n".repeat(MAX_HISTORY_SOURCE_BYTES));
+    source.truncate(MAX_HISTORY_SOURCE_BYTES);
+    let history = (0..ENTRY_COUNT)
+        .map(|index| {
+            WorkspaceHistoryEntry::new(
+                index as u64 + 1,
+                &source,
+                WorkspaceRunTarget::Current,
+                index as i64,
+                WorkspaceHistoryStatus::Succeeded,
+                1,
+                0,
+                0,
+                false,
+            )
+            .expect("escape-heavy history")
+        })
+        .collect::<Vec<_>>();
+    let instance_id = ProfileInstanceId::from_bytes([0xd1; 16]);
+    let profile = ProfileWorkspaceSnapshot::new(
+        instance_id,
+        ProfileId("escape-heavy".to_owned()),
+        true,
+        Vec::new(),
+        None,
+        WorkspaceGeometrySnapshot::new(300.0, 0.6, true).expect("escape-heavy geometry"),
+        history,
+    )
+    .expect("escape-heavy profile");
+    let fixture_elapsed = fixture_started.elapsed();
+
+    assert!(
+        serde_json::to_vec(&profile)
+            .expect("encode production-boundary profile")
+            .len()
+            > MAX_PROFILE_SHARD_BYTES,
+        "escaped source crosses the encoded shard bound while remaining under count limits"
+    );
+    assert!(ENTRY_COUNT * source.len() < MAX_PROFILE_SHARD_BYTES);
+
+    let planner_started = Instant::now();
+    let bounded = WorkspaceSnapshotSet::new_with_retention(vec![profile])
+        .expect("production shard-bound retention plan");
+    let planner_elapsed = planner_started.elapsed();
+    eprintln!(
+        "production-shard fixture_ms={} planner_ms={}",
+        fixture_elapsed.as_millis(),
+        planner_elapsed.as_millis()
+    );
+
+    assert!(bounded.history_evicted() > 0);
+    assert_eq!(
+        bounded.profiles()[0].history().len() + bounded.history_evicted(),
+        ENTRY_COUNT
+    );
+    assert!(
+        serde_json::to_vec(&bounded.profiles()[0])
+            .expect("encode bounded production profile")
+            .len()
+            < MAX_PROFILE_SHARD_BYTES
+    );
+    assert_eq!(bounded.profiles()[0].instance_id(), instance_id);
+    for (index, identity) in bounded.history_evictions().iter().enumerate() {
+        assert_eq!(identity.instance_id(), instance_id);
+        assert_eq!(identity.history_id(), index as u64 + 1);
+    }
+    assert!(
+        !format!("{bounded:?}").contains(PRIVATE_SENTINEL),
+        "planner results expose counts and identities, never source text"
+    );
 }
 
 #[test]

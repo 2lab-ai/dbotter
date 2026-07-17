@@ -472,10 +472,105 @@ impl ProfileWorkspaceSnapshot {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorkspaceHistoryEvictionIdentity {
+    instance_id: ProfileInstanceId,
+    history_id: u64,
+}
+
+impl std::fmt::Debug for WorkspaceHistoryEvictionIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceHistoryEvictionIdentity")
+            .field("instance_id", &"<redacted>")
+            .field("history_id", &self.history_id)
+            .finish()
+    }
+}
+
+impl WorkspaceHistoryEvictionIdentity {
+    pub const fn instance_id(&self) -> ProfileInstanceId {
+        self.instance_id
+    }
+
+    pub const fn history_id(&self) -> u64 {
+        self.history_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceRetentionLimit {
+    ProfileHistoryEntries,
+    TotalHistoryEntries,
+    ProfileShardBytes,
+    TotalStoreBytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WorkspaceRetentionError {
+    #[error(transparent)]
+    Snapshot(#[from] WorkspaceSnapshotError),
+    #[error("protected workspace state prevents satisfying {0:?}")]
+    RetentionExhausted(WorkspaceRetentionLimit),
+    #[error("workspace retention byte accounting failed")]
+    AccountingFailed,
+}
+
+impl WorkspaceRetentionError {
+    const fn into_snapshot_error(self) -> WorkspaceSnapshotError {
+        match self {
+            Self::Snapshot(error) => error,
+            Self::RetentionExhausted(
+                WorkspaceRetentionLimit::ProfileHistoryEntries
+                | WorkspaceRetentionLimit::ProfileShardBytes,
+            ) => WorkspaceSnapshotError::TooManyHistoryEntries,
+            Self::RetentionExhausted(
+                WorkspaceRetentionLimit::TotalHistoryEntries
+                | WorkspaceRetentionLimit::TotalStoreBytes,
+            )
+            | Self::AccountingFailed => WorkspaceSnapshotError::TooManyHistoryEntriesTotal,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WorkspaceRetentionLimits {
+    history_entries_per_profile: usize,
+    history_entries_total: usize,
+    profile_shard_bytes: usize,
+    workspace_store_bytes: u64,
+}
+
+impl WorkspaceRetentionLimits {
+    const PRODUCTION: Self = Self {
+        history_entries_per_profile: MAX_HISTORY_ENTRIES_PER_PROFILE,
+        history_entries_total: MAX_HISTORY_ENTRIES_TOTAL,
+        profile_shard_bytes: MAX_PROFILE_SHARD_BYTES,
+        workspace_store_bytes: MAX_WORKSPACE_STORE_BYTES,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct HistoryRetentionCandidate {
+    completed_at_unix_ms: i64,
+    instance: [u8; 16],
+    history_id: u64,
+    profile_index: usize,
+}
+
+impl HistoryRetentionCandidate {
+    const fn identity(self) -> WorkspaceHistoryEvictionIdentity {
+        WorkspaceHistoryEvictionIdentity {
+            instance_id: ProfileInstanceId::from_bytes(self.instance),
+            history_id: self.history_id,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkspaceSnapshotSet {
     profiles: Vec<ProfileWorkspaceSnapshot>,
-    history_evicted: usize,
+    history_evictions: Vec<WorkspaceHistoryEvictionIdentity>,
 }
 
 impl std::fmt::Debug for WorkspaceSnapshotSet {
@@ -483,76 +578,126 @@ impl std::fmt::Debug for WorkspaceSnapshotSet {
         formatter
             .debug_struct("WorkspaceSnapshotSet")
             .field("profile_count", &self.profiles.len())
-            .field("history_evicted", &self.history_evicted)
+            .field("history_evicted", &self.history_evictions.len())
             .finish()
     }
 }
 
 impl WorkspaceSnapshotSet {
-    pub fn new(
+    pub fn new(profiles: Vec<ProfileWorkspaceSnapshot>) -> Result<Self, WorkspaceSnapshotError> {
+        Self::new_with_retention(profiles).map_err(WorkspaceRetentionError::into_snapshot_error)
+    }
+
+    pub fn new_with_retention(
+        profiles: Vec<ProfileWorkspaceSnapshot>,
+    ) -> Result<Self, WorkspaceRetentionError> {
+        Self::plan_with_limits(profiles, WorkspaceRetentionLimits::PRODUCTION)
+    }
+
+    fn plan_with_limits(
         mut profiles: Vec<ProfileWorkspaceSnapshot>,
-    ) -> Result<Self, WorkspaceSnapshotError> {
+        limits: WorkspaceRetentionLimits,
+    ) -> Result<Self, WorkspaceRetentionError> {
         let mut instances = HashSet::with_capacity(profiles.len());
         let mut editor_tabs = 0_usize;
-        let mut history_entries = 0_usize;
         for profile in &profiles {
             profile.validate()?;
             if !instances.insert(profile.instance_id()) {
-                return Err(WorkspaceSnapshotError::DuplicateProfileInstance);
+                return Err(WorkspaceSnapshotError::DuplicateProfileInstance.into());
             }
             editor_tabs = editor_tabs
                 .checked_add(profile.editor_tabs.len())
                 .ok_or(WorkspaceSnapshotError::TooManyEditorTabsTotal)?;
-            history_entries = history_entries
-                .checked_add(profile.history.len())
-                .ok_or(WorkspaceSnapshotError::TooManyHistoryEntriesTotal)?;
         }
         if editor_tabs > MAX_EDITOR_TABS_TOTAL {
-            return Err(WorkspaceSnapshotError::TooManyEditorTabsTotal);
+            return Err(WorkspaceSnapshotError::TooManyEditorTabsTotal.into());
         }
 
-        let history_evicted = history_entries.saturating_sub(MAX_HISTORY_ENTRIES_TOTAL);
-        if history_evicted > 0 {
-            let mut candidates = profiles
-                .iter()
-                .enumerate()
-                .flat_map(|(profile_index, profile)| {
-                    let instance = *profile.instance_id().as_bytes();
-                    profile
-                        .history
-                        .iter()
-                        .filter(|entry| {
-                            !matches!(entry.status, WorkspaceHistoryStatus::OutcomeUnknown)
-                        })
-                        .map(move |entry| {
-                            (
-                                entry.completed_at_unix_ms,
-                                instance,
-                                entry.id,
-                                profile_index,
-                            )
-                        })
-                })
-                .collect::<Vec<_>>();
-            if candidates.len() < history_evicted {
-                return Err(WorkspaceSnapshotError::TooManyHistoryEntriesTotal);
+        let mut evicted = Vec::new();
+        let mut profile_order = (0..profiles.len()).collect::<Vec<_>>();
+        profile_order.sort_unstable_by_key(|index| *profiles[*index].instance_id().as_bytes());
+        for profile_index in profile_order {
+            let overflow = profiles[profile_index]
+                .history
+                .len()
+                .saturating_sub(limits.history_entries_per_profile);
+            if overflow == 0 {
+                continue;
             }
-            candidates.sort_unstable();
-            let evicted = candidates
-                .into_iter()
-                .take(history_evicted)
-                .map(|(_, _, history_id, profile_index)| (profile_index, history_id))
-                .collect::<HashSet<_>>();
-            for (profile_index, profile) in profiles.iter_mut().enumerate() {
-                profile
-                    .history
-                    .retain(|entry| !evicted.contains(&(profile_index, entry.id)));
+            let candidates = history_retention_candidates(&profiles, Some(profile_index));
+            if candidates.len() < overflow {
+                return Err(WorkspaceRetentionError::RetentionExhausted(
+                    WorkspaceRetentionLimit::ProfileHistoryEntries,
+                ));
             }
+            apply_history_evictions(&mut profiles, &candidates[..overflow], &mut evicted);
         }
 
+        let history_entries = profiles.iter().try_fold(0_usize, |total, profile| {
+            total.checked_add(profile.history.len()).ok_or(
+                WorkspaceRetentionError::RetentionExhausted(
+                    WorkspaceRetentionLimit::TotalHistoryEntries,
+                ),
+            )
+        })?;
+        let overflow = history_entries.saturating_sub(limits.history_entries_total);
+        if overflow > 0 {
+            let candidates = history_retention_candidates(&profiles, None);
+            if candidates.len() < overflow {
+                return Err(WorkspaceRetentionError::RetentionExhausted(
+                    WorkspaceRetentionLimit::TotalHistoryEntries,
+                ));
+            }
+            apply_history_evictions(&mut profiles, &candidates[..overflow], &mut evicted);
+        }
+
+        let mut encoded_profiles = profiles
+            .iter()
+            .map(ProfileEncodedAccounting::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut profile_order = (0..profiles.len()).collect::<Vec<_>>();
+        profile_order.sort_unstable_by_key(|index| *profiles[*index].instance_id().as_bytes());
+        for profile_index in profile_order {
+            let profile_shard_limit = u64::try_from(limits.profile_shard_bytes)
+                .map_err(|_| WorkspaceRetentionError::AccountingFailed)?;
+            if encoded_profiles[profile_index].encoded_size()?.shard_bytes <= profile_shard_limit {
+                continue;
+            }
+            let candidates = history_retention_candidates(&profiles, Some(profile_index));
+            let removal_count = minimum_profile_evictions_to_fit(
+                &encoded_profiles[profile_index],
+                &candidates,
+                profile_shard_limit,
+            )?;
+            apply_encoded_evictions(&mut encoded_profiles, &candidates[..removal_count])?;
+            apply_history_evictions(&mut profiles, &candidates[..removal_count], &mut evicted);
+        }
+
+        if conservative_encoded_store_bytes(&encoded_profiles)? > limits.workspace_store_bytes {
+            let candidates = history_retention_candidates(&profiles, None);
+            let removal_count = minimum_total_evictions_to_fit(
+                &encoded_profiles,
+                &candidates,
+                limits.workspace_store_bytes,
+            )?;
+            apply_encoded_evictions(&mut encoded_profiles, &candidates[..removal_count])?;
+            apply_history_evictions(&mut profiles, &candidates[..removal_count], &mut evicted);
+        }
+
+        evicted.sort_unstable_by_key(|candidate| {
+            (
+                candidate.completed_at_unix_ms,
+                candidate.instance,
+                candidate.history_id,
+            )
+        });
+        let history_evictions = evicted
+            .into_iter()
+            .map(HistoryRetentionCandidate::identity)
+            .collect();
         Ok(Self {
             profiles,
-            history_evicted,
+            history_evictions,
         })
     }
 
@@ -565,8 +710,445 @@ impl WorkspaceSnapshotSet {
     }
 
     pub const fn history_evicted(&self) -> usize {
-        self.history_evicted
+        self.history_evictions.len()
     }
+
+    pub fn history_evictions(&self) -> &[WorkspaceHistoryEvictionIdentity] {
+        &self.history_evictions
+    }
+}
+
+const RETENTION_CHECKSUM_PLACEHOLDER: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+const JSON_NULL_BYTES: u64 = 4;
+
+#[derive(Serialize)]
+struct WorkspaceShardSizeProbe<'a> {
+    schema: &'a str,
+    instance_id: ProfileInstanceId,
+    generation: u64,
+    payload_length: u64,
+    payload_checksum: &'a str,
+    payload: (),
+}
+
+#[derive(Serialize)]
+struct ProfileWorkspaceSizeProbe<'a> {
+    instance_id: ProfileInstanceId,
+    profile_id: &'a ProfileId,
+    persistence_enabled: bool,
+    editor_tabs: &'a [EditorTabSnapshot],
+    selected_editor_tab_id: Option<u64>,
+    geometry: WorkspaceGeometrySnapshot,
+    history: &'a [WorkspaceHistoryEntry],
+}
+
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: u64,
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let length = u64::try_from(buffer.len())
+            .map_err(|_| std::io::Error::other("JSON byte count overflow"))?;
+        self.bytes = self
+            .bytes
+            .checked_add(length)
+            .ok_or_else(|| std::io::Error::other("JSON byte count overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConservativeEncodedProfileSize {
+    shard_bytes: u64,
+    committed_bytes: u64,
+}
+
+struct ProfileEncodedAccounting {
+    payload_fixed_bytes: u64,
+    retained_history_entries: usize,
+    retained_history_json_bytes: u64,
+    history_json_bytes: HashMap<u64, u64>,
+    shard_fixed_bytes: u64,
+    manifest_fixed_bytes: u64,
+}
+
+impl ProfileEncodedAccounting {
+    fn new(snapshot: &ProfileWorkspaceSnapshot) -> Result<Self, WorkspaceRetentionError> {
+        let payload_fixed_bytes = encoded_json_bytes(&ProfileWorkspaceSizeProbe {
+            instance_id: snapshot.instance_id,
+            profile_id: &snapshot.profile_id,
+            persistence_enabled: snapshot.persistence_enabled,
+            editor_tabs: &snapshot.editor_tabs,
+            selected_editor_tab_id: snapshot.selected_editor_tab_id,
+            geometry: snapshot.geometry,
+            history: &[],
+        })?;
+        let mut history_json_bytes = HashMap::with_capacity(snapshot.history.len());
+        let mut retained_history_json_bytes = 0_u64;
+        for entry in &snapshot.history {
+            let entry_bytes = encoded_json_bytes(entry)?;
+            if history_json_bytes.insert(entry.id, entry_bytes).is_some() {
+                return Err(WorkspaceRetentionError::AccountingFailed);
+            }
+            retained_history_json_bytes = retained_history_json_bytes
+                .checked_add(entry_bytes)
+                .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        }
+        let (shard_fixed_bytes, manifest_fixed_bytes) =
+            conservative_encoded_overheads(snapshot.instance_id())?;
+        Ok(Self {
+            payload_fixed_bytes,
+            retained_history_entries: snapshot.history.len(),
+            retained_history_json_bytes,
+            history_json_bytes,
+            shard_fixed_bytes,
+            manifest_fixed_bytes,
+        })
+    }
+
+    fn encoded_size(&self) -> Result<ConservativeEncodedProfileSize, WorkspaceRetentionError> {
+        self.encoded_size_after_removals(0, 0)
+    }
+
+    fn encoded_size_after_removals(
+        &self,
+        removed_entries: usize,
+        removed_json_bytes: u64,
+    ) -> Result<ConservativeEncodedProfileSize, WorkspaceRetentionError> {
+        let retained_entries = self
+            .retained_history_entries
+            .checked_sub(removed_entries)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        let retained_json_bytes = self
+            .retained_history_json_bytes
+            .checked_sub(removed_json_bytes)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        let history_commas = u64::try_from(retained_entries.saturating_sub(1))
+            .map_err(|_| WorkspaceRetentionError::AccountingFailed)?;
+        let payload_bytes = self
+            .payload_fixed_bytes
+            .checked_add(retained_json_bytes)
+            .and_then(|value| value.checked_add(history_commas))
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        let shard_bytes = self
+            .shard_fixed_bytes
+            .checked_add(decimal_digits(payload_bytes))
+            .and_then(|value| value.checked_add(payload_bytes))
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        let manifest_bytes = self
+            .manifest_fixed_bytes
+            .checked_add(decimal_digits(shard_bytes))
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        let committed_bytes = shard_bytes
+            .checked_add(manifest_bytes)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        Ok(ConservativeEncodedProfileSize {
+            shard_bytes,
+            committed_bytes,
+        })
+    }
+
+    fn history_json_bytes(&self, history_id: u64) -> Result<u64, WorkspaceRetentionError> {
+        self.history_json_bytes
+            .get(&history_id)
+            .copied()
+            .ok_or(WorkspaceRetentionError::AccountingFailed)
+    }
+
+    fn remove_history(&mut self, history_id: u64) -> Result<(), WorkspaceRetentionError> {
+        let entry_bytes = self
+            .history_json_bytes
+            .remove(&history_id)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        self.retained_history_entries = self
+            .retained_history_entries
+            .checked_sub(1)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        self.retained_history_json_bytes = self
+            .retained_history_json_bytes
+            .checked_sub(entry_bytes)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        Ok(())
+    }
+}
+
+fn history_retention_candidates(
+    profiles: &[ProfileWorkspaceSnapshot],
+    selected_profile_index: Option<usize>,
+) -> Vec<HistoryRetentionCandidate> {
+    let mut candidates = profiles
+        .iter()
+        .enumerate()
+        .filter(|(profile_index, _)| {
+            selected_profile_index.is_none_or(|selected| selected == *profile_index)
+        })
+        .flat_map(|(profile_index, profile)| {
+            let instance = *profile.instance_id().as_bytes();
+            profile
+                .history
+                .iter()
+                .filter(|entry| !matches!(entry.status, WorkspaceHistoryStatus::OutcomeUnknown))
+                .map(move |entry| HistoryRetentionCandidate {
+                    completed_at_unix_ms: entry.completed_at_unix_ms,
+                    instance,
+                    history_id: entry.id,
+                    profile_index,
+                })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|candidate| {
+        (
+            candidate.completed_at_unix_ms,
+            candidate.instance,
+            candidate.history_id,
+        )
+    });
+    candidates
+}
+
+fn apply_history_evictions(
+    profiles: &mut [ProfileWorkspaceSnapshot],
+    candidates: &[HistoryRetentionCandidate],
+    evicted: &mut Vec<HistoryRetentionCandidate>,
+) {
+    let mut selected = HashMap::<usize, HashSet<u64>>::new();
+    for candidate in candidates {
+        selected
+            .entry(candidate.profile_index)
+            .or_default()
+            .insert(candidate.history_id);
+    }
+    for (profile_index, history_ids) in selected {
+        profiles[profile_index]
+            .history
+            .retain(|entry| !history_ids.contains(&entry.id));
+    }
+    evicted.extend_from_slice(candidates);
+}
+
+fn apply_encoded_evictions(
+    profiles: &mut [ProfileEncodedAccounting],
+    candidates: &[HistoryRetentionCandidate],
+) -> Result<(), WorkspaceRetentionError> {
+    for candidate in candidates {
+        let profile = profiles
+            .get_mut(candidate.profile_index)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        profile.remove_history(candidate.history_id)?;
+    }
+    Ok(())
+}
+
+fn minimum_profile_evictions_to_fit(
+    profile: &ProfileEncodedAccounting,
+    candidates: &[HistoryRetentionCandidate],
+    limit: u64,
+) -> Result<usize, WorkspaceRetentionError> {
+    let prefix_sizes = profile_shard_bytes_after_prefixes(profile, candidates)?;
+    minimum_prefix_to_fit(&prefix_sizes, limit).ok_or(WorkspaceRetentionError::RetentionExhausted(
+        WorkspaceRetentionLimit::ProfileShardBytes,
+    ))
+}
+
+fn minimum_total_evictions_to_fit(
+    profiles: &[ProfileEncodedAccounting],
+    candidates: &[HistoryRetentionCandidate],
+    limit: u64,
+) -> Result<usize, WorkspaceRetentionError> {
+    let prefix_sizes = encoded_store_bytes_after_prefixes(profiles, candidates)?;
+    minimum_prefix_to_fit(&prefix_sizes, limit).ok_or(WorkspaceRetentionError::RetentionExhausted(
+        WorkspaceRetentionLimit::TotalStoreBytes,
+    ))
+}
+
+fn minimum_prefix_to_fit(prefix_sizes: &[u64], limit: u64) -> Option<usize> {
+    let index = prefix_sizes.partition_point(|size| *size > limit);
+    (index < prefix_sizes.len()).then_some(index + 1)
+}
+
+fn profile_shard_bytes_after_prefixes(
+    profile: &ProfileEncodedAccounting,
+    candidates: &[HistoryRetentionCandidate],
+) -> Result<Vec<u64>, WorkspaceRetentionError> {
+    let mut removed_json_bytes = 0_u64;
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            removed_json_bytes = removed_json_bytes
+                .checked_add(profile.history_json_bytes(candidate.history_id)?)
+                .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+            profile
+                .encoded_size_after_removals(index + 1, removed_json_bytes)
+                .map(|size| size.shard_bytes)
+        })
+        .collect()
+}
+
+fn conservative_encoded_store_bytes(
+    profiles: &[ProfileEncodedAccounting],
+) -> Result<u64, WorkspaceRetentionError> {
+    profiles.iter().try_fold(0_u64, |total, profile| {
+        total
+            .checked_add(profile.encoded_size()?.committed_bytes)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)
+    })
+}
+
+fn encoded_store_bytes_after_prefixes(
+    profiles: &[ProfileEncodedAccounting],
+    candidates: &[HistoryRetentionCandidate],
+) -> Result<Vec<u64>, WorkspaceRetentionError> {
+    let mut removed_entries = vec![0_usize; profiles.len()];
+    let mut removed_json_bytes = vec![0_u64; profiles.len()];
+    let mut profile_sizes = profiles
+        .iter()
+        .map(ProfileEncodedAccounting::encoded_size)
+        .map(|result| result.map(|size| size.committed_bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut total = profile_sizes.iter().try_fold(0_u64, |total, size| {
+        total
+            .checked_add(*size)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)
+    })?;
+    let mut prefix_sizes = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let profile = profiles
+            .get(candidate.profile_index)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        let entry_bytes = profile.history_json_bytes(candidate.history_id)?;
+        removed_entries[candidate.profile_index] = removed_entries[candidate.profile_index]
+            .checked_add(1)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        removed_json_bytes[candidate.profile_index] = removed_json_bytes[candidate.profile_index]
+            .checked_add(entry_bytes)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        let prior = profile_sizes[candidate.profile_index];
+        let next = profile
+            .encoded_size_after_removals(
+                removed_entries[candidate.profile_index],
+                removed_json_bytes[candidate.profile_index],
+            )?
+            .committed_bytes;
+        total = total
+            .checked_sub(prior)
+            .and_then(|value| value.checked_add(next))
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        profile_sizes[candidate.profile_index] = next;
+        prefix_sizes.push(total);
+    }
+    Ok(prefix_sizes)
+}
+
+fn conservative_encoded_overheads(
+    instance_id: ProfileInstanceId,
+) -> Result<(u64, u64), WorkspaceRetentionError> {
+    let generation = u64::MAX;
+    let shard_probe = WorkspaceShardSizeProbe {
+        schema: SHARD_SCHEMA,
+        instance_id,
+        generation,
+        payload_length: 0,
+        payload_checksum: RETENTION_CHECKSUM_PLACEHOLDER,
+        payload: (),
+    };
+    let shard_probe_bytes = encoded_json_bytes(&shard_probe)?;
+    let shard_fixed_bytes = shard_probe_bytes
+        .checked_sub(decimal_digits(0))
+        .and_then(|value| value.checked_sub(JSON_NULL_BYTES))
+        .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+    let manifest_probe = WorkspaceManifest {
+        schema: MANIFEST_SCHEMA.to_owned(),
+        instance_id,
+        generation,
+        shard: shard_name(generation),
+        shard_length: 0,
+        checksum: RETENTION_CHECKSUM_PLACEHOLDER.to_owned(),
+    };
+    let manifest_fixed_bytes = encoded_json_bytes(&manifest_probe)?
+        .checked_sub(decimal_digits(0))
+        .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+    Ok((shard_fixed_bytes, manifest_fixed_bytes))
+}
+
+fn encoded_json_bytes<T: Serialize>(value: &T) -> Result<u64, WorkspaceRetentionError> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|_| WorkspaceRetentionError::AccountingFailed)?;
+    Ok(counter.bytes)
+}
+
+const fn decimal_digits(mut value: u64) -> u64 {
+    let mut digits = 1_u64;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+#[cfg(test)]
+fn conservative_encoded_profile_size_after_evictions(
+    profile: &ProfileWorkspaceSnapshot,
+    candidates: &[HistoryRetentionCandidate],
+    removal_count: usize,
+) -> Result<ConservativeEncodedProfileSize, WorkspaceRetentionError> {
+    let removed = candidates
+        .iter()
+        .take(removal_count)
+        .map(|candidate| candidate.history_id)
+        .collect::<HashSet<_>>();
+    let mut projected = profile.clone();
+    projected
+        .history
+        .retain(|entry| !removed.contains(&entry.id));
+    conservative_encoded_profile_size(&projected)
+}
+
+#[cfg(test)]
+fn conservative_encoded_projected_store_bytes(
+    profiles: &[ProfileWorkspaceSnapshot],
+    candidates: &[HistoryRetentionCandidate],
+    removal_count: usize,
+) -> Result<u64, WorkspaceRetentionError> {
+    let mut removed = HashMap::<usize, HashSet<u64>>::new();
+    for candidate in candidates.iter().take(removal_count) {
+        removed
+            .entry(candidate.profile_index)
+            .or_default()
+            .insert(candidate.history_id);
+    }
+    profiles
+        .iter()
+        .enumerate()
+        .try_fold(0_u64, |total, (profile_index, profile)| {
+            let size = if let Some(history_ids) = removed.get(&profile_index) {
+                let mut projected = profile.clone();
+                projected
+                    .history
+                    .retain(|entry| !history_ids.contains(&entry.id));
+                conservative_encoded_profile_size(&projected)?
+            } else {
+                conservative_encoded_profile_size(profile)?
+            };
+            total
+                .checked_add(size.committed_bytes)
+                .ok_or(WorkspaceRetentionError::AccountingFailed)
+        })
+}
+
+#[cfg(test)]
+fn conservative_encoded_profile_size(
+    snapshot: &ProfileWorkspaceSnapshot,
+) -> Result<ConservativeEncodedProfileSize, WorkspaceRetentionError> {
+    ProfileEncodedAccounting::new(snapshot)?.encoded_size()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -3440,6 +4022,386 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
+
+    fn retention_history(
+        id: u64,
+        completed_at_unix_ms: i64,
+        status: WorkspaceHistoryStatus,
+        source: &str,
+    ) -> WorkspaceHistoryEntry {
+        WorkspaceHistoryEntry::new(
+            id,
+            source,
+            WorkspaceRunTarget::Current,
+            completed_at_unix_ms,
+            status,
+            1,
+            0,
+            0,
+            false,
+        )
+        .expect("retention history")
+    }
+
+    fn retention_profile(
+        instance_byte: u8,
+        history: Vec<WorkspaceHistoryEntry>,
+    ) -> ProfileWorkspaceSnapshot {
+        ProfileWorkspaceSnapshot::new(
+            ProfileInstanceId::from_bytes([instance_byte; 16]),
+            ProfileId(format!("retention-{instance_byte:02x}")),
+            true,
+            Vec::new(),
+            None,
+            WorkspaceGeometrySnapshot::new(300.0, 0.6, true).expect("retention geometry"),
+            history,
+        )
+        .expect("retention profile")
+    }
+
+    fn unbounded_retention_limits() -> WorkspaceRetentionLimits {
+        WorkspaceRetentionLimits {
+            history_entries_per_profile: usize::MAX,
+            history_entries_total: usize::MAX,
+            profile_shard_bytes: usize::MAX,
+            workspace_store_bytes: u64::MAX,
+        }
+    }
+
+    fn actual_conservative_encoded_profile_size(
+        snapshot: &ProfileWorkspaceSnapshot,
+    ) -> ConservativeEncodedProfileSize {
+        let generation = u64::MAX;
+        let payload = serde_json::to_vec(snapshot).expect("actual payload encoding");
+        let envelope = WorkspaceShard {
+            schema: SHARD_SCHEMA.to_owned(),
+            instance_id: snapshot.instance_id(),
+            generation,
+            payload_length: payload.len() as u64,
+            payload_checksum: checksum(&payload),
+            payload: snapshot.clone(),
+        };
+        let shard = serde_json::to_vec(&envelope).expect("actual shard encoding");
+        let manifest = WorkspaceManifest {
+            schema: MANIFEST_SCHEMA.to_owned(),
+            instance_id: snapshot.instance_id(),
+            generation,
+            shard: shard_name(generation),
+            shard_length: shard.len() as u64,
+            checksum: checksum(&shard),
+        };
+        let manifest = serde_json::to_vec(&manifest).expect("actual manifest encoding");
+        ConservativeEncodedProfileSize {
+            shard_bytes: shard.len() as u64,
+            committed_bytes: (shard.len() + manifest.len()) as u64,
+        }
+    }
+
+    fn actual_conservative_encoded_profile_size_after_evictions(
+        profile: &ProfileWorkspaceSnapshot,
+        candidates: &[HistoryRetentionCandidate],
+        removal_count: usize,
+    ) -> ConservativeEncodedProfileSize {
+        let removed = candidates
+            .iter()
+            .take(removal_count)
+            .map(|candidate| candidate.history_id)
+            .collect::<HashSet<_>>();
+        let mut projected = profile.clone();
+        projected
+            .history
+            .retain(|entry| !removed.contains(&entry.id));
+        actual_conservative_encoded_profile_size(&projected)
+    }
+
+    #[test]
+    fn precomputed_accounting_matches_actual_serde_at_escape_comma_and_digit_boundaries() {
+        let base = retention_profile(
+            0x61,
+            vec![retention_history(
+                1,
+                1,
+                WorkspaceHistoryStatus::Succeeded,
+                "",
+            )],
+        );
+        let base_payload_bytes = serde_json::to_vec(&base)
+            .expect("base payload encoding")
+            .len();
+        assert!(base_payload_bytes < 999);
+        for target_payload_bytes in [999_usize, 1_000, 9_999, 10_000] {
+            let profile = retention_profile(
+                0x61,
+                vec![retention_history(
+                    1,
+                    1,
+                    WorkspaceHistoryStatus::Succeeded,
+                    &"a".repeat(target_payload_bytes - base_payload_bytes),
+                )],
+            );
+            assert_eq!(
+                serde_json::to_vec(&profile)
+                    .expect("boundary payload encoding")
+                    .len(),
+                target_payload_bytes
+            );
+            assert_eq!(
+                ProfileEncodedAccounting::new(&profile)
+                    .expect("boundary accounting")
+                    .encoded_size()
+                    .expect("boundary encoded size"),
+                actual_conservative_encoded_profile_size(&profile)
+            );
+        }
+
+        let escaped = retention_profile(
+            0x62,
+            vec![
+                retention_history(1, 1, WorkspaceHistoryStatus::Succeeded, "\"\\\nfirst"),
+                retention_history(2, 2, WorkspaceHistoryStatus::OutcomeUnknown, "\tprotected"),
+                retention_history(3, 3, WorkspaceHistoryStatus::Cancelled, "\r\nlast"),
+            ],
+        );
+        let accounting = ProfileEncodedAccounting::new(&escaped).expect("escaped accounting");
+        assert_eq!(
+            accounting.encoded_size().expect("escaped encoded size"),
+            actual_conservative_encoded_profile_size(&escaped)
+        );
+        let candidates = history_retention_candidates(std::slice::from_ref(&escaped), Some(0));
+        let prefix_sizes =
+            profile_shard_bytes_after_prefixes(&accounting, &candidates).expect("profile prefixes");
+        for removal_count in 1..=candidates.len() {
+            assert_eq!(
+                prefix_sizes[removal_count - 1],
+                actual_conservative_encoded_profile_size_after_evictions(
+                    &escaped,
+                    &candidates,
+                    removal_count,
+                )
+                .shard_bytes
+            );
+        }
+
+        let profiles = vec![
+            escaped.clone(),
+            retention_profile(
+                0x63,
+                vec![retention_history(
+                    7,
+                    0,
+                    WorkspaceHistoryStatus::Failed(WorkspaceHistoryCode::Backend),
+                    "\\global\noldest",
+                )],
+            ),
+        ];
+        let accounting = profiles
+            .iter()
+            .map(ProfileEncodedAccounting::new)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("total accounting");
+        let candidates = history_retention_candidates(&profiles, None);
+        let prefix_sizes =
+            encoded_store_bytes_after_prefixes(&accounting, &candidates).expect("store prefixes");
+        for removal_count in 1..=candidates.len() {
+            let removed = candidates
+                .iter()
+                .take(removal_count)
+                .map(|candidate| (candidate.profile_index, candidate.history_id))
+                .collect::<HashSet<_>>();
+            let actual_total = profiles
+                .iter()
+                .enumerate()
+                .map(|(profile_index, profile)| {
+                    let mut projected = profile.clone();
+                    projected
+                        .history
+                        .retain(|entry| !removed.contains(&(profile_index, entry.id)));
+                    actual_conservative_encoded_profile_size(&projected).committed_bytes
+                })
+                .sum::<u64>();
+            assert_eq!(prefix_sizes[removal_count - 1], actual_total);
+        }
+
+        let (_, manifest_fixed_bytes) =
+            conservative_encoded_overheads(escaped.instance_id()).expect("manifest overhead");
+        for shard_bytes in [9_u64, 10, 99, 100, 999, 1_000, 9_999, 10_000, u64::MAX] {
+            let manifest = WorkspaceManifest {
+                schema: MANIFEST_SCHEMA.to_owned(),
+                instance_id: escaped.instance_id(),
+                generation: u64::MAX,
+                shard: shard_name(u64::MAX),
+                shard_length: shard_bytes,
+                checksum: RETENTION_CHECKSUM_PLACEHOLDER.to_owned(),
+            };
+            assert_eq!(
+                manifest_fixed_bytes + decimal_digits(shard_bytes),
+                serde_json::to_vec(&manifest)
+                    .expect("manifest digit-boundary encoding")
+                    .len() as u64
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_count_limits_apply_per_profile_and_total_key_order_without_evicting_unknown() {
+        let protected =
+            retention_history(1, -100, WorkspaceHistoryStatus::OutcomeUnknown, "protected");
+        let profiles = vec![
+            retention_profile(
+                0x22,
+                vec![
+                    retention_history(2, 10, WorkspaceHistoryStatus::Succeeded, "later-key"),
+                    protected,
+                    retention_history(3, 30, WorkspaceHistoryStatus::Succeeded, "retained"),
+                ],
+            ),
+            retention_profile(
+                0x11,
+                vec![retention_history(
+                    9,
+                    10,
+                    WorkspaceHistoryStatus::Cancelled,
+                    "earlier-instance-key",
+                )],
+            ),
+        ];
+        let limits = WorkspaceRetentionLimits {
+            history_entries_per_profile: 2,
+            history_entries_total: 2,
+            ..unbounded_retention_limits()
+        };
+
+        let planned =
+            WorkspaceSnapshotSet::plan_with_limits(profiles, limits).expect("tiny count plan");
+
+        assert_eq!(planned.history_evicted(), 2);
+        assert_eq!(
+            planned.history_evictions()[0].instance_id(),
+            ProfileInstanceId::from_bytes([0x11; 16])
+        );
+        assert_eq!(planned.history_evictions()[0].history_id(), 9);
+        assert_eq!(
+            planned.history_evictions()[1].instance_id(),
+            ProfileInstanceId::from_bytes([0x22; 16])
+        );
+        assert_eq!(planned.history_evictions()[1].history_id(), 2);
+        assert!(
+            planned
+                .profiles()
+                .iter()
+                .flat_map(ProfileWorkspaceSnapshot::history)
+                .any(|entry| entry.status() == WorkspaceHistoryStatus::OutcomeUnknown)
+        );
+    }
+
+    #[test]
+    fn tiny_profile_byte_limit_counts_json_escapes_and_evicts_the_minimum_oldest_prefix() {
+        let source = "\n".repeat(512);
+        let profile = retention_profile(
+            0x31,
+            vec![
+                retention_history(1, 1, WorkspaceHistoryStatus::Succeeded, &source),
+                retention_history(2, 2, WorkspaceHistoryStatus::Succeeded, &source),
+                retention_history(3, 3, WorkspaceHistoryStatus::Succeeded, &source),
+            ],
+        );
+        let candidates = history_retention_candidates(std::slice::from_ref(&profile), Some(0));
+        let after_one = conservative_encoded_profile_size_after_evictions(&profile, &candidates, 1)
+            .expect("encoded size after one eviction")
+            .shard_bytes;
+        let initial = conservative_encoded_profile_size(&profile)
+            .expect("initial encoded size")
+            .shard_bytes;
+        assert!(initial > after_one);
+        assert!(
+            initial - after_one > u64::try_from(source.len()).expect("source length"),
+            "escaped newlines occupy more encoded bytes than raw source bytes"
+        );
+        let limits = WorkspaceRetentionLimits {
+            profile_shard_bytes: usize::try_from(after_one).expect("profile shard limit"),
+            ..unbounded_retention_limits()
+        };
+
+        let planned = WorkspaceSnapshotSet::plan_with_limits(vec![profile], limits)
+            .expect("tiny profile-byte plan");
+
+        assert_eq!(planned.history_evicted(), 1);
+        assert_eq!(planned.history_evictions()[0].history_id(), 1);
+        assert_eq!(planned.profiles()[0].history().len(), 2);
+    }
+
+    #[test]
+    fn tiny_total_byte_limit_evicts_the_minimum_global_oldest_prefix() {
+        let profiles = vec![
+            retention_profile(
+                0x42,
+                vec![retention_history(
+                    1,
+                    20,
+                    WorkspaceHistoryStatus::Succeeded,
+                    "newer",
+                )],
+            ),
+            retention_profile(
+                0x41,
+                vec![retention_history(
+                    7,
+                    10,
+                    WorkspaceHistoryStatus::Failed(WorkspaceHistoryCode::Backend),
+                    "older",
+                )],
+            ),
+        ];
+        let candidates = history_retention_candidates(&profiles, None);
+        let after_one = conservative_encoded_projected_store_bytes(&profiles, &candidates, 1)
+            .expect("encoded store size after one eviction");
+        assert!(
+            conservative_encoded_projected_store_bytes(&profiles, &[], 0)
+                .expect("initial encoded store size")
+                > after_one
+        );
+        let limits = WorkspaceRetentionLimits {
+            workspace_store_bytes: after_one,
+            ..unbounded_retention_limits()
+        };
+
+        let planned =
+            WorkspaceSnapshotSet::plan_with_limits(profiles, limits).expect("tiny total-byte plan");
+
+        assert_eq!(planned.history_evicted(), 1);
+        assert_eq!(
+            planned.history_evictions()[0].instance_id(),
+            ProfileInstanceId::from_bytes([0x41; 16])
+        );
+        assert_eq!(planned.history_evictions()[0].history_id(), 7);
+    }
+
+    #[test]
+    fn protected_outcome_unknown_reports_the_exhausted_byte_limit() {
+        let profile = retention_profile(
+            0x51,
+            vec![retention_history(
+                1,
+                1,
+                WorkspaceHistoryStatus::OutcomeUnknown,
+                "protected-private-source",
+            )],
+        );
+        let encoded = conservative_encoded_profile_size(&profile)
+            .expect("protected encoded size")
+            .shard_bytes;
+        let limits = WorkspaceRetentionLimits {
+            profile_shard_bytes: usize::try_from(encoded - 1).expect("protected shard limit"),
+            ..unbounded_retention_limits()
+        };
+
+        assert!(matches!(
+            WorkspaceSnapshotSet::plan_with_limits(vec![profile], limits),
+            Err(WorkspaceRetentionError::RetentionExhausted(
+                WorkspaceRetentionLimit::ProfileShardBytes
+            ))
+        ));
+    }
 
     #[test]
     fn bound_profile_removal_refuses_a_canonical_inode_replacement() {
