@@ -27,7 +27,8 @@ This repository publishes only the Preview channel. It does not publish a stable
 - Browse MySQL schemas, tables/views and columns with bounded pagination, keep the selected object in context and open bounded base-table Data in a new editor tab.
 - Scan/filter Redis keys and inspect bounded type, TTL and value previews, including binary key identity.
 - Run the current selection/statement or a fully preflighted read-only script on one correlated operation and one session. MySQL uses the server prepared protocol and a proven read-only session; Redis admits only the exact bounded read allowlist.
-- Work with multiple session-only editor and result tabs, per-editor results, direct session history, Grid/Record inspection, local filter/sort and closable outputs.
+- Keep multiple SQL editor tabs and searchable execution-history metadata across restart, with bounded private persistence, opt-out and clear controls.
+- Retain ordered per-editor result and typed error tabs during the session, then inspect them in Grid/Record/Value modes with local filter/sort and closable outputs.
 - Keep navigator, editor, results/history and status context visible in the resizable desktop workspace, with accessible collapse/restore controls and a compact fallback.
 - Cancel the active run, inspect bounded result provenance, copy cells/rows and export retained CSV/TSV/JSON without overwriting an existing file.
 - Use headless `check`, `exec`, MySQL catalog browse and Redis browse/inspect commands when a profile is already configured.
@@ -36,16 +37,16 @@ This repository publishes only the Preview channel. It does not publish a stable
 
 The current Preview is useful for bounded inspection and one-off commands, but it is not yet the Daily-driver v1.2 product:
 
-- editor/result tabs and execution-history metadata are session-only; they are not restart-persistent or searchable yet (J2 is first);
+- result/error payload tabs are intentionally session-only and omitted after restart; durable editor state and history metadata are restored;
 - Run all is read-only. There is no typed row-change review or managed Begin/Commit/Rollback UI yet;
 - MySQL scripts whose boundaries depend on the exact session `sql_mode` can be rejected conservatively before execution until mode-aware pre-split is complete;
 - the MySQL explorer opens bounded generated base-table Data but does not provide typed paging/filter/sort or edit rows;
 - there is no CSV import flow or structured Redis core-type mutation;
 - the CLI cannot bootstrap profiles or accept a session credential safely from stdin;
 - secure Keychain credentials and SSH tunnelling are not implemented;
-- the installed J1–J5 evidence required by the v1.2 contract is still pending.
+- J2's exact Preview/xbrew installed proof is pending; installed J1/J3/J4/J5 evidence remains pending.
 
-The Daily-driver v1.2 contract is under independent freeze review:
+The frozen Daily-driver v1.2 contract and current evidence are here:
 
 - [`docs/daily-use/research.md`](docs/daily-use/research.md) — first-party feature research and priority basis;
 - [`docs/daily-use/spec.md`](docs/daily-use/spec.md) — product and safety contract;
