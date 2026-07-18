@@ -14,6 +14,31 @@ fn tracked_source(path: &str) -> String {
         .unwrap_or_else(|_| panic!("missing canonical J2 installed dependency: {path}"))
 }
 
+fn has_bound_author_id(source: &str, id: &str) -> bool {
+    let literal = format!("\"{id}\"");
+    let lines = source.lines().collect::<Vec<_>>();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(&literal))
+        .any(|(line, _)| {
+            let start = line.saturating_sub(8);
+            let end = (line + 9).min(lines.len());
+            lines[start..end].join("\n").contains("author_id")
+        })
+}
+
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start = source
+        .find(start)
+        .unwrap_or_else(|| panic!("source is missing section start `{start}`"));
+    let end = source[start..]
+        .find(end)
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("source is missing section end `{end}`"));
+    &source[start..end]
+}
+
 #[test]
 fn installed_j2_verifier_owns_all_six_exact_acceptance_steps() {
     let verifier = tracked_source("scripts/verify-installed-j2.sh");
@@ -48,9 +73,14 @@ fn installed_j2_verifier_owns_all_six_exact_acceptance_steps() {
         "tab_bound_enforced",
         "shard_bound_enforced",
         "persistence_opt_out_and_clear",
+        "persistence_off_edit_save_disabled_execute",
+        "failed_query_error_retained",
         "private_store_payload_scan_clean",
+        "private_store_payload_scan_pass_count",
         "MAX_PROFILE_SHARD_BYTES=33554432",
         "scripts/scan-private-workspace.py",
+        "workspace-contract",
+        "dbotter.workspace-contract.v1",
     ] {
         assert!(
             verifier.contains(required),
@@ -89,9 +119,15 @@ fn native_j2_driver_emits_only_sanitized_checkpoint_truth() {
         "editor.autocomplete.candidate.",
         "result.mode.grid",
         "result.mode.record",
+        "result.mode.value",
+        "result.value.status",
+        "result.value.content",
         "result.filter",
         "result.sort.0",
         "result.copy.cell",
+        "result.copy.row",
+        "result.error.status",
+        "editor.syntax.status",
         "workspace.persistence.toggle",
         "workspace.persistence.clear",
         "workspace.persistence.clear.confirm",
@@ -122,6 +158,8 @@ fn native_j2_driver_emits_only_sanitized_checkpoint_truth() {
         "history_source_plus_one_omitted",
         "tab_bound_enforced",
         "persistence_opt_out_and_clear",
+        "persistence_off_edit_save_disabled_execute",
+        "failed_query_error_retained",
     ] {
         assert!(
             driver.contains(checkpoint),
@@ -131,6 +169,316 @@ fn native_j2_driver_emits_only_sanitized_checkpoint_truth() {
     assert!(
         driver.contains("dbotter.installed-j2-ax-observations.v1"),
         "native J2 observations need a versioned safe schema"
+    );
+
+    let syntax = source_between(
+        &driver,
+        "private func exerciseSyntaxAndAutocomplete",
+        "private func exerciseTabBound",
+    );
+    assert!(
+        syntax.contains("waitForStatus(") && syntax.contains("\"editor.syntax.status\""),
+        "installed syntax exercise must wait for the rendered syntax status"
+    );
+    let result = source_between(
+        &driver,
+        "private func exerciseResultInspection",
+        "private func inspectHistory",
+    );
+    for identifier in [
+        "result.mode.value",
+        "result.value.status",
+        "result.value.content",
+        "result.copy.row",
+    ] {
+        assert!(
+            result.contains(identifier),
+            "installed result exercise must observe `{identifier}`"
+        );
+    }
+    let failed = source_between(
+        &driver,
+        "try setEditorSource(failedSource",
+        "let exactHistorySource",
+    );
+    assert!(
+        failed.contains("waitForStatus(") && failed.contains("\"result.error.status\""),
+        "failed execution must visibly retain `result.error.status` before history work continues"
+    );
+}
+
+#[test]
+fn production_and_installed_driver_expose_the_remaining_j2_ax_boundaries() {
+    for (path, identifier) in [
+        ("src/ui/editor.rs", "editor.syntax.status"),
+        ("src/ui/result_view.rs", "result.mode.value"),
+        ("src/ui/result_view.rs", "result.value.status"),
+        ("src/ui/result_view.rs", "result.value.content"),
+        ("src/ui/result_view.rs", "result.copy.row"),
+        ("src/ui/app.rs", "result.error.status"),
+    ] {
+        let source = tracked_source(path);
+        assert!(
+            has_bound_author_id(&source, identifier),
+            "production renderer `{path}` must bind J2 AX id `{identifier}`"
+        );
+    }
+}
+
+#[test]
+fn persistence_opt_out_edits_observes_save_disabled_and_executes_before_turning_back_on() {
+    let driver = tracked_source("scripts/native-j2-ax-driver.swift");
+    let body = source_between(
+        &driver,
+        "private func exercisePersistenceOptOutAndClear",
+        "private func exerciseSyntaxAndAutocomplete",
+    );
+    let toggle = "workspace.persistence.toggle";
+    let first_toggle = body
+        .find(toggle)
+        .expect("persistence exercise must switch Off");
+    let second_toggle = body[first_toggle + toggle.len()..]
+        .find(toggle)
+        .map(|offset| first_toggle + toggle.len() + offset)
+        .expect("persistence exercise must eventually switch back On");
+    let off_status = body[first_toggle..]
+        .find("$0.hasPrefix(\"Off\")")
+        .map(|offset| first_toggle + offset)
+        .expect("persistence exercise must visibly observe Off");
+    let edit = body
+        .find("j2_opt_out_private_marker")
+        .expect("persistence exercise must edit a private opt-out marker");
+    let save_disabled = body[edit..second_toggle]
+        .find("\"editor.save\"")
+        .map(|offset| edit + offset)
+        .expect("persistence exercise must observe Save while Off");
+    let save_observation = &body[save_disabled..second_toggle];
+    assert!(
+        save_observation.contains("kAXEnabledAttribute")
+            && save_observation.contains("== false")
+            && !body[edit..second_toggle].contains("press(try single(\"editor.save\""),
+        "`editor.save` must be observed as AX disabled, never pressed, while persistence is Off"
+    );
+    let execute = body[save_disabled..]
+        .find("\"editor.execute\"")
+        .map(|offset| save_disabled + offset)
+        .expect("persistence exercise must execute while Off");
+    assert!(
+        first_toggle < off_status
+            && off_status < edit
+            && edit < save_disabled
+            && save_disabled < execute
+            && execute < second_toggle,
+        "the installed journey must edit, observe Save disabled, and execute while persistence is visibly Off"
+    );
+    assert!(
+        body.contains("j2_clear_private_marker"),
+        "the durable clear exercise needs a distinct private marker"
+    );
+}
+
+#[test]
+fn installed_private_scan_is_final_for_all_markers_and_reports_its_pass_count() {
+    let verifier = tracked_source("scripts/verify-installed-j2.sh");
+    assert_eq!(
+        verifier.matches("\"$scanner\" \\").count(),
+        2,
+        "installed verifier must scan once after the seed save and once after every writer stops"
+    );
+    assert!(
+        verifier.contains("private_store_payload_scan_pass_count=0"),
+        "private scan pass count must start at zero"
+    );
+    assert_eq!(
+        verifier
+            .matches(
+                "private_store_payload_scan_pass_count=$((private_store_payload_scan_pass_count + 1))",
+            )
+            .count(),
+        2,
+        "each successful private scan must increment the pass count exactly once"
+    );
+    let last_workspace_write = verifier
+        .rfind("stop_pid \"$corrupt_pid\"")
+        .expect("installed verifier must stop the last workspace writer");
+    let final_scan = verifier
+        .rfind("\"$scanner\" \\")
+        .expect("installed verifier must run the private scanner");
+    let receipt = verifier
+        .rfind("output_parent=\"$(dirname \"$output\")\"")
+        .expect("installed verifier must assemble a final receipt");
+    assert!(
+        last_workspace_write < final_scan && final_scan < receipt,
+        "the final private scan must run after every installed app writer and before receipt assembly"
+    );
+
+    let final_scan_block = &verifier[final_scan..receipt];
+    for forbidden_env in [
+        "DBOTTER_MYSQL_PASSWORD",
+        "DBOTTER_MYSQL_ROOT_PASSWORD",
+        "DBOTTER_J2_RESULT_SENTINEL",
+        "DBOTTER_J2_OPT_OUT_MARKER",
+        "DBOTTER_J2_CLEAR_MARKER",
+    ] {
+        assert!(
+            final_scan_block.contains(&format!("--forbidden-env {forbidden_env}")),
+            "final private scan must forbid `{forbidden_env}`"
+        );
+    }
+    let scan_pass = final_scan_block
+        .find("private_store_payload_scan_pass_count")
+        .expect("successful final scan must increment its pass count");
+    assert!(
+        scan_pass > final_scan_block.find('\n').unwrap_or_default(),
+        "private scan pass count must be recorded only after the scanner succeeds"
+    );
+    for receipt_token in [
+        "--argjson private_store_payload_scan_pass_count",
+        "payload_scan_pass_count: $private_store_payload_scan_pass_count",
+        ".private_store.payload_scan_pass_count == 2",
+    ] {
+        assert!(
+            verifier.contains(receipt_token),
+            "installed receipt must retain final scan proof `{receipt_token}`"
+        );
+    }
+}
+
+#[test]
+fn installed_exact_executable_runs_the_bounded_workspace_contract_probe() {
+    let verifier = tracked_source("scripts/verify-installed-j2.sh");
+    assert!(
+        verifier.contains("\"$executable\" workspace-contract --format json"),
+        "the exact installed executable must emit the workspace contract JSON"
+    );
+    for required in [
+        "dbotter.workspace-contract.v1",
+        "editor_tabs_per_profile",
+        "editor_tabs_total",
+        "editor_source_bytes",
+        "history_entries_per_profile",
+        "history_entries_total",
+        "history_source_bytes",
+        "profile_shard_bytes",
+        "workspace_store_bytes",
+        "editor_tabs_per_profile_exact",
+        "editor_tabs_per_profile_plus_one_rejected",
+        "editor_tabs_total_exact",
+        "editor_tabs_total_plus_one_rejected",
+        "editor_source_bytes_exact",
+        "editor_source_bytes_plus_one_rejected",
+        "history_entries_per_profile_exact",
+        "history_entries_per_profile_plus_one_rejected",
+        "history_entries_total_exact",
+        "history_entries_total_plus_one_rejected",
+        "history_source_bytes_exact",
+        "history_source_bytes_plus_one_rejected",
+        "profile_shard_bytes_exact",
+        "profile_shard_bytes_plus_one_rejected",
+        "workspace_store_bytes_exact",
+        "workspace_store_bytes_plus_one_rejected",
+    ] {
+        assert!(
+            verifier.contains(required),
+            "installed workspace probe must validate `{required}`"
+        );
+    }
+    for exact_limit in [
+        ".limits.editor_tabs_per_profile == 20",
+        ".limits.editor_tabs_total == 100",
+        ".limits.editor_source_bytes == 262144",
+        ".limits.history_entries_per_profile == 2000",
+        ".limits.history_entries_total == 10000",
+        ".limits.history_source_bytes == 65536",
+        ".limits.profile_shard_bytes == 33554432",
+        ".limits.workspace_store_bytes == 134217728",
+    ] {
+        assert!(
+            verifier.contains(exact_limit),
+            "installed workspace probe must freeze `{exact_limit}`"
+        );
+    }
+}
+
+#[test]
+fn workspace_contract_command_reports_exact_and_plus_one_boundary_probes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_dbotter"))
+        .args(["workspace-contract", "--format", "json"])
+        .output()
+        .expect("run local dbotter workspace-contract probe");
+    assert!(
+        output.status.success(),
+        "workspace-contract command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let contract: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("workspace contract must be JSON");
+    assert_eq!(
+        contract["schema"].as_str(),
+        Some("dbotter.workspace-contract.v1")
+    );
+    let limits = contract["limits"]
+        .as_object()
+        .expect("workspace contract limits object");
+    let probes = contract["probes"]
+        .as_object()
+        .expect("workspace contract probes object");
+    for (limit, exact, expected) in [
+        (
+            "editor_tabs_per_profile",
+            "editor_tabs_per_profile_exact",
+            20_u64,
+        ),
+        ("editor_tabs_total", "editor_tabs_total_exact", 100),
+        ("editor_source_bytes", "editor_source_bytes_exact", 262_144),
+        (
+            "history_entries_per_profile",
+            "history_entries_per_profile_exact",
+            2_000,
+        ),
+        (
+            "history_entries_total",
+            "history_entries_total_exact",
+            10_000,
+        ),
+        ("history_source_bytes", "history_source_bytes_exact", 65_536),
+        (
+            "profile_shard_bytes",
+            "profile_shard_bytes_exact",
+            33_554_432,
+        ),
+        (
+            "workspace_store_bytes",
+            "workspace_store_bytes_exact",
+            134_217_728,
+        ),
+    ] {
+        assert_eq!(
+            limits.get(limit).and_then(serde_json::Value::as_u64),
+            Some(expected),
+            "workspace limit `{limit}` drifted"
+        );
+        assert_eq!(
+            probes.get(exact).and_then(serde_json::Value::as_bool),
+            Some(true),
+            "workspace exact-bound probe `{exact}` did not pass"
+        );
+        let plus_one = format!("{limit}_plus_one_rejected");
+        assert_eq!(
+            probes.get(&plus_one).and_then(serde_json::Value::as_bool),
+            Some(true),
+            "workspace plus-one probe `{plus_one}` did not reject"
+        );
+    }
+    assert_eq!(
+        limits.len(),
+        8,
+        "workspace contract must freeze eight limits"
+    );
+    assert_eq!(
+        probes.len(),
+        16,
+        "workspace contract must freeze exact/+1 proof for every limit"
     );
 }
 

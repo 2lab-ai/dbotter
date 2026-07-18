@@ -190,6 +190,75 @@ fn result_grid_exposes_filter_sort_and_keyboard_record_detail() {
 }
 
 #[test]
+fn result_value_mode_exposes_selected_cell_status_content_and_row_copy() {
+    let context = Context::default();
+    context.enable_accesskit();
+    let mut harness = NativeUiHarness::p7_result();
+    let initial = context.run_ui(RawInput::default(), |ui| harness.show(ui));
+    let initial_update = initial
+        .platform_output
+        .accesskit_update
+        .expect("the native result harness must emit AccessKit");
+    let (value_id, value_mode) = initial_update
+        .nodes
+        .iter()
+        .find_map(|(node_id, node)| {
+            (node.author_id() == Some("result.mode.value")).then_some((*node_id, node))
+        })
+        .expect("result inspection must expose actual AX mode `result.mode.value`");
+    assert_eq!(value_mode.is_selected(), Some(false));
+    assert!(value_mode.supports_action(accesskit::Action::Focus));
+    assert!(value_mode.supports_action(accesskit::Action::Click));
+
+    let mut focus_value = RawInput::default();
+    focus_value
+        .events
+        .push(Event::AccessKitActionRequest(accesskit::ActionRequest {
+            action: accesskit::Action::Focus,
+            target_tree: accesskit::TreeId::ROOT,
+            target_node: value_id,
+            data: None,
+        }));
+    let _ = context.run_ui(focus_value, |ui| harness.show(ui));
+    let value_output = context.run_ui(
+        RawInput {
+            events: vec![Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..RawInput::default()
+        },
+        |ui| harness.show(ui),
+    );
+    let value_update = value_output
+        .platform_output
+        .accesskit_update
+        .expect("value mode must emit AccessKit");
+    let author_node = |author_id: &str| {
+        value_update
+            .nodes
+            .iter()
+            .find_map(|(_, node)| (node.author_id() == Some(author_id)).then_some(node))
+            .unwrap_or_else(|| panic!("missing actual value-mode AX id {author_id}"))
+    };
+    let value_mode = author_node("result.mode.value");
+    assert_eq!(value_mode.is_selected(), Some(true));
+    let status = author_node("result.value.status");
+    assert!(
+        status.value().is_some_and(|value| !value.is_empty()),
+        "value mode must expose a non-empty selected-cell status"
+    );
+    let content = author_node("result.value.content");
+    assert_eq!(content.value(), Some("sample"));
+    let copy_row = author_node("result.copy.row");
+    assert!(!copy_row.is_disabled());
+    assert!(copy_row.supports_action(accesskit::Action::Click));
+}
+
+#[test]
 fn a_new_result_has_one_valid_initial_cell_and_row_selection() {
     let context = Context::default();
     context.enable_accesskit();
