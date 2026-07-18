@@ -440,16 +440,28 @@ fn installed_process_guard_uses_exact_text_vnode_identity() {
 #[test]
 fn installed_process_guard_rejects_a_masked_argv_writer() {
     let directory = tempfile::tempdir().expect("masked-writer tempdir");
+    let source = directory.path().join("masked-writer.c");
     let executable = directory.path().join("dbotter-masked-writer");
-    fs::copy("/bin/sleep", &executable).expect("copy unique masked writer executable");
-    let mut permissions = fs::metadata(&executable)
-        .expect("masked writer metadata")
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&executable, permissions).expect("masked writer executable mode");
+    fs::write(
+        &source,
+        "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+    )
+    .expect("write masked writer source");
+    let compile = Command::new("xcrun")
+        .args(["clang", "-Os"])
+        .arg(&source)
+        .args(["-o"])
+        .arg(&executable)
+        .output()
+        .expect("compile unique masked writer executable");
+    assert!(
+        compile.status.success(),
+        "masked writer compilation failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
 
     let child = Command::new("/bin/bash")
-        .args(["-c", "exec -a j2-masked-writer \"$1\" 30", "--"])
+        .args(["-c", "exec -a j2-masked-writer \"$1\"", "--"])
         .arg(&executable)
         .spawn()
         .expect("launch masked-argv writer");
@@ -671,6 +683,7 @@ fn preview_source_verification_tracks_the_j2_installed_dependencies() {
         "scripts/verify-installed-j2.sh",
         "scripts/native-j2-ax-driver.swift",
         "scripts/build-native-j2-ax-driver.sh",
+        "scripts/exact-executable-process-set.sh",
         "scripts/scan-private-workspace.py",
         "tests/fixtures/installed-j2/compose.yml",
     ] {
@@ -685,6 +698,7 @@ fn preview_source_verification_tracks_the_j2_installed_dependencies() {
         "scripts/verify-installed-j2.sh",
         "scripts/native-j2-ax-driver.swift",
         "scripts/build-native-j2-ax-driver.sh",
+        "scripts/exact-executable-process-set.sh",
     ] {
         assert!(
             release.contains(dependency),

@@ -84,13 +84,14 @@ done
   || fail "DBOTTER_MYSQL_ROOT_PASSWORD does not match the dedicated fixture"
 
 for dependency in \
-  brew codesign docker git jq lsof pgrep plutil python3 shasum stat xcrun; do
+  brew codesign docker git jq lsof plutil python3 shasum stat xcrun; do
   command -v "$dependency" >/dev/null 2>&1 || fail "$dependency is required"
 done
 
 builder="$ROOT/scripts/build-native-j2-ax-driver.sh"
 driver_source="$ROOT/scripts/native-j2-ax-driver.swift"
 scanner="$ROOT/scripts/scan-private-workspace.py"
+process_guard="$ROOT/scripts/exact-executable-process-set.sh"
 fixture_compose="$ROOT/tests/fixtures/installed-j2/compose.yml"
 [[ -x "$builder" && -f "$builder" && ! -L "$builder" ]] \
   || fail "scripts/build-native-j2-ax-driver.sh is unavailable"
@@ -98,10 +99,13 @@ fixture_compose="$ROOT/tests/fixtures/installed-j2/compose.yml"
   || fail "scripts/native-j2-ax-driver.swift is unavailable"
 [[ -x "$scanner" && -f "$scanner" && ! -L "$scanner" ]] \
   || fail "scripts/scan-private-workspace.py is unavailable"
+[[ -x "$process_guard" && -f "$process_guard" && ! -L "$process_guard" ]] \
+  || fail "scripts/exact-executable-process-set.sh is unavailable"
 [[ -f "$fixture_compose" && ! -L "$fixture_compose" ]] \
   || fail "installed J2 fixture compose is unavailable"
 git -C "$ROOT" ls-files --error-unmatch \
   scripts/build-native-j2-ax-driver.sh \
+  scripts/exact-executable-process-set.sh \
   scripts/native-j2-ax-driver.swift \
   scripts/scan-private-workspace.py \
   tests/fixtures/installed-j2/compose.yml >/dev/null 2>&1 \
@@ -139,6 +143,7 @@ expected_executable_sha256="$(
 actual_executable_sha256="$(shasum -a 256 "$executable" | awk '{print $1}')"
 [[ "$actual_executable_sha256" == "$expected_executable_sha256" ]] \
   || fail "installed executable hash does not match the Preview manifest"
+expected_executable_device_inode="$(stat -f '%d:%i' "$executable")"
 
 config_realpath="$(python3 - "$config" <<'PY'
 import os
@@ -265,9 +270,8 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-if pgrep -f "$executable" >/dev/null 2>&1; then
-  fail "stale exact installed-app process exists"
-fi
+"$process_guard" --assert-empty "$executable" \
+  || fail "stale exact installed-app process exists"
 
 "$builder" --output "$driver"
 [[ -f "$driver" && ! -L "$driver" && -x "$driver" ]] \
@@ -572,11 +576,13 @@ kill -0 "$restart_pid" >/dev/null 2>&1 \
 stop_pid "$restart_pid"
 restart_pid=""
 for _ in {1..100}; do
-  pgrep -f "$executable" >/dev/null 2>&1 || break
+  "$process_guard" --assert-empty "$executable" >/dev/null 2>&1 && break
   sleep 0.1
 done
-pgrep -f "$executable" >/dev/null 2>&1 \
-  && fail "writer process set did not close before corruption fixture"
+[[ "$(stat -f '%d:%i' "$executable")" == "$expected_executable_device_inode" ]] \
+  || fail "installed executable identity changed before the corruption fixture"
+"$process_guard" --assert-empty "$executable" \
+  || fail "writer process set did not close before corruption fixture"
 
 primary_shard_name="$(jq -r '.shard' "$primary_manifest")"
 primary_shard="$primary_profile_directory/$primary_shard_name"
@@ -616,8 +622,10 @@ healthy_profile_remains_usable=true
 
 stop_pid "$corrupt_pid"
 corrupt_pid=""
-pgrep -f "$executable" >/dev/null 2>&1 \
-  && fail "installed executable process set was not empty before the final scan"
+[[ "$(stat -f '%d:%i' "$executable")" == "$expected_executable_device_inode" ]] \
+  || fail "installed executable identity changed before the final scan"
+"$process_guard" --assert-empty "$executable" \
+  || fail "installed executable process set was not empty before the final scan"
 
 "$scanner" \
   --root "$workspace_root" \
