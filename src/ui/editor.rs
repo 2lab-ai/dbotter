@@ -2064,7 +2064,7 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.display.starts_with("Account_"))
         );
-        let debug = format!("{:?}", &candidates[0]);
+        let debug = format!("{:?}", candidates[0]);
         assert!(!debug.contains("Account_00"));
         assert!(debug.contains("<redacted>"));
 

@@ -4149,6 +4149,15 @@ where
         .map_err(|_| WorkspaceStoreError::UnsafePath)
 }
 
+fn normalize_stat_value<T, U>(value: T) -> Result<U, WorkspaceStoreError>
+where
+    T: TryInto<U>,
+{
+    value
+        .try_into()
+        .map_err(|_| WorkspaceStoreError::UnsafePath)
+}
+
 fn private_file_fingerprint(
     stat: &rustix::fs::Stat,
 ) -> Result<PrivateFileFingerprint, WorkspaceStoreError> {
@@ -4156,13 +4165,10 @@ fn private_file_fingerprint(
         return Err(WorkspaceStoreError::UnsafePath);
     }
     Ok(PrivateFileFingerprint {
-        device: stat
-            .st_dev
-            .try_into()
-            .map_err(|_| WorkspaceStoreError::UnsafePath)?,
+        device: normalize_stat_value(stat.st_dev)?,
         inode: stat.st_ino,
-        mode: stat.st_mode.into(),
-        links: stat.st_nlink.into(),
+        mode: normalize_stat_value(stat.st_mode)?,
+        links: normalize_stat_value(stat.st_nlink)?,
         length: stat
             .st_size
             .try_into()
@@ -4470,10 +4476,7 @@ fn managed_entry_identity(
         ManagedEntryKind::Other
     };
     Ok(ManagedEntryIdentity {
-        device: stat
-            .st_dev
-            .try_into()
-            .map_err(|_| WorkspaceStoreError::UnsafePath)?,
+        device: normalize_stat_value(stat.st_dev)?,
         inode: stat.st_ino,
         kind,
     })
