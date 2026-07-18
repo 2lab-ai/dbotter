@@ -40,22 +40,25 @@ fn every_production_ast_region_has_no_panicking_placeholder_or_legacy_upsert() {
 fn workspace_fingerprint_normalizes_platform_nanoseconds_with_checked_conversion() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace = fs::read_to_string(root.join("src/workspace.rs")).expect("workspace source");
-    let fingerprint = workspace
-        .split_once("fn private_file_fingerprint(")
-        .map(|(_, source)| source)
-        .and_then(|source| source.split_once("fn create_private_temp_at("))
-        .map(|(source, _)| source)
-        .expect("private file fingerprint source");
+    let compact = workspace
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
 
     for field in ["st_mtime_nsec", "st_ctime_nsec"] {
-        let checked_conversion = format!(
-            "stat.{field}\n            .try_into()\n            .map_err(|_| WorkspaceStoreError::UnsafePath)?"
-        );
+        let checked_conversion = format!("normalize_stat_nanoseconds(stat.{field})?");
         assert!(
-            fingerprint.contains(&checked_conversion),
+            compact.contains(&checked_conversion),
             "{field} differs across Unix targets and must be normalized without truncation"
         );
     }
+    assert!(
+        compact.contains(
+            "fnnormalize_stat_nanoseconds<T>(value:T)->Result<i64,WorkspaceStoreError>\
+             whereT:TryInto<i64>,{value.try_into().map_err(|_|WorkspaceStoreError::UnsafePath)}"
+        ),
+        "platform stat nanoseconds must use one generic checked conversion"
+    );
 }
 
 #[test]

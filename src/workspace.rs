@@ -4140,6 +4140,15 @@ fn optional_private_file_fingerprint_at(
     private_file_fingerprint(&stat).map(Some)
 }
 
+fn normalize_stat_nanoseconds<T>(value: T) -> Result<i64, WorkspaceStoreError>
+where
+    T: TryInto<i64>,
+{
+    value
+        .try_into()
+        .map_err(|_| WorkspaceStoreError::UnsafePath)
+}
+
 fn private_file_fingerprint(
     stat: &rustix::fs::Stat,
 ) -> Result<PrivateFileFingerprint, WorkspaceStoreError> {
@@ -4159,9 +4168,9 @@ fn private_file_fingerprint(
             .try_into()
             .map_err(|_| WorkspaceStoreError::UnsafePath)?,
         modified_seconds: stat.st_mtime,
-        modified_nanoseconds: stat.st_mtime_nsec,
+        modified_nanoseconds: normalize_stat_nanoseconds(stat.st_mtime_nsec)?,
         changed_seconds: stat.st_ctime,
-        changed_nanoseconds: stat.st_ctime_nsec,
+        changed_nanoseconds: normalize_stat_nanoseconds(stat.st_ctime_nsec)?,
     })
 }
 
