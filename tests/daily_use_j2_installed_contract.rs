@@ -749,6 +749,10 @@ fn installed_fixture_and_private_scanner_are_fail_closed_and_consumed() {
             "installed fixture is missing isolation token `{required}`"
         );
     }
+    assert!(
+        !compose.contains("MYSQL_PWD:"),
+        "installed fixture must not leak an application client password into MySQL entrypoint initialization"
+    );
 
     let scanner = tracked_source("scripts/scan-private-workspace.py");
     for required in [
