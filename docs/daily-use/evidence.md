@@ -12,7 +12,7 @@ without credentials, query values, keys, cell values or imported/exported data.
 
 | Journey | RED commit | GREEN commit(s) | Local/live/native evidence | Preview/xbrew/installed evidence | Status |
 |---|---|---|---|---|---|
-| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` through `6ade3eff0b370c1c3475311fc52dd38724ad54e0`; CI portability REDs `b689d352b1295ab42c56b28ee52eaee2e382aa1a`, `819a7c7d7878a793b127180992f0e55dd242565f` and `1fe4afdbabc80bd72e5985df9434030017fba213`; earlier exact ancestry retained at `03d8127` | `d674aa6984f2ceace1edd834eba5c0be7ca5797e` through `a66352b58e4183e4a98e3e1cbcf8caa13486bb6b`; ordered errors `4e21cb0098dbf076a3687a6371b23de6c1508fdb`; exact writer guard `b485f7b450ebb43c0b8bd837cd6a276ee0c0c906`; Unix stat portability `215b7386fdecce5b0b88ecf31dcf5aabe185b910` and `4da2f908610f760e2be139f1d8c6d9f1e453c8d4`; cross-target installed test `4a18a0541e387025c5749bbd992e1939086f633b` | See J2 local GREEN checkpoint below | — | local GREEN |
+| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` through `6ade3eff0b370c1c3475311fc52dd38724ad54e0`; CI portability REDs `b689d352b1295ab42c56b28ee52eaee2e382aa1a`, `819a7c7d7878a793b127180992f0e55dd242565f` and `1fe4afdbabc80bd72e5985df9434030017fba213`; installed fixture RED `ac93ab18bb788cca14ab9d4226332e8301d5b202`; earlier exact ancestry retained at `03d8127` | `d674aa6984f2ceace1edd834eba5c0be7ca5797e` through `a66352b58e4183e4a98e3e1cbcf8caa13486bb6b`; ordered errors `4e21cb0098dbf076a3687a6371b23de6c1508fdb`; exact writer guard `b485f7b450ebb43c0b8bd837cd6a276ee0c0c906`; Unix stat portability `215b7386fdecce5b0b88ecf31dcf5aabe185b910` and `4da2f908610f760e2be139f1d8c6d9f1e453c8d4`; cross-target installed test `4a18a0541e387025c5749bbd992e1939086f633b`; isolated MySQL entrypoint `577d70d860a9d0d6b7cb4f2a382a2819b2bd7fae` | See J2 local GREEN checkpoint below | — | local GREEN |
 | J1 secure MySQL connection/Data | — | — | — | — | not started |
 | J3 safe typed MySQL row edit | — | — | — | — | not started |
 | J4 bounded export/CSV import | — | — | — | — | not started |
@@ -20,7 +20,7 @@ without credentials, query values, keys, cell values or imported/exported data.
 
 ## J2 local GREEN checkpoint
 
-- Fixed implementation SHA: `4a18a0541e387025c5749bbd992e1939086f633b`;
+- Fixed implementation SHA: `577d70d860a9d0d6b7cb4f2a382a2819b2bd7fae`;
   clean tree and upstream divergence `0/0`.
 - `just check` and `just check-all` pass. The all-feature run includes library
   254/254, installed J2 14/14, workspace model 8/8, renderer 10/10, store 34/34,
@@ -48,11 +48,23 @@ without credentials, query values, keys, cell values or imported/exported data.
   GREEN `4a18a0541e387025c5749bbd992e1939086f633b` fully qualifies the macOS-only
   dependencies and passes both full local gate families plus read-only Linux
   arm64 Rust 1.97.1 all-target/all-feature Clippy with warnings denied.
+- Preview run `29638136623` fixed exact source
+  `cf156534076f4c7ec55a254a3c7d3cff1d799d08` and passed its GitHub hermetic
+  job in 14m36s. It was deliberately canceled before publication after the
+  canonical installed Compose failed locally: `MYSQL_PWD=dbotter-local-only`
+  contaminated MySQL entrypoint root initialization and produced an
+  authentication failure. RED
+  `ac93ab18bb788cca14ab9d4226332e8301d5b202` captures the forbidden
+  entrypoint environment; GREEN
+  `577d70d860a9d0d6b7cb4f2a382a2819b2bd7fae` removes only that redundant
+  variable. The exact `mysql:8.4` fixture then reached healthy and reported
+  MySQL `8.4.10` with general logging enabled to `TABLE`; both full local gate
+  families pass at the GREEN SHA.
 - Independent fixed-hash reviews are Critical 0 / High 0 for both the installed
   writer guard and all three CI portability fixes, with no review-time source
-  changes. All three failed Preview runs stopped before publication; tap, xbrew
-  installation and the complete installed black-box journey remain pending
-  before `verified`.
+  changes. All three failed Preview runs and the deliberately canceled fourth
+  run stopped before publication; tap, xbrew installation and the complete
+  installed black-box journey remain pending before `verified`.
 
 ## Status transition
 
