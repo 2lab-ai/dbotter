@@ -62,6 +62,38 @@ fn workspace_fingerprint_normalizes_platform_nanoseconds_with_checked_conversion
 }
 
 #[test]
+fn workspace_fingerprint_normalizes_all_platform_varying_stat_fields() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = fs::read_to_string(root.join("src/workspace.rs")).expect("workspace source");
+    let compact = workspace
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+
+    for (field, expected_calls) in [("st_dev", 2), ("st_mode", 1), ("st_nlink", 1)] {
+        let checked_conversion = format!("normalize_stat_value(stat.{field})?");
+        assert_eq!(
+            compact.matches(&checked_conversion).count(),
+            expected_calls,
+            "{field} differs across Unix targets and must use the generic checked normalizer"
+        );
+    }
+    assert!(
+        compact.contains(
+            "fnnormalize_stat_value<T,U>(value:T)->Result<U,WorkspaceStoreError>\
+             whereT:TryInto<U>,{value.try_into().map_err(|_|WorkspaceStoreError::UnsafePath)}"
+        ),
+        "platform stat fields must share one generic checked conversion"
+    );
+
+    let editor = fs::read_to_string(root.join("src/ui/editor.rs")).expect("editor source");
+    assert!(
+        !editor.contains("format!(\"{:?}\", &candidates[0])"),
+        "the contract test must compile cleanly under the Preview Rust toolchain"
+    );
+}
+
+#[test]
 fn p2_controller_identity_and_secret_boundaries_are_structural() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let service = fs::read_to_string(root.join("src/service.rs")).expect("service source");
