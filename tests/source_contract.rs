@@ -37,6 +37,28 @@ fn every_production_ast_region_has_no_panicking_placeholder_or_legacy_upsert() {
 }
 
 #[test]
+fn workspace_fingerprint_normalizes_platform_nanoseconds_with_checked_conversion() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = fs::read_to_string(root.join("src/workspace.rs")).expect("workspace source");
+    let fingerprint = workspace
+        .split_once("fn private_file_fingerprint(")
+        .map(|(_, source)| source)
+        .and_then(|source| source.split_once("fn create_private_temp_at("))
+        .map(|(source, _)| source)
+        .expect("private file fingerprint source");
+
+    for field in ["st_mtime_nsec", "st_ctime_nsec"] {
+        let checked_conversion = format!(
+            "stat.{field}\n            .try_into()\n            .map_err(|_| WorkspaceStoreError::UnsafePath)?"
+        );
+        assert!(
+            fingerprint.contains(&checked_conversion),
+            "{field} differs across Unix targets and must be normalized without truncation"
+        );
+    }
+}
+
+#[test]
 fn p2_controller_identity_and_secret_boundaries_are_structural() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let service = fs::read_to_string(root.join("src/service.rs")).expect("service source");
