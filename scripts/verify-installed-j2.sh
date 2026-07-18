@@ -331,7 +331,7 @@ kill -0 "$restart_pid" >/dev/null 2>&1 || fail "restart Preview PID exited"
 
 mysql_count() {
   mysql_root_exec \
-    "SELECT COUNT(*) FROM mysql.general_log WHERE command_type = 'Query' AND argument = 'SELECT 42 AS j2_second'"
+    "SELECT COUNT(*) FROM mysql.general_log WHERE command_type = 'Execute' AND argument = 'SELECT 42 AS j2_second'"
 }
 
 zero_dispatch_before="$(mysql_count)"
@@ -426,7 +426,7 @@ corrupt_profile_quarantined=true
 
 healthy_query_count="$(
   mysql_root_exec \
-    "SELECT COUNT(*) FROM mysql.general_log WHERE command_type = 'Query' AND argument = 'SELECT 84 AS j2_healthy'"
+    "SELECT COUNT(*) FROM mysql.general_log WHERE command_type = 'Execute' AND argument = 'SELECT 84 AS j2_healthy'"
 )"
 [[ "$healthy_query_count" =~ ^[1-9][0-9]*$ ]] \
   || fail "healthy profile produced no independent server observation"

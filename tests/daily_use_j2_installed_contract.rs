@@ -42,9 +42,7 @@ fn installed_j2_verifier_owns_all_six_exact_acceptance_steps() {
         );
     }
     assert!(
-        !verifier.contains(
-            "command_type = 'Query' AND argument = 'SELECT 42 AS j2_second'"
-        ),
+        !verifier.contains("command_type = 'Query' AND argument = 'SELECT 42 AS j2_second'"),
         "prepared MySQL execution must be counted from Execute rows, not text Query rows"
     );
 }

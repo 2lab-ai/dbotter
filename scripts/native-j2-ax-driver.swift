@@ -332,6 +332,19 @@ private func prefixRecords(
         .sorted { lhs, rhs in orderBefore(lhs.1.order, rhs.1.order) }
 }
 
+private func editorTabIdentifiers(application: AXUIElement) -> Set<String> {
+    let prefix = "editor.tab."
+    return Set(
+        prefixRecords(prefix, application: application).compactMap { identifier, _ in
+            let suffix = identifier.dropFirst(prefix.count)
+            guard !suffix.isEmpty, suffix.allSatisfy(\.isNumber) else {
+                return nil
+            }
+            return identifier
+        }
+    )
+}
+
 private func orderBefore(_ lhs: [Int], _ rhs: [Int]) -> Bool {
     for index in 0 ..< min(lhs.count, rhs.count) {
         if lhs[index] != rhs[index] {
@@ -743,21 +756,26 @@ private func runHistoryOpen(_ options: Options) throws {
     }), let entry = prefixRecords("history.entry.", application: application).first else {
         throw fail("searchable history entry was not observed")
     }
+    let tabIdentifiersBefore = editorTabIdentifiers(application: application)
     try press(entry.1)
     guard waitUntil(timeout: 15, {
-        prefixRecords("editor.tab.", application: application)
-            .filter { !$0.0.hasPrefix("editor.tab.close.") }.count >= 3
+        let tabIdentifiersAfter = editorTabIdentifiers(application: application)
+        return tabIdentifiersAfter.count == tabIdentifiersBefore.count + 1
+            && tabIdentifiersAfter.isSuperset(of: tabIdentifiersBefore)
             && statusValue("status.operation", application: application)?
                 .contains("Run remains explicit") == true
     }) else {
         throw fail("history did not open as a new zero-run editor")
     }
+    let tabIdentifiersAfter = editorTabIdentifiers(application: application)
     let openedSource = stringAttribute(
         try single("editor.input", application: application).element,
         kAXValueAttribute as CFString
     )
     let historyOpenedWithoutRun =
-        openedSource == secondSource
+        tabIdentifiersAfter.count == tabIdentifiersBefore.count + 1
+        && tabIdentifiersAfter.isSuperset(of: tabIdentifiersBefore)
+        && openedSource == secondSource
         && optionalSingle("editor.pending", application: application) == nil
         && prefixRecords("result.output.", application: application).isEmpty
     guard historyOpenedWithoutRun else {
