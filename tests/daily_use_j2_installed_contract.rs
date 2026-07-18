@@ -674,6 +674,24 @@ fn j2_driver_builder_is_reproducible_and_source_bound() {
 }
 
 #[test]
+fn installed_j2_verifier_source_binds_an_opt_in_stable_ax_driver() {
+    let verifier = tracked_source("scripts/verify-installed-j2.sh");
+    for required in [
+        "DBOTTER_J2_AX_DRIVER_PATH",
+        "driver_candidate=\"$temporary/native-j2-ax-driver\"",
+        "\"$builder\" --output \"$driver_candidate\"",
+        "cmp -s -- \"$driver_candidate\" \"$driver\"",
+        "stable J2 AX driver must resolve under TMPDIR",
+        "stable J2 AX driver does not match the exact source build",
+    ] {
+        assert!(
+            verifier.contains(required),
+            "installed verifier is missing stable AX source-binding token `{required}`"
+        );
+    }
+}
+
+#[test]
 fn preview_source_verification_tracks_the_j2_installed_dependencies() {
     let hermetic = tracked_source("scripts/verify-hermetic.sh");
     for dependency in [
