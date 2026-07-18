@@ -12,7 +12,7 @@ without credentials, query values, keys, cell values or imported/exported data.
 
 | Journey | RED commit | GREEN commit(s) | Local/live/native evidence | Preview/xbrew/installed evidence | Status |
 |---|---|---|---|---|---|
-| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` through `6ade3eff0b370c1c3475311fc52dd38724ad54e0`; CI portability REDs `b689d352b1295ab42c56b28ee52eaee2e382aa1a`, `819a7c7d7878a793b127180992f0e55dd242565f` and `1fe4afdbabc80bd72e5985df9434030017fba213`; installed fixture RED `ac93ab18bb788cca14ab9d4226332e8301d5b202`; earlier exact ancestry retained at `03d8127` | `d674aa6984f2ceace1edd834eba5c0be7ca5797e` through `a66352b58e4183e4a98e3e1cbcf8caa13486bb6b`; ordered errors `4e21cb0098dbf076a3687a6371b23de6c1508fdb`; exact writer guard `b485f7b450ebb43c0b8bd837cd6a276ee0c0c906`; Unix stat portability `215b7386fdecce5b0b88ecf31dcf5aabe185b910` and `4da2f908610f760e2be139f1d8c6d9f1e453c8d4`; cross-target installed test `4a18a0541e387025c5749bbd992e1939086f633b`; isolated MySQL entrypoint `577d70d860a9d0d6b7cb4f2a382a2819b2bd7fae` | See J2 local GREEN checkpoint below | — | local GREEN |
+| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` through `6ade3eff0b370c1c3475311fc52dd38724ad54e0`; CI portability REDs `b689d352b1295ab42c56b28ee52eaee2e382aa1a`, `819a7c7d7878a793b127180992f0e55dd242565f` and `1fe4afdbabc80bd72e5985df9434030017fba213`; installed-fixture REDs `ac93ab18bb788cca14ab9d4226332e8301d5b202` and `88e20761a5c9f9cb7d07eee52c4d09a00c2851c6`; stable-AX RED `6533ca8d174d8b6a1af88787698e2a9872bdbd68`; earlier exact ancestry retained at `03d8127` | `d674aa6984f2ceace1edd834eba5c0be7ca5797e` through `a66352b58e4183e4a98e3e1cbcf8caa13486bb6b`; ordered errors `4e21cb0098dbf076a3687a6371b23de6c1508fdb`; exact writer guard `b485f7b450ebb43c0b8bd837cd6a276ee0c0c906`; Unix stat portability `215b7386fdecce5b0b88ecf31dcf5aabe185b910` and `4da2f908610f760e2be139f1d8c6d9f1e453c8d4`; cross-target installed test `4a18a0541e387025c5749bbd992e1939086f633b`; isolated MySQL entrypoint `577d70d860a9d0d6b7cb4f2a382a2819b2bd7fae`; inspectable tmpfs `1fc60773882b44912d91f29d013b3d86fad2380e`; source-bound stable AX `59eb274767d7d9b064a362b1087b5e7b96b544a5` | See J2 local GREEN and repair-forward checkpoints below | Preview `29639223586` / `7bfae29d4e7094a66d4dd5462504618db6778470` and xbrew installation passed exact identity; installed six-step receipt is absent and a higher repair-forward Preview is required | local GREEN |
 | J1 secure MySQL connection/Data | — | — | — | — | not started |
 | J3 safe typed MySQL row edit | — | — | — | — | not started |
 | J4 bounded export/CSV import | — | — | — | — | not started |
@@ -62,9 +62,47 @@ without credentials, query values, keys, cell values or imported/exported data.
   families pass at the GREEN SHA.
 - Independent fixed-hash reviews are Critical 0 / High 0 for both the installed
   writer guard and all three CI portability fixes, with no review-time source
-  changes. All three failed Preview runs and the deliberately canceled fourth
-  run stopped before publication; tap, xbrew installation and the complete
-  installed black-box journey remain pending before `verified`.
+  changes. The three failed Preview runs and deliberately canceled fourth run
+  all stopped before publication.
+
+## J2 Preview/install and repair-forward checkpoint
+
+- Preview run `29639223586` fixed source
+  `7bfae29d4e7094a66d4dd5462504618db6778470` and completed hermetic,
+  macOS-package, live, all four target builds, publish and tap successfully.
+  Its replacement-fenced prerelease is
+  `preview-2026-07-18-094835-29639223586-1-7bfae29d4e70`, version
+  `2026.07.18.094835.29639223586.1`, with manifest SHA-256
+  `fb66e38353ba676153ab67357a5b227ba4a61559a44d4002468d561d3155e80e`.
+- Tap proof binds formula commit
+  `6509182a270184c2c7032e6b319a1e3f54819208`, formula blob
+  `c9d4f41aab5056ac9bbb5c231bc64635ff24aac2` and tap run
+  `29640160981` to that tag, version, source and manifest.
+- xbrew installed `2lab-ai/tap/dbotter-preview` version
+  `2026.07.18.094835.29639223586.1`. The linked app is signed, has bundle ID
+  `ai.2lab.dbotter.preview`, declares `dbotter.icns`, and its host-arm64
+  executable SHA-256 is
+  `0689e17d166a24550ff8192656d9d3d6ac6c0d21b3bedd70e35bf077ef8c998d`,
+  exactly matching the manifest.
+- The installed six-step verifier produced no receipt. Its first preflight
+  exposed that Compose short-form `tmpfs:` did not appear in Docker's
+  inspectable `.Mounts[]` identity. RED
+  `88e20761a5c9f9cb7d07eee52c4d09a00c2851c6` freezes the required mount and
+  GREEN `1fc60773882b44912d91f29d013b3d86fad2380e` uses long-form `type: tmpfs`.
+  The canonical fixture now reports healthy MySQL `8.4.10`, general log
+  `TABLE`, exact loopback port `33316` and `/var/lib/mysql` as a tmpfs mount.
+- The next preflight reached the native driver and stopped with macOS
+  Accessibility permission required. The old verifier built that executable
+  under a new `mktemp` directory on every run. RED
+  `6533ca8d174d8b6a1af88787698e2a9872bdbd68` requires an opt-in stable path;
+  GREEN `59eb274767d7d9b064a362b1087b5e7b96b544a5` accepts it only under
+  `TMPDIR`, only with safe ownership/mode, and only when `cmp` matches a fresh
+  exact-source build. The focused installed-contract suite passes 15/15, plus
+  `bash -n`, source-following ShellCheck and `git diff --check`.
+- Both repairs postdate the published Preview, so the installed
+  `7bfae29d4e70` binary cannot complete the final acceptance. J2 remains
+  `local GREEN` until a higher exact Preview, xbrew update, the complete
+  six-step receipt and independent file/MySQL readback all pass.
 
 ## Status transition
 
