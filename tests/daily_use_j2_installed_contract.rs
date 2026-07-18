@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+use std::thread;
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -37,6 +39,17 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         .map(|offset| start + offset)
         .unwrap_or_else(|| panic!("source is missing section end `{end}`"));
     &source[start..end]
+}
+
+#[cfg(target_os = "macos")]
+struct ChildProcessGuard(Child);
+
+#[cfg(target_os = "macos")]
+impl Drop for ChildProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[test]
@@ -80,6 +93,7 @@ fn installed_j2_verifier_owns_all_six_exact_acceptance_steps() {
         "private_store_payload_scan_pass_count",
         "MAX_PROFILE_SHARD_BYTES=33554432",
         "scripts/scan-private-workspace.py",
+        "scripts/exact-executable-process-set.sh",
         "workspace-contract",
         "dbotter.workspace-contract.v1",
     ] {
@@ -392,10 +406,102 @@ fn installed_private_scan_requires_the_last_writer_to_be_confirmed_dead() {
         .expect("installed verifier must run the final private scan");
     let between_stop_and_scan = &verifier[final_stop..final_scan];
     assert!(
-        between_stop_and_scan.contains("pgrep -f \"$executable\"")
+        between_stop_and_scan.contains("\"$process_guard\" --assert-empty \"$executable\"")
             && between_stop_and_scan.contains("fail "),
-        "the exact installed executable process set must be empty immediately before the final scan"
+        "the text-vnode exact installed executable process set must be empty immediately before the final scan"
     );
+    assert!(
+        !verifier.contains("pgrep -f"),
+        "argv-regex process discovery may not guard installed writer shutdown"
+    );
+}
+
+#[test]
+fn installed_process_guard_uses_exact_text_vnode_identity() {
+    let guard = tracked_source("scripts/exact-executable-process-set.sh");
+    for required in [
+        "set -euo pipefail",
+        "--assert-empty",
+        "lsof -a -d txt -Fp \"$executable\"",
+        "exact executable process set is not empty",
+    ] {
+        assert!(
+            guard.contains(required),
+            "exact installed process guard is missing `{required}`"
+        );
+    }
+    assert!(
+        !guard.contains("pgrep"),
+        "exact installed process identity may not depend on argv matching"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn installed_process_guard_rejects_a_masked_argv_writer() {
+    let directory = tempfile::tempdir().expect("masked-writer tempdir");
+    let executable = directory.path().join("dbotter-masked-writer");
+    fs::copy("/bin/sleep", &executable).expect("copy unique masked writer executable");
+    let mut permissions = fs::metadata(&executable)
+        .expect("masked writer metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&executable, permissions).expect("masked writer executable mode");
+
+    let child = Command::new("/bin/bash")
+        .args(["-c", "exec -a j2-masked-writer \"$1\" 30", "--"])
+        .arg(&executable)
+        .spawn()
+        .expect("launch masked-argv writer");
+    let mut child = ChildProcessGuard(child);
+    let pid = child.0.id();
+    let mut masked = false;
+    for _ in 0..50 {
+        let ps = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .expect("inspect masked writer argv");
+        let command = String::from_utf8_lossy(&ps.stdout);
+        if command.contains("j2-masked-writer")
+            && !command.contains(executable.as_os_str().to_string_lossy().as_ref())
+        {
+            masked = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        masked,
+        "writer argv was not masked before the process-set probe"
+    );
+
+    let old_probe = Command::new("pgrep")
+        .args(["-f", executable.as_os_str().to_string_lossy().as_ref()])
+        .output()
+        .expect("run the superseded argv-regex probe");
+    let old_probe_pids = String::from_utf8_lossy(&old_probe.stdout);
+    assert!(
+        !old_probe_pids.lines().any(|line| line == pid.to_string()),
+        "the regression fixture must demonstrate that pgrep -f misses the masked writer"
+    );
+
+    let guard = Command::new(repository_path("scripts/exact-executable-process-set.sh"))
+        .args(["--assert-empty"])
+        .arg(&executable)
+        .output()
+        .expect("run exact executable process guard");
+    assert!(
+        !guard.status.success(),
+        "a masked-argv writer must block the final installed receipt"
+    );
+    assert!(
+        String::from_utf8_lossy(&guard.stderr)
+            .contains("exact executable process set is not empty"),
+        "the exact guard must fail closed for the masked writer"
+    );
+
+    child.0.kill().expect("stop masked writer");
+    child.0.wait().expect("reap masked writer");
 }
 
 #[test]
