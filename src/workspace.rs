@@ -1653,6 +1653,18 @@ impl std::fmt::Debug for WorkspaceStore {
     }
 }
 
+impl Drop for WorkspaceStore {
+    fn drop(&mut self) {
+        if self.mode == WorkspaceStoreMode::ReadWrite {
+            // A fork can briefly retain a duplicate of this descriptor before
+            // exec closes CLOEXEC files. Unlock the shared open-file
+            // description explicitly so a replacement writer is not fenced by
+            // that inherited descriptor after this store is gone.
+            let _ = rustix::fs::flock(&self._lock, rustix::fs::FlockOperation::Unlock);
+        }
+    }
+}
+
 impl WorkspaceStore {
     pub fn open(config_path: &Path) -> Result<Self, WorkspaceStoreError> {
         let root = workspace_root_for_config(config_path)?;
