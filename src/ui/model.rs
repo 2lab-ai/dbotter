@@ -1587,6 +1587,8 @@ pub enum UiEvent {
         base_revision: u64,
         mode: WorkspaceStoreMode,
         read_only_reason: Option<WorkspaceReadOnlyReason>,
+        generation: Option<u64>,
+        committed_bytes: u64,
         snapshot: Option<Box<ProfileWorkspaceSnapshot>>,
     },
     WorkspaceCommitted {
@@ -1594,6 +1596,7 @@ pub enum UiEvent {
         identity: WorkspaceIdentity,
         revision: u64,
         generation: u64,
+        committed_bytes: u64,
         warnings: Vec<WorkspaceStoreWarning>,
     },
     WorkspaceCleared {

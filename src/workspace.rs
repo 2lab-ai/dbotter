@@ -1050,7 +1050,13 @@ fn encoded_store_bytes_after_prefixes(
 fn conservative_encoded_overheads(
     instance_id: ProfileInstanceId,
 ) -> Result<(u64, u64), WorkspaceRetentionError> {
-    let generation = u64::MAX;
+    encoded_overheads_at_generation(instance_id, u64::MAX)
+}
+
+fn encoded_overheads_at_generation(
+    instance_id: ProfileInstanceId,
+    generation: u64,
+) -> Result<(u64, u64), WorkspaceRetentionError> {
     let shard_probe = WorkspaceShardSizeProbe {
         schema: SHARD_SCHEMA,
         instance_id,
@@ -1151,7 +1157,75 @@ fn conservative_encoded_profile_size(
     ProfileEncodedAccounting::new(snapshot)?.encoded_size()
 }
 
+#[cfg(feature = "desktop")]
+pub(crate) fn conservative_encoded_profile_bytes(
+    snapshot: &ProfileWorkspaceSnapshot,
+) -> Result<(u64, u64), WorkspaceRetentionError> {
+    let size = ProfileEncodedAccounting::new(snapshot)?.encoded_size()?;
+    Ok((size.shard_bytes, size.committed_bytes))
+}
+
+#[cfg(any(feature = "desktop", test))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EncodedProfileByteAccounting {
+    instance_id: ProfileInstanceId,
+    payload_bytes: u64,
+}
+
+#[cfg(any(feature = "desktop", test))]
+impl std::fmt::Debug for EncodedProfileByteAccounting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EncodedProfileByteAccounting")
+            .field("instance_id", &"<redacted>")
+            .field("payload_bytes", &self.payload_bytes)
+            .finish()
+    }
+}
+
+#[cfg(any(feature = "desktop", test))]
+impl EncodedProfileByteAccounting {
+    pub(crate) fn new(
+        snapshot: &ProfileWorkspaceSnapshot,
+    ) -> Result<Self, WorkspaceRetentionError> {
+        Ok(Self {
+            instance_id: snapshot.instance_id(),
+            payload_bytes: encoded_json_bytes(snapshot)?,
+        })
+    }
+
+    pub(crate) fn encoded_bytes_at_generation(
+        self,
+        generation: u64,
+    ) -> Result<(u64, u64), WorkspaceRetentionError> {
+        if generation == 0 {
+            return Err(WorkspaceRetentionError::AccountingFailed);
+        }
+        let (shard_fixed_bytes, manifest_fixed_bytes) =
+            encoded_overheads_at_generation(self.instance_id, generation)?;
+        let shard_bytes = shard_fixed_bytes
+            .checked_add(decimal_digits(self.payload_bytes))
+            .and_then(|value| value.checked_add(self.payload_bytes))
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        let manifest_bytes = manifest_fixed_bytes
+            .checked_add(decimal_digits(shard_bytes))
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        let committed_bytes = shard_bytes
+            .checked_add(manifest_bytes)
+            .ok_or(WorkspaceRetentionError::AccountingFailed)?;
+        Ok((shard_bytes, committed_bytes))
+    }
+}
+
 #[cfg(test)]
+pub(crate) fn encoded_profile_bytes_at_generation(
+    snapshot: &ProfileWorkspaceSnapshot,
+    generation: u64,
+) -> Result<(u64, u64), WorkspaceRetentionError> {
+    EncodedProfileByteAccounting::new(snapshot)?.encoded_bytes_at_generation(generation)
+}
+
+#[cfg(all(test, feature = "desktop"))]
 pub(crate) fn conservative_encoded_profile_bytes_for_test(
     snapshot: &ProfileWorkspaceSnapshot,
 ) -> Result<(u64, u64), WorkspaceRetentionError> {
@@ -1230,6 +1304,7 @@ pub enum WorkspaceStoreWarning {
 #[derive(Clone, PartialEq, Eq)]
 pub struct WorkspaceCommit {
     generation: u64,
+    committed_bytes: u64,
     checksum: String,
     warnings: Vec<WorkspaceStoreWarning>,
 }
@@ -1239,6 +1314,7 @@ impl std::fmt::Debug for WorkspaceCommit {
         formatter
             .debug_struct("WorkspaceCommit")
             .field("generation", &self.generation)
+            .field("committed_bytes", &self.committed_bytes)
             .field("checksum", &"<redacted>")
             .field("warnings", &self.warnings)
             .finish()
@@ -1248,6 +1324,10 @@ impl std::fmt::Debug for WorkspaceCommit {
 impl WorkspaceCommit {
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub const fn committed_bytes(&self) -> u64 {
+        self.committed_bytes
     }
 
     pub fn checksum(&self) -> &str {
@@ -1902,6 +1982,9 @@ impl WorkspaceStore {
         }
         Ok(WorkspaceCommit {
             generation,
+            committed_bytes: (shard_bytes.len() as u64)
+                .checked_add(manifest_bytes.len() as u64)
+                .ok_or(WorkspaceStoreError::StoreTooLarge)?,
             checksum: shard_checksum,
             warnings,
         })
@@ -1911,6 +1994,14 @@ impl WorkspaceStore {
         &self,
         instance_id: ProfileInstanceId,
     ) -> Result<Option<ProfileWorkspaceSnapshot>, WorkspaceStoreError> {
+        self.load_with_metadata(instance_id)
+            .map(|(snapshot, _, _)| snapshot)
+    }
+
+    pub(crate) fn load_with_metadata(
+        &self,
+        instance_id: ProfileInstanceId,
+    ) -> Result<(Option<ProfileWorkspaceSnapshot>, Option<u64>, u64), WorkspaceStoreError> {
         let _writer = if self.mode == WorkspaceStoreMode::ReadWrite {
             Some(
                 self.writer
@@ -1933,7 +2024,7 @@ impl WorkspaceStore {
             &profile_directory,
         ) {
             Ok(Some(profile_handle)) => profile_handle,
-            Ok(None) => return Ok(None),
+            Ok(None) => return Ok((None, None, 0)),
             Err(WorkspaceStoreError::UnsafePath) => {
                 let state = if self.mode == WorkspaceStoreMode::ReadWrite {
                     self.isolate_unsafe_profile_entry(instance_id)?
@@ -1986,7 +2077,7 @@ impl WorkspaceStore {
             MAX_MANIFEST_BYTES,
         ) {
             Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(None),
+            Ok(None) => return Ok((None, None, 0)),
             Err(error @ WorkspaceStoreError::UnsafePath) => {
                 let candidates = profile_corruption_candidates(&profile_handle, instance_id);
                 return Err(self.profile_corruption_error(
@@ -2099,7 +2190,14 @@ impl WorkspaceStore {
         }
         self.validate_store_chain()?;
         validate_directory_entry(&self.profiles_directory, &profile_name, &profile_handle)?;
-        Ok(Some(shard.payload))
+        let committed_bytes = (manifest_bytes.len() as u64)
+            .checked_add(shard_bytes.len() as u64)
+            .ok_or(WorkspaceStoreError::StoreTooLarge)?;
+        Ok((
+            Some(shard.payload),
+            Some(manifest.generation),
+            committed_bytes,
+        ))
     }
 
     pub fn clear(&self, instance_id: ProfileInstanceId) -> Result<(), WorkspaceStoreError> {
@@ -4266,6 +4364,56 @@ mod tests {
                     .len() as u64
             );
         }
+    }
+
+    #[test]
+    fn load_metadata_reports_raw_noncanonical_manifest_bytes() {
+        let directory = tempfile::tempdir().expect("workspace metadata directory");
+        let config_path = directory.path().join("config.toml");
+        let snapshot = retention_profile(
+            0x64,
+            vec![retention_history(
+                1,
+                1,
+                WorkspaceHistoryStatus::Succeeded,
+                "SELECT raw_manifest_bytes",
+            )],
+        );
+        let store = WorkspaceStore::open(&config_path).expect("metadata workspace store");
+        let commit = store.commit(&snapshot).expect("canonical workspace commit");
+        let canonical_bytes = encoded_profile_bytes_at_generation(&snapshot, commit.generation())
+            .expect("canonical committed bytes")
+            .1;
+        assert_eq!(commit.committed_bytes(), canonical_bytes);
+
+        let manifest_path = store
+            .profile_directory(snapshot.instance_id())
+            .join("manifest.json");
+        let mut manifest_bytes = fs::read(&manifest_path).expect("canonical manifest");
+        manifest_bytes.push(b'\n');
+        fs::write(&manifest_path, &manifest_bytes).expect("valid noncanonical manifest");
+
+        let (loaded, generation, committed_bytes) = store
+            .load_with_metadata(snapshot.instance_id())
+            .expect("load valid noncanonical manifest");
+        assert_eq!(loaded.as_ref(), Some(&snapshot));
+        assert_eq!(generation, Some(commit.generation()));
+        assert_eq!(committed_bytes, canonical_bytes.saturating_add(1));
+        assert_eq!(
+            committed_bytes,
+            fs::metadata(&manifest_path)
+                .expect("raw manifest metadata")
+                .len()
+                .saturating_add(
+                    fs::metadata(
+                        store
+                            .profile_directory(snapshot.instance_id())
+                            .join(shard_name(commit.generation())),
+                    )
+                    .expect("raw shard metadata")
+                    .len()
+                )
+        );
     }
 
     #[test]

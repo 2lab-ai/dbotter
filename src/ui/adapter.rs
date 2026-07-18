@@ -949,6 +949,8 @@ mod tests {
                 base_revision: 9,
                 mode: WorkspaceStoreMode::ReadWrite,
                 read_only_reason: None,
+                generation: Some(1),
+                committed_bytes: 1,
                 snapshot: Some(snapshot),
             }
         );

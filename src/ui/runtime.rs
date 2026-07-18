@@ -688,10 +688,13 @@ enum WorkspaceStoreOutput {
     Loaded {
         mode: WorkspaceStoreMode,
         read_only_reason: Option<WorkspaceReadOnlyReason>,
+        generation: Option<u64>,
+        committed_bytes: u64,
         snapshot: Option<Box<ProfileWorkspaceSnapshot>>,
     },
     Committed {
         generation: u64,
+        committed_bytes: u64,
         warnings: Vec<WorkspaceStoreWarning>,
     },
     Cleared,
@@ -1066,8 +1069,8 @@ fn run_workspace_store_request(
 ) -> WorkspaceExecutionResult {
     match request {
         WorkspaceRequest::Load { identity, .. } => {
-            let snapshot = store
-                .load(identity.instance_id())
+            let (snapshot, generation, committed_bytes) = store
+                .load_with_metadata(identity.instance_id())
                 .map_err(|error| workspace_store_failure(error, store.read_only_reason()))?;
             if snapshot.as_ref().is_some_and(|snapshot| {
                 snapshot.instance_id() != identity.instance_id()
@@ -1078,6 +1081,8 @@ fn run_workspace_store_request(
             Ok(WorkspaceStoreOutput::Loaded {
                 mode: store.mode(),
                 read_only_reason: store.read_only_reason(),
+                generation,
+                committed_bytes,
                 snapshot: snapshot.map(Box::new),
             })
         }
@@ -1087,6 +1092,7 @@ fn run_workspace_store_request(
                 .map_err(|error| workspace_store_failure(error, store.read_only_reason()))?;
             Ok(WorkspaceStoreOutput::Committed {
                 generation: commit.generation(),
+                committed_bytes: commit.committed_bytes(),
                 warnings: commit.warnings().to_vec(),
             })
         }
@@ -1161,6 +1167,8 @@ fn workspace_terminal_event(
             Ok(WorkspaceStoreOutput::Loaded {
                 mode,
                 read_only_reason,
+                generation,
+                committed_bytes,
                 snapshot,
             }),
         ) => UiEvent::WorkspaceLoaded {
@@ -1169,12 +1177,15 @@ fn workspace_terminal_event(
             base_revision: meta.revision,
             mode,
             read_only_reason,
+            generation,
+            committed_bytes,
             snapshot,
         },
         (
             WorkspaceAction::Commit,
             Ok(WorkspaceStoreOutput::Committed {
                 generation,
+                committed_bytes,
                 warnings,
             }),
         ) => UiEvent::WorkspaceCommitted {
@@ -1182,6 +1193,7 @@ fn workspace_terminal_event(
             identity: meta.identity,
             revision: meta.revision,
             generation,
+            committed_bytes,
             warnings,
         },
         (WorkspaceAction::Clear, Ok(WorkspaceStoreOutput::Cleared)) => UiEvent::WorkspaceCleared {
