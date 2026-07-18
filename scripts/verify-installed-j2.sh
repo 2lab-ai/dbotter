@@ -242,6 +242,8 @@ stop_pid() {
     kill -0 "$pid" >/dev/null 2>&1 || return 0
     sleep 0.1
   done
+  kill -0 "$pid" >/dev/null 2>&1 \
+    && fail "installed app PID remained alive after TERM/KILL"
 }
 
 mysql_root_exec() {
@@ -401,6 +403,7 @@ jq -e '
   and .checkpoints.persistence_opt_out_and_clear == true
   and .checkpoints.persistence_off_edit_save_disabled_execute == true
   and .checkpoints.failed_query_error_retained == true
+  and .checkpoints.failed_query_error_retained_after_later_results == true
   and .checkpoints.tabs_created_renamed_reordered == true
   and .checkpoints.saved_visible_before_kill == true
   and (.split_value | type == "number")
@@ -613,6 +616,8 @@ healthy_profile_remains_usable=true
 
 stop_pid "$corrupt_pid"
 corrupt_pid=""
+pgrep -f "$executable" >/dev/null 2>&1 \
+  && fail "installed executable process set was not empty before the final scan"
 
 "$scanner" \
   --root "$workspace_root" \
@@ -658,6 +663,9 @@ persistence_off_edit_save_disabled_execute="$(
 )"
 failed_query_error_retained="$(
   jq -r '.checkpoints.failed_query_error_retained' "$seed_evidence"
+)"
+failed_query_error_retained_after_later_results="$(
+  jq -r '.checkpoints.failed_query_error_retained_after_later_results' "$seed_evidence"
 )"
 saved_visible_before_kill="$(
   jq -r '.checkpoints.saved_visible_before_kill' "$seed_evidence"
@@ -724,6 +732,8 @@ jq -n \
   --argjson persistence_off_edit_save_disabled_execute \
     "$persistence_off_edit_save_disabled_execute" \
   --argjson failed_query_error_retained "$failed_query_error_retained" \
+  --argjson failed_query_error_retained_after_later_results \
+    "$failed_query_error_retained_after_later_results" \
   --argjson private_store_payload_scan_clean "$private_store_payload_scan_clean" \
   --argjson private_store_payload_scan_pass_count \
     "$private_store_payload_scan_pass_count" \
@@ -759,6 +769,8 @@ jq -n \
       persistence_off_edit_save_disabled_execute:
         $persistence_off_edit_save_disabled_execute,
       failed_query_error_retained: $failed_query_error_retained,
+      failed_query_error_retained_after_later_results:
+        $failed_query_error_retained_after_later_results,
       private_store_payload_scan_clean: $private_store_payload_scan_clean,
       tabs_created_renamed_reordered: $tabs_created_renamed_reordered,
       saved_visible_before_kill: $saved_visible_before_kill,

@@ -1083,11 +1083,17 @@ private func runSeed(_ options: Options) throws {
     let currentSelectionAllExercised = true
 
     try setEditorSource(failedSource, application: application)
+    let beforeFailed = resultTabIdentifiers(application: application)
     try press(try single("editor.execute", application: application))
-    guard waitUntil(timeout: 30, {
-        optionalSingle("editor.pending", application: application) == nil
-    }) else {
-        throw fail("failed execution did not settle")
+    let afterFailed = try waitForResultDelta(
+        application: application,
+        before: beforeFailed,
+        delta: 1
+    )
+    let failedResultTabs = afterFailed.subtracting(beforeFailed)
+    guard failedResultTabs.count == 1,
+          let failedResultTab = failedResultTabs.first else {
+        throw fail("failed execution did not retain one exact error output")
     }
     let failedErrorStatus = try waitForStatus(
         "result.error.status",
@@ -1131,6 +1137,22 @@ private func runSeed(_ options: Options) throws {
         historySourcePlusOneOmitted
     ) = try inspectHistory(application: application)
 
+    try press(try single(failedResultTab, application: application))
+    let retainedFailedErrorStatus = try waitForStatus(
+        "result.error.status",
+        application: application,
+        timeout: 15
+    ) {
+        !$0.isEmpty && $0.contains("Category:") && $0.contains("Code:")
+    }
+    let failedQueryErrorRetainedAfterLaterResults =
+        resultTabIdentifiers(application: application).contains(failedResultTab)
+        && retainedFailedErrorStatus.contains("Category:")
+        && retainedFailedErrorStatus.contains("Code:")
+    guard failedQueryErrorRetainedAfterLaterResults else {
+        throw fail("earlier typed error was not selectable after later results")
+    }
+
     try press(try single("editor.tab.1", application: application))
     try setEditorSource(firstSource, application: application)
     try press(try single("editor.tab.2", application: application))
@@ -1153,6 +1175,8 @@ private func runSeed(_ options: Options) throws {
                 "history_source_exact_retained": historySourceExactRetained,
                 "history_source_plus_one_omitted": historySourcePlusOneOmitted,
                 "failed_query_error_retained": failedQueryErrorRetained,
+                "failed_query_error_retained_after_later_results":
+                    failedQueryErrorRetainedAfterLaterResults,
                 "persistence_opt_out_and_clear": persistenceOptOutAndClear,
                 "persistence_off_edit_save_disabled_execute":
                     persistenceOffEditSaveDisabledExecute,
