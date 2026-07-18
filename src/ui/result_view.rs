@@ -18,6 +18,7 @@ enum ResultDisplayMode {
     #[default]
     Grid,
     Record,
+    Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,6 +248,7 @@ impl ResultViewState {
         match self.display_mode {
             ResultDisplayMode::Grid => render_table(ui, result, self, &visible_rows),
             ResultDisplayMode::Record => render_record(ui, result, self, &visible_rows),
+            ResultDisplayMode::Value => render_value(ui, result, self, &visible_rows),
         }
         intent
     }
@@ -259,12 +261,12 @@ impl ResultViewState {
                 egui::Button::new("Grid").selected(self.display_mode == ResultDisplayMode::Grid),
             );
             let grid = named_author_id(grid, "result.mode.grid", "Show result as a grid");
-            grid.ctx.accesskit_node_builder(grid.id, |node| {
-                node.set_selected(self.display_mode == ResultDisplayMode::Grid);
-            });
             if grid.clicked() {
                 self.display_mode = ResultDisplayMode::Grid;
             }
+            grid.ctx.accesskit_node_builder(grid.id, |node| {
+                node.set_selected(self.display_mode == ResultDisplayMode::Grid);
+            });
             let record = ui.add_sized(
                 [80.0, RESULT_ACTION_HEIGHT],
                 egui::Button::new("Record")
@@ -272,12 +274,27 @@ impl ResultViewState {
             );
             let record =
                 named_author_id(record, "result.mode.record", "Show selected result record");
-            record.ctx.accesskit_node_builder(record.id, |node| {
-                node.set_selected(self.display_mode == ResultDisplayMode::Record);
-            });
             if record.clicked() {
                 self.display_mode = ResultDisplayMode::Record;
             }
+            record.ctx.accesskit_node_builder(record.id, |node| {
+                node.set_selected(self.display_mode == ResultDisplayMode::Record);
+            });
+            let value = ui.add_sized(
+                [72.0, RESULT_ACTION_HEIGHT],
+                egui::Button::new("Value").selected(self.display_mode == ResultDisplayMode::Value),
+            );
+            let value = named_author_id(
+                value,
+                "result.mode.value",
+                "Show selected result cell value",
+            );
+            if value.clicked() {
+                self.display_mode = ResultDisplayMode::Value;
+            }
+            value.ctx.accesskit_node_builder(value.id, |node| {
+                node.set_selected(self.display_mode == ResultDisplayMode::Value);
+            });
 
             let filter = ui.add_sized(
                 [220.0, RESULT_ACTION_HEIGHT],
@@ -658,6 +675,71 @@ fn render_record(
         record_surface.response,
         "result.record",
         "Selected result record detail",
+    );
+}
+
+fn render_value(
+    ui: &mut egui::Ui,
+    result: &ResultSnapshot,
+    state: &ResultViewState,
+    visible_rows: &[usize],
+) {
+    let selected_cell = state
+        .selected_cell
+        .filter(|(row, column)| {
+            visible_rows.contains(row)
+                && *column < result.columns.len()
+                && result
+                    .rows
+                    .get(*row)
+                    .is_some_and(|cells| *column < cells.len())
+        })
+        .or_else(|| visible_rows.first().copied().map(|row| (row, 0)));
+    let Some((row, column)) = selected_cell else {
+        let empty = ui.weak("Select a result cell to inspect its full value.");
+        named_author_id(empty, "result.value.empty", "No selected result cell value");
+        return;
+    };
+    let Some(column_metadata) = result.columns.get(column) else {
+        return;
+    };
+    let Some(cell) = result.rows.get(row).and_then(|cells| cells.get(column)) else {
+        return;
+    };
+
+    let status_value = format!(
+        "Row {} · Column {} · {} · {}",
+        row + 1,
+        column + 1,
+        column_metadata.name,
+        column_metadata.type_name
+    );
+    let status = ui.strong(&status_value);
+    named_dynamic_value_author_id(
+        status,
+        "result.value.status".to_owned(),
+        "Selected result cell".to_owned(),
+        status_value,
+    );
+    ui.separator();
+
+    let value = clipboard_scalar(cell);
+    let mut rendered_value = value.clone();
+    let content = ui.add_sized(
+        [
+            ui.available_width(),
+            ui.available_height().max(RESULT_ROW_HEIGHT * 3.0),
+        ],
+        egui::TextEdit::multiline(&mut rendered_value)
+            .font(egui::TextStyle::Monospace)
+            .desired_width(f32::INFINITY)
+            .interactive(false),
+    );
+    named_dynamic_value_author_id(
+        content,
+        "result.value.content".to_owned(),
+        "Full selected result cell value".to_owned(),
+        value,
     );
 }
 

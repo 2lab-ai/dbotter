@@ -7292,6 +7292,10 @@ impl DbotterApp {
         let mut has_result = false;
         if let Some(key) = selected_workspace_key {
             let workspace = self.model.workspace_mut(key);
+            if let Some(error) = workspace.error.as_ref() {
+                render_result_error(ui, error);
+                ui.add_space(8.0);
+            }
             if let Some(result) = workspace.result.clone() {
                 has_result = true;
                 if let Some(intent) = workspace.result_view.show(ui, result.as_ref(), true) {
@@ -8291,6 +8295,29 @@ const fn environment_availability_label(availability: EnvironmentAvailability) -
         EnvironmentAvailability::Missing => "Missing",
         EnvironmentAvailability::Empty => "Empty",
     }
+}
+
+fn render_result_error(ui: &mut egui::Ui, error: &PublicOperationError) {
+    egui::Frame::new()
+        .fill(egui::Color32::WHITE)
+        .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK))
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            let status_value = format!(
+                "{} · Category: {:?} · Code: {:?}",
+                error.summary.message(),
+                error.category,
+                error.code
+            );
+            let status = ui.strong(error.summary.message());
+            named_dynamic_value_author_id(
+                status,
+                "result.error.status".to_owned(),
+                "Last query failed".to_owned(),
+                status_value,
+            );
+        });
 }
 
 fn render_recovery_error(
@@ -18353,6 +18380,13 @@ mod tests {
         let (_, retained_tab) =
             accesskit_author_node(&frame, &format!("result.output.{}", result_tab_id.0));
         assert_eq!(retained_tab.label(), Some("Execution result tab"));
+        let (_, result_error) = accesskit_author_node(&frame, "result.error.status");
+        assert_eq!(result_error.label(), Some("Last query failed"));
+        assert!(result_error.value().is_some_and(|value| {
+            value.contains("The server rejected the syntax.")
+                && value.contains("Category: Syntax")
+                && value.contains("Code: StatementTarget")
+        }));
         let (_, operation_status) = accesskit_author_node(&frame, "status.operation");
         assert_eq!(operation_status.value(), Some(expected_status));
 

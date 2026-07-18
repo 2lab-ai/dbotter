@@ -630,6 +630,30 @@ fn syntax_spans(language: QueryLanguage, source: &str) -> Vec<SyntaxSpan> {
     spans
 }
 
+fn syntax_status_value(language: QueryLanguage, source: &str) -> String {
+    let mut keywords = 0_usize;
+    let mut literals = 0_usize;
+    let mut numbers = 0_usize;
+    let mut comments = 0_usize;
+    for span in syntax_spans(language, source) {
+        match span.class {
+            SyntaxClass::Plain => {}
+            SyntaxClass::Keyword => keywords = keywords.saturating_add(1),
+            SyntaxClass::Literal => literals = literals.saturating_add(1),
+            SyntaxClass::Number => numbers = numbers.saturating_add(1),
+            SyntaxClass::Comment => comments = comments.saturating_add(1),
+        }
+    }
+    let language = match language {
+        QueryLanguage::Sql => "SQL",
+        QueryLanguage::RedisCommand => "Redis",
+        QueryLanguage::MongoDocument => "MongoDB",
+    };
+    format!(
+        "{language} syntax · keywords {keywords} · literals {literals} · numbers {numbers} · comments {comments}"
+    )
+}
+
 fn push_syntax_span(spans: &mut Vec<SyntaxSpan>, byte_range: Range<usize>, class: SyntaxClass) {
     if let Some(last) = spans.last_mut()
         && last.class == class
@@ -1399,6 +1423,15 @@ impl EditorSurface {
             editor_response.request_focus();
         }
 
+        let syntax_status_value = syntax_status_value(language, &workspace.editor_text);
+        let syntax_status = ui.small(&syntax_status_value);
+        named_dynamic_value_author_id(
+            syntax_status,
+            "editor.syntax.status".to_owned(),
+            "Editor syntax highlighting status".to_owned(),
+            syntax_status_value,
+        );
+
         ui.add_space(16.0);
         let mut row_response = None;
         let mut timeout_response = None;
@@ -1937,6 +1970,10 @@ mod tests {
                 .map(|span| &unterminated[span.byte_range.clone()])
                 .collect::<String>(),
             unterminated
+        );
+        assert_eq!(
+            syntax_status_value(QueryLanguage::Sql, "-- note\nSELECT 42, 'value'"),
+            "SQL syntax · keywords 1 · literals 1 · numbers 1 · comments 1"
         );
 
         let keyword = syntax_format(egui::FontId::monospace(14.0), SyntaxClass::Keyword);
