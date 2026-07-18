@@ -223,6 +223,10 @@ corrupt_pid=""
 output_temporary=""
 MAX_PROFILE_SHARD_BYTES=33554432
 result_sentinel=""
+opt_out_marker="j2_opt_out_private_marker"
+clear_marker="j2_clear_private_marker"
+private_store_payload_scan_pass_count=0
+private_store_payload_scan_clean=false
 
 stop_pid() {
   local pid="$1"
@@ -267,6 +271,39 @@ fi
 [[ -f "$driver" && ! -L "$driver" && -x "$driver" ]] \
   || fail "J2 AX driver build produced no executable"
 
+workspace_contract="$temporary/workspace-contract.json"
+"$executable" workspace-contract --format json >"$workspace_contract"
+jq -e '
+  .schema == "dbotter.workspace-contract.v1"
+  and (.limits | keys | length) == 8
+  and .limits.editor_tabs_per_profile == 20
+  and .limits.editor_tabs_total == 100
+  and .limits.editor_source_bytes == 262144
+  and .limits.history_entries_per_profile == 2000
+  and .limits.history_entries_total == 10000
+  and .limits.history_source_bytes == 65536
+  and .limits.profile_shard_bytes == 33554432
+  and .limits.workspace_store_bytes == 134217728
+  and (.probes | keys | length) == 16
+  and .probes.editor_tabs_per_profile_exact == true
+  and .probes.editor_tabs_per_profile_plus_one_rejected == true
+  and .probes.editor_tabs_total_exact == true
+  and .probes.editor_tabs_total_plus_one_rejected == true
+  and .probes.editor_source_bytes_exact == true
+  and .probes.editor_source_bytes_plus_one_rejected == true
+  and .probes.history_entries_per_profile_exact == true
+  and .probes.history_entries_per_profile_plus_one_rejected == true
+  and .probes.history_entries_total_exact == true
+  and .probes.history_entries_total_plus_one_rejected == true
+  and .probes.history_source_bytes_exact == true
+  and .probes.history_source_bytes_plus_one_rejected == true
+  and .probes.profile_shard_bytes_exact == true
+  and .probes.profile_shard_bytes_plus_one_rejected == true
+  and .probes.workspace_store_bytes_exact == true
+  and .probes.workspace_store_bytes_plus_one_rejected == true
+' "$workspace_contract" >/dev/null || fail "installed workspace contract is invalid"
+workspace_bounds_exact=true
+
 [[ "$(mysql_root_exec \
   "SELECT CONCAT(@@global.general_log, ':', @@global.log_output)")" == "1:TABLE" ]] \
   || fail "dedicated MySQL fixture must start with TABLE general logging enabled"
@@ -290,6 +327,8 @@ result_sentinel="DBOTTER_J2_RESULT_$(python3 -c \
 [[ "$result_sentinel" =~ ^DBOTTER_J2_RESULT_[0-9a-f]{32}$ ]] \
   || fail "private result sentinel generation failed"
 export DBOTTER_J2_RESULT_SENTINEL="$result_sentinel"
+export DBOTTER_J2_OPT_OUT_MARKER="$opt_out_marker"
+export DBOTTER_J2_CLEAR_MARKER="$clear_marker"
 mysql_root_exec "
   DROP TABLE IF EXISTS dbotter.dbotter_j2_private_result;
   CREATE TABLE dbotter.dbotter_j2_private_result (
@@ -310,6 +349,8 @@ mysql_execute_count() {
       |"SELECT 40 AS j2_selected" \
       |"SELECT 41 AS j2_first" \
       |"SELECT 42 AS j2_second" \
+      |"SELECT 6 AS j2_opt_out_private_marker" \
+      |"SELECT 7 AS j2_clear_private_marker" \
       |"SELECT 84 AS j2_healthy") ;;
     *) fail "refusing an unknown MySQL observation argument" ;;
   esac
@@ -322,16 +363,21 @@ unselected_query="SELECT 39 AS j2_unselected"
 selected_query="SELECT 40 AS j2_selected"
 first_query="SELECT 41 AS j2_first"
 second_query="SELECT 42 AS j2_second"
+opt_out_query="SELECT 6 AS $opt_out_marker"
+clear_query="SELECT 7 AS $clear_marker"
 healthy_query="SELECT 84 AS j2_healthy"
 privacy_before="$(mysql_execute_count "$privacy_query")"
 unselected_before="$(mysql_execute_count "$unselected_query")"
 selected_before="$(mysql_execute_count "$selected_query")"
 first_before="$(mysql_execute_count "$first_query")"
 second_before="$(mysql_execute_count "$second_query")"
+opt_out_before="$(mysql_execute_count "$opt_out_query")"
+clear_before="$(mysql_execute_count "$clear_query")"
 healthy_before="$(mysql_execute_count "$healthy_query")"
 for baseline in \
   "$privacy_before" "$unselected_before" "$selected_before" \
-  "$first_before" "$second_before" "$healthy_before"; do
+  "$first_before" "$second_before" "$opt_out_before" "$clear_before" \
+  "$healthy_before"; do
   [[ "$baseline" =~ ^[0-9]+$ ]] || fail "invalid MySQL observation baseline"
 done
 
@@ -353,6 +399,8 @@ jq -e '
   and .checkpoints.history_source_plus_one_omitted == true
   and .checkpoints.tab_bound_enforced == true
   and .checkpoints.persistence_opt_out_and_clear == true
+  and .checkpoints.persistence_off_edit_save_disabled_execute == true
+  and .checkpoints.failed_query_error_retained == true
   and .checkpoints.tabs_created_renamed_reordered == true
   and .checkpoints.saved_visible_before_kill == true
   and (.split_value | type == "number")
@@ -365,6 +413,8 @@ unselected_after_seed="$(mysql_execute_count "$unselected_query")"
 selected_after_seed="$(mysql_execute_count "$selected_query")"
 first_after_seed="$(mysql_execute_count "$first_query")"
 second_after_seed="$(mysql_execute_count "$second_query")"
+opt_out_after_seed="$(mysql_execute_count "$opt_out_query")"
+clear_after_seed="$(mysql_execute_count "$clear_query")"
 (( privacy_after_seed == privacy_before + 1 )) \
   || fail "current execution did not dispatch the exact private-result query once"
 (( unselected_after_seed == unselected_before )) \
@@ -375,6 +425,10 @@ second_after_seed="$(mysql_execute_count "$second_query")"
   || fail "Run all did not dispatch the first statement exactly once"
 (( second_after_seed == second_before + 1 )) \
   || fail "Run all did not dispatch the second statement exactly once"
+(( opt_out_after_seed == opt_out_before + 1 )) \
+  || fail "persistence Off did not execute its exact marker query once"
+(( clear_after_seed == clear_before + 1 )) \
+  || fail "durable clear setup did not execute its exact marker query once"
 
 pid_text_path="$(lsof -a -p "$seed_pid" -d txt -Fn | sed -n 's/^n//p' | head -1)"
 pid_realpath="$(python3 - "$pid_text_path" <<'PY'
@@ -430,8 +484,10 @@ shard_bound_enforced=true
   --root "$workspace_root" \
   --forbidden-env DBOTTER_MYSQL_PASSWORD \
   --forbidden-env DBOTTER_MYSQL_ROOT_PASSWORD \
-  --forbidden-env DBOTTER_J2_RESULT_SENTINEL >/dev/null
-private_store_payload_scan_clean=true
+  --forbidden-env DBOTTER_J2_RESULT_SENTINEL \
+  --forbidden-env DBOTTER_J2_OPT_OUT_MARKER \
+  --forbidden-env DBOTTER_J2_CLEAR_MARKER >/dev/null
+private_store_payload_scan_pass_count=$((private_store_payload_scan_pass_count + 1))
 
 kill -KILL "$seed_pid"
 for _ in {1..100}; do
@@ -558,6 +614,18 @@ healthy_profile_remains_usable=true
 stop_pid "$corrupt_pid"
 corrupt_pid=""
 
+"$scanner" \
+  --root "$workspace_root" \
+  --forbidden-env DBOTTER_MYSQL_PASSWORD \
+  --forbidden-env DBOTTER_MYSQL_ROOT_PASSWORD \
+  --forbidden-env DBOTTER_J2_RESULT_SENTINEL \
+  --forbidden-env DBOTTER_J2_OPT_OUT_MARKER \
+  --forbidden-env DBOTTER_J2_CLEAR_MARKER >/dev/null
+private_store_payload_scan_pass_count=$((private_store_payload_scan_pass_count + 1))
+(( private_store_payload_scan_pass_count == 2 )) \
+  || fail "private workspace payload scan pass count is not exact"
+private_store_payload_scan_clean=true
+
 tabs_created_renamed_reordered="$(
   jq -r '.checkpoints.tabs_created_renamed_reordered' "$seed_evidence"
 )"
@@ -585,6 +653,12 @@ tab_bound_enforced="$(
 persistence_opt_out_and_clear="$(
   jq -r '.checkpoints.persistence_opt_out_and_clear' "$seed_evidence"
 )"
+persistence_off_edit_save_disabled_execute="$(
+  jq -r '.checkpoints.persistence_off_edit_save_disabled_execute' "$seed_evidence"
+)"
+failed_query_error_retained="$(
+  jq -r '.checkpoints.failed_query_error_retained' "$seed_evidence"
+)"
 saved_visible_before_kill="$(
   jq -r '.checkpoints.saved_visible_before_kill' "$seed_evidence"
 )"
@@ -604,6 +678,8 @@ unselected_query_delta=$((unselected_after_seed - unselected_before))
 selected_query_delta=$((selected_after_seed - selected_before))
 run_all_first_delta=$((first_after_seed - first_before))
 run_all_second_delta=$((second_after_seed - second_before))
+persistence_opt_out_query_delta=$((opt_out_after_seed - opt_out_before))
+persistence_clear_query_delta=$((clear_after_seed - clear_before))
 
 output_parent="$(dirname "$output")"
 [[ -d "$output_parent" && ! -L "$output_parent" ]] \
@@ -628,6 +704,8 @@ jq -n \
   --argjson selected_query_delta "$selected_query_delta" \
   --argjson run_all_first_delta "$run_all_first_delta" \
   --argjson run_all_second_delta "$run_all_second_delta" \
+  --argjson persistence_opt_out_query_delta "$persistence_opt_out_query_delta" \
+  --argjson persistence_clear_query_delta "$persistence_clear_query_delta" \
   --argjson zero_dispatch_before "$zero_dispatch_before" \
   --argjson zero_dispatch_after_open "$zero_dispatch_after_open" \
   --argjson zero_dispatch_after_run "$zero_dispatch_after_run" \
@@ -641,8 +719,14 @@ jq -n \
   --argjson history_source_plus_one_omitted "$history_source_plus_one_omitted" \
   --argjson tab_bound_enforced "$tab_bound_enforced" \
   --argjson shard_bound_enforced "$shard_bound_enforced" \
+  --argjson workspace_bounds_exact "$workspace_bounds_exact" \
   --argjson persistence_opt_out_and_clear "$persistence_opt_out_and_clear" \
+  --argjson persistence_off_edit_save_disabled_execute \
+    "$persistence_off_edit_save_disabled_execute" \
+  --argjson failed_query_error_retained "$failed_query_error_retained" \
   --argjson private_store_payload_scan_clean "$private_store_payload_scan_clean" \
+  --argjson private_store_payload_scan_pass_count \
+    "$private_store_payload_scan_pass_count" \
   --argjson saved_visible_before_kill "$saved_visible_before_kill" \
   --argjson tabs_restored "$tabs_restored" \
   --argjson results_omitted_after_restart "$results_omitted_after_restart" \
@@ -670,7 +754,11 @@ jq -n \
       history_source_plus_one_omitted: $history_source_plus_one_omitted,
       tab_bound_enforced: $tab_bound_enforced,
       shard_bound_enforced: $shard_bound_enforced,
+      workspace_bounds_exact: $workspace_bounds_exact,
       persistence_opt_out_and_clear: $persistence_opt_out_and_clear,
+      persistence_off_edit_save_disabled_execute:
+        $persistence_off_edit_save_disabled_execute,
+      failed_query_error_retained: $failed_query_error_retained,
       private_store_payload_scan_clean: $private_store_payload_scan_clean,
       tabs_created_renamed_reordered: $tabs_created_renamed_reordered,
       saved_visible_before_kill: $saved_visible_before_kill,
@@ -690,7 +778,8 @@ jq -n \
       root_mode: 448,
       file_mode: 384,
       quarantine_files: $quarantine_files,
-      payload_scan_clean: $private_store_payload_scan_clean
+      payload_scan_clean: $private_store_payload_scan_clean,
+      payload_scan_pass_count: $private_store_payload_scan_pass_count
     },
     mysql_observation: {
       current_query_delta: $current_query_delta,
@@ -698,6 +787,8 @@ jq -n \
       selected_query_delta: $selected_query_delta,
       run_all_first_delta: $run_all_first_delta,
       run_all_second_delta: $run_all_second_delta,
+      persistence_opt_out_query_delta: $persistence_opt_out_query_delta,
+      persistence_clear_query_delta: $persistence_clear_query_delta,
       zero_dispatch_before: $zero_dispatch_before,
       zero_dispatch_after_open: $zero_dispatch_after_open,
       after_explicit_run: $zero_dispatch_after_run,
@@ -724,11 +815,14 @@ jq -e '
   and .private_store.quarantine_files > 0
   and .private_store.shard_bytes <= .private_store.max_profile_shard_bytes
   and .private_store.payload_scan_clean == true
+  and .private_store.payload_scan_pass_count == 2
   and .mysql_observation.current_query_delta == 1
   and .mysql_observation.unselected_query_delta == 0
   and .mysql_observation.selected_query_delta == 1
   and .mysql_observation.run_all_first_delta == 1
   and .mysql_observation.run_all_second_delta == 1
+  and .mysql_observation.persistence_opt_out_query_delta == 1
+  and .mysql_observation.persistence_clear_query_delta == 1
   and .mysql_observation.zero_dispatch_before
       == .mysql_observation.zero_dispatch_after_open
   and .mysql_observation.after_explicit_run
@@ -739,7 +833,9 @@ jq -e '
 if receipt_candidate_has_static_leak "$output_temporary" \
   || receipt_candidate_contains_secret "$output_temporary" "$DBOTTER_MYSQL_PASSWORD" \
   || receipt_candidate_contains_secret "$output_temporary" "$DBOTTER_MYSQL_ROOT_PASSWORD" \
-  || receipt_candidate_contains_secret "$output_temporary" "$result_sentinel"; then
+  || receipt_candidate_contains_secret "$output_temporary" "$result_sentinel" \
+  || receipt_candidate_contains_secret "$output_temporary" "$opt_out_marker" \
+  || receipt_candidate_contains_secret "$output_temporary" "$clear_marker"; then
   fail "assembled J2 evidence contains a credential or value-bearing payload"
 fi
 

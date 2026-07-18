@@ -42,6 +42,11 @@ enum Command {
         #[arg(long, value_enum, default_value = "json")]
         format: OutputFormat,
     },
+    /// Prove the exact private workspace retention limits and their +1 rejection.
+    WorkspaceContract {
+        #[arg(long, value_enum, default_value = "json")]
+        format: OutputFormat,
+    },
     /// Connect to a profile and ping its server.
     Check {
         #[arg(long)]
@@ -207,6 +212,9 @@ pub async fn run(cli: Cli) -> Result<(), AppError> {
         Command::ConfigContract { format } => match format {
             OutputFormat::Json => print_json(&crate::config::config_contract()),
         },
+        Command::WorkspaceContract { format } => match format {
+            OutputFormat::Json => print_json(&crate::workspace::workspace_contract()),
+        },
         Command::Drivers => print_json(&crate::drivers::descriptors()),
         command => {
             let config_path = crate::config::resolve_config_path(
@@ -265,9 +273,10 @@ async fn run_with_config(command: Command, config_path: PathBuf) -> Result<(), A
             let service = ApplicationService::load_path(config_path)?;
             inspect(&service, backend).await
         }
-        Command::Version { .. } | Command::ConfigContract { .. } | Command::Drivers => {
-            Err(AppError::InvalidInput)
-        }
+        Command::Version { .. }
+        | Command::ConfigContract { .. }
+        | Command::WorkspaceContract { .. }
+        | Command::Drivers => Err(AppError::InvalidInput),
     }
 }
 

@@ -39,6 +39,97 @@ const PROFILE_CORRUPT_MARKER_TEMP_PREFIX: &str = ".dbotter-workspace.profile-cor
 pub const MAX_QUARANTINE_FILES: usize = 16;
 pub const MAX_QUARANTINE_BYTES: u64 = 64 * 1024 * 1024;
 
+#[derive(Serialize)]
+pub(crate) struct WorkspaceContract {
+    schema: &'static str,
+    limits: WorkspaceContractLimits,
+    probes: WorkspaceContractProbes,
+}
+
+#[derive(Serialize)]
+struct WorkspaceContractLimits {
+    editor_tabs_per_profile: usize,
+    editor_tabs_total: usize,
+    editor_source_bytes: usize,
+    history_entries_per_profile: usize,
+    history_entries_total: usize,
+    history_source_bytes: usize,
+    profile_shard_bytes: usize,
+    workspace_store_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct WorkspaceContractProbes {
+    editor_tabs_per_profile_exact: bool,
+    editor_tabs_per_profile_plus_one_rejected: bool,
+    editor_tabs_total_exact: bool,
+    editor_tabs_total_plus_one_rejected: bool,
+    editor_source_bytes_exact: bool,
+    editor_source_bytes_plus_one_rejected: bool,
+    history_entries_per_profile_exact: bool,
+    history_entries_per_profile_plus_one_rejected: bool,
+    history_entries_total_exact: bool,
+    history_entries_total_plus_one_rejected: bool,
+    history_source_bytes_exact: bool,
+    history_source_bytes_plus_one_rejected: bool,
+    profile_shard_bytes_exact: bool,
+    profile_shard_bytes_plus_one_rejected: bool,
+    workspace_store_bytes_exact: bool,
+    workspace_store_bytes_plus_one_rejected: bool,
+}
+
+pub(crate) fn workspace_contract() -> WorkspaceContract {
+    let (editor_source_bytes_exact, editor_source_bytes_plus_one_rejected) =
+        contract_editor_source_probes();
+    let (editor_tabs_per_profile_exact, editor_tabs_per_profile_plus_one_rejected) =
+        contract_editor_tabs_per_profile_probes();
+    let (editor_tabs_total_exact, editor_tabs_total_plus_one_rejected) =
+        contract_editor_tabs_total_probes();
+    let (history_source_bytes_exact, history_source_bytes_plus_one_rejected) =
+        contract_history_source_probes();
+    let (history_entries_per_profile_exact, history_entries_per_profile_plus_one_rejected) =
+        contract_history_entries_per_profile_probes();
+    let (history_entries_total_exact, history_entries_total_plus_one_rejected) =
+        contract_history_entries_total_probes();
+    let mut byte_probes = ContractByteProbes::default();
+    if let Some(probes) = contract_byte_probes() {
+        byte_probes = probes;
+    }
+    WorkspaceContract {
+        schema: "dbotter.workspace-contract.v1",
+        limits: WorkspaceContractLimits {
+            editor_tabs_per_profile: MAX_EDITOR_TABS_PER_PROFILE,
+            editor_tabs_total: MAX_EDITOR_TABS_TOTAL,
+            editor_source_bytes: MAX_EDITOR_SOURCE_BYTES,
+            history_entries_per_profile: MAX_HISTORY_ENTRIES_PER_PROFILE,
+            history_entries_total: MAX_HISTORY_ENTRIES_TOTAL,
+            history_source_bytes: MAX_HISTORY_SOURCE_BYTES,
+            profile_shard_bytes: MAX_PROFILE_SHARD_BYTES,
+            workspace_store_bytes: MAX_WORKSPACE_STORE_BYTES,
+        },
+        probes: WorkspaceContractProbes {
+            editor_tabs_per_profile_exact,
+            editor_tabs_per_profile_plus_one_rejected,
+            editor_tabs_total_exact,
+            editor_tabs_total_plus_one_rejected,
+            editor_source_bytes_exact,
+            editor_source_bytes_plus_one_rejected,
+            history_entries_per_profile_exact,
+            history_entries_per_profile_plus_one_rejected,
+            history_entries_total_exact,
+            history_entries_total_plus_one_rejected,
+            history_source_bytes_exact,
+            history_source_bytes_plus_one_rejected,
+            profile_shard_bytes_exact: byte_probes.profile_shard_bytes_exact,
+            profile_shard_bytes_plus_one_rejected: byte_probes
+                .profile_shard_bytes_plus_one_rejected,
+            workspace_store_bytes_exact: byte_probes.workspace_store_bytes_exact,
+            workspace_store_bytes_plus_one_rejected: byte_probes
+                .workspace_store_bytes_plus_one_rejected,
+        },
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkspaceLanguage {
@@ -1045,6 +1136,407 @@ fn encoded_store_bytes_after_prefixes(
         prefix_sizes.push(total);
     }
     Ok(prefix_sizes)
+}
+
+fn contract_editor(id: u64, source: String) -> Result<EditorTabSnapshot, WorkspaceSnapshotError> {
+    let cursor_character_index = source.chars().count();
+    EditorTabSnapshot::new(
+        id,
+        "Contract",
+        WorkspaceLanguage::Sql,
+        source,
+        None,
+        cursor_character_index,
+        None,
+    )
+}
+
+fn contract_history(
+    id: u64,
+    source: &str,
+    completed_at_unix_ms: i64,
+    status: WorkspaceHistoryStatus,
+) -> Result<WorkspaceHistoryEntry, WorkspaceSnapshotError> {
+    WorkspaceHistoryEntry::new(
+        id,
+        source,
+        WorkspaceRunTarget::Current,
+        completed_at_unix_ms,
+        status,
+        1,
+        1,
+        0,
+        false,
+    )
+}
+
+fn contract_profile(
+    instance_byte: u8,
+    editor_tabs: Vec<EditorTabSnapshot>,
+    history: Vec<WorkspaceHistoryEntry>,
+) -> Result<ProfileWorkspaceSnapshot, WorkspaceSnapshotError> {
+    let selected_editor_tab_id = editor_tabs.first().map(EditorTabSnapshot::id);
+    ProfileWorkspaceSnapshot::new(
+        ProfileInstanceId::from_bytes([instance_byte; 16]),
+        ProfileId(format!("contract-{instance_byte:02x}")),
+        true,
+        editor_tabs,
+        selected_editor_tab_id,
+        WorkspaceGeometrySnapshot::new(300.0, 0.6, true)?,
+        history,
+    )
+}
+
+fn contract_editor_tabs(count: usize) -> Option<Vec<EditorTabSnapshot>> {
+    (0..count)
+        .map(|index| {
+            let id = u64::try_from(index).ok()?.checked_add(1)?;
+            contract_editor(id, "SELECT 1".to_owned()).ok()
+        })
+        .collect()
+}
+
+fn contract_history_entries(
+    count: usize,
+    status: WorkspaceHistoryStatus,
+) -> Option<Vec<WorkspaceHistoryEntry>> {
+    (0..count)
+        .map(|index| {
+            let id = u64::try_from(index).ok()?.checked_add(1)?;
+            let completed_at_unix_ms = i64::try_from(index).ok()?;
+            contract_history(id, "SELECT 1", completed_at_unix_ms, status).ok()
+        })
+        .collect()
+}
+
+fn contract_editor_profile_set(
+    first_instance_byte: u8,
+    editor_counts: &[usize],
+) -> Option<Vec<ProfileWorkspaceSnapshot>> {
+    editor_counts
+        .iter()
+        .enumerate()
+        .map(|(index, count)| {
+            let offset = u8::try_from(index).ok()?;
+            let instance_byte = first_instance_byte.checked_add(offset)?;
+            let editor_tabs = contract_editor_tabs(*count)?;
+            contract_profile(instance_byte, editor_tabs, Vec::new()).ok()
+        })
+        .collect()
+}
+
+fn contract_history_profile_set(
+    first_instance_byte: u8,
+    history_counts: &[usize],
+) -> Option<Vec<ProfileWorkspaceSnapshot>> {
+    history_counts
+        .iter()
+        .enumerate()
+        .map(|(index, count)| {
+            let offset = u8::try_from(index).ok()?;
+            let instance_byte = first_instance_byte.checked_add(offset)?;
+            let history = contract_history_entries(*count, WorkspaceHistoryStatus::OutcomeUnknown)?;
+            contract_profile(instance_byte, Vec::new(), history).ok()
+        })
+        .collect()
+}
+
+fn contract_editor_source_probes() -> (bool, bool) {
+    let exact_source = "x".repeat(MAX_EDITOR_SOURCE_BYTES);
+    let exact = matches!(
+        contract_editor(1, exact_source),
+        Ok(editor) if editor.source().len() == MAX_EDITOR_SOURCE_BYTES
+    );
+    let plus_one = MAX_EDITOR_SOURCE_BYTES
+        .checked_add(1)
+        .is_some_and(|length| {
+            matches!(
+                contract_editor(1, "x".repeat(length)),
+                Err(WorkspaceSnapshotError::EditorSourceTooLarge)
+            )
+        });
+    (exact, plus_one)
+}
+
+fn contract_editor_tabs_per_profile_probes() -> (bool, bool) {
+    let exact = contract_editor_tabs(MAX_EDITOR_TABS_PER_PROFILE).is_some_and(|editor_tabs| {
+        matches!(
+            contract_profile(0x10, editor_tabs, Vec::new()),
+            Ok(profile) if profile.editor_tabs().len() == MAX_EDITOR_TABS_PER_PROFILE
+        )
+    });
+    let plus_one = MAX_EDITOR_TABS_PER_PROFILE
+        .checked_add(1)
+        .and_then(contract_editor_tabs)
+        .is_some_and(|editor_tabs| {
+            matches!(
+                contract_profile(0x11, editor_tabs, Vec::new()),
+                Err(WorkspaceSnapshotError::TooManyEditorTabs)
+            )
+        });
+    (exact, plus_one)
+}
+
+fn contract_editor_tabs_total_probes() -> (bool, bool) {
+    let exact_counts = [MAX_EDITOR_TABS_PER_PROFILE; 5];
+    let exact = contract_editor_profile_set(0x20, &exact_counts).is_some_and(|profiles| {
+        matches!(
+            WorkspaceSnapshotSet::new_with_retention(profiles),
+            Ok(set)
+                if set.history_evicted() == 0
+                    && set
+                        .profiles()
+                        .iter()
+                        .map(|profile| profile.editor_tabs().len())
+                        .sum::<usize>()
+                        == MAX_EDITOR_TABS_TOTAL
+        )
+    });
+    let plus_one_counts = [
+        MAX_EDITOR_TABS_PER_PROFILE,
+        MAX_EDITOR_TABS_PER_PROFILE,
+        MAX_EDITOR_TABS_PER_PROFILE,
+        MAX_EDITOR_TABS_PER_PROFILE,
+        MAX_EDITOR_TABS_PER_PROFILE,
+        1,
+    ];
+    let plus_one = contract_editor_profile_set(0x28, &plus_one_counts).is_some_and(|profiles| {
+        matches!(
+            WorkspaceSnapshotSet::new_with_retention(profiles),
+            Err(WorkspaceRetentionError::Snapshot(
+                WorkspaceSnapshotError::TooManyEditorTabsTotal
+            ))
+        )
+    });
+    (exact, plus_one)
+}
+
+fn contract_history_source_probes() -> (bool, bool) {
+    let exact_source = "x".repeat(MAX_HISTORY_SOURCE_BYTES);
+    let exact = matches!(
+        contract_history(
+            1,
+            &exact_source,
+            0,
+            WorkspaceHistoryStatus::Succeeded
+        ),
+        Ok(entry)
+            if entry.source().is_some_and(|source| source.len() == MAX_HISTORY_SOURCE_BYTES)
+                && !entry.source_omitted()
+    );
+    let plus_one = MAX_HISTORY_SOURCE_BYTES
+        .checked_add(1)
+        .and_then(|length| {
+            contract_history(1, &"x".repeat(length), 0, WorkspaceHistoryStatus::Succeeded).ok()
+        })
+        .is_some_and(|entry| entry.source().is_none() && entry.source_omitted());
+    (exact, plus_one)
+}
+
+fn contract_history_entries_per_profile_probes() -> (bool, bool) {
+    let exact = contract_history_entries(
+        MAX_HISTORY_ENTRIES_PER_PROFILE,
+        WorkspaceHistoryStatus::Succeeded,
+    )
+    .is_some_and(|history| {
+        matches!(
+            contract_profile(0x30, Vec::new(), history),
+            Ok(profile) if profile.history().len() == MAX_HISTORY_ENTRIES_PER_PROFILE
+        )
+    });
+    let plus_one = MAX_HISTORY_ENTRIES_PER_PROFILE
+        .checked_add(1)
+        .and_then(|count| contract_history_entries(count, WorkspaceHistoryStatus::Succeeded))
+        .is_some_and(|history| {
+            matches!(
+                contract_profile(0x31, Vec::new(), history),
+                Err(WorkspaceSnapshotError::TooManyHistoryEntries)
+            )
+        });
+    (exact, plus_one)
+}
+
+fn contract_history_entries_total_probes() -> (bool, bool) {
+    let exact_counts = [MAX_HISTORY_ENTRIES_PER_PROFILE; 5];
+    let exact = contract_history_profile_set(0x40, &exact_counts).is_some_and(|profiles| {
+        matches!(
+            WorkspaceSnapshotSet::new_with_retention(profiles),
+            Ok(set)
+                if set.history_evicted() == 0
+                    && set
+                        .profiles()
+                        .iter()
+                        .map(|profile| profile.history().len())
+                        .sum::<usize>()
+                        == MAX_HISTORY_ENTRIES_TOTAL
+        )
+    });
+    let plus_one_counts = [
+        MAX_HISTORY_ENTRIES_PER_PROFILE,
+        MAX_HISTORY_ENTRIES_PER_PROFILE,
+        MAX_HISTORY_ENTRIES_PER_PROFILE,
+        MAX_HISTORY_ENTRIES_PER_PROFILE,
+        MAX_HISTORY_ENTRIES_PER_PROFILE,
+        1,
+    ];
+    let plus_one = contract_history_profile_set(0x48, &plus_one_counts).is_some_and(|profiles| {
+        matches!(
+            WorkspaceSnapshotSet::new_with_retention(profiles),
+            Err(WorkspaceRetentionError::RetentionExhausted(
+                WorkspaceRetentionLimit::TotalHistoryEntries
+            ))
+        )
+    });
+    (exact, plus_one)
+}
+
+const CONTRACT_BYTE_FULL_ENTRIES: usize = 85;
+const CONTRACT_BYTE_TUNER_NUL_BYTES: usize = 16 * 1024;
+const CONTRACT_BYTE_TUNER_MAX_ASCII_BYTES: usize =
+    MAX_HISTORY_SOURCE_BYTES - CONTRACT_BYTE_TUNER_NUL_BYTES;
+
+fn contract_byte_profile(
+    instance_byte: u8,
+    tunable_ascii_bytes: usize,
+) -> Option<ProfileWorkspaceSnapshot> {
+    if tunable_ascii_bytes > CONTRACT_BYTE_TUNER_MAX_ASCII_BYTES {
+        return None;
+    }
+    let full_source = "\0".repeat(MAX_HISTORY_SOURCE_BYTES);
+    let mut history = Vec::with_capacity(CONTRACT_BYTE_FULL_ENTRIES.checked_add(1)?);
+    for index in 0..CONTRACT_BYTE_FULL_ENTRIES {
+        let id = u64::try_from(index).ok()?.checked_add(1)?;
+        let completed_at_unix_ms = i64::try_from(index).ok()?;
+        history.push(
+            contract_history(
+                id,
+                &full_source,
+                completed_at_unix_ms,
+                WorkspaceHistoryStatus::OutcomeUnknown,
+            )
+            .ok()?,
+        );
+    }
+    let mut tuner_source = "\0".repeat(CONTRACT_BYTE_TUNER_NUL_BYTES);
+    tuner_source.push_str(&"x".repeat(tunable_ascii_bytes));
+    let tuner_id = u64::try_from(CONTRACT_BYTE_FULL_ENTRIES)
+        .ok()?
+        .checked_add(1)?;
+    history.push(
+        contract_history(
+            tuner_id,
+            &tuner_source,
+            i64::try_from(CONTRACT_BYTE_FULL_ENTRIES).ok()?,
+            WorkspaceHistoryStatus::OutcomeUnknown,
+        )
+        .ok()?,
+    );
+    contract_profile(instance_byte, Vec::new(), history).ok()
+}
+
+fn contract_profile_encoded_bytes(snapshot: &ProfileWorkspaceSnapshot) -> Option<(u64, u64)> {
+    let size = ProfileEncodedAccounting::new(snapshot)
+        .and_then(|accounting| accounting.encoded_size())
+        .ok()?;
+    Some((size.shard_bytes, size.committed_bytes))
+}
+
+#[derive(Default)]
+struct ContractByteProbes {
+    profile_shard_bytes_exact: bool,
+    profile_shard_bytes_plus_one_rejected: bool,
+    workspace_store_bytes_exact: bool,
+    workspace_store_bytes_plus_one_rejected: bool,
+}
+
+fn contract_byte_probes() -> Option<ContractByteProbes> {
+    let shard_target = u64::try_from(MAX_PROFILE_SHARD_BYTES).ok()?;
+    let store_target = MAX_WORKSPACE_STORE_BYTES;
+
+    let shard_base = contract_byte_profile(0x70, 0)?;
+    let (shard_base_bytes, _) = contract_profile_encoded_bytes(&shard_base)?;
+    let shard_tail = usize::try_from(shard_target.checked_sub(shard_base_bytes)?).ok()?;
+    let shard_plus_one_tail = shard_tail.checked_add(1)?;
+    if shard_plus_one_tail > CONTRACT_BYTE_TUNER_MAX_ASCII_BYTES {
+        return None;
+    }
+
+    let shard_exact = contract_byte_profile(0x70, shard_tail)?;
+    let (shard_exact_bytes, _) = contract_profile_encoded_bytes(&shard_exact)?;
+    let shard_plus_one = contract_byte_profile(0x71, shard_plus_one_tail)?;
+    let (shard_plus_one_bytes, _) = contract_profile_encoded_bytes(&shard_plus_one)?;
+    let shard_plus_one_rejected = shard_plus_one_bytes == shard_target.checked_add(1)?
+        && matches!(
+            WorkspaceSnapshotSet::new_with_retention(vec![shard_plus_one]),
+            Err(WorkspaceRetentionError::RetentionExhausted(
+                WorkspaceRetentionLimit::ProfileShardBytes
+            ))
+        );
+
+    let mut exact_store_profiles = Vec::with_capacity(4);
+    let mut exact_store_bytes = 0_u64;
+    let mut first_three_shards_exact = true;
+    for instance_byte in [0x72, 0x73, 0x74] {
+        let profile = contract_byte_profile(instance_byte, shard_tail)?;
+        let (shard_bytes, committed_bytes) = contract_profile_encoded_bytes(&profile)?;
+        first_three_shards_exact &= shard_bytes == shard_target;
+        exact_store_bytes = exact_store_bytes.checked_add(committed_bytes)?;
+        exact_store_profiles.push(profile);
+    }
+    let fourth_base = contract_byte_profile(0x75, 0)?;
+    let (_, fourth_base_committed_bytes) = contract_profile_encoded_bytes(&fourth_base)?;
+    let store_base_bytes = exact_store_bytes.checked_add(fourth_base_committed_bytes)?;
+    let store_tail = usize::try_from(store_target.checked_sub(store_base_bytes)?).ok()?;
+    let store_plus_one_tail = store_tail.checked_add(1)?;
+    if store_plus_one_tail > CONTRACT_BYTE_TUNER_MAX_ASCII_BYTES {
+        return None;
+    }
+    let fourth_exact = contract_byte_profile(0x75, store_tail)?;
+    let (fourth_exact_shard_bytes, fourth_exact_committed_bytes) =
+        contract_profile_encoded_bytes(&fourth_exact)?;
+    exact_store_bytes = exact_store_bytes.checked_add(fourth_exact_committed_bytes)?;
+    let exact_store_accounted = exact_store_bytes == store_target
+        && fourth_exact_shard_bytes <= shard_target
+        && first_three_shards_exact;
+    exact_store_profiles.push(fourth_exact);
+    let exact_store_accepted = matches!(
+        WorkspaceSnapshotSet::new_with_retention(exact_store_profiles),
+        Ok(set) if set.history_evicted() == 0 && set.profiles().len() == 4
+    );
+
+    let mut plus_one_store_profiles = Vec::with_capacity(4);
+    let mut plus_one_store_bytes = 0_u64;
+    let mut plus_one_store_shards_bounded = true;
+    for instance_byte in [0x76, 0x77, 0x78] {
+        let profile = contract_byte_profile(instance_byte, shard_tail)?;
+        let (shard_bytes, committed_bytes) = contract_profile_encoded_bytes(&profile)?;
+        plus_one_store_shards_bounded &= shard_bytes <= shard_target;
+        plus_one_store_bytes = plus_one_store_bytes.checked_add(committed_bytes)?;
+        plus_one_store_profiles.push(profile);
+    }
+    let fourth_plus_one = contract_byte_profile(0x79, store_plus_one_tail)?;
+    let (fourth_plus_one_shard_bytes, fourth_plus_one_committed_bytes) =
+        contract_profile_encoded_bytes(&fourth_plus_one)?;
+    plus_one_store_shards_bounded &= fourth_plus_one_shard_bytes <= shard_target;
+    plus_one_store_bytes = plus_one_store_bytes.checked_add(fourth_plus_one_committed_bytes)?;
+    plus_one_store_profiles.push(fourth_plus_one);
+    let store_plus_one_rejected = plus_one_store_shards_bounded
+        && plus_one_store_bytes == store_target.checked_add(1)?
+        && matches!(
+            WorkspaceSnapshotSet::new_with_retention(plus_one_store_profiles),
+            Err(WorkspaceRetentionError::RetentionExhausted(
+                WorkspaceRetentionLimit::TotalStoreBytes
+            ))
+        );
+
+    Some(ContractByteProbes {
+        profile_shard_bytes_exact: shard_exact_bytes == shard_target
+            && first_three_shards_exact
+            && exact_store_accepted,
+        profile_shard_bytes_plus_one_rejected: shard_plus_one_rejected,
+        workspace_store_bytes_exact: exact_store_accounted && exact_store_accepted,
+        workspace_store_bytes_plus_one_rejected: store_plus_one_rejected,
+    })
 }
 
 fn conservative_encoded_overheads(

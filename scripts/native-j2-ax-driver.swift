@@ -664,13 +664,40 @@ private let commonAllowed: Set<String> = [
     "--phase", "--app-path", "--config", "--output", "--pid", "--seed-evidence",
 ]
 
-private func exercisePersistenceOptOutAndClear(application: AXUIElement) throws -> Bool {
+private func exercisePersistenceOptOutAndClear(
+    application: AXUIElement
+) throws -> (Bool, Bool) {
     try press(try single("workspace.persistence.toggle", application: application))
     _ = try waitForStatus(
         "workspace.persistence.status",
         application: application,
         timeout: 20
     ) { $0.hasPrefix("Off") }
+
+    let optOutSource = "SELECT 6 AS j2_opt_out_private_marker"
+    try setEditorSource(optOutSource, application: application)
+    let saveWhileOff = try single("editor.save", application: application)
+    guard boolAttribute(
+        saveWhileOff.element,
+        kAXEnabledAttribute as CFString
+    ) == false else {
+        throw fail("Save remained enabled while private persistence was Off")
+    }
+    let beforeOptOut = resultTabIdentifiers(application: application)
+    try press(try single("editor.execute", application: application))
+    _ = try waitForResultDelta(
+        application: application,
+        before: beforeOptOut,
+        delta: 1
+    )
+    try press(try single("result.tab.history", application: application))
+    guard waitUntil(timeout: 10, {
+        historyEntryValues(application: application).isEmpty
+    }) else {
+        throw fail("persistence Off retained executed source in private history")
+    }
+    try press(try single("result.tab.results", application: application))
+    try setEditorSource("SELECT 1 AS j2_safe_after_opt_out", application: application)
     try press(try single("workspace.persistence.toggle", application: application))
     _ = try waitForStatus(
         "workspace.persistence.status",
@@ -678,7 +705,8 @@ private func exercisePersistenceOptOutAndClear(application: AXUIElement) throws 
         timeout: 20
     ) { !$0.hasPrefix("Off") && $0 != "Loading" }
 
-    try setEditorSource("SELECT 7 AS j2_clear_probe", application: application)
+    let clearSource = "SELECT 7 AS j2_clear_private_marker"
+    try setEditorSource(clearSource, application: application)
     let before = resultTabIdentifiers(application: application)
     try press(try single("editor.execute", application: application))
     _ = try waitForResultDelta(application: application, before: before, delta: 1)
@@ -705,13 +733,14 @@ private func exercisePersistenceOptOutAndClear(application: AXUIElement) throws 
         throw fail("durable clear retained a history entry")
     }
     try press(try single("result.tab.results", application: application))
+    try setEditorSource("SELECT 1 AS j2_safe_after_clear", application: application)
     try press(try single("workspace.persistence.toggle", application: application))
     _ = try waitForStatus(
         "workspace.persistence.status",
         application: application,
         timeout: 20
     ) { !$0.hasPrefix("Off") && $0 != "Loading" }
-    return true
+    return (true, true)
 }
 
 private func exerciseSyntaxAndAutocomplete(application: AXUIElement) throws -> Bool {
@@ -734,6 +763,13 @@ private func exerciseSyntaxAndAutocomplete(application: AXUIElement) throws -> B
 
     let source = "-- j2 syntax\nSELECT 1 FROM dbo"
     try setEditorSource(source, application: application)
+    _ = try waitForStatus(
+        "editor.syntax.status",
+        application: application,
+        timeout: 10
+    ) {
+        $0 == "SQL syntax · keywords 2 · literals 0 · numbers 1 · comments 1"
+    }
     var candidate: AXRecord?
     guard waitUntil(timeout: 20, {
         candidate = prefixRecords(
@@ -822,6 +858,26 @@ private func exerciseResultInspection(application: AXUIElement) throws -> Bool {
         NSPasteboard.general.string(forType: .string) == "alpha"
     }) else {
         throw fail("selected result cell was not copied exactly")
+    }
+    NSPasteboard.general.clearContents()
+    try press(try single("result.mode.value", application: application))
+    _ = try waitForStatus(
+        "result.value.status",
+        application: application,
+        timeout: 10
+    ) {
+        $0.contains("Row 2")
+            && $0.contains("Column 2")
+            && $0.contains("value")
+    }
+    guard statusValue("result.value.content", application: application) == "alpha" else {
+        throw fail("full selected result value was not exposed exactly")
+    }
+    try press(try single("result.copy.row", application: application))
+    guard waitUntil(timeout: 10, {
+        NSPasteboard.general.string(forType: .string) == "id\tvalue\n2\talpha\n"
+    }) else {
+        throw fail("selected result row was not copied as exact TSV")
     }
     NSPasteboard.general.clearContents()
     try press(try single("result.mode.record", application: application))
@@ -925,7 +981,10 @@ private func runSeed(_ options: Options) throws {
     try connectSelectedProfile(application: application)
 
     _ = try single("editor.tab.1", application: application, timeout: 20)
-    let persistenceOptOutAndClear =
+    let (
+        persistenceOptOutAndClear,
+        persistenceOffEditSaveDisabledExecute
+    ) =
         try exercisePersistenceOptOutAndClear(application: application)
     try press(try single("editor.tab.new", application: application))
     _ = try single("editor.tab.2", application: application)
@@ -1030,6 +1089,16 @@ private func runSeed(_ options: Options) throws {
     }) else {
         throw fail("failed execution did not settle")
     }
+    let failedErrorStatus = try waitForStatus(
+        "result.error.status",
+        application: application,
+        timeout: 15
+    ) {
+        !$0.isEmpty && $0.contains("Category:") && $0.contains("Code:")
+    }
+    let failedQueryErrorRetained =
+        failedErrorStatus.contains("Category:")
+        && failedErrorStatus.contains("Code:")
 
     let exactHistorySource = try boundaryHistorySource(
         marker: exactHistoryMarker,
@@ -1083,7 +1152,10 @@ private func runSeed(_ options: Options) throws {
                 "history_filters_and_metrics_visible": historyFiltersAndMetricsVisible,
                 "history_source_exact_retained": historySourceExactRetained,
                 "history_source_plus_one_omitted": historySourcePlusOneOmitted,
+                "failed_query_error_retained": failedQueryErrorRetained,
                 "persistence_opt_out_and_clear": persistenceOptOutAndClear,
+                "persistence_off_edit_save_disabled_execute":
+                    persistenceOffEditSaveDisabledExecute,
                 "result_inspection_completed": resultInspectionCompleted,
                 "tabs_created_renamed_reordered": tabsCreatedRenamedReordered,
                 "tab_bound_enforced": tabBoundEnforced,
