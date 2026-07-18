@@ -12,7 +12,6 @@ services:
       MYSQL_USER: dbotter
       MYSQL_PASSWORD: dbotter-local-only
       MYSQL_ROOT_PASSWORD: root-local-only
-      MYSQL_PWD: dbotter-local-only
     labels:
       ai.2lab.dbotter.fixture: installed-j2-v1
     ports:
