@@ -84,7 +84,7 @@ done
   || fail "DBOTTER_MYSQL_ROOT_PASSWORD does not match the dedicated fixture"
 
 for dependency in \
-  brew codesign docker git jq lsof plutil python3 shasum stat xcrun; do
+  brew cmp codesign docker git jq lsof plutil python3 shasum stat xcrun; do
   command -v "$dependency" >/dev/null 2>&1 || fail "$dependency is required"
 done
 
@@ -215,7 +215,40 @@ docker inspect "$mysql_container" | jq -e '
 ' >/dev/null || fail "MySQL fixture port or tmpfs isolation is invalid"
 
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/dbotter-installed-j2.XXXXXX")"
-driver="$temporary/native-j2-ax-driver"
+driver_candidate="$temporary/native-j2-ax-driver"
+driver="$driver_candidate"
+stable_driver="${DBOTTER_J2_AX_DRIVER_PATH:-}"
+if [[ -n "$stable_driver" ]]; then
+  [[ "$stable_driver" == /* ]] \
+    || fail "DBOTTER_J2_AX_DRIVER_PATH must be absolute"
+  [[ -f "$stable_driver" && ! -L "$stable_driver" && -x "$stable_driver" ]] \
+    || fail "stable J2 AX driver must be a non-symlink executable"
+  stable_driver_realpath="$(python3 - "$stable_driver" <<'PY'
+import os
+import sys
+print(os.path.realpath(sys.argv[1]))
+PY
+)"
+  case "$stable_driver_realpath" in
+    "$tmp_realpath"/*) ;;
+    *) fail "stable J2 AX driver must resolve under TMPDIR" ;;
+  esac
+  python3 - "$stable_driver" <<'PY' \
+    || fail "stable J2 AX driver ownership or mode is unsafe"
+import os
+import stat
+import sys
+
+metadata = os.stat(sys.argv[1], follow_symlinks=False)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != os.geteuid()
+    or metadata.st_mode & 0o022
+):
+    raise SystemExit(1)
+PY
+  driver="$stable_driver"
+fi
 seed_evidence="$temporary/seed.json"
 restart_evidence="$temporary/restart.json"
 history_evidence="$temporary/history-open.json"
@@ -273,9 +306,13 @@ trap cleanup EXIT HUP INT TERM
 "$process_guard" --assert-empty "$executable" \
   || fail "stale exact installed-app process exists"
 
-"$builder" --output "$driver"
-[[ -f "$driver" && ! -L "$driver" && -x "$driver" ]] \
+"$builder" --output "$driver_candidate"
+[[ -f "$driver_candidate" && ! -L "$driver_candidate" && -x "$driver_candidate" ]] \
   || fail "J2 AX driver build produced no executable"
+if [[ "$driver" != "$driver_candidate" ]]; then
+  cmp -s -- "$driver_candidate" "$driver" \
+    || fail "stable J2 AX driver does not match the exact source build"
+fi
 
 workspace_contract="$temporary/workspace-contract.json"
 "$executable" workspace-contract --format json >"$workspace_contract"
