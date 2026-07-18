@@ -265,6 +265,7 @@ fn successful_executions_append_distinct_selectable_result_tabs() {
             .selected_result_tab()
             .expect("selected result")
             .snapshot()
+            .expect("selected result payload")
             .provenance
             .result_id,
         ResultId(11)
@@ -298,6 +299,7 @@ fn closing_result_tabs_selects_the_adjacent_output_and_clears_the_last_surface()
             .selected_result_tab()
             .expect("right-adjacent result selected")
             .snapshot()
+            .expect("adjacent result payload")
             .provenance
             .result_id,
         ResultId(23)

@@ -368,8 +368,31 @@ pub struct ResultTabId(pub u64);
 pub struct ResultTab {
     id: ResultTabId,
     origin_editor_tab_id: Option<EditorTabId>,
-    snapshot: Arc<ResultSnapshot>,
-    view: ResultViewState,
+    content: ResultTabContent,
+}
+
+#[derive(Clone)]
+enum ResultTabContent {
+    Result {
+        snapshot: Arc<ResultSnapshot>,
+        view: ResultViewState,
+    },
+    Error(PublicOperationError),
+}
+
+impl ResultTabContent {
+    fn surface(
+        &self,
+    ) -> (
+        Option<Arc<ResultSnapshot>>,
+        ResultViewState,
+        Option<PublicOperationError>,
+    ) {
+        match self {
+            Self::Result { snapshot, view } => (Some(snapshot.clone()), view.clone(), None),
+            Self::Error(error) => (None, ResultViewState::default(), Some(error.clone())),
+        }
+    }
 }
 
 impl std::fmt::Debug for ResultTab {
@@ -378,7 +401,13 @@ impl std::fmt::Debug for ResultTab {
             .debug_struct("ResultTab")
             .field("id", &self.id)
             .field("origin_editor_tab_id", &self.origin_editor_tab_id)
-            .field("snapshot", &"<retained>")
+            .field(
+                "content",
+                &match &self.content {
+                    ResultTabContent::Result { .. } => "<retained-result>",
+                    ResultTabContent::Error(_) => "<retained-error>",
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -388,8 +417,18 @@ impl ResultTab {
         self.id
     }
 
-    pub fn snapshot(&self) -> &Arc<ResultSnapshot> {
-        &self.snapshot
+    pub fn snapshot(&self) -> Option<&Arc<ResultSnapshot>> {
+        match &self.content {
+            ResultTabContent::Result { snapshot, .. } => Some(snapshot),
+            ResultTabContent::Error(_) => None,
+        }
+    }
+
+    pub fn error(&self) -> Option<&PublicOperationError> {
+        match &self.content {
+            ResultTabContent::Result { .. } => None,
+            ResultTabContent::Error(error) => Some(error),
+        }
     }
 
     pub const fn origin_editor_tab_id(&self) -> Option<EditorTabId> {
@@ -397,11 +436,38 @@ impl ResultTab {
     }
 
     pub fn title(&self) -> String {
-        format!("Result {}", self.snapshot.provenance.result_id.0)
+        match &self.content {
+            ResultTabContent::Result { snapshot, .. } => {
+                format!("Result {}", snapshot.provenance.result_id.0)
+            }
+            ResultTabContent::Error(_) => format!("Error {}", self.id.0),
+        }
+    }
+
+    pub const fn is_error(&self) -> bool {
+        matches!(&self.content, ResultTabContent::Error(_))
     }
 
     pub(crate) const fn can_close(&self) -> bool {
-        !self.view.has_pending_export()
+        match &self.content {
+            ResultTabContent::Result { view, .. } => !view.has_pending_export(),
+            ResultTabContent::Error(_) => true,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.snapshot()
+            .map_or(0, |snapshot| snapshot.retained_bytes)
+    }
+
+    fn surface(
+        &self,
+    ) -> (
+        Option<Arc<ResultSnapshot>>,
+        ResultViewState,
+        Option<PublicOperationError>,
+    ) {
+        self.content.surface()
     }
 }
 
@@ -435,6 +501,7 @@ pub struct ProfileWorkspace {
     pub row_limit: String,
     pub timeout_seconds: String,
     pub pending_execute: Option<OperationId>,
+    pending_execute_editor_tab_id: Option<EditorTabId>,
     pub result: Option<Arc<ResultSnapshot>>,
     pub(crate) result_view: ResultViewState,
     pub error: Option<PublicOperationError>,
@@ -492,6 +559,7 @@ impl Default for ProfileWorkspace {
             row_limit: String::new(),
             timeout_seconds: String::new(),
             pending_execute: None,
+            pending_execute_editor_tab_id: None,
             result: None,
             result_view: ResultViewState::default(),
             error: None,
@@ -961,6 +1029,7 @@ impl ProfileWorkspace {
     fn retain_editor_context_for_profile_retag(&mut self) {
         let _ = self.sync_selected_editor_tab_from_surface();
         self.pending_execute = None;
+        self.pending_execute_editor_tab_id = None;
         self.result = None;
         self.result_view = ResultViewState::default();
         self.error = None;
@@ -1002,8 +1071,17 @@ impl ProfileWorkspace {
 
     pub fn retained_result_bytes(&self) -> usize {
         self.result_tabs.iter().fold(0_usize, |total, tab| {
-            total.saturating_add(tab.snapshot.retained_bytes)
+            total.saturating_add(tab.retained_bytes())
         })
+    }
+
+    pub(crate) fn begin_execute(
+        &mut self,
+        operation_id: OperationId,
+        editor_tab_id: Option<EditorTabId>,
+    ) {
+        self.pending_execute = Some(operation_id);
+        self.pending_execute_editor_tab_id = editor_tab_id;
     }
 
     pub const fn selected_result_tab_id(&self) -> Option<ResultTabId> {
@@ -1027,10 +1105,35 @@ impl ProfileWorkspace {
         snapshot: Arc<ResultSnapshot>,
         origin_editor_tab_id: Option<EditorTabId>,
     ) -> Result<ResultTabId, ResultTabError> {
+        let mut view = ResultViewState::default();
+        view.reset_for(snapshot.provenance.result_id);
+        self.append_output_tab_for_editor(
+            ResultTabContent::Result { snapshot, view },
+            origin_editor_tab_id,
+        )
+    }
+
+    pub(crate) fn append_error_tab_for_editor(
+        &mut self,
+        error: PublicOperationError,
+        origin_editor_tab_id: Option<EditorTabId>,
+    ) -> Result<ResultTabId, ResultTabError> {
+        self.append_output_tab_for_editor(ResultTabContent::Error(error), origin_editor_tab_id)
+    }
+
+    fn append_output_tab_for_editor(
+        &mut self,
+        content: ResultTabContent,
+        origin_editor_tab_id: Option<EditorTabId>,
+    ) -> Result<ResultTabId, ResultTabError> {
         self.sync_selected_result_tab_from_surface();
         let mut evictions = vec![false; self.result_tabs.len()];
         let mut retained_count = self.result_tabs.len();
         let mut retained_bytes = self.retained_result_bytes();
+        let new_retained_bytes = match &content {
+            ResultTabContent::Result { snapshot, .. } => snapshot.retained_bytes,
+            ResultTabContent::Error(_) => 0,
+        };
 
         if let Some(editor_tab_id) = origin_editor_tab_id {
             let editor_result_count = self
@@ -1051,7 +1154,7 @@ impl ProfileWorkspace {
                 {
                     evictions[index] = true;
                     retained_count = retained_count.saturating_sub(1);
-                    retained_bytes = retained_bytes.saturating_sub(tab.snapshot.retained_bytes);
+                    retained_bytes = retained_bytes.saturating_sub(tab.retained_bytes());
                     required_evictions -= 1;
                 }
             }
@@ -1061,7 +1164,7 @@ impl ProfileWorkspace {
         }
 
         while retained_count.saturating_add(1) > MAX_RESULT_TABS_PER_PROFILE
-            || retained_bytes.saturating_add(snapshot.retained_bytes) > MAX_PROFILE_RESULT_BYTES
+            || retained_bytes.saturating_add(new_retained_bytes) > MAX_PROFILE_RESULT_BYTES
         {
             let Some((index, tab)) = self.result_tabs.iter().enumerate().find(|(index, tab)| {
                 !evictions[*index] && Some(tab.id) != self.selected_result_tab && tab.can_close()
@@ -1070,7 +1173,7 @@ impl ProfileWorkspace {
             };
             evictions[index] = true;
             retained_count = retained_count.saturating_sub(1);
-            retained_bytes = retained_bytes.saturating_sub(tab.snapshot.retained_bytes);
+            retained_bytes = retained_bytes.saturating_sub(tab.retained_bytes());
         }
 
         for index in (0..evictions.len()).rev() {
@@ -1080,20 +1183,19 @@ impl ProfileWorkspace {
         }
         let id = ResultTabId(self.next_result_tab_id.max(1));
         self.next_result_tab_id = id.0.saturating_add(1);
-        let mut view = ResultViewState::default();
-        view.reset_for(snapshot.provenance.result_id);
         let activate =
             origin_editor_tab_id.is_none() || origin_editor_tab_id == self.selected_editor_tab;
+        let surface = content.surface();
         self.result_tabs.push(ResultTab {
             id,
             origin_editor_tab_id,
-            snapshot: snapshot.clone(),
-            view: view.clone(),
+            content,
         });
         if activate {
             self.selected_result_tab = Some(id);
-            self.result = Some(snapshot);
-            self.result_view = view;
+            self.result = surface.0;
+            self.result_view = surface.1;
+            self.error = surface.2;
             self.result_area_tab = ResultAreaTab::Results;
         }
         Ok(id)
@@ -1104,15 +1206,17 @@ impl ProfileWorkspace {
         let replacement = self
             .result_tabs_for_editor(editor_tab_id)
             .next_back()
-            .map(|tab| (tab.id, tab.snapshot.clone(), tab.view.clone()));
-        if let Some((id, snapshot, view)) = replacement {
+            .map(|tab| (tab.id, tab.surface()));
+        if let Some((id, surface)) = replacement {
             self.selected_result_tab = Some(id);
-            self.result = Some(snapshot);
-            self.result_view = view;
+            self.result = surface.0;
+            self.result_view = surface.1;
+            self.error = surface.2;
         } else {
             self.selected_result_tab = None;
             self.result = None;
             self.result_view = ResultViewState::default();
+            self.error = None;
         }
     }
 
@@ -1121,9 +1225,11 @@ impl ProfileWorkspace {
         let Some(tab) = self.result_tabs.iter().find(|tab| tab.id == tab_id) else {
             return Err(ResultTabError::NotFound);
         };
+        let surface = tab.surface();
         self.selected_result_tab = Some(tab_id);
-        self.result = Some(tab.snapshot.clone());
-        self.result_view = tab.view.clone();
+        self.result = surface.0;
+        self.result_view = surface.1;
+        self.error = surface.2;
         self.result_area_tab = ResultAreaTab::Results;
         Ok(())
     }
@@ -1160,15 +1266,17 @@ impl ProfileWorkspace {
                             || tab.origin_editor_tab_id == selected_editor_tab
                     })
             })
-            .map(|tab| (tab.id, tab.snapshot.clone(), tab.view.clone()));
-        if let Some((id, snapshot, view)) = replacement {
+            .map(|tab| (tab.id, tab.surface()));
+        if let Some((id, surface)) = replacement {
             self.selected_result_tab = Some(id);
-            self.result = Some(snapshot);
-            self.result_view = view;
+            self.result = surface.0;
+            self.result_view = surface.1;
+            self.error = surface.2;
         } else {
             self.selected_result_tab = None;
             self.result = None;
             self.result_view = ResultViewState::default();
+            self.error = None;
         }
         Ok(())
     }
@@ -1180,20 +1288,22 @@ impl ProfileWorkspace {
         let Some(tab) = self.result_tabs.iter_mut().find(|tab| tab.id == selected) else {
             return;
         };
-        if self
-            .result
-            .as_ref()
-            .is_some_and(|result| Arc::ptr_eq(result, &tab.snapshot))
+        if let ResultTabContent::Result { snapshot, view } = &mut tab.content
+            && self
+                .result
+                .as_ref()
+                .is_some_and(|result| Arc::ptr_eq(result, snapshot))
         {
-            tab.view = self.result_view.clone();
+            *view = self.result_view.clone();
         }
     }
 
     pub(crate) fn result_snapshot(&self, result_id: ResultId) -> Option<Arc<ResultSnapshot>> {
         self.result_tabs
             .iter()
-            .find(|tab| tab.snapshot.provenance.result_id == result_id)
-            .map(|tab| tab.snapshot.clone())
+            .filter_map(ResultTab::snapshot)
+            .find(|snapshot| snapshot.provenance.result_id == result_id)
+            .cloned()
             .or_else(|| {
                 self.result
                     .as_ref()
@@ -1210,10 +1320,12 @@ impl ProfileWorkspace {
         self.sync_selected_result_tab_from_surface();
         let mut accepted = false;
         for tab in &mut self.result_tabs {
-            if tab.snapshot.provenance.result_id == result_id {
-                accepted = tab.view.begin_export(result_id, operation_id);
+            if let ResultTabContent::Result { snapshot, view } = &mut tab.content
+                && snapshot.provenance.result_id == result_id
+            {
+                accepted = view.begin_export(result_id, operation_id);
                 if accepted && self.selected_result_tab == Some(tab.id) {
-                    self.result_view = tab.view.clone();
+                    self.result_view = view.clone();
                 }
                 break;
             }
@@ -1237,10 +1349,12 @@ impl ProfileWorkspace {
 
     pub(crate) fn finish_result_export(&mut self, result_id: ResultId, operation_id: OperationId) {
         for tab in &mut self.result_tabs {
-            if tab.snapshot.provenance.result_id == result_id {
-                let _ = tab.view.finish_export(result_id, operation_id);
+            if let ResultTabContent::Result { snapshot, view } = &mut tab.content
+                && snapshot.provenance.result_id == result_id
+            {
+                let _ = view.finish_export(result_id, operation_id);
                 if self.selected_result_tab == Some(tab.id) {
-                    self.result_view = tab.view.clone();
+                    self.result_view = view.clone();
                 }
             }
         }
@@ -1897,6 +2011,7 @@ impl UiModel {
                     let workspace = self.exact_workspace_mut(&profile_id, profile_generation);
                     if workspace.pending_execute == Some(operation_id) {
                         workspace.pending_execute = None;
+                        workspace.pending_execute_editor_tab_id = None;
                     }
                     self.status = summary.message().to_owned();
                 }
@@ -1917,12 +2032,12 @@ impl UiModel {
                             return;
                         }
                         workspace.pending_execute = None;
+                        workspace.pending_execute_editor_tab_id = None;
                         if editor_tab_id
                             .is_some_and(|tab_id| workspace.editor_tab(tab_id).is_none())
                         {
                             (true, false)
                         } else {
-                            workspace.error = None;
                             (
                                 false,
                                 workspace
@@ -1966,18 +2081,18 @@ impl UiModel {
                     let duration_ms = results.iter().fold(0_u128, |total, result| {
                         total.saturating_add(result.provenance.duration_ms)
                     });
-                    let origin_missing = {
+                    let (origin_missing, error_not_retained) = {
                         let workspace = self.exact_workspace_mut(&profile_id, profile_generation);
                         if workspace.pending_execute != Some(operation_id) {
                             return;
                         }
                         workspace.pending_execute = None;
+                        workspace.pending_execute_editor_tab_id = None;
                         if editor_tab_id
                             .is_some_and(|tab_id| workspace.editor_tab(tab_id).is_none())
                         {
-                            true
+                            (true, error.is_some())
                         } else {
-                            workspace.error = error;
                             for result in results {
                                 if workspace
                                     .append_result_tab_for_editor(Arc::new(result), editor_tab_id)
@@ -1986,7 +2101,24 @@ impl UiModel {
                                     discarded_results = discarded_results.saturating_add(1);
                                 }
                             }
-                            false
+                            let error_not_retained = if let Some(error) = error {
+                                if workspace
+                                    .append_error_tab_for_editor(error.clone(), editor_tab_id)
+                                    .is_err()
+                                {
+                                    if editor_tab_id.is_none()
+                                        || editor_tab_id == workspace.selected_editor_tab
+                                    {
+                                        workspace.error = Some(error);
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            (false, error_not_retained)
                         }
                     };
                     self.status = if origin_missing {
@@ -2000,6 +2132,9 @@ impl UiModel {
                             status.push_str(&format!(
                                 " ({discarded_results} completed results were not retained.)"
                             ));
+                        }
+                        if error_not_retained {
+                            status.push_str(" The typed error could not be retained.");
                         }
                         status
                     } else {
@@ -2234,11 +2369,41 @@ impl UiModel {
                         }
                     }
                     OperationKind::ExecuteRead | OperationKind::ExecuteMutation => {
-                        let workspace = self.exact_workspace_mut(&profile_id, profile_generation);
-                        if workspace.pending_execute == Some(operation_id) {
+                        let (origin_missing, error_not_retained) = {
+                            let workspace =
+                                self.exact_workspace_mut(&profile_id, profile_generation);
+                            if workspace.pending_execute != Some(operation_id) {
+                                return;
+                            }
                             workspace.pending_execute = None;
-                            workspace.error = Some(error);
-                            self.status = summary.message().to_owned();
+                            let editor_tab_id = workspace.pending_execute_editor_tab_id.take();
+                            if editor_tab_id
+                                .is_some_and(|tab_id| workspace.editor_tab(tab_id).is_none())
+                            {
+                                (true, true)
+                            } else if workspace
+                                .append_error_tab_for_editor(error.clone(), editor_tab_id)
+                                .is_err()
+                            {
+                                if editor_tab_id.is_none()
+                                    || editor_tab_id == workspace.selected_editor_tab
+                                {
+                                    workspace.error = Some(error);
+                                }
+                                (false, true)
+                            } else {
+                                (false, false)
+                            }
+                        };
+                        self.status = if origin_missing {
+                            "The originating editor tab is no longer available.".to_owned()
+                        } else if error_not_retained {
+                            format!(
+                                "{} The typed error could not be retained.",
+                                summary.message()
+                            )
+                        } else {
+                            summary.message().to_owned()
                         }
                     }
                     _ => self.status = summary.message().to_owned(),
@@ -2278,6 +2443,7 @@ impl UiModel {
                 self.connection_states.clear();
                 for workspace in self.workspaces.values_mut() {
                     workspace.pending_execute = None;
+                    workspace.pending_execute_editor_tab_id = None;
                 }
                 self.status = "Configuration state is uncertain.".to_owned();
             }
@@ -2288,6 +2454,7 @@ impl UiModel {
                 }
                 for workspace in self.workspaces.values_mut() {
                     workspace.pending_execute = None;
+                    workspace.pending_execute_editor_tab_id = None;
                 }
                 self.status = "Runtime shut down".to_owned();
             }

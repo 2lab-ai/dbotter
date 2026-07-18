@@ -3245,7 +3245,7 @@ impl DbotterApp {
                 workspace
                     .result_tabs()
                     .iter()
-                    .map(|tab| tab.snapshot().provenance.result_id)
+                    .filter_map(|tab| tab.snapshot().map(|snapshot| snapshot.provenance.result_id))
                     .chain(
                         workspace
                             .result
@@ -4366,6 +4366,7 @@ impl DbotterApp {
         let profile_generation = intent.profile_generation();
         let operation_kind = intent.operation_kind();
         let target_count = intent.target_count();
+        let editor_tab_id = intent.editor_tab_id();
         let history_source = intent.text().to_owned();
         let history_target = intent.run_target();
         let workspace_key = WorkspaceKey::new(profile_id.clone(), profile_generation);
@@ -4425,7 +4426,9 @@ impl DbotterApp {
                         history_target,
                     );
                 }
-                self.model.workspace_mut(workspace_key).pending_execute = Some(operation_id);
+                self.model
+                    .workspace_mut(workspace_key)
+                    .begin_execute(operation_id, editor_tab_id);
                 self.active_operations.insert(
                     profile_id,
                     ActiveOperation {
@@ -4450,6 +4453,7 @@ impl DbotterApp {
         let profile_id = intent.profile_id().clone();
         let profile_generation = intent.profile_generation();
         let operation_kind = intent.operation_kind();
+        let editor_tab_id = intent.editor_tab_id();
         let history_source = intent.text().to_owned();
         let history_target = intent.run_target();
         let workspace_key = WorkspaceKey::new(profile_id.clone(), profile_generation);
@@ -4507,7 +4511,7 @@ impl DbotterApp {
                 }
                 self.model
                     .workspace_mut(workspace_key.clone())
-                    .pending_execute = Some(operation_id);
+                    .begin_execute(operation_id, editor_tab_id);
                 self.active_operations.insert(
                     profile_id,
                     ActiveOperation {
@@ -7224,22 +7228,25 @@ impl DbotterApp {
             .map_or_else(Vec::new, |workspace| {
                 workspace
                     .result_tabs_for_editor(selected_editor_tab_id)
-                    .map(|tab| (tab.id(), tab.title(), tab.can_close()))
+                    .map(|tab| (tab.id(), tab.title(), tab.can_close(), tab.is_error()))
                     .collect::<Vec<_>>()
             });
         let selected_result = selected_workspace_key
             .as_ref()
             .and_then(|key| self.model.workspace(key))
             .and_then(ProfileWorkspace::selected_result_tab_id);
-        let selected_result = selected_result
-            .filter(|selected| result_tabs.iter().any(|(tab_id, _, _)| tab_id == selected));
+        let selected_result = selected_result.filter(|selected| {
+            result_tabs
+                .iter()
+                .any(|(tab_id, _, _, _)| tab_id == selected)
+        });
         let mut select_result = None;
         let mut close_result = None;
         egui::ScrollArea::horizontal()
             .id_salt("result.output.tabs")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (tab_id, title, can_close) in &result_tabs {
+                    for (tab_id, title, can_close, is_error) in &result_tabs {
                         ui.push_id(tab_id.0, |ui| {
                             ui.horizontal(|ui| {
                                 let tab = ui.add_sized(
@@ -7250,7 +7257,11 @@ impl DbotterApp {
                                 let tab = named_dynamic_author_id(
                                     tab,
                                     format!("result.output.{}", tab_id.0),
-                                    "Execution result tab",
+                                    if *is_error {
+                                        "Execution error tab"
+                                    } else {
+                                        "Execution result tab"
+                                    },
                                 );
                                 if tab.clicked() {
                                     select_result = Some(*tab_id);
@@ -7289,22 +7300,23 @@ impl DbotterApp {
         }
 
         let mut result_intent = None;
-        let mut has_result = false;
+        let mut has_output = false;
         if let Some(key) = selected_workspace_key {
             let workspace = self.model.workspace_mut(key);
             if let Some(error) = workspace.error.as_ref() {
+                has_output = true;
                 render_result_error(ui, error);
                 ui.add_space(8.0);
             }
             if let Some(result) = workspace.result.clone() {
-                has_result = true;
+                has_output = true;
                 if let Some(intent) = workspace.result_view.show(ui, result.as_ref(), true) {
                     result_intent = Some((result, intent));
                 }
                 workspace.sync_selected_result_tab_from_surface();
             }
         }
-        if !has_result {
+        if !has_output {
             ui.weak("No result yet");
         }
         if let Some((result, intent)) = result_intent {
@@ -8317,6 +8329,25 @@ fn render_result_error(ui: &mut egui::Ui, error: &PublicOperationError) {
                 "Last query failed".to_owned(),
                 status_value,
             );
+            ui.horizontal_wrapped(|ui| {
+                let category_value = format!("{:?}", error.category);
+                let category = ui.small(format!("Category: {category_value}"));
+                named_dynamic_value_author_id(
+                    category,
+                    "result.error.category".to_owned(),
+                    "Error category".to_owned(),
+                    category_value,
+                );
+                ui.separator();
+                let code_value = format!("{:?}", error.code);
+                let code = ui.small(format!("Code: {code_value}"));
+                named_dynamic_value_author_id(
+                    code,
+                    "result.error.code".to_owned(),
+                    "Error code".to_owned(),
+                    code_value,
+                );
+            });
         });
 }
 
@@ -13788,10 +13819,10 @@ mod tests {
                 .expect("single terminal workspace");
             assert!(workspace.pending_execute.is_none());
             assert_eq!(
-                workspace
-                    .result_tabs()
-                    .last()
-                    .map(|tab| tab.snapshot().provenance.operation_id),
+                workspace.result_tabs().last().and_then(|tab| {
+                    tab.snapshot()
+                        .map(|snapshot| snapshot.provenance.operation_id)
+                }),
                 Some(pending)
             );
             let history = workspace
@@ -13947,7 +13978,8 @@ mod tests {
             assert!(workspace.pending_execute.is_none());
             assert_eq!(workspace.result_tabs().len(), 2);
             assert!(workspace.result_tabs().iter().all(|tab| {
-                tab.snapshot().provenance.operation_id == pending
+                tab.snapshot()
+                    .is_some_and(|snapshot| snapshot.provenance.operation_id == pending)
                     && tab.origin_editor_tab_id() == Some(editor_tab_id)
             }));
             let history = workspace
@@ -18211,9 +18243,9 @@ mod tests {
                     .map(|tab| tab.id())
             );
             assert_eq!(
-                workspace
-                    .selected_result_tab()
-                    .map(|tab| tab.snapshot().provenance.result_id),
+                workspace.selected_result_tab().and_then(|tab| {
+                    tab.snapshot().map(|snapshot| snapshot.provenance.result_id)
+                }),
                 Some(ResultId(102)),
                 "returning to the origin editor must activate its newest result"
             );
@@ -18406,8 +18438,8 @@ mod tests {
         app.poll_events();
         let workspace = app.model.workspace(&key).expect("workspace retained");
         assert!(workspace.pending_execute.is_none());
-        assert_eq!(workspace.result_tabs().len(), 1);
-        assert_eq!(workspace.selected_result_tab_id(), Some(result_tab_id));
+        assert_eq!(workspace.result_tabs().len(), 2);
+        assert_eq!(workspace.selected_result_tab_id(), Some(error_tab_id));
         assert_eq!(app.model.status, expected_status);
         assert_eq!(
             app.model.connection_state(&profile.id),
@@ -18539,7 +18571,15 @@ mod tests {
         assert!(!app.active_operations.contains_key(&profile.id));
         assert_eq!(app.model.status, "The operation was cancelled.");
         let workspace = app.model.workspace(&key).expect("workspace retained");
-        assert_eq!(workspace.result_tabs().len(), 0);
+        assert_eq!(workspace.result_tabs().len(), 1);
+        let error_tab = workspace
+            .selected_result_tab()
+            .expect("cancelled operation output");
+        assert_eq!(error_tab.title(), "Error 1");
+        assert_eq!(
+            error_tab.error().map(|error| error.summary),
+            Some(PublicSummary::OperationCancelled)
+        );
         assert!(workspace.pending_execute.is_none());
     }
 
