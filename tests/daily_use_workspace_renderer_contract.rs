@@ -100,6 +100,26 @@ fn navigator_renders_connection_and_object_filters_with_stable_author_ids() {
 }
 
 #[test]
+fn profile_cards_expose_opaque_ordered_selection_identity() {
+    let connections = function_body(APP_RENDERER_SOURCE, "connections_contents");
+    let card = function_body(APP_RENDERER_SOURCE, "profile_card");
+    assert!(
+        connections.contains(".enumerate()")
+            && connections.contains("self.profile_card(ui, &profile, profile_index)"),
+        "profile cards must retain their config-order identity through filtering"
+    );
+    assert!(
+        card.contains("named_dynamic_author_id")
+            && card.contains("format!(\"connection.profile.{profile_index}\")"),
+        "each profile selection needs a unique opaque AX identifier"
+    );
+    assert!(
+        !card.contains("format!(\"connection.profile.{}\", profile.id"),
+        "profile AX identifiers must not expose user-owned profile text"
+    );
+}
+
+#[test]
 fn result_area_exposes_distinct_results_and_history_tabs() {
     let results = function_body(APP_RENDERER_SOURCE, "show_result_surface");
     assert!(
