@@ -94,6 +94,34 @@ fn workspace_fingerprint_normalizes_all_platform_varying_stat_fields() {
 }
 
 #[test]
+fn macos_installed_fixture_keeps_platform_only_imports_out_of_linux_clippy() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let installed = fs::read_to_string(root.join("tests/daily_use_j2_installed_contract.rs"))
+        .expect("installed J2 contract source");
+
+    for forbidden in [
+        "use std::process::{Child, Command};",
+        "use std::thread;",
+        "use std::time::Duration;",
+    ] {
+        assert!(
+            !installed.contains(forbidden),
+            "macOS-only installed fixture dependency must not be imported on Linux: {forbidden}"
+        );
+    }
+    for required in [
+        "use std::process::Command;",
+        "struct ChildProcessGuard(std::process::Child);",
+        "std::thread::sleep(std::time::Duration::from_millis(20));",
+    ] {
+        assert!(
+            installed.contains(required),
+            "macOS-only installed fixture dependency must stay fully qualified: {required}"
+        );
+    }
+}
+
+#[test]
 fn p2_controller_identity_and_secret_boundaries_are_structural() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let service = fs::read_to_string(root.join("src/service.rs")).expect("service source");
