@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(unix)]
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 fn repository_path(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
@@ -674,21 +674,134 @@ fn j2_driver_builder_is_reproducible_and_source_bound() {
 }
 
 #[test]
-fn installed_j2_verifier_source_binds_an_opt_in_stable_ax_driver() {
+fn installed_j2_verifier_runs_every_ax_phase_through_source_bound_guard() {
     let verifier = tracked_source("scripts/verify-installed-j2.sh");
+    let guard = tracked_source("scripts/run-source-bound-ax-driver.py");
     for required in [
         "DBOTTER_J2_AX_DRIVER_PATH",
         "driver_candidate=\"$temporary/native-j2-ax-driver\"",
         "\"$builder\" --output \"$driver_candidate\"",
-        "cmp -s -- \"$driver_candidate\" \"$driver\"",
-        "stable J2 AX driver must resolve under TMPDIR",
-        "stable J2 AX driver does not match the exact source build",
+        "driver_identity=\"$temporary/native-j2-ax-driver.identity.json\"",
+        "\"$ax_guard\" capture",
+        "run_ax_driver()",
     ] {
         assert!(
             verifier.contains(required),
-            "installed verifier is missing stable AX source-binding token `{required}`"
+            "installed verifier is missing source-bound AX guard token `{required}`"
         );
     }
+    assert_eq!(
+        verifier.matches("run_ax_driver \\\n  --phase").count(),
+        6,
+        "all six AX acceptance phases must execute through the source-bound guard"
+    );
+    assert!(
+        !verifier.contains("\"$driver\" \\\n  --phase"),
+        "the verifier must not reopen the unguarded AX driver pathname"
+    );
+    for required in [
+        "canonical_path",
+        "device",
+        "inode",
+        "mode",
+        "uid",
+        "size",
+        "sha256",
+        "cdhashes",
+        "before execution",
+        "after execution",
+    ] {
+        assert!(
+            guard.contains(required),
+            "source-bound AX guard is missing pinned identity field `{required}`"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn source_bound_ax_driver_rejects_atomic_inode_replacement_before_execution() {
+    let guard = repository_path("scripts/run-source-bound-ax-driver.py");
+    assert!(
+        guard.is_file(),
+        "source-bound AX guard must exist before the atomic replacement contract can pass"
+    );
+
+    let temporary = tempfile::tempdir().expect("create source-bound AX fixture");
+    fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
+        .expect("secure source-bound AX fixture");
+    let candidate = temporary.path().join("candidate");
+    let driver = temporary.path().join("stable");
+    let replacement = temporary.path().join("replacement");
+    let identity = temporary.path().join("identity.json");
+
+    fs::copy("/usr/bin/true", &candidate).expect("copy source-bound candidate");
+    fs::copy("/usr/bin/true", &driver).expect("copy source-bound stable driver");
+    for path in [&candidate, &driver] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .expect("set source-bound executable mode");
+    }
+
+    let capture = Command::new(&guard)
+        .args(["capture", "--candidate"])
+        .arg(&candidate)
+        .arg("--driver")
+        .arg(&driver)
+        .arg("--identity")
+        .arg(&identity)
+        .output()
+        .unwrap_or_else(|error| panic!("run source-bound AX capture: {error}"));
+    assert!(
+        capture.status.success(),
+        "source-bound AX capture failed: {}",
+        String::from_utf8_lossy(&capture.stderr)
+    );
+
+    let original_inode = fs::metadata(&driver)
+        .expect("stat original stable driver")
+        .ino();
+    fs::copy("/usr/bin/printf", &replacement).expect("copy atomic replacement");
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755))
+        .expect("set replacement executable mode");
+    fs::rename(&replacement, &driver).expect("atomically replace stable driver");
+    let replacement_inode = fs::metadata(&driver)
+        .expect("stat replacement stable driver")
+        .ino();
+    assert_ne!(
+        original_inode, replacement_inode,
+        "fixture must replace the stable path with a distinct inode"
+    );
+
+    let marker = "REPLACEMENT_EXECUTED";
+    let run = Command::new(&guard)
+        .args(["run", "--candidate"])
+        .arg(&candidate)
+        .arg("--driver")
+        .arg(&driver)
+        .arg("--identity")
+        .arg(&identity)
+        .arg("--")
+        .arg(marker)
+        .output()
+        .expect("run source-bound AX replacement probe");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        !run.status.success(),
+        "atomically replaced stable driver must fail closed"
+    );
+    assert!(
+        !stdout.contains(marker),
+        "atomically replaced executable ran before the identity guard rejected it"
+    );
+    assert!(
+        stderr.contains("source-bound AX driver identity changed before execution"),
+        "replacement failure must name the safe identity boundary: {stderr}"
+    );
+    assert!(
+        !stderr.contains(&*temporary.path().to_string_lossy()),
+        "identity failure must not disclose fixture paths"
+    );
 }
 
 #[test]
@@ -699,6 +812,7 @@ fn preview_source_verification_tracks_the_j2_installed_dependencies() {
         "scripts/verify-installed-j2.sh",
         "scripts/native-j2-ax-driver.swift",
         "scripts/build-native-j2-ax-driver.sh",
+        "scripts/run-source-bound-ax-driver.py",
         "scripts/exact-executable-process-set.sh",
         "scripts/scan-private-workspace.py",
         "tests/fixtures/installed-j2/compose.yml",
@@ -714,6 +828,7 @@ fn preview_source_verification_tracks_the_j2_installed_dependencies() {
         "scripts/verify-installed-j2.sh",
         "scripts/native-j2-ax-driver.swift",
         "scripts/build-native-j2-ax-driver.sh",
+        "scripts/run-source-bound-ax-driver.py",
         "scripts/exact-executable-process-set.sh",
     ] {
         assert!(
