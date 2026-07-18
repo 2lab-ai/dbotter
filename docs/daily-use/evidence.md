@@ -12,7 +12,7 @@ without credentials, query values, keys, cell values or imported/exported data.
 
 | Journey | RED commit | GREEN commit(s) | Local/live/native evidence | Preview/xbrew/installed evidence | Status |
 |---|---|---|---|---|---|
-| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` through `6ade3eff0b370c1c3475311fc52dd38724ad54e0`; CI portability REDs `b689d352b1295ab42c56b28ee52eaee2e382aa1a`, `819a7c7d7878a793b127180992f0e55dd242565f` and `1fe4afdbabc80bd72e5985df9434030017fba213`; installed-fixture REDs `ac93ab18bb788cca14ab9d4226332e8301d5b202` and `88e20761a5c9f9cb7d07eee52c4d09a00c2851c6`; stable-AX RED `6533ca8d174d8b6a1af88787698e2a9872bdbd68`; earlier exact ancestry retained at `03d8127` | `d674aa6984f2ceace1edd834eba5c0be7ca5797e` through `a66352b58e4183e4a98e3e1cbcf8caa13486bb6b`; ordered errors `4e21cb0098dbf076a3687a6371b23de6c1508fdb`; exact writer guard `b485f7b450ebb43c0b8bd837cd6a276ee0c0c906`; Unix stat portability `215b7386fdecce5b0b88ecf31dcf5aabe185b910` and `4da2f908610f760e2be139f1d8c6d9f1e453c8d4`; cross-target installed test `4a18a0541e387025c5749bbd992e1939086f633b`; isolated MySQL entrypoint `577d70d860a9d0d6b7cb4f2a382a2819b2bd7fae`; inspectable tmpfs `1fc60773882b44912d91f29d013b3d86fad2380e`; source-bound stable AX `59eb274767d7d9b064a362b1087b5e7b96b544a5` | See J2 local GREEN and repair-forward checkpoints below | Preview `29639223586` / `7bfae29d4e7094a66d4dd5462504618db6778470` and xbrew installation passed exact identity; installed six-step receipt is absent and a higher repair-forward Preview is required | local GREEN |
+| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` through `6ade3eff0b370c1c3475311fc52dd38724ad54e0`; CI portability REDs `b689d352b1295ab42c56b28ee52eaee2e382aa1a`, `819a7c7d7878a793b127180992f0e55dd242565f` and `1fe4afdbabc80bd72e5985df9434030017fba213`; installed-fixture REDs `ac93ab18bb788cca14ab9d4226332e8301d5b202` and `88e20761a5c9f9cb7d07eee52c4d09a00c2851c6`; stable-AX REDs `6533ca8d174d8b6a1af88787698e2a9872bdbd68` and atomic-replacement `e5b490ceff45ea172fe0110c68ff4b19c5b5d52d`; earlier exact ancestry retained at `03d8127` | `d674aa6984f2ceace1edd834eba5c0be7ca5797e` through `a66352b58e4183e4a98e3e1cbcf8caa13486bb6b`; ordered errors `4e21cb0098dbf076a3687a6371b23de6c1508fdb`; exact writer guard `b485f7b450ebb43c0b8bd837cd6a276ee0c0c906`; Unix stat portability `215b7386fdecce5b0b88ecf31dcf5aabe185b910` and `4da2f908610f760e2be139f1d8c6d9f1e453c8d4`; cross-target installed test `4a18a0541e387025c5749bbd992e1939086f633b`; isolated MySQL entrypoint `577d70d860a9d0d6b7cb4f2a382a2819b2bd7fae`; inspectable tmpfs `1fc60773882b44912d91f29d013b3d86fad2380e`; stable AX path `59eb274767d7d9b064a362b1087b5e7b96b544a5`; per-phase pinned AX identity `5c54b6158dbac98e106129b89390940bf35bbcef` | See J2 local GREEN and repair-forward checkpoints below | Preview `29639223586` / `7bfae29d4e7094a66d4dd5462504618db6778470` and xbrew installation passed exact identity; installed six-step receipt is absent and a higher repair-forward Preview is required | local GREEN |
 | J1 secure MySQL connection/Data | — | — | — | — | not started |
 | J3 safe typed MySQL row edit | — | — | — | — | not started |
 | J4 bounded export/CSV import | — | — | — | — | not started |
@@ -95,11 +95,25 @@ without credentials, query values, keys, cell values or imported/exported data.
   Accessibility permission required. The old verifier built that executable
   under a new `mktemp` directory on every run. RED
   `6533ca8d174d8b6a1af88787698e2a9872bdbd68` requires an opt-in stable path;
-  GREEN `59eb274767d7d9b064a362b1087b5e7b96b544a5` accepts it only under
-  `TMPDIR`, only with safe ownership/mode, and only when `cmp` matches a fresh
-  exact-source build. The focused installed-contract suite passes 15/15, plus
-  `bash -n`, source-following ShellCheck and `git diff --check`.
-- Both repairs postdate the published Preview, so the installed
+  GREEN `59eb274767d7d9b064a362b1087b5e7b96b544a5` introduced that path and
+  compared it once with a fresh exact-source build. Independent review of
+  successor `174b3cd6abef84b05d8145fe17141ef8c4892d4b` rejected it at
+  Critical 0 / High 1 because each later phase reopened the pathname without
+  revalidating the compared inode.
+- Atomic-replacement RED
+  `e5b490ceff45ea172fe0110c68ff4b19c5b5d52d` replaces the stable path with a
+  distinct signed Mach-O inode carrying an observable execution marker.
+  GREEN `5c54b6158dbac98e106129b89390940bf35bbcef` executes only the canonical
+  realpath and pins device, inode, mode, uid, size, SHA-256 and CDHash. It
+  validates the euid-owned non-writable `TMPDIR` parent chain and exact
+  candidate bytes immediately before and after every one of the six AX phases.
+  The focused installed-contract suite passes 16/16, including unchanged
+  execution and fail-closed atomic replacement, plus release-contract tests,
+  `bash -n`, source-following ShellCheck and `git diff --check`. A concurrently
+  hostile same-euid process remains outside the pathname-guard threat boundary
+  because macOS provides no `fexecve`-style execution of the verified Mach-O
+  descriptor; the guard does not claim otherwise.
+- These repair-forward commits postdate the published Preview, so the installed
   `7bfae29d4e70` binary cannot complete the final acceptance. J2 remains
   `local GREEN` until a higher exact Preview, xbrew update, the complete
   six-step receipt and independent file/MySQL readback all pass.
