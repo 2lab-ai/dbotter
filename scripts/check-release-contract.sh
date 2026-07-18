@@ -73,6 +73,7 @@ for executable in \
   scripts/build-native-ax-driver.sh \
   scripts/verify-installed-gui.sh \
   scripts/build-native-j2-ax-driver.sh \
+  scripts/run-source-bound-ax-driver.py \
   scripts/verify-installed-j2.sh \
   scripts/exact-executable-process-set.sh \
   scripts/scan-private-workspace.py \
@@ -117,6 +118,7 @@ require_literal scripts/verify-hermetic.sh 'scripts/build-native-ax-driver.sh'
 require_literal scripts/verify-hermetic.sh 'tests/daily_use_j2_installed_contract.rs'
 require_literal scripts/verify-hermetic.sh 'scripts/native-j2-ax-driver.swift'
 require_literal scripts/verify-hermetic.sh 'scripts/build-native-j2-ax-driver.sh'
+require_literal scripts/verify-hermetic.sh 'scripts/run-source-bound-ax-driver.py'
 require_literal scripts/verify-hermetic.sh 'scripts/verify-installed-j2.sh'
 require_literal scripts/verify-hermetic.sh 'scripts/exact-executable-process-set.sh'
 require_literal scripts/verify-hermetic.sh 'scripts/scan-private-workspace.py'
@@ -139,6 +141,7 @@ require_literal scripts/verify-installed-gui.sh 'dbotter.native-ax-observations.
 require_literal scripts/verify-installed-gui.sh 'scripts/build-native-ax-driver.sh'
 require_literal scripts/verify-installed-j2.sh 'dbotter.installed-j2-evidence.v1'
 require_literal scripts/verify-installed-j2.sh 'scripts/build-native-j2-ax-driver.sh'
+require_literal scripts/verify-installed-j2.sh 'scripts/run-source-bound-ax-driver.py'
 require_literal scripts/verify-installed-j2.sh 'kill -KILL "$seed_pid"'
 require_literal scripts/verify-installed-j2.sh 'scripts/exact-executable-process-set.sh'
 require_literal scripts/verify-installed-j2.sh 'scripts/scan-private-workspace.py'
@@ -146,6 +149,8 @@ require_literal scripts/verify-installed-j2.sh 'com.docker.compose.project'
 require_literal scripts/verify-installed-j2.sh 'ai.2lab.dbotter.fixture'
 require_literal scripts/verify-installed-j2.sh '--forbidden-env DBOTTER_J2_RESULT_SENTINEL'
 require_literal scripts/verify-installed-j2.sh 'MAX_PROFILE_SHARD_BYTES=33554432'
+require_literal scripts/run-source-bound-ax-driver.py \
+  'dbotter.source-bound-ax-driver.v1'
 require_literal scripts/exact-executable-process-set.sh \
   'lsof -a -d txt -Fp "$executable"'
 require_literal scripts/exact-executable-process-set.sh \

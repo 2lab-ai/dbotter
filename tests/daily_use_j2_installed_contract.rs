@@ -757,6 +757,23 @@ fn source_bound_ax_driver_rejects_atomic_inode_replacement_before_execution() {
         String::from_utf8_lossy(&capture.stderr)
     );
 
+    let baseline = Command::new(&guard)
+        .args(["run", "--candidate"])
+        .arg(&candidate)
+        .arg("--driver")
+        .arg(&driver)
+        .arg("--identity")
+        .arg(&identity)
+        .arg("--")
+        .arg("BASELINE_EXECUTION")
+        .output()
+        .expect("run source-bound AX baseline");
+    assert!(
+        baseline.status.success(),
+        "unchanged source-bound AX driver must execute: {}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+
     let original_inode = fs::metadata(&driver)
         .expect("stat original stable driver")
         .ino();

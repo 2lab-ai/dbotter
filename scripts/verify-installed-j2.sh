@@ -84,12 +84,13 @@ done
   || fail "DBOTTER_MYSQL_ROOT_PASSWORD does not match the dedicated fixture"
 
 for dependency in \
-  brew cmp codesign docker git jq lsof plutil python3 shasum stat xcrun; do
+  brew codesign docker git jq lsof plutil python3 shasum stat xcrun; do
   command -v "$dependency" >/dev/null 2>&1 || fail "$dependency is required"
 done
 
 builder="$ROOT/scripts/build-native-j2-ax-driver.sh"
 driver_source="$ROOT/scripts/native-j2-ax-driver.swift"
+ax_guard="$ROOT/scripts/run-source-bound-ax-driver.py"
 scanner="$ROOT/scripts/scan-private-workspace.py"
 process_guard="$ROOT/scripts/exact-executable-process-set.sh"
 fixture_compose="$ROOT/tests/fixtures/installed-j2/compose.yml"
@@ -97,6 +98,8 @@ fixture_compose="$ROOT/tests/fixtures/installed-j2/compose.yml"
   || fail "scripts/build-native-j2-ax-driver.sh is unavailable"
 [[ -f "$driver_source" && ! -L "$driver_source" ]] \
   || fail "scripts/native-j2-ax-driver.swift is unavailable"
+[[ -x "$ax_guard" && -f "$ax_guard" && ! -L "$ax_guard" ]] \
+  || fail "scripts/run-source-bound-ax-driver.py is unavailable"
 [[ -x "$scanner" && -f "$scanner" && ! -L "$scanner" ]] \
   || fail "scripts/scan-private-workspace.py is unavailable"
 [[ -x "$process_guard" && -f "$process_guard" && ! -L "$process_guard" ]] \
@@ -107,6 +110,7 @@ git -C "$ROOT" ls-files --error-unmatch \
   scripts/build-native-j2-ax-driver.sh \
   scripts/exact-executable-process-set.sh \
   scripts/native-j2-ax-driver.swift \
+  scripts/run-source-bound-ax-driver.py \
   scripts/scan-private-workspace.py \
   tests/fixtures/installed-j2/compose.yml >/dev/null 2>&1 \
   || fail "canonical J2 AX dependencies must be tracked"
@@ -221,34 +225,9 @@ stable_driver="${DBOTTER_J2_AX_DRIVER_PATH:-}"
 if [[ -n "$stable_driver" ]]; then
   [[ "$stable_driver" == /* ]] \
     || fail "DBOTTER_J2_AX_DRIVER_PATH must be absolute"
-  [[ -f "$stable_driver" && ! -L "$stable_driver" && -x "$stable_driver" ]] \
-    || fail "stable J2 AX driver must be a non-symlink executable"
-  stable_driver_realpath="$(python3 - "$stable_driver" <<'PY'
-import os
-import sys
-print(os.path.realpath(sys.argv[1]))
-PY
-)"
-  case "$stable_driver_realpath" in
-    "$tmp_realpath"/*) ;;
-    *) fail "stable J2 AX driver must resolve under TMPDIR" ;;
-  esac
-  python3 - "$stable_driver" <<'PY' \
-    || fail "stable J2 AX driver ownership or mode is unsafe"
-import os
-import stat
-import sys
-
-metadata = os.stat(sys.argv[1], follow_symlinks=False)
-if (
-    not stat.S_ISREG(metadata.st_mode)
-    or metadata.st_uid != os.geteuid()
-    or metadata.st_mode & 0o022
-):
-    raise SystemExit(1)
-PY
   driver="$stable_driver"
 fi
+driver_identity="$temporary/native-j2-ax-driver.identity.json"
 seed_evidence="$temporary/seed.json"
 restart_evidence="$temporary/restart.json"
 history_evidence="$temporary/history-open.json"
@@ -309,10 +288,19 @@ trap cleanup EXIT HUP INT TERM
 "$builder" --output "$driver_candidate"
 [[ -f "$driver_candidate" && ! -L "$driver_candidate" && -x "$driver_candidate" ]] \
   || fail "J2 AX driver build produced no executable"
-if [[ "$driver" != "$driver_candidate" ]]; then
-  cmp -s -- "$driver_candidate" "$driver" \
-    || fail "stable J2 AX driver does not match the exact source build"
-fi
+"$ax_guard" capture \
+  --candidate "$driver_candidate" \
+  --driver "$driver" \
+  --identity "$driver_identity" \
+  || fail "J2 AX driver source-bound capture failed"
+
+run_ax_driver() {
+  "$ax_guard" run \
+    --candidate "$driver_candidate" \
+    --driver "$driver" \
+    --identity "$driver_identity" \
+    -- "$@"
+}
 
 workspace_contract="$temporary/workspace-contract.json"
 "$executable" workspace-contract --format json >"$workspace_contract"
@@ -424,7 +412,7 @@ for baseline in \
   [[ "$baseline" =~ ^[0-9]+$ ]] || fail "invalid MySQL observation baseline"
 done
 
-"$driver" \
+run_ax_driver \
   --phase seed \
   --app-path "$app_path" \
   --config "$config" \
@@ -541,7 +529,7 @@ done
 kill -0 "$seed_pid" >/dev/null 2>&1 && fail "force-killed seed PID remained alive"
 seed_pid=""
 
-"$driver" \
+run_ax_driver \
   --phase restart \
   --app-path "$app_path" \
   --config "$config" \
@@ -560,7 +548,7 @@ kill -0 "$restart_pid" >/dev/null 2>&1 || fail "restart Preview PID exited"
 zero_dispatch_before="$(mysql_execute_count "$second_query")"
 [[ "$zero_dispatch_before" =~ ^[0-9]+$ ]] || fail "invalid pre-open MySQL counter"
 
-"$driver" \
+run_ax_driver \
   --phase history-open \
   --app-path "$app_path" \
   --config "$config" \
@@ -576,7 +564,7 @@ zero_dispatch_after_open="$(mysql_execute_count "$second_query")"
 [[ "$zero_dispatch_after_open" == "$zero_dispatch_before" ]] \
   || fail "opening history dispatched a database query"
 
-"$driver" \
+run_ax_driver \
   --phase explicit-run \
   --app-path "$app_path" \
   --config "$config" \
@@ -595,7 +583,7 @@ zero_dispatch_after_run="$(mysql_execute_count "$second_query")"
   || fail "explicit history rerun did not dispatch exactly one expected query"
 fresh_result_after_explicit_run=true
 
-"$driver" \
+run_ax_driver \
   --phase second-instance \
   --app-path "$app_path" \
   --config "$config" \
@@ -627,7 +615,7 @@ primary_shard="$primary_profile_directory/$primary_shard_name"
   || fail "latest primary shard is unavailable before corruption"
 printf '\n' >>"$primary_shard"
 
-"$driver" \
+run_ax_driver \
   --phase corrupt-reopen \
   --app-path "$app_path" \
   --config "$config" \

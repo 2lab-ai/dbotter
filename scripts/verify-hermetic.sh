@@ -81,6 +81,7 @@ required_inputs=(
   scripts/verify-installed-gui.sh
   scripts/native-j2-ax-driver.swift
   scripts/build-native-j2-ax-driver.sh
+  scripts/run-source-bound-ax-driver.py
   scripts/verify-installed-j2.sh
   scripts/exact-executable-process-set.sh
   scripts/scan-private-workspace.py
