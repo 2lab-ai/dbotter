@@ -1,8 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
-use std::thread;
-use std::time::Duration;
+use std::process::Command;
 
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -42,7 +40,7 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 #[cfg(target_os = "macos")]
-struct ChildProcessGuard(Child);
+struct ChildProcessGuard(std::process::Child);
 
 #[cfg(target_os = "macos")]
 impl Drop for ChildProcessGuard {
@@ -480,7 +478,7 @@ fn installed_process_guard_rejects_a_masked_argv_writer() {
             masked = true;
             break;
         }
-        thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(
         masked,
