@@ -75,6 +75,7 @@ fn installed_j2_verifier_owns_all_six_exact_acceptance_steps() {
         "persistence_opt_out_and_clear",
         "persistence_off_edit_save_disabled_execute",
         "failed_query_error_retained",
+        "failed_query_error_retained_after_later_results",
         "private_store_payload_scan_clean",
         "private_store_payload_scan_pass_count",
         "MAX_PROFILE_SHARD_BYTES=33554432",
@@ -160,6 +161,7 @@ fn native_j2_driver_emits_only_sanitized_checkpoint_truth() {
         "persistence_opt_out_and_clear",
         "persistence_off_edit_save_disabled_execute",
         "failed_query_error_retained",
+        "failed_query_error_retained_after_later_results",
     ] {
         assert!(
             driver.contains(checkpoint),
@@ -204,6 +206,24 @@ fn native_j2_driver_emits_only_sanitized_checkpoint_truth() {
     assert!(
         failed.contains("waitForStatus(") && failed.contains("\"result.error.status\""),
         "failed execution must visibly retain `result.error.status` before history work continues"
+    );
+    assert!(
+        failed.contains("beforeFailed")
+            && failed.contains("waitForResultDelta(")
+            && failed.contains("failedResultTabs"),
+        "failed execution must create one identifiable retained output tab"
+    );
+    let retained_after_later_results = source_between(
+        &driver,
+        "let exactHistorySource",
+        "try press(try single(\"editor.tab.1\"",
+    );
+    assert!(
+        retained_after_later_results.contains("failedResultTab")
+            && retained_after_later_results.contains("try press(")
+            && retained_after_later_results.contains("\"result.error.status\"")
+            && retained_after_later_results.contains("failedQueryErrorRetainedAfterLaterResults"),
+        "the installed journey must reselect the earlier error output after later results"
     );
 }
 
@@ -342,6 +362,40 @@ fn installed_private_scan_is_final_for_all_markers_and_reports_its_pass_count() 
             "installed receipt must retain final scan proof `{receipt_token}`"
         );
     }
+}
+
+#[test]
+fn installed_private_scan_requires_the_last_writer_to_be_confirmed_dead() {
+    let verifier = tracked_source("scripts/verify-installed-j2.sh");
+    let stop_pid = source_between(&verifier, "stop_pid() {", "mysql_root_exec() {");
+    let kill = stop_pid
+        .rfind("kill -KILL \"$pid\"")
+        .expect("stop_pid must escalate to KILL");
+    let final_probe = stop_pid[kill..]
+        .rfind("kill -0 \"$pid\"")
+        .map(|offset| kill + offset)
+        .expect("stop_pid must probe after its KILL wait");
+    let hard_failure = stop_pid[final_probe..]
+        .find("fail ")
+        .map(|offset| final_probe + offset)
+        .expect("a surviving installed process must fail verification");
+    assert!(
+        kill < final_probe && final_probe < hard_failure,
+        "the final private scan may run only after stop_pid confirms the writer is dead"
+    );
+
+    let final_stop = verifier
+        .rfind("stop_pid \"$corrupt_pid\"")
+        .expect("installed verifier must stop the last workspace writer");
+    let final_scan = verifier
+        .rfind("\"$scanner\" \\")
+        .expect("installed verifier must run the final private scan");
+    let between_stop_and_scan = &verifier[final_stop..final_scan];
+    assert!(
+        between_stop_and_scan.contains("pgrep -f \"$executable\"")
+            && between_stop_and_scan.contains("fail "),
+        "the exact installed executable process set must be empty immediately before the final scan"
+    );
 }
 
 #[test]

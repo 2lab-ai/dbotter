@@ -18248,7 +18248,7 @@ mod tests {
     }
 
     #[test]
-    fn run_all_partial_failure_retains_origin_result_and_keeps_connected_session() {
+    fn run_all_partial_failure_retains_ordered_error_after_later_success() {
         let (ui_port, mut service) = bounded_ports(8);
         let mut app = DbotterApp::new(ui_port);
         assert!(matches!(
@@ -18327,34 +18327,39 @@ mod tests {
         app.poll_events();
 
         let expected_status = "Run all stopped after 1/3 targets: The server rejected the syntax.";
-        let result_tab_id = {
+        let (result_tab_id, error_tab_id) = {
             let workspace = app.model.workspace(&key).expect("workspace retained");
             assert!(workspace.pending_execute.is_none());
-            assert_eq!(workspace.result_tabs().len(), 1);
+            assert_eq!(workspace.result_tabs().len(), 2);
             assert_eq!(
                 workspace
                     .result_tabs_for_editor(Some(origin_editor_tab_id))
                     .count(),
-                1
+                2
             );
             let result_tab = workspace.result_tabs().first().expect("partial result tab");
+            let error_tab = workspace.result_tabs().get(1).expect("typed error tab");
             assert_eq!(
                 result_tab.origin_editor_tab_id(),
                 Some(origin_editor_tab_id)
             );
-            assert_eq!(workspace.selected_result_tab_id(), Some(result_tab.id()));
+            assert_eq!(error_tab.origin_editor_tab_id(), Some(origin_editor_tab_id));
             assert_eq!(
                 workspace
-                    .result
-                    .as_ref()
-                    .map(|result| result.provenance.result_id),
-                Some(ResultId(201))
+                    .result_tabs()
+                    .iter()
+                    .map(|tab| tab.title())
+                    .collect::<Vec<_>>(),
+                ["Result 201", "Error 2"],
+                "the partial result and typed error must retain source order"
             );
+            assert_eq!(workspace.selected_result_tab_id(), Some(error_tab.id()));
+            assert!(workspace.result.is_none());
             assert_eq!(
                 workspace.error.as_ref().map(|error| error.summary),
                 Some(PublicSummary::SyntaxRejected)
             );
-            result_tab.id()
+            (result_tab.id(), error_tab.id())
         };
         assert!(!app.active_operations.contains_key(&profile.id));
         assert_eq!(app.model.status, expected_status);
@@ -18380,6 +18385,9 @@ mod tests {
         let (_, retained_tab) =
             accesskit_author_node(&frame, &format!("result.output.{}", result_tab_id.0));
         assert_eq!(retained_tab.label(), Some("Execution result tab"));
+        let (_, retained_error_tab) =
+            accesskit_author_node(&frame, &format!("result.output.{}", error_tab_id.0));
+        assert_eq!(retained_error_tab.label(), Some("Execution error tab"));
         let (_, result_error) = accesskit_author_node(&frame, "result.error.status");
         assert_eq!(result_error.label(), Some("Last query failed"));
         assert!(result_error.value().is_some_and(|value| {
@@ -18387,6 +18395,10 @@ mod tests {
                 && value.contains("Category: Syntax")
                 && value.contains("Code: StatementTarget")
         }));
+        let (_, error_category) = accesskit_author_node(&frame, "result.error.category");
+        assert_eq!(error_category.value(), Some("Syntax"));
+        let (_, error_code) = accesskit_author_node(&frame, "result.error.code");
+        assert_eq!(error_code.value(), Some("StatementTarget"));
         let (_, operation_status) = accesskit_author_node(&frame, "status.operation");
         assert_eq!(operation_status.value(), Some(expected_status));
 
@@ -18405,6 +18417,76 @@ mod tests {
             }
         );
         assert!(service.try_next_command().is_none());
+
+        {
+            let workspace = app.model.workspace_mut(key.clone());
+            workspace.editor_text = "SELECT 4".to_owned();
+            workspace.caret_character_index = workspace.editor_text.chars().count();
+            workspace.selection_character_range = None;
+        }
+        let later = build_execute_intent(
+            &profile,
+            app.model.workspace(&key).expect("workspace"),
+            EditorCursor::caret(8),
+        )
+        .expect("later read");
+        assert!(app.submit_editor_execute(later));
+        let later_operation = match service.try_next_command() {
+            Some(UiCommand::Execute { operation_id, .. }) => operation_id,
+            other => panic!("expected later read command, got {other:?}"),
+        };
+        assert!(service.try_emit(UiEvent::QueryFinished {
+            operation_id: later_operation,
+            profile_id: profile.id.clone(),
+            profile_generation: profile.generation,
+            editor_tab_id: Some(origin_editor_tab_id),
+            session_generation: SessionGeneration(9),
+            result: result_snapshot_for_operation(
+                &profile,
+                "later",
+                later_operation,
+                ResultId(202),
+            ),
+        }));
+        app.poll_events();
+
+        {
+            let workspace = app.model.workspace(&key).expect("workspace retained");
+            assert_eq!(
+                workspace
+                    .result_tabs()
+                    .iter()
+                    .map(|tab| tab.title())
+                    .collect::<Vec<_>>(),
+                ["Result 201", "Error 2", "Result 202"],
+                "a later result must not overwrite the earlier typed error"
+            );
+            assert_eq!(
+                workspace
+                    .result
+                    .as_ref()
+                    .map(|result| result.provenance.result_id),
+                Some(ResultId(202))
+            );
+            assert!(workspace.error.is_none());
+        }
+        app.model
+            .workspace_mut(key.clone())
+            .select_result_tab(error_tab_id)
+            .expect("reselect retained typed error");
+        let retained_error_frame = context
+            .run_ui(RawInput::default(), |ui| app.show_result_surface(ui))
+            .platform_output
+            .accesskit_update
+            .expect("reselected error frame must emit AccessKit");
+        let (_, retained_error) =
+            accesskit_author_node(&retained_error_frame, "result.error.status");
+        assert_eq!(retained_error.label(), Some("Last query failed"));
+        assert!(retained_error.value().is_some_and(|value| {
+            value.contains("The server rejected the syntax.")
+                && value.contains("Category: Syntax")
+                && value.contains("Code: StatementTarget")
+        }));
     }
 
     #[test]
