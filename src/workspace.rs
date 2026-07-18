@@ -4417,6 +4417,24 @@ mod tests {
     }
 
     #[test]
+    fn dropping_writer_unlocks_an_inherited_descriptor() {
+        let directory = tempfile::tempdir().expect("inherited writer descriptor directory");
+        let config_path = directory.path().join("config.toml");
+        let store = WorkspaceStore::open(&config_path).expect("initial workspace writer");
+        assert_eq!(store.mode(), WorkspaceStoreMode::ReadWrite);
+        let inherited_descriptor = store
+            ._lock
+            .try_clone()
+            .expect("simulate a descriptor inherited across fork");
+
+        drop(store);
+        let reopened = WorkspaceStore::open(&config_path).expect("reopen after writer drop");
+        assert_eq!(reopened.mode(), WorkspaceStoreMode::ReadWrite);
+
+        drop(inherited_descriptor);
+    }
+
+    #[test]
     fn tiny_count_limits_apply_per_profile_and_total_key_order_without_evicting_unknown() {
         let protected =
             retention_history(1, -100, WorkspaceHistoryStatus::OutcomeUnknown, "protected");
