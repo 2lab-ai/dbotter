@@ -30,6 +30,7 @@ fn installed_j2_verifier_owns_all_six_exact_acceptance_steps() {
         "workspace_manifest_generation",
         "zero_dispatch_before",
         "zero_dispatch_after_open",
+        "command_type = 'Execute'",
         "fresh_result_after_explicit_run",
         "second_instance_read_only",
         "corrupt_profile_quarantined",
@@ -40,6 +41,12 @@ fn installed_j2_verifier_owns_all_six_exact_acceptance_steps() {
             "installed J2 verifier is missing exact acceptance token `{required}`"
         );
     }
+    assert!(
+        !verifier.contains(
+            "command_type = 'Query' AND argument = 'SELECT 42 AS j2_second'"
+        ),
+        "prepared MySQL execution must be counted from Execute rows, not text Query rows"
+    );
 }
 
 #[test]
@@ -62,6 +69,9 @@ fn native_j2_driver_emits_only_sanitized_checkpoint_truth() {
         "result.tab.history",
         "history.search",
         "history.entry.",
+        "editorTabIdentifiers",
+        "tabIdentifiersBefore",
+        "tabIdentifiersBefore.count + 1",
     ] {
         assert!(
             driver.contains(identifier),
