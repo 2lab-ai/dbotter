@@ -6571,7 +6571,8 @@ impl DbotterApp {
                     .model
                     .profiles
                     .iter()
-                    .filter(|profile| {
+                    .enumerate()
+                    .filter(|(_, profile)| {
                         normalized_filter.is_empty()
                             || profile
                                 .name
@@ -6595,10 +6596,10 @@ impl DbotterApp {
                                 database.to_ascii_lowercase().contains(&normalized_filter)
                             })
                     })
-                    .cloned()
+                    .map(|(profile_index, profile)| (profile_index, profile.clone()))
                     .collect::<Vec<_>>();
-                for profile in profiles {
-                    self.profile_card(ui, &profile);
+                for (profile_index, profile) in profiles {
+                    self.profile_card(ui, &profile, profile_index);
                     ui.add_space(8.0);
                 }
                 if !normalized_filter.is_empty()
@@ -6708,12 +6709,16 @@ impl DbotterApp {
         }
     }
 
-    fn profile_card(&mut self, ui: &mut egui::Ui, profile: &ProfileSnapshot) {
+    fn profile_card(&mut self, ui: &mut egui::Ui, profile: &ProfileSnapshot, profile_index: usize) {
         let selected = self.model.selected_profile.as_ref() == Some(&profile.id);
-        if ui
-            .selectable_label(selected, format!("{} · {}", profile.name, profile.driver))
-            .clicked()
-        {
+        let profile_selection =
+            ui.selectable_label(selected, format!("{} · {}", profile.name, profile.driver));
+        let profile_selection = named_dynamic_author_id(
+            profile_selection,
+            format!("connection.profile.{profile_index}"),
+            "Connection profile",
+        );
+        if profile_selection.clicked() {
             self.model.selected_profile = Some(profile.id.clone());
         }
         ui.small(&profile.endpoint);
@@ -19038,7 +19043,8 @@ mod tests {
             profile.environment_availability = Some(availability);
             let context = Context::default();
             context.enable_accesskit();
-            let output = context.run_ui(RawInput::default(), |ui| app.profile_card(ui, &profile));
+            let output =
+                context.run_ui(RawInput::default(), |ui| app.profile_card(ui, &profile, 0));
             let update = output
                 .platform_output
                 .accesskit_update

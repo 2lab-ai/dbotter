@@ -72,6 +72,8 @@ for executable in \
   scripts/verify-installed.sh \
   scripts/build-native-ax-driver.sh \
   scripts/verify-installed-gui.sh \
+  scripts/build-native-j2-ax-driver.sh \
+  scripts/verify-installed-j2.sh \
   scripts/verify-local.sh; do
   test -x "$executable" || fail "$executable is missing or not executable"
 done
@@ -84,6 +86,8 @@ for schema in \
 done
 test -s scripts/live_contract.py || fail "scripts/live_contract.py is missing or empty"
 test -s scripts/native-ax-driver.swift || fail "scripts/native-ax-driver.swift is missing or empty"
+test -s scripts/native-j2-ax-driver.swift \
+  || fail "scripts/native-j2-ax-driver.swift is missing or empty"
 
 package_version="$(./scripts/package-version.sh)"
 manifest_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -1)"
@@ -108,6 +112,10 @@ require_literal scripts/verify-hermetic.sh 'src/export.rs'
 require_literal scripts/verify-hermetic.sh 'tests/export_file_contract.rs'
 require_literal scripts/verify-hermetic.sh 'scripts/native-ax-driver.swift'
 require_literal scripts/verify-hermetic.sh 'scripts/build-native-ax-driver.sh'
+require_literal scripts/verify-hermetic.sh 'tests/daily_use_j2_installed_contract.rs'
+require_literal scripts/verify-hermetic.sh 'scripts/native-j2-ax-driver.swift'
+require_literal scripts/verify-hermetic.sh 'scripts/build-native-j2-ax-driver.sh'
+require_literal scripts/verify-hermetic.sh 'scripts/verify-installed-j2.sh'
 require_literal scripts/verify-hermetic.sh 'scripts/check-installed-receipt-contract.sh'
 require_literal scripts/verify-hermetic.sh 'scripts/validate-installed-receipt-config-contract.py'
 require_literal scripts/check-installed-receipt-contract.sh \
@@ -124,6 +132,9 @@ require_literal scripts/verify-installed-gui.sh 'profile.connection_id'
 require_literal scripts/verify-installed-gui.sh 'result.export.json'
 require_literal scripts/verify-installed-gui.sh 'dbotter.native-ax-observations.v1'
 require_literal scripts/verify-installed-gui.sh 'scripts/build-native-ax-driver.sh'
+require_literal scripts/verify-installed-j2.sh 'dbotter.installed-j2-evidence.v1'
+require_literal scripts/verify-installed-j2.sh 'scripts/build-native-j2-ax-driver.sh'
+require_literal scripts/verify-installed-j2.sh 'kill -KILL "$seed_pid"'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.p7-installed-evidence.v1'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.formula-install-evidence.v1'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.live-contract-receipt.v2'

@@ -110,3 +110,31 @@ fn j2_driver_builder_is_reproducible_and_source_bound() {
         );
     }
 }
+
+#[test]
+fn preview_source_verification_tracks_the_j2_installed_dependencies() {
+    let hermetic = tracked_source("scripts/verify-hermetic.sh");
+    for dependency in [
+        "tests/daily_use_j2_installed_contract.rs",
+        "scripts/verify-installed-j2.sh",
+        "scripts/native-j2-ax-driver.swift",
+        "scripts/build-native-j2-ax-driver.sh",
+    ] {
+        assert!(
+            hermetic.contains(dependency),
+            "hermetic Preview verification is missing J2 dependency `{dependency}`"
+        );
+    }
+
+    let release = tracked_source("scripts/check-release-contract.sh");
+    for dependency in [
+        "scripts/verify-installed-j2.sh",
+        "scripts/native-j2-ax-driver.swift",
+        "scripts/build-native-j2-ax-driver.sh",
+    ] {
+        assert!(
+            release.contains(dependency),
+            "release contract is missing installed J2 dependency `{dependency}`"
+        );
+    }
+}

@@ -48,6 +48,7 @@ required_inputs=(
   tests/ui_raw_input.rs
   tests/ui_accesskit.rs
   tests/ui_contrast.rs
+  tests/daily_use_j2_installed_contract.rs
   tests/live_evidence_recorder.rs
   tests/common/live_evidence.rs
   tests/live_mysql_safety.rs
@@ -78,6 +79,9 @@ required_inputs=(
   scripts/native-ax-driver.swift
   scripts/build-native-ax-driver.sh
   scripts/verify-installed-gui.sh
+  scripts/native-j2-ax-driver.swift
+  scripts/build-native-j2-ax-driver.sh
+  scripts/verify-installed-j2.sh
   packaging/macos/Info.plist
   packaging/macos/stable-ax-identifiers.json
   packaging/release/preview-manifest.schema.json
