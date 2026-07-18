@@ -12,7 +12,7 @@ without credentials, query values, keys, cell values or imported/exported data.
 
 | Journey | RED commit | GREEN commit(s) | Local/live/native evidence | Preview/xbrew/installed evidence | Status |
 |---|---|---|---|---|---|
-| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` through `6ade3eff0b370c1c3475311fc52dd38724ad54e0`; CI portability RED `b689d352b1295ab42c56b28ee52eaee2e382aa1a`; earlier exact ancestry retained at `03d8127` | `d674aa6984f2ceace1edd834eba5c0be7ca5797e` through `a66352b58e4183e4a98e3e1cbcf8caa13486bb6b`; ordered errors `4e21cb0098dbf076a3687a6371b23de6c1508fdb`; exact writer guard `b485f7b450ebb43c0b8bd837cd6a276ee0c0c906`; Unix stat portability `215b7386fdecce5b0b88ecf31dcf5aabe185b910` | See J2 local GREEN checkpoint below | — | local GREEN |
+| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` through `6ade3eff0b370c1c3475311fc52dd38724ad54e0`; CI portability REDs `b689d352b1295ab42c56b28ee52eaee2e382aa1a` and `819a7c7d7878a793b127180992f0e55dd242565f`; earlier exact ancestry retained at `03d8127` | `d674aa6984f2ceace1edd834eba5c0be7ca5797e` through `a66352b58e4183e4a98e3e1cbcf8caa13486bb6b`; ordered errors `4e21cb0098dbf076a3687a6371b23de6c1508fdb`; exact writer guard `b485f7b450ebb43c0b8bd837cd6a276ee0c0c906`; Unix stat portability `215b7386fdecce5b0b88ecf31dcf5aabe185b910` and `4da2f908610f760e2be139f1d8c6d9f1e453c8d4` | See J2 local GREEN checkpoint below | — | local GREEN |
 | J1 secure MySQL connection/Data | — | — | — | — | not started |
 | J3 safe typed MySQL row edit | — | — | — | — | not started |
 | J4 bounded export/CSV import | — | — | — | — | not started |
@@ -20,7 +20,7 @@ without credentials, query values, keys, cell values or imported/exported data.
 
 ## J2 local GREEN checkpoint
 
-- Fixed implementation SHA: `215b7386fdecce5b0b88ecf31dcf5aabe185b910`;
+- Fixed implementation SHA: `4da2f908610f760e2be139f1d8c6d9f1e453c8d4`;
   clean tree and upstream divergence `0/0`.
 - `just check` and `just check-all` pass. The all-feature run includes library
   254/254, installed J2 14/14, workspace model 8/8, renderer 10/10, store 34/34,
@@ -30,16 +30,23 @@ without credentials, query values, keys, cell values or imported/exported data.
   contract compiles and exercises a masked-argv Mach-O writer that the old
   argv-regex probe misses, while the text-vnode guard fails closed.
 - Exact-source hermetic verification passed through documentation successor
-  `d122cdae2aaaaffc49bb4575294ca5bb8522089c`. Preview run `29635298351` then
+  `59582a86da4b4baad9c0419b1bb7fad3a80200be`. Preview run `29635298351`
   failed before publication on Ubuntu because Unix stat nanoseconds are `u64`
   there and `i64` on macOS. RED `b689d352b1295ab42c56b28ee52eaee2e382aa1a`
   captured the missing checked conversion; GREEN
   `215b7386fdecce5b0b88ecf31dcf5aabe185b910` uses one generic fail-closed
-  normalizer and passes both full local gate families.
+  normalizer. Preview run `29636456372` then reached Ubuntu Rust 1.97 Clippy
+  and found the same target-type issue for device, mode and link fields plus one
+  redundant test borrow. RED `819a7c7d7878a793b127180992f0e55dd242565f`
+  captured every remaining field and the toolchain lint; GREEN
+  `4da2f908610f760e2be139f1d8c6d9f1e453c8d4` uses one generic checked
+  normalizer for the target-dependent fingerprint fields and passes both full
+  local gate families.
 - Independent fixed-hash reviews are Critical 0 / High 0 for both the installed
-  writer guard and the Unix portability fix, with no review-time source changes.
-  Preview, tap, xbrew installation and the complete installed black-box journey
-  remain pending before `verified`.
+  writer guard and both Unix portability fixes, with no review-time source
+  changes. Both failed Preview runs stopped before publication; tap, xbrew
+  installation and the complete installed black-box journey remain pending
+  before `verified`.
 
 ## Status transition
 
