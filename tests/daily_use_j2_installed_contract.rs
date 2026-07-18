@@ -742,6 +742,8 @@ fn installed_fixture_and_private_scanner_are_fail_closed_and_consumed() {
         "--log-output=TABLE",
         "ai.2lab.dbotter.fixture: installed-j2-v1",
         "127.0.0.1:33316:3306",
+        "type: tmpfs",
+        "target: /var/lib/mysql",
         "/var/lib/mysql",
     ] {
         assert!(
