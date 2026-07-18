@@ -271,7 +271,14 @@ impl MySqlExplorerState {
                     ui.add_space(8.0);
 
                     ui.horizontal_wrapped(|ui| {
-                        if primary_button(ui, "Refresh schemas", !self.is_pending()).clicked() {
+                        let refresh = primary_button(ui, "Refresh schemas", !self.is_pending());
+                        if named_author_id(
+                            refresh,
+                            "navigator.catalog.refresh-schemas",
+                            "Refresh MySQL schemas",
+                        )
+                        .clicked()
+                        {
                             intents.push(MySqlExplorerIntent::RefreshSchemas {
                                 prefix: normalized_prefix(&self.prefix),
                             });

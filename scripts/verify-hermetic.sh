@@ -82,6 +82,8 @@ required_inputs=(
   scripts/native-j2-ax-driver.swift
   scripts/build-native-j2-ax-driver.sh
   scripts/verify-installed-j2.sh
+  scripts/scan-private-workspace.py
+  tests/fixtures/installed-j2/compose.yml
   packaging/macos/Info.plist
   packaging/macos/stable-ax-identifiers.json
   packaging/release/preview-manifest.schema.json

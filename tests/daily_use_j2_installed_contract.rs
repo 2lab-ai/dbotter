@@ -1,5 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 fn repository_path(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
@@ -91,6 +95,7 @@ fn native_j2_driver_emits_only_sanitized_checkpoint_truth() {
         "workspace.persistence.toggle",
         "workspace.persistence.clear",
         "workspace.persistence.clear.confirm",
+        "navigator.catalog.refresh-schemas",
         "configuration.environment = [credentialEnvName: credential]",
         "configuration.allowsRunningApplicationSubstitution = false",
     ] {
@@ -158,6 +163,8 @@ fn preview_source_verification_tracks_the_j2_installed_dependencies() {
         "scripts/verify-installed-j2.sh",
         "scripts/native-j2-ax-driver.swift",
         "scripts/build-native-j2-ax-driver.sh",
+        "scripts/scan-private-workspace.py",
+        "tests/fixtures/installed-j2/compose.yml",
     ] {
         assert!(
             hermetic.contains(dependency),
@@ -176,4 +183,137 @@ fn preview_source_verification_tracks_the_j2_installed_dependencies() {
             "release contract is missing installed J2 dependency `{dependency}`"
         );
     }
+}
+
+#[test]
+fn installed_fixture_and_private_scanner_are_fail_closed_and_consumed() {
+    let verifier = tracked_source("scripts/verify-installed-j2.sh");
+    for required in [
+        "com.docker.compose.project",
+        "dbotter-installed-j2",
+        "com.docker.compose.service",
+        "ai.2lab.dbotter.fixture",
+        "installed-j2-v1",
+        "127.0.0.1\",\"HostPort\":\"33316",
+        "scripts/scan-private-workspace.py",
+        "--forbidden-env DBOTTER_MYSQL_PASSWORD",
+        "--forbidden-env DBOTTER_MYSQL_ROOT_PASSWORD",
+        "--forbidden-env DBOTTER_J2_RESULT_SENTINEL",
+        "SELECT CONCAT(@@global.general_log, ':', @@global.log_output)",
+        "mysql@sha256:",
+    ] {
+        assert!(
+            verifier.contains(required),
+            "installed verifier does not enforce fixture/scanner token `{required}`"
+        );
+    }
+    for forbidden in ["TRUNCATE TABLE mysql.general_log", "SET GLOBAL general_log"] {
+        assert!(
+            !verifier.contains(forbidden),
+            "installed verifier must not mutate shared MySQL logging with `{forbidden}`"
+        );
+    }
+
+    let compose = tracked_source("tests/fixtures/installed-j2/compose.yml");
+    for required in [
+        "name: dbotter-installed-j2",
+        "image: mysql:8.4",
+        "--general-log=ON",
+        "--log-output=TABLE",
+        "ai.2lab.dbotter.fixture: installed-j2-v1",
+        "127.0.0.1:33316:3306",
+        "/var/lib/mysql",
+    ] {
+        assert!(
+            compose.contains(required),
+            "installed fixture is missing isolation token `{required}`"
+        );
+    }
+
+    let scanner = tracked_source("scripts/scan-private-workspace.py");
+    for required in [
+        "MAX_FILE_BYTES",
+        "MAX_TREE_BYTES",
+        "MAX_ENTRIES",
+        "MAX_DEPTH",
+        "os.O_NOFOLLOW",
+        "os.O_DIRECTORY",
+        "os.fstat",
+        "os.scandir(directory_fd)",
+        "json.dumps",
+        "base64.b64encode",
+        "workspace file changed during the scan",
+    ] {
+        assert!(
+            scanner.contains(required),
+            "private scanner is missing fail-closed token `{required}`"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn private_scanner_rejects_encoded_values_and_symlinks() {
+    const ENV_NAME: &str = "DBOTTER_TEST_FORBIDDEN_VALUE";
+    const SECRET: &str = "j2-quote-\"-slash-\\-private";
+    let scanner = repository_path("scripts/scan-private-workspace.py");
+
+    let clean = tempfile::tempdir().expect("private scanner clean root");
+    fs::set_permissions(clean.path(), fs::Permissions::from_mode(0o700))
+        .expect("private scanner clean root mode");
+    let clean_file = clean.path().join("manifest.json");
+    fs::write(&clean_file, b"{\"schema\":1}\n").expect("private scanner clean file");
+    fs::set_permissions(&clean_file, fs::Permissions::from_mode(0o600))
+        .expect("private scanner clean file mode");
+    let clean_status = Command::new("python3")
+        .arg(&scanner)
+        .arg("--root")
+        .arg(clean.path())
+        .arg("--forbidden-env")
+        .arg(ENV_NAME)
+        .env(ENV_NAME, SECRET)
+        .status()
+        .expect("run clean private scanner");
+    assert!(clean_status.success(), "clean private tree must pass");
+
+    let escaped = tempfile::tempdir().expect("private scanner encoded root");
+    fs::set_permissions(escaped.path(), fs::Permissions::from_mode(0o700))
+        .expect("private scanner encoded root mode");
+    let escaped_file = escaped.path().join("shard.json");
+    let encoded = serde_json::to_string(SECRET).expect("encoded scanner value");
+    fs::write(&escaped_file, encoded).expect("private scanner encoded file");
+    fs::set_permissions(&escaped_file, fs::Permissions::from_mode(0o600))
+        .expect("private scanner encoded file mode");
+    let encoded_status = Command::new("python3")
+        .arg(&scanner)
+        .arg("--root")
+        .arg(escaped.path())
+        .arg("--forbidden-env")
+        .arg(ENV_NAME)
+        .env(ENV_NAME, SECRET)
+        .status()
+        .expect("run encoded private scanner");
+    assert!(
+        !encoded_status.success(),
+        "JSON-escaped forbidden values must fail"
+    );
+
+    let linked = tempfile::tempdir().expect("private scanner symlink root");
+    fs::set_permissions(linked.path(), fs::Permissions::from_mode(0o700))
+        .expect("private scanner symlink root mode");
+    symlink(&clean_file, linked.path().join("unsafe-link"))
+        .expect("private scanner symlink fixture");
+    let linked_status = Command::new("python3")
+        .arg(&scanner)
+        .arg("--root")
+        .arg(linked.path())
+        .arg("--forbidden-env")
+        .arg(ENV_NAME)
+        .env(ENV_NAME, SECRET)
+        .status()
+        .expect("run symlink private scanner");
+    assert!(
+        !linked_status.success(),
+        "workspace symlinks must fail closed"
+    );
 }

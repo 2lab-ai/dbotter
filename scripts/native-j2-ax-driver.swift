@@ -5,15 +5,21 @@ import Foundation
 
 private let bundleIdentifier = "ai.2lab.dbotter.preview"
 private let observationSchema = "dbotter.installed-j2-ax-observations.v1"
+private let credentialEnvName = "DBOTTER_MYSQL_PASSWORD"
 private let primaryProfileFilter = "J2 Primary"
 private let healthyProfileFilter = "J2 Healthy"
 private let firstTitle = "J2 Alpha"
 private let secondTitle = "J2 Beta"
 private let firstSource = "SELECT 41 AS j2_alpha"
 private let secondSource = "SELECT 41 AS j2_first; SELECT 42 AS j2_second"
+private let privateResultSource =
+    "SELECT id, value FROM dbotter_j2_private_result ORDER BY id"
+private let selectionSource =
+    "SELECT 39 AS j2_unselected;\nSELECT 40 AS j2_selected"
 private let failedSource = "SELECT * FROM dbotter_j2_missing_relation"
 private let healthySource = "SELECT 84 AS j2_healthy"
 private let historySearch = "j2_second"
+private let exactHistoryMarker = "j2_history_exact"
 
 private enum DriverFailure: Error, CustomStringConvertible {
     case message(String)
@@ -224,6 +230,14 @@ private func numberAttribute(_ element: AXUIElement, _ attribute: CFString) -> D
     return nil
 }
 
+private func boolAttribute(_ element: AXUIElement, _ attribute: CFString) -> Bool? {
+    let (error, value) = copyAttribute(element, attribute)
+    guard error == .success, let number = value as? NSNumber else {
+        return nil
+    }
+    return number.boolValue
+}
+
 private func selectedRange(_ element: AXUIElement) -> CFRange? {
     let (error, value) = copyAttribute(element, kAXSelectedTextRangeAttribute as CFString)
     guard error == .success, let value else {
@@ -243,8 +257,12 @@ private func selectedRange(_ element: AXUIElement) -> CFRange? {
     return range
 }
 
-private func setSelectedRange(_ element: AXUIElement, location: Int) throws {
-    var range = CFRange(location: location, length: 0)
+private func setSelectedRange(
+    _ element: AXUIElement,
+    location: Int,
+    length: Int = 0
+) throws {
+    var range = CFRange(location: location, length: length)
     guard let value = AXValueCreate(.cfRange, &range) else {
         throw fail("could not construct selected text range")
     }
@@ -256,6 +274,7 @@ private func setSelectedRange(_ element: AXUIElement, location: Int) throws {
     guard error == .success else {
         throw fail("could not set editor caret: \(error.rawValue)")
     }
+    pump(0.2)
 }
 
 private func snapshot(_ application: AXUIElement) throws -> [String: [AXRecord]] {
@@ -333,8 +352,18 @@ private func prefixRecords(
 }
 
 private func editorTabIdentifiers(application: AXUIElement) -> Set<String> {
-    let prefix = "editor.tab."
-    return Set(
+    numericIdentifiers(prefix: "editor.tab.", application: application)
+}
+
+private func resultTabIdentifiers(application: AXUIElement) -> Set<String> {
+    numericIdentifiers(prefix: "result.output.", application: application)
+}
+
+private func numericIdentifiers(
+    prefix: String,
+    application: AXUIElement
+) -> Set<String> {
+    Set(
         prefixRecords(prefix, application: application).compactMap { identifier, _ in
             let suffix = identifier.dropFirst(prefix.count)
             guard !suffix.isEmpty, suffix.allSatisfy(\.isNumber) else {
@@ -448,12 +477,18 @@ private func launch(
     if requireCleanProcessSet && !runningPreviewApplications().isEmpty {
         throw fail("a stale Preview process exists")
     }
+    guard let credential = ProcessInfo.processInfo.environment[credentialEnvName],
+          !credential.isEmpty else {
+        throw fail("the required Environment credential is unavailable")
+    }
 
     let configuration = NSWorkspace.OpenConfiguration()
     configuration.activates = true
     configuration.addsToRecentItems = false
     configuration.arguments = ["--config", configPath]
     configuration.createsNewApplicationInstance = true
+    configuration.environment = [credentialEnvName: credential]
+    configuration.allowsRunningApplicationSubstitution = false
     var launched: NSRunningApplication?
     var launchError: Error?
     NSWorkspace.shared.openApplication(
@@ -538,17 +573,54 @@ private func setEditorSource(
     }
 }
 
-private func waitForExecutionToSettle(
+@discardableResult
+private func waitForResultDelta(
     application: AXUIElement,
-    requireResultCount: Int
-) throws {
+    before: Set<String>,
+    delta: Int
+) throws -> Set<String> {
+    var observed = Set<String>()
     guard waitUntil(timeout: 45, {
-        let results = prefixRecords("result.output.", application: application)
-        return results.count >= requireResultCount
+        observed = resultTabIdentifiers(application: application)
+        return observed.count == before.count + delta
+            && observed.isSuperset(of: before)
             && optionalSingle("editor.pending", application: application) == nil
     }) else {
-        throw fail("execution did not produce the expected retained result")
+        throw fail("execution did not retain the exact result-tab delta")
     }
+    return observed
+}
+
+private func historyEntryValues(application: AXUIElement) -> [(AXRecord, String)] {
+    prefixRecords("history.entry.", application: application).compactMap { _, record in
+        stringAttribute(record.element, kAXValueAttribute as CFString).map { (record, $0) }
+    }
+}
+
+private func boundaryHistorySource(marker: String, bytes: Int) throws -> String {
+    let prefix = "SELECT 1 AS \(marker) /*"
+    let suffix = "*/"
+    let fixedBytes = prefix.utf8.count + suffix.utf8.count
+    guard bytes >= fixedBytes else {
+        throw fail("history boundary source size is invalid")
+    }
+    let source = prefix + String(repeating: "x", count: bytes - fixedBytes) + suffix
+    guard source.utf8.count == bytes else {
+        throw fail("history boundary source did not reach the exact byte size")
+    }
+    return source
+}
+
+private func currentUTCDate() -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "yyyy-MM-dd"
+    return formatter.string(from: Date())
+}
+
+private func numericIdentifierSuffix(_ identifier: String) -> Int {
+    Int(identifier.split(separator: ".").last ?? "0") ?? 0
 }
 
 private func adjustSplitter(application: AXUIElement) throws -> Double {
@@ -592,6 +664,250 @@ private let commonAllowed: Set<String> = [
     "--phase", "--app-path", "--config", "--output", "--pid", "--seed-evidence",
 ]
 
+private func exercisePersistenceOptOutAndClear(application: AXUIElement) throws -> Bool {
+    try press(try single("workspace.persistence.toggle", application: application))
+    _ = try waitForStatus(
+        "workspace.persistence.status",
+        application: application,
+        timeout: 20
+    ) { $0.hasPrefix("Off") }
+    try press(try single("workspace.persistence.toggle", application: application))
+    _ = try waitForStatus(
+        "workspace.persistence.status",
+        application: application,
+        timeout: 20
+    ) { !$0.hasPrefix("Off") && $0 != "Loading" }
+
+    try setEditorSource("SELECT 7 AS j2_clear_probe", application: application)
+    let before = resultTabIdentifiers(application: application)
+    try press(try single("editor.execute", application: application))
+    _ = try waitForResultDelta(application: application, before: before, delta: 1)
+    try press(try single("result.tab.history", application: application))
+    guard waitUntil(timeout: 20, {
+        !historyEntryValues(application: application).isEmpty
+    }) else {
+        throw fail("persistence clear probe did not enter private history")
+    }
+    try press(try single("result.tab.results", application: application))
+    try press(try single("workspace.persistence.clear", application: application))
+    try press(
+        try single("workspace.persistence.clear.confirm", application: application)
+    )
+    _ = try waitForStatus(
+        "workspace.persistence.status",
+        application: application,
+        timeout: 30
+    ) { $0.hasPrefix("Off") }
+    try press(try single("result.tab.history", application: application))
+    guard waitUntil(timeout: 15, {
+        historyEntryValues(application: application).isEmpty
+    }) else {
+        throw fail("durable clear retained a history entry")
+    }
+    try press(try single("result.tab.results", application: application))
+    try press(try single("workspace.persistence.toggle", application: application))
+    _ = try waitForStatus(
+        "workspace.persistence.status",
+        application: application,
+        timeout: 20
+    ) { !$0.hasPrefix("Off") && $0 != "Loading" }
+    return true
+}
+
+private func exerciseSyntaxAndAutocomplete(application: AXUIElement) throws -> Bool {
+    let refresh = try single(
+        "navigator.catalog.refresh-schemas",
+        application: application,
+        timeout: 20
+    )
+    try press(refresh)
+    guard waitUntil(timeout: 30, {
+        optionalSingle(
+            "navigator.catalog.refresh-schemas",
+            application: application
+        ).flatMap {
+            boolAttribute($0.element, kAXEnabledAttribute as CFString)
+        } == true
+    }) else {
+        throw fail("catalog refresh did not complete")
+    }
+
+    let source = "-- j2 syntax\nSELECT 1 FROM dbo"
+    try setEditorSource(source, application: application)
+    var candidate: AXRecord?
+    guard waitUntil(timeout: 20, {
+        candidate = prefixRecords(
+            "editor.autocomplete.candidate.",
+            application: application
+        ).first(where: { _, record in
+            stringAttribute(record.element, kAXValueAttribute as CFString) == "dbotter"
+        })?.1
+        return candidate != nil
+    }), let candidate else {
+        throw fail("bounded catalog autocomplete candidate was not observed")
+    }
+    try press(candidate)
+    let expected = "-- j2 syntax\nSELECT 1 FROM `dbotter`"
+    guard waitUntil(timeout: 10, {
+        statusValue("editor.input", application: application) == expected
+    }) else {
+        throw fail("catalog autocomplete did not replace the exact syntax token")
+    }
+    return true
+}
+
+private func exerciseTabBound(application: AXUIElement) throws -> Bool {
+    while editorTabIdentifiers(application: application).count < 20 {
+        let before = editorTabIdentifiers(application: application)
+        try press(try single("editor.tab.new", application: application))
+        guard waitUntil(timeout: 10, {
+            let after = editorTabIdentifiers(application: application)
+            return after.count == before.count + 1 && after.isSuperset(of: before)
+        }) else {
+            throw fail("editor tab did not grow to the profile bound")
+        }
+    }
+    let atBound = editorTabIdentifiers(application: application)
+    try press(try single("editor.tab.new", application: application))
+    pump(0.5)
+    guard editorTabIdentifiers(application: application) == atBound else {
+        throw fail("editor tab profile bound accepted a plus-one tab")
+    }
+
+    try press(try single("editor.save", application: application))
+    _ = try waitForStatus(
+        "workspace.persistence.status",
+        application: application,
+        timeout: 30
+    ) { $0 == "Saved" }
+    let removable = atBound
+        .filter { $0 != "editor.tab.1" && $0 != "editor.tab.2" }
+        .sorted { numericIdentifierSuffix($0) > numericIdentifierSuffix($1) }
+    for identifier in removable {
+        let tabIdentifier = identifier.replacingOccurrences(
+            of: "editor.tab.",
+            with: "editor.tab.close."
+        )
+        let before = editorTabIdentifiers(application: application)
+        try press(try single(tabIdentifier, application: application))
+        guard waitUntil(timeout: 10, {
+            let after = editorTabIdentifiers(application: application)
+            return after.count + 1 == before.count && !after.contains(identifier)
+        }) else {
+            throw fail("saved excess editor tab could not be closed")
+        }
+    }
+    return editorTabIdentifiers(application: application)
+        == Set(["editor.tab.1", "editor.tab.2"])
+}
+
+private func exerciseResultInspection(application: AXUIElement) throws -> Bool {
+    try press(try single("result.sort.0", application: application))
+    guard waitUntil(timeout: 10, {
+        statusValue("result.sort.0", application: application)?
+            .contains("Ascending") == true
+    }) else {
+        throw fail("result sort state was not exposed")
+    }
+    try setValue(identifier: "result.filter", value: "alpha", application: application)
+    _ = try waitForStatus(
+        "result.filter.status",
+        application: application,
+        timeout: 10
+    ) { $0 == "1 visible of 3" }
+    try press(try single("result.cell.1.1", application: application))
+    NSPasteboard.general.clearContents()
+    try press(try single("result.copy.cell", application: application))
+    guard waitUntil(timeout: 10, {
+        NSPasteboard.general.string(forType: .string) == "alpha"
+    }) else {
+        throw fail("selected result cell was not copied exactly")
+    }
+    NSPasteboard.general.clearContents()
+    try press(try single("result.mode.record", application: application))
+    _ = try waitForStatus(
+        "result.record.status",
+        application: application,
+        timeout: 10
+    ) { $0 == "Record 1 of 1" }
+    guard statusValue("result.record.field.1", application: application) == "alpha" else {
+        throw fail("record result detail did not retain the selected value")
+    }
+    try press(try single("result.mode.grid", application: application))
+    try setValue(identifier: "result.filter", value: "", application: application)
+    _ = try waitForStatus(
+        "result.filter.status",
+        application: application,
+        timeout: 10
+    ) { $0 == "3 visible of 3" }
+    return true
+}
+
+private func inspectHistory(application: AXUIElement) throws -> (Bool, Bool, Bool) {
+    try press(try single("result.tab.history", application: application))
+
+    try setValue(identifier: "history.search", value: "succeeded", application: application)
+    guard waitUntil(timeout: 20, {
+        historyEntryValues(application: application).contains { _, value in
+            value.contains("Succeeded")
+                && value.contains(" ms")
+                && value.contains(" returned")
+                && value.contains(" affected")
+        }
+    }) else {
+        throw fail("history success filter did not expose typed metrics")
+    }
+    try setValue(identifier: "history.search", value: "failed", application: application)
+    guard waitUntil(timeout: 20, {
+        historyEntryValues(application: application).contains { _, value in
+            value.contains("Failed")
+        }
+    }) else {
+        throw fail("history failed-status filter did not match")
+    }
+    try setValue(identifier: "history.search", value: currentUTCDate(), application: application)
+    guard waitUntil(timeout: 20, {
+        !historyEntryValues(application: application).isEmpty
+    }) else {
+        throw fail("history UTC date filter did not match")
+    }
+
+    try setValue(identifier: "history.search", value: exactHistoryMarker, application: application)
+    var exactRetained = false
+    guard waitUntil(timeout: 20, {
+        exactRetained = historyEntryValues(application: application).contains { record, value in
+            value.contains(exactHistoryMarker)
+                && boolAttribute(record.element, kAXEnabledAttribute as CFString) == true
+        }
+        return exactRetained
+    }) else {
+        throw fail("exact 64 KiB history source was not reopenable")
+    }
+
+    try setValue(identifier: "history.search", value: "", application: application)
+    var plusOneOmitted = false
+    var filtersAndMetrics = false
+    guard waitUntil(timeout: 20, {
+        let entries = historyEntryValues(application: application)
+        plusOneOmitted = entries.contains { record, value in
+            value.contains("Source omitted (over 64 KiB)")
+                && boolAttribute(record.element, kAXEnabledAttribute as CFString) == false
+        }
+        filtersAndMetrics = ["Current", "Selection", "All"].allSatisfy { target in
+            entries.contains { _, value in value.contains(" · \(target) · ") }
+        } && entries.contains { _, value in
+            value.contains(" ms")
+                && value.contains(" returned")
+                && value.contains(" affected")
+        }
+        return plusOneOmitted && filtersAndMetrics
+    }) else {
+        throw fail("history omission, targets, or metrics were not visible")
+    }
+    try press(try single("result.tab.results", application: application))
+    return (filtersAndMetrics, exactRetained, plusOneOmitted)
+}
+
 private func runSeed(_ options: Options) throws {
     try options.rejectUnknown(commonAllowed)
     let appPath = try options.require("--app-path")
@@ -609,10 +925,75 @@ private func runSeed(_ options: Options) throws {
     try connectSelectedProfile(application: application)
 
     _ = try single("editor.tab.1", application: application, timeout: 20)
-    try setValue(identifier: "editor.tab.title", value: firstTitle, application: application)
-    try setEditorSource(firstSource, application: application)
+    let persistenceOptOutAndClear =
+        try exercisePersistenceOptOutAndClear(application: application)
     try press(try single("editor.tab.new", application: application))
     _ = try single("editor.tab.2", application: application)
+    let tabBoundEnforced = try exerciseTabBound(application: application)
+    guard tabBoundEnforced else {
+        throw fail("editor tab bound did not return to the exact two-tab fixture")
+    }
+
+    try press(try single("editor.tab.1", application: application))
+    try setValue(identifier: "editor.tab.title", value: firstTitle, application: application)
+    let syntaxAutocompleteExercised =
+        try exerciseSyntaxAndAutocomplete(application: application)
+
+    try setEditorSource(privateResultSource, application: application)
+    let beforeCurrent = resultTabIdentifiers(application: application)
+    try press(try single("editor.execute", application: application))
+    let afterCurrent = try waitForResultDelta(
+        application: application,
+        before: beforeCurrent,
+        delta: 1
+    )
+    let currentResultTabs = afterCurrent.subtracting(beforeCurrent)
+    guard currentResultTabs.count == 1 else {
+        throw fail("current execution did not retain one exact result tab")
+    }
+    let resultInspectionCompleted =
+        try exerciseResultInspection(application: application)
+
+    try setEditorSource(selectionSource, application: application)
+    let selectedStatement = "SELECT 40 AS j2_selected"
+    guard let selectionStart = selectionSource.range(of: selectedStatement) else {
+        throw fail("selection fixture is invalid")
+    }
+    let selectionLocation =
+        selectionSource[..<selectionStart.lowerBound].utf16.count
+    let editor = try single("editor.input", application: application)
+    try setSelectedRange(
+        editor.element,
+        location: selectionLocation,
+        length: selectedStatement.utf16.count
+    )
+    let beforeSelection = resultTabIdentifiers(application: application)
+    try press(try single("editor.execute", application: application))
+    let afterSelection = try waitForResultDelta(
+        application: application,
+        before: beforeSelection,
+        delta: 1
+    )
+    let selectionResultTabs = afterSelection.subtracting(beforeSelection)
+    guard selectionResultTabs.count == 1,
+          let currentResult = currentResultTabs.first,
+          let selectionResult = selectionResultTabs.first else {
+        throw fail("selection execution did not retain one exact result tab")
+    }
+    try press(try single(currentResult, application: application))
+    _ = try waitForStatus(
+        "result.filter.status",
+        application: application,
+        timeout: 10
+    ) { $0 == "3 visible of 3" }
+    try press(try single(selectionResult, application: application))
+    _ = try waitForStatus(
+        "result.filter.status",
+        application: application,
+        timeout: 10
+    ) { $0 == "1 visible of 1" }
+
+    try press(try single("editor.tab.2", application: application))
     try setValue(identifier: "editor.tab.title", value: secondTitle, application: application)
     try setEditorSource(secondSource, application: application)
     try press(try single("editor.tab.move_left", application: application))
@@ -633,23 +1014,57 @@ private func runSeed(_ options: Options) throws {
     }
 
     let splitValue = try adjustSplitter(application: application)
+    let beforeAll = resultTabIdentifiers(application: application)
     try press(try single("editor.execute_all", application: application))
-    try waitForExecutionToSettle(application: application, requireResultCount: 2)
+    _ = try waitForResultDelta(
+        application: application,
+        before: beforeAll,
+        delta: 2
+    )
+    let currentSelectionAllExercised = true
 
     try setEditorSource(failedSource, application: application)
     try press(try single("editor.execute", application: application))
-    _ = waitUntil(timeout: 30) {
+    guard waitUntil(timeout: 30, {
         optionalSingle("editor.pending", application: application) == nil
-    }
-    pump(2.2)
-    try press(try single("result.tab.history", application: application))
-    guard waitUntil(timeout: 20, {
-        prefixRecords("history.entry.", application: application).count >= 2
     }) else {
-        throw fail("typed success/error history was not retained")
+        throw fail("failed execution did not settle")
     }
-    try press(try single("result.tab.results", application: application))
 
+    let exactHistorySource = try boundaryHistorySource(
+        marker: exactHistoryMarker,
+        bytes: 65_536
+    )
+    try setEditorSource(exactHistorySource, application: application)
+    let beforeExact = resultTabIdentifiers(application: application)
+    try press(try single("editor.execute", application: application))
+    _ = try waitForResultDelta(
+        application: application,
+        before: beforeExact,
+        delta: 1
+    )
+
+    let plusOneHistorySource = try boundaryHistorySource(
+        marker: "j2_history_plus_one",
+        bytes: 65_537
+    )
+    try setEditorSource(plusOneHistorySource, application: application)
+    let beforePlusOne = resultTabIdentifiers(application: application)
+    try press(try single("editor.execute", application: application))
+    _ = try waitForResultDelta(
+        application: application,
+        before: beforePlusOne,
+        delta: 1
+    )
+    let (
+        historyFiltersAndMetricsVisible,
+        historySourceExactRetained,
+        historySourcePlusOneOmitted
+    ) = try inspectHistory(application: application)
+
+    try press(try single("editor.tab.1", application: application))
+    try setEditorSource(firstSource, application: application)
+    try press(try single("editor.tab.2", application: application))
     try setEditorSource(secondSource, application: application)
     try press(try single("editor.save", application: application))
     let saved = try waitForStatus(
@@ -664,7 +1079,15 @@ private func runSeed(_ options: Options) throws {
     try writeObservation(
         Observation(
             checkpoints: [
+                "current_selection_all_exercised": currentSelectionAllExercised,
+                "history_filters_and_metrics_visible": historyFiltersAndMetricsVisible,
+                "history_source_exact_retained": historySourceExactRetained,
+                "history_source_plus_one_omitted": historySourcePlusOneOmitted,
+                "persistence_opt_out_and_clear": persistenceOptOutAndClear,
+                "result_inspection_completed": resultInspectionCompleted,
                 "tabs_created_renamed_reordered": tabsCreatedRenamedReordered,
+                "tab_bound_enforced": tabBoundEnforced,
+                "syntax_autocomplete_exercised": syntaxAutocompleteExercised,
                 "saved_visible_before_kill": true,
             ],
             phase: "seed",
@@ -699,26 +1122,44 @@ private func runRestart(_ options: Options) throws {
 
     let tabOne = try single("editor.tab.1", application: application)
     let tabTwo = try single("editor.tab.2", application: application)
-    let title = stringAttribute(
+    try press(tabOne)
+    let firstRestoredTitle = stringAttribute(
         try single("editor.tab.title", application: application).element,
         kAXValueAttribute as CFString
     )
-    let editor = try single("editor.input", application: application)
-    let source = stringAttribute(editor.element, kAXValueAttribute as CFString)
-    let caret = selectedRange(editor.element)
+    let firstEditor = try single("editor.input", application: application)
+    let firstRestoredSource = stringAttribute(
+        firstEditor.element,
+        kAXValueAttribute as CFString
+    )
+    let firstCaret = selectedRange(firstEditor.element)
+    try press(tabTwo)
+    let secondRestoredTitle = stringAttribute(
+        try single("editor.tab.title", application: application).element,
+        kAXValueAttribute as CFString
+    )
+    let secondEditor = try single("editor.input", application: application)
+    let secondRestoredSource = stringAttribute(
+        secondEditor.element,
+        kAXValueAttribute as CFString
+    )
+    let secondCaret = selectedRange(secondEditor.element)
     let split = numberAttribute(
         try single("workspace.splitter", application: application).element,
         kAXValueAttribute as CFString
     )
     let tabsRestored =
         orderBefore(tabTwo.order, tabOne.order)
-        && title == secondTitle
-        && source == secondSource
-        && caret?.location == secondSource.utf16.count
+        && firstRestoredTitle == firstTitle
+        && firstRestoredSource == firstSource
+        && firstCaret?.location == firstSource.utf16.count
+        && secondRestoredTitle == secondTitle
+        && secondRestoredSource == secondSource
+        && secondCaret?.location == secondSource.utf16.count
         && split != nil
         && abs((split ?? 0) - (seed.splitValue ?? -1)) < 0.000_001
     let resultsOmitted =
-        prefixRecords("result.output.", application: application).isEmpty
+        resultTabIdentifiers(application: application).isEmpty
         && statusValue("status.result", application: application) == "None"
     guard tabsRestored, resultsOmitted else {
         throw fail("restart did not restore tabs or omit result payloads exactly")
@@ -777,7 +1218,7 @@ private func runHistoryOpen(_ options: Options) throws {
         && tabIdentifiersAfter.isSuperset(of: tabIdentifiersBefore)
         && openedSource == secondSource
         && optionalSingle("editor.pending", application: application) == nil
-        && prefixRecords("result.output.", application: application).isEmpty
+        && resultTabIdentifiers(application: application).isEmpty
     guard historyOpenedWithoutRun else {
         throw fail("history open dispatched work or changed source identity")
     }
@@ -804,10 +1245,11 @@ private func runExplicitRun(_ options: Options) throws {
     let application = try applicationElement(pid: pid)
     let editor = try single("editor.input", application: application)
     try setSelectedRange(editor.element, location: secondSource.utf16.count)
+    let before = resultTabIdentifiers(application: application)
     try press(try single("editor.execute", application: application))
-    try waitForExecutionToSettle(application: application, requireResultCount: 1)
+    _ = try waitForResultDelta(application: application, before: before, delta: 1)
     let explicitRunCompleted =
-        !prefixRecords("result.output.", application: application).isEmpty
+        resultTabIdentifiers(application: application).count == before.count + 1
         && optionalSingle("editor.pending", application: application) == nil
     guard explicitRunCompleted else {
         throw fail("explicit history rerun did not complete")
@@ -892,10 +1334,11 @@ private func runCorruptReopen(_ options: Options) throws {
     try selectProfile(index: 1, filter: healthyProfileFilter, application: application)
     try connectSelectedProfile(application: application)
     try setEditorSource(healthySource, application: application)
+    let before = resultTabIdentifiers(application: application)
     try press(try single("editor.execute", application: application))
-    try waitForExecutionToSettle(application: application, requireResultCount: 1)
+    _ = try waitForResultDelta(application: application, before: before, delta: 1)
     let healthyProfileRemainsUsable =
-        !prefixRecords("result.output.", application: application).isEmpty
+        resultTabIdentifiers(application: application).count == before.count + 1
         && optionalSingle("editor.pending", application: application) == nil
     guard healthyProfileRemainsUsable else {
         throw fail("healthy profile stopped working after isolated corruption")

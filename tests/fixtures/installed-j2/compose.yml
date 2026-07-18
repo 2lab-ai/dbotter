@@ -1,0 +1,27 @@
+name: dbotter-installed-j2
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: "no"
+    command:
+      - --general-log=ON
+      - --log-output=TABLE
+    environment:
+      MYSQL_DATABASE: dbotter
+      MYSQL_USER: dbotter
+      MYSQL_PASSWORD: dbotter-local-only
+      MYSQL_ROOT_PASSWORD: root-local-only
+      MYSQL_PWD: dbotter-local-only
+    labels:
+      ai.2lab.dbotter.fixture: installed-j2-v1
+    ports:
+      - "127.0.0.1:33316:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "--host=127.0.0.1", "--user=dbotter", "--silent"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 15s
+    tmpfs:
+      - /var/lib/mysql

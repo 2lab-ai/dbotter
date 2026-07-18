@@ -74,6 +74,7 @@ for executable in \
   scripts/verify-installed-gui.sh \
   scripts/build-native-j2-ax-driver.sh \
   scripts/verify-installed-j2.sh \
+  scripts/scan-private-workspace.py \
   scripts/verify-local.sh; do
   test -x "$executable" || fail "$executable is missing or not executable"
 done
@@ -116,6 +117,8 @@ require_literal scripts/verify-hermetic.sh 'tests/daily_use_j2_installed_contrac
 require_literal scripts/verify-hermetic.sh 'scripts/native-j2-ax-driver.swift'
 require_literal scripts/verify-hermetic.sh 'scripts/build-native-j2-ax-driver.sh'
 require_literal scripts/verify-hermetic.sh 'scripts/verify-installed-j2.sh'
+require_literal scripts/verify-hermetic.sh 'scripts/scan-private-workspace.py'
+require_literal scripts/verify-hermetic.sh 'tests/fixtures/installed-j2/compose.yml'
 require_literal scripts/verify-hermetic.sh 'scripts/check-installed-receipt-contract.sh'
 require_literal scripts/verify-hermetic.sh 'scripts/validate-installed-receipt-config-contract.py'
 require_literal scripts/check-installed-receipt-contract.sh \
@@ -135,6 +138,15 @@ require_literal scripts/verify-installed-gui.sh 'scripts/build-native-ax-driver.
 require_literal scripts/verify-installed-j2.sh 'dbotter.installed-j2-evidence.v1'
 require_literal scripts/verify-installed-j2.sh 'scripts/build-native-j2-ax-driver.sh'
 require_literal scripts/verify-installed-j2.sh 'kill -KILL "$seed_pid"'
+require_literal scripts/verify-installed-j2.sh 'scripts/scan-private-workspace.py'
+require_literal scripts/verify-installed-j2.sh 'com.docker.compose.project'
+require_literal scripts/verify-installed-j2.sh 'ai.2lab.dbotter.fixture'
+require_literal scripts/verify-installed-j2.sh '--forbidden-env DBOTTER_J2_RESULT_SENTINEL'
+require_literal scripts/verify-installed-j2.sh 'MAX_PROFILE_SHARD_BYTES=33554432'
+require_literal scripts/scan-private-workspace.py 'os.O_NOFOLLOW'
+require_literal scripts/scan-private-workspace.py 'os.fstat'
+require_literal scripts/scan-private-workspace.py 'MAX_ENTRIES'
+require_literal scripts/scan-private-workspace.py 'MAX_DEPTH'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.p7-installed-evidence.v1'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.formula-install-evidence.v1'
 require_literal scripts/assemble-installed-receipt.py 'dbotter.live-contract-receipt.v2'

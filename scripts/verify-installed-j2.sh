@@ -78,9 +78,10 @@ done
   || fail "--mysql-container is invalid"
 [[ -n "$output" && ! -e "$output" && ! -L "$output" ]] \
   || fail "--output must not already exist"
-[[ -n "${DBOTTER_MYSQL_PASSWORD:-}" ]] || fail "DBOTTER_MYSQL_PASSWORD is required"
-[[ -n "${DBOTTER_MYSQL_ROOT_PASSWORD:-}" ]] \
-  || fail "DBOTTER_MYSQL_ROOT_PASSWORD is required"
+[[ "${DBOTTER_MYSQL_PASSWORD:-}" == "dbotter-local-only" ]] \
+  || fail "DBOTTER_MYSQL_PASSWORD does not match the dedicated fixture"
+[[ "${DBOTTER_MYSQL_ROOT_PASSWORD:-}" == "root-local-only" ]] \
+  || fail "DBOTTER_MYSQL_ROOT_PASSWORD does not match the dedicated fixture"
 
 for dependency in \
   brew codesign docker git jq lsof pgrep plutil python3 shasum stat xcrun; do
@@ -89,13 +90,21 @@ done
 
 builder="$ROOT/scripts/build-native-j2-ax-driver.sh"
 driver_source="$ROOT/scripts/native-j2-ax-driver.swift"
+scanner="$ROOT/scripts/scan-private-workspace.py"
+fixture_compose="$ROOT/tests/fixtures/installed-j2/compose.yml"
 [[ -x "$builder" && -f "$builder" && ! -L "$builder" ]] \
   || fail "scripts/build-native-j2-ax-driver.sh is unavailable"
 [[ -f "$driver_source" && ! -L "$driver_source" ]] \
   || fail "scripts/native-j2-ax-driver.swift is unavailable"
+[[ -x "$scanner" && -f "$scanner" && ! -L "$scanner" ]] \
+  || fail "scripts/scan-private-workspace.py is unavailable"
+[[ -f "$fixture_compose" && ! -L "$fixture_compose" ]] \
+  || fail "installed J2 fixture compose is unavailable"
 git -C "$ROOT" ls-files --error-unmatch \
   scripts/build-native-j2-ax-driver.sh \
-  scripts/native-j2-ax-driver.swift >/dev/null 2>&1 \
+  scripts/native-j2-ax-driver.swift \
+  scripts/scan-private-workspace.py \
+  tests/fixtures/installed-j2/compose.yml >/dev/null 2>&1 \
   || fail "canonical J2 AX dependencies must be tracked"
 
 "$ROOT/scripts/validate-preview-manifest.py" "$manifest" >/dev/null
@@ -153,6 +162,12 @@ grep -Fq 'name = "J2 Primary"' "$config" || fail "fixture lacks J2 Primary"
 grep -Fq 'name = "J2 Healthy"' "$config" || fail "fixture lacks J2 Healthy"
 grep -Fq 'credential_mode = "environment"' "$config" \
   || fail "fixture must use an Environment credential"
+[[ "$(grep -Fc 'host = "127.0.0.1"' "$config")" -eq 2 ]] \
+  || fail "fixture profiles must use the dedicated loopback host"
+[[ "$(grep -Fc 'port = 33316' "$config")" -eq 2 ]] \
+  || fail "fixture profiles must use the dedicated MySQL port"
+[[ "$(grep -Fc 'secret_env = "DBOTTER_MYSQL_PASSWORD"' "$config")" -eq 2 ]] \
+  || fail "fixture profiles must use the exact Environment credential name"
 
 instance_ids=()
 while IFS= read -r instance_id; do
@@ -175,6 +190,24 @@ docker inspect "$mysql_container" >/dev/null 2>&1 \
   || fail "MySQL fixture container is unavailable"
 [[ "$(docker inspect -f '{{.State.Running}}' "$mysql_container")" == "true" ]] \
   || fail "MySQL fixture container is not running"
+[[ "$(docker inspect -f '{{.State.Health.Status}}' "$mysql_container")" == "healthy" ]] \
+  || fail "MySQL fixture container is not healthy"
+[[ "$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' \
+  "$mysql_container")" == "dbotter-installed-j2" ]] \
+  || fail "MySQL fixture has the wrong Compose project"
+[[ "$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' \
+  "$mysql_container")" == "mysql" ]] \
+  || fail "MySQL fixture has the wrong Compose service"
+[[ "$(docker inspect -f '{{ index .Config.Labels "ai.2lab.dbotter.fixture" }}' \
+  "$mysql_container")" == "installed-j2-v1" ]] \
+  || fail "MySQL fixture identity label is invalid"
+[[ "$(docker inspect -f '{{.Config.Image}}' "$mysql_container")" == "mysql:8.4" ]] \
+  || fail "MySQL fixture image tag is invalid"
+docker inspect "$mysql_container" | jq -e '
+  .[0].HostConfig.PortBindings["3306/tcp"]
+    == [{"HostIp":"127.0.0.1","HostPort":"33316"}]
+  and any(.[0].Mounts[]; .Type == "tmpfs" and .Destination == "/var/lib/mysql")
+' >/dev/null || fail "MySQL fixture port or tmpfs isolation is invalid"
 
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/dbotter-installed-j2.XXXXXX")"
 driver="$temporary/native-j2-ax-driver"
@@ -187,8 +220,9 @@ corrupt_evidence="$temporary/corrupt-reopen.json"
 seed_pid=""
 restart_pid=""
 corrupt_pid=""
-general_log_enabled=false
 output_temporary=""
+MAX_PROFILE_SHARD_BYTES=33554432
+result_sentinel=""
 
 stop_pid() {
   local pid="$1"
@@ -219,9 +253,6 @@ cleanup() {
   stop_pid "$corrupt_pid"
   stop_pid "$restart_pid"
   stop_pid "$seed_pid"
-  if [[ "$general_log_enabled" == true ]]; then
-    mysql_root_exec "SET GLOBAL general_log = OFF" >/dev/null 2>&1 || true
-  fi
   [[ ! -d "$temporary" || -L "$temporary" ]] || rm -rf -- "$temporary"
   [[ -z "$output_temporary" ]] || rm -f -- "$output_temporary"
   exit "$status"
@@ -236,10 +267,73 @@ fi
 [[ -f "$driver" && ! -L "$driver" && -x "$driver" ]] \
   || fail "J2 AX driver build produced no executable"
 
-mysql_root_exec \
-  "SET GLOBAL general_log = OFF; TRUNCATE TABLE mysql.general_log; SET GLOBAL log_output = 'TABLE'; SET GLOBAL general_log = ON" \
-  >/dev/null
-general_log_enabled=true
+[[ "$(mysql_root_exec \
+  "SELECT CONCAT(@@global.general_log, ':', @@global.log_output)")" == "1:TABLE" ]] \
+  || fail "dedicated MySQL fixture must start with TABLE general logging enabled"
+mysql_server_version="$(mysql_root_exec "SELECT VERSION()")"
+[[ "$mysql_server_version" =~ ^8\.4\.[0-9]+ ]] \
+  || fail "dedicated MySQL fixture did not report an 8.4 server"
+mysql_image_id="$(docker inspect -f '{{.Image}}' "$mysql_container")"
+[[ "$mysql_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] \
+  || fail "MySQL fixture image ID is invalid"
+mysql_image_digest="$(
+  docker image inspect "$mysql_image_id" | jq -r '
+    [.[0].RepoDigests[]? | select(startswith("mysql@sha256:"))]
+    | if length >= 1 then .[0] else error("mysql digest") end
+  '
+)"
+[[ "$mysql_image_digest" =~ ^mysql@sha256:[0-9a-f]{64}$ ]] \
+  || fail "MySQL fixture repository digest is invalid"
+
+result_sentinel="DBOTTER_J2_RESULT_$(python3 -c \
+  'import secrets; print(secrets.token_hex(16))')"
+[[ "$result_sentinel" =~ ^DBOTTER_J2_RESULT_[0-9a-f]{32}$ ]] \
+  || fail "private result sentinel generation failed"
+export DBOTTER_J2_RESULT_SENTINEL="$result_sentinel"
+mysql_root_exec "
+  DROP TABLE IF EXISTS dbotter.dbotter_j2_private_result;
+  CREATE TABLE dbotter.dbotter_j2_private_result (
+    id BIGINT PRIMARY KEY,
+    value VARCHAR(128) NOT NULL
+  );
+  INSERT INTO dbotter.dbotter_j2_private_result (id, value) VALUES
+    (1, '$result_sentinel'),
+    (2, 'alpha'),
+    (3, 'zulu')
+" >/dev/null
+
+mysql_execute_count() {
+  local argument="$1"
+  case "$argument" in
+    "SELECT id, value FROM dbotter_j2_private_result ORDER BY id" \
+      |"SELECT 39 AS j2_unselected" \
+      |"SELECT 40 AS j2_selected" \
+      |"SELECT 41 AS j2_first" \
+      |"SELECT 42 AS j2_second" \
+      |"SELECT 84 AS j2_healthy") ;;
+    *) fail "refusing an unknown MySQL observation argument" ;;
+  esac
+  mysql_root_exec \
+    "SELECT COUNT(*) FROM mysql.general_log WHERE command_type = 'Execute' AND argument = '$argument'"
+}
+
+privacy_query="SELECT id, value FROM dbotter_j2_private_result ORDER BY id"
+unselected_query="SELECT 39 AS j2_unselected"
+selected_query="SELECT 40 AS j2_selected"
+first_query="SELECT 41 AS j2_first"
+second_query="SELECT 42 AS j2_second"
+healthy_query="SELECT 84 AS j2_healthy"
+privacy_before="$(mysql_execute_count "$privacy_query")"
+unselected_before="$(mysql_execute_count "$unselected_query")"
+selected_before="$(mysql_execute_count "$selected_query")"
+first_before="$(mysql_execute_count "$first_query")"
+second_before="$(mysql_execute_count "$second_query")"
+healthy_before="$(mysql_execute_count "$healthy_query")"
+for baseline in \
+  "$privacy_before" "$unselected_before" "$selected_before" \
+  "$first_before" "$second_before" "$healthy_before"; do
+  [[ "$baseline" =~ ^[0-9]+$ ]] || fail "invalid MySQL observation baseline"
+done
 
 "$driver" \
   --phase seed \
@@ -251,12 +345,36 @@ jq -e '
   .schema == "dbotter.installed-j2-ax-observations.v1"
   and .phase == "seed"
   and (.pid | type == "number" and . > 0 and floor == .)
+  and .checkpoints.current_selection_all_exercised == true
+  and .checkpoints.syntax_autocomplete_exercised == true
+  and .checkpoints.result_inspection_completed == true
+  and .checkpoints.history_filters_and_metrics_visible == true
+  and .checkpoints.history_source_exact_retained == true
+  and .checkpoints.history_source_plus_one_omitted == true
+  and .checkpoints.tab_bound_enforced == true
+  and .checkpoints.persistence_opt_out_and_clear == true
   and .checkpoints.tabs_created_renamed_reordered == true
   and .checkpoints.saved_visible_before_kill == true
   and (.split_value | type == "number")
 ' "$seed_evidence" >/dev/null || fail "seed AX evidence is invalid"
 seed_pid="$(jq -r '.pid' "$seed_evidence")"
 kill -0 "$seed_pid" >/dev/null 2>&1 || fail "seed Preview PID exited"
+
+privacy_after_seed="$(mysql_execute_count "$privacy_query")"
+unselected_after_seed="$(mysql_execute_count "$unselected_query")"
+selected_after_seed="$(mysql_execute_count "$selected_query")"
+first_after_seed="$(mysql_execute_count "$first_query")"
+second_after_seed="$(mysql_execute_count "$second_query")"
+(( privacy_after_seed == privacy_before + 1 )) \
+  || fail "current execution did not dispatch the exact private-result query once"
+(( unselected_after_seed == unselected_before )) \
+  || fail "selection execution dispatched the unselected statement"
+(( selected_after_seed == selected_before + 1 )) \
+  || fail "selection execution did not dispatch the selected statement exactly once"
+(( first_after_seed == first_before + 1 )) \
+  || fail "Run all did not dispatch the first statement exactly once"
+(( second_after_seed == second_before + 1 )) \
+  || fail "Run all did not dispatch the second statement exactly once"
 
 pid_text_path="$(lsof -a -p "$seed_pid" -d txt -Fn | sed -n 's/^n//p' | head -1)"
 pid_realpath="$(python3 - "$pid_text_path" <<'PY'
@@ -304,6 +422,16 @@ primary_shard="$primary_profile_directory/$primary_shard_name"
   || fail "workspace shard mode is not 0600"
 manifest_bytes="$(stat -f '%z' "$primary_manifest")"
 shard_bytes="$(stat -f '%z' "$primary_shard")"
+(( shard_bytes <= MAX_PROFILE_SHARD_BYTES )) \
+  || fail "committed profile shard exceeds the 32 MiB bound"
+shard_bound_enforced=true
+
+"$scanner" \
+  --root "$workspace_root" \
+  --forbidden-env DBOTTER_MYSQL_PASSWORD \
+  --forbidden-env DBOTTER_MYSQL_ROOT_PASSWORD \
+  --forbidden-env DBOTTER_J2_RESULT_SENTINEL >/dev/null
+private_store_payload_scan_clean=true
 
 kill -KILL "$seed_pid"
 for _ in {1..100}; do
@@ -329,12 +457,7 @@ jq -e '
 restart_pid="$(jq -r '.pid' "$restart_evidence")"
 kill -0 "$restart_pid" >/dev/null 2>&1 || fail "restart Preview PID exited"
 
-mysql_count() {
-  mysql_root_exec \
-    "SELECT COUNT(*) FROM mysql.general_log WHERE command_type = 'Execute' AND argument = 'SELECT 42 AS j2_second'"
-}
-
-zero_dispatch_before="$(mysql_count)"
+zero_dispatch_before="$(mysql_execute_count "$second_query")"
 [[ "$zero_dispatch_before" =~ ^[0-9]+$ ]] || fail "invalid pre-open MySQL counter"
 
 "$driver" \
@@ -349,7 +472,7 @@ jq -e '
   and .phase == "history-open"
   and .checkpoints.history_opened_without_run == true
 ' "$history_evidence" >/dev/null || fail "history-open AX evidence is invalid"
-zero_dispatch_after_open="$(mysql_count)"
+zero_dispatch_after_open="$(mysql_execute_count "$second_query")"
 [[ "$zero_dispatch_after_open" == "$zero_dispatch_before" ]] \
   || fail "opening history dispatched a database query"
 
@@ -365,7 +488,7 @@ jq -e '
   and .phase == "explicit-run"
   and .checkpoints.explicit_run_completed == true
 ' "$explicit_evidence" >/dev/null || fail "explicit-run AX evidence is invalid"
-zero_dispatch_after_run="$(mysql_count)"
+zero_dispatch_after_run="$(mysql_execute_count "$second_query")"
 [[ "$zero_dispatch_after_run" =~ ^[0-9]+$ ]] \
   || fail "invalid post-run MySQL counter"
 (( zero_dispatch_after_run == zero_dispatch_before + 1 )) \
@@ -424,21 +547,43 @@ quarantine_files="${#quarantine_entries[@]}"
 (( quarantine_files > 0 )) || fail "corrupt shard produced no bounded quarantine entry"
 corrupt_profile_quarantined=true
 
-healthy_query_count="$(
-  mysql_root_exec \
-    "SELECT COUNT(*) FROM mysql.general_log WHERE command_type = 'Execute' AND argument = 'SELECT 84 AS j2_healthy'"
-)"
-[[ "$healthy_query_count" =~ ^[1-9][0-9]*$ ]] \
-  || fail "healthy profile produced no independent server observation"
+healthy_after="$(mysql_execute_count "$healthy_query")"
+[[ "$healthy_after" =~ ^[0-9]+$ ]] \
+  || fail "healthy profile produced an invalid server observation"
+(( healthy_after == healthy_before + 1 )) \
+  || fail "healthy profile did not dispatch its exact query once"
+healthy_query_count=1
 healthy_profile_remains_usable=true
 
 stop_pid "$corrupt_pid"
 corrupt_pid=""
-mysql_root_exec "SET GLOBAL general_log = OFF" >/dev/null
-general_log_enabled=false
 
 tabs_created_renamed_reordered="$(
   jq -r '.checkpoints.tabs_created_renamed_reordered' "$seed_evidence"
+)"
+current_selection_all_exercised="$(
+  jq -r '.checkpoints.current_selection_all_exercised' "$seed_evidence"
+)"
+syntax_autocomplete_exercised="$(
+  jq -r '.checkpoints.syntax_autocomplete_exercised' "$seed_evidence"
+)"
+result_inspection_completed="$(
+  jq -r '.checkpoints.result_inspection_completed' "$seed_evidence"
+)"
+history_filters_and_metrics_visible="$(
+  jq -r '.checkpoints.history_filters_and_metrics_visible' "$seed_evidence"
+)"
+history_source_exact_retained="$(
+  jq -r '.checkpoints.history_source_exact_retained' "$seed_evidence"
+)"
+history_source_plus_one_omitted="$(
+  jq -r '.checkpoints.history_source_plus_one_omitted' "$seed_evidence"
+)"
+tab_bound_enforced="$(
+  jq -r '.checkpoints.tab_bound_enforced' "$seed_evidence"
+)"
+persistence_opt_out_and_clear="$(
+  jq -r '.checkpoints.persistence_opt_out_and_clear' "$seed_evidence"
 )"
 saved_visible_before_kill="$(
   jq -r '.checkpoints.saved_visible_before_kill' "$seed_evidence"
@@ -451,6 +596,15 @@ history_opened_without_run="$(
   jq -r '.checkpoints.history_opened_without_run' "$history_evidence"
 )"
 
+[[ "$(mysql_root_exec \
+  "SELECT CONCAT(@@global.general_log, ':', @@global.log_output)")" == "1:TABLE" ]] \
+  || fail "installed verification changed the dedicated fixture logging state"
+current_query_delta=$((privacy_after_seed - privacy_before))
+unselected_query_delta=$((unselected_after_seed - unselected_before))
+selected_query_delta=$((selected_after_seed - selected_before))
+run_all_first_delta=$((first_after_seed - first_before))
+run_all_second_delta=$((second_after_seed - second_before))
+
 output_parent="$(dirname "$output")"
 [[ -d "$output_parent" && ! -L "$output_parent" ]] \
   || fail "--output parent must be a directory and not a symlink"
@@ -462,15 +616,33 @@ jq -n \
   --arg tag "$tag" \
   --arg target "$target" \
   --arg executable_sha256 "$actual_executable_sha256" \
+  --arg mysql_server_version "$mysql_server_version" \
+  --arg mysql_image_digest "$mysql_image_digest" \
   --argjson workspace_manifest_generation "$workspace_manifest_generation" \
   --argjson manifest_bytes "$manifest_bytes" \
   --argjson shard_bytes "$shard_bytes" \
+  --argjson max_profile_shard_bytes "$MAX_PROFILE_SHARD_BYTES" \
   --argjson quarantine_files "$quarantine_files" \
+  --argjson current_query_delta "$current_query_delta" \
+  --argjson unselected_query_delta "$unselected_query_delta" \
+  --argjson selected_query_delta "$selected_query_delta" \
+  --argjson run_all_first_delta "$run_all_first_delta" \
+  --argjson run_all_second_delta "$run_all_second_delta" \
   --argjson zero_dispatch_before "$zero_dispatch_before" \
   --argjson zero_dispatch_after_open "$zero_dispatch_after_open" \
   --argjson zero_dispatch_after_run "$zero_dispatch_after_run" \
   --argjson healthy_query_count "$healthy_query_count" \
   --argjson tabs_created_renamed_reordered "$tabs_created_renamed_reordered" \
+  --argjson current_selection_all_exercised "$current_selection_all_exercised" \
+  --argjson syntax_autocomplete_exercised "$syntax_autocomplete_exercised" \
+  --argjson result_inspection_completed "$result_inspection_completed" \
+  --argjson history_filters_and_metrics_visible "$history_filters_and_metrics_visible" \
+  --argjson history_source_exact_retained "$history_source_exact_retained" \
+  --argjson history_source_plus_one_omitted "$history_source_plus_one_omitted" \
+  --argjson tab_bound_enforced "$tab_bound_enforced" \
+  --argjson shard_bound_enforced "$shard_bound_enforced" \
+  --argjson persistence_opt_out_and_clear "$persistence_opt_out_and_clear" \
+  --argjson private_store_payload_scan_clean "$private_store_payload_scan_clean" \
   --argjson saved_visible_before_kill "$saved_visible_before_kill" \
   --argjson tabs_restored "$tabs_restored" \
   --argjson results_omitted_after_restart "$results_omitted_after_restart" \
@@ -485,9 +657,21 @@ jq -n \
     tag: $tag,
     installed_identity: {
       target: $target,
-      executable_sha256: $executable_sha256
+      executable_sha256: $executable_sha256,
+      mysql_server_version: $mysql_server_version,
+      mysql_image_digest: $mysql_image_digest
     },
     checkpoints: {
+      current_selection_all_exercised: $current_selection_all_exercised,
+      syntax_autocomplete_exercised: $syntax_autocomplete_exercised,
+      result_inspection_completed: $result_inspection_completed,
+      history_filters_and_metrics_visible: $history_filters_and_metrics_visible,
+      history_source_exact_retained: $history_source_exact_retained,
+      history_source_plus_one_omitted: $history_source_plus_one_omitted,
+      tab_bound_enforced: $tab_bound_enforced,
+      shard_bound_enforced: $shard_bound_enforced,
+      persistence_opt_out_and_clear: $persistence_opt_out_and_clear,
+      private_store_payload_scan_clean: $private_store_payload_scan_clean,
       tabs_created_renamed_reordered: $tabs_created_renamed_reordered,
       saved_visible_before_kill: $saved_visible_before_kill,
       tabs_restored: $tabs_restored,
@@ -502,11 +686,18 @@ jq -n \
       workspace_manifest_generation: $workspace_manifest_generation,
       manifest_bytes: $manifest_bytes,
       shard_bytes: $shard_bytes,
+      max_profile_shard_bytes: $max_profile_shard_bytes,
       root_mode: 448,
       file_mode: 384,
-      quarantine_files: $quarantine_files
+      quarantine_files: $quarantine_files,
+      payload_scan_clean: $private_store_payload_scan_clean
     },
     mysql_observation: {
+      current_query_delta: $current_query_delta,
+      unselected_query_delta: $unselected_query_delta,
+      selected_query_delta: $selected_query_delta,
+      run_all_first_delta: $run_all_first_delta,
+      run_all_second_delta: $run_all_second_delta,
       zero_dispatch_before: $zero_dispatch_before,
       zero_dispatch_after_open: $zero_dispatch_after_open,
       after_explicit_run: $zero_dispatch_after_run,
@@ -523,21 +714,32 @@ jq -e '
   and .schema == "dbotter.installed-j2-evidence.v1"
   and (.source_sha | test("^[0-9a-f]{40}$"))
   and (.tag | startswith("preview-"))
+  and (.installed_identity.mysql_server_version | test("^8\\.4\\.[0-9]+"))
+  and (.installed_identity.mysql_image_digest
+      | test("^mysql@sha256:[0-9a-f]{64}$"))
   and all(.checkpoints[]; . == true)
   and .private_store.workspace_manifest_generation > 0
   and .private_store.root_mode == 448
   and .private_store.file_mode == 384
   and .private_store.quarantine_files > 0
+  and .private_store.shard_bytes <= .private_store.max_profile_shard_bytes
+  and .private_store.payload_scan_clean == true
+  and .mysql_observation.current_query_delta == 1
+  and .mysql_observation.unselected_query_delta == 0
+  and .mysql_observation.selected_query_delta == 1
+  and .mysql_observation.run_all_first_delta == 1
+  and .mysql_observation.run_all_second_delta == 1
   and .mysql_observation.zero_dispatch_before
       == .mysql_observation.zero_dispatch_after_open
   and .mysql_observation.after_explicit_run
       == (.mysql_observation.zero_dispatch_before + 1)
-  and .mysql_observation.healthy_profile_query_count > 0
+  and .mysql_observation.healthy_profile_query_count == 1
 ' "$output_temporary" >/dev/null || fail "assembled J2 evidence is invalid"
 
 if receipt_candidate_has_static_leak "$output_temporary" \
   || receipt_candidate_contains_secret "$output_temporary" "$DBOTTER_MYSQL_PASSWORD" \
-  || receipt_candidate_contains_secret "$output_temporary" "$DBOTTER_MYSQL_ROOT_PASSWORD"; then
+  || receipt_candidate_contains_secret "$output_temporary" "$DBOTTER_MYSQL_ROOT_PASSWORD" \
+  || receipt_candidate_contains_secret "$output_temporary" "$result_sentinel"; then
   fail "assembled J2 evidence contains a credential or value-bearing payload"
 fi
 
