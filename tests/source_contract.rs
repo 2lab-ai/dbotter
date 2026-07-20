@@ -103,6 +103,7 @@ fn macos_installed_fixture_keeps_platform_only_imports_out_of_linux_clippy() {
         "use std::process::{Child, Command};",
         "use std::thread;",
         "use std::time::Duration;",
+        "use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};",
     ] {
         assert!(
             !installed.contains(forbidden),
@@ -111,6 +112,7 @@ fn macos_installed_fixture_keeps_platform_only_imports_out_of_linux_clippy() {
     }
     for required in [
         "use std::process::Command;",
+        "#[cfg(target_os = \"macos\")]\nuse std::os::unix::fs::MetadataExt;",
         "struct ChildProcessGuard(std::process::Child);",
         "std::thread::sleep(std::time::Duration::from_millis(20));",
     ] {
