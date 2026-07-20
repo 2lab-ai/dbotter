@@ -12,7 +12,7 @@ without credentials, query values, keys, cell values or imported/exported data.
 
 | Journey | RED commit | GREEN commit(s) | Local/live/native evidence | Preview/xbrew/installed evidence | Status |
 |---|---|---|---|---|---|
-| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` through `6ade3eff0b370c1c3475311fc52dd38724ad54e0`; CI portability REDs `b689d352b1295ab42c56b28ee52eaee2e382aa1a`, `819a7c7d7878a793b127180992f0e55dd242565f` and `1fe4afdbabc80bd72e5985df9434030017fba213`; installed-fixture REDs `ac93ab18bb788cca14ab9d4226332e8301d5b202` and `88e20761a5c9f9cb7d07eee52c4d09a00c2851c6`; stable-AX REDs `6533ca8d174d8b6a1af88787698e2a9872bdbd68` and atomic-replacement `e5b490ceff45ea172fe0110c68ff4b19c5b5d52d`; earlier exact ancestry retained at `03d8127` | `d674aa6984f2ceace1edd834eba5c0be7ca5797e` through `a66352b58e4183e4a98e3e1cbcf8caa13486bb6b`; ordered errors `4e21cb0098dbf076a3687a6371b23de6c1508fdb`; exact writer guard `b485f7b450ebb43c0b8bd837cd6a276ee0c0c906`; Unix stat portability `215b7386fdecce5b0b88ecf31dcf5aabe185b910` and `4da2f908610f760e2be139f1d8c6d9f1e453c8d4`; cross-target installed test `4a18a0541e387025c5749bbd992e1939086f633b`; isolated MySQL entrypoint `577d70d860a9d0d6b7cb4f2a382a2819b2bd7fae`; inspectable tmpfs `1fc60773882b44912d91f29d013b3d86fad2380e`; stable AX path `59eb274767d7d9b064a362b1087b5e7b96b544a5`; per-phase pinned AX identity `5c54b6158dbac98e106129b89390940bf35bbcef` | See J2 local GREEN and repair-forward checkpoints below | Preview `29639223586` / `7bfae29d4e7094a66d4dd5462504618db6778470` and xbrew installation passed exact identity; installed six-step receipt is absent and a higher repair-forward Preview is required | local GREEN |
+| J2 durable SQL workspace/history | `0e1e38d3d1bdf945a49595816d7946b21c2f97f9` through `6ade3eff0b370c1c3475311fc52dd38724ad54e0`; CI portability REDs `b689d352b1295ab42c56b28ee52eaee2e382aa1a`, `819a7c7d7878a793b127180992f0e55dd242565f`, `1fe4afdbabc80bd72e5985df9434030017fba213` and `608f1e4911e8c272b3749006e1bd702c6484c9dc`; installed-fixture REDs `ac93ab18bb788cca14ab9d4226332e8301d5b202` and `88e20761a5c9f9cb7d07eee52c4d09a00c2851c6`; stable-AX REDs `6533ca8d174d8b6a1af88787698e2a9872bdbd68` and atomic-replacement `e5b490ceff45ea172fe0110c68ff4b19c5b5d52d`; earlier exact ancestry retained at `03d8127` | `d674aa6984f2ceace1edd834eba5c0be7ca5797e` through `a66352b58e4183e4a98e3e1cbcf8caa13486bb6b`; ordered errors `4e21cb0098dbf076a3687a6371b23de6c1508fdb`; exact writer guard `b485f7b450ebb43c0b8bd837cd6a276ee0c0c906`; Unix stat portability `215b7386fdecce5b0b88ecf31dcf5aabe185b910` and `4da2f908610f760e2be139f1d8c6d9f1e453c8d4`; cross-target installed tests `4a18a0541e387025c5749bbd992e1939086f633b` and `863f95ae93875f86cf5cf3c8723589c376456aeb`; isolated MySQL entrypoint `577d70d860a9d0d6b7cb4f2a382a2819b2bd7fae`; inspectable tmpfs `1fc60773882b44912d91f29d013b3d86fad2380e`; stable AX path `59eb274767d7d9b064a362b1087b5e7b96b544a5`; per-phase pinned AX identity `5c54b6158dbac98e106129b89390940bf35bbcef` | See J2 local GREEN and repair-forward checkpoints below | Preview `29639223586` / `7bfae29d4e7094a66d4dd5462504618db6778470` and xbrew installation passed exact identity; installed six-step receipt is absent and a higher repair-forward Preview is required | local GREEN |
 | J1 secure MySQL connection/Data | — | — | — | — | not started |
 | J3 safe typed MySQL row edit | — | — | — | — | not started |
 | J4 bounded export/CSV import | — | — | — | — | not started |
@@ -117,6 +117,17 @@ without credentials, query values, keys, cell values or imported/exported data.
   `7bfae29d4e70` binary cannot complete the final acceptance. J2 remains
   `local GREEN` until a higher exact Preview, xbrew update, the complete
   six-step receipt and independent file/MySQL readback all pass.
+- Preview run `29721277916` fixed source
+  `fbb9f438d831f4f07211465dca56e6aa39188e76` and stopped in Ubuntu hermetic
+  before plan, build, publish or tap. `MetadataExt`, used only by the macOS
+  atomic-replacement test, was imported for all Unix targets and failed Linux
+  Clippy with warnings denied. RED
+  `608f1e4911e8c272b3749006e1bd702c6484c9dc` extends the existing cross-target
+  source contract; GREEN
+  `863f95ae93875f86cf5cf3c8723589c376456aeb` scopes only that trait import to
+  macOS. The focused source contract, installed J2 16/16 and local
+  all-target/all-feature Clippy pass. No release or tag was published by the
+  failed run; the succeeding exact Preview must provide the Linux proof.
 
 ## Status transition
 
